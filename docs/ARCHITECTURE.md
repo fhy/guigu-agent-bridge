@@ -160,3 +160,9 @@ Agent B -> Agent A -> Matrix -> 用户
 `/home/fhy/opencode-chat-bridge` 主要参考其 ACP 封装、Connector/Core 分离、线程会话隔离、进程管理、流式事件、权限边界、限流去重、配置分层和测试结构。
 
 其固定触发词、固定 Agent 角色、Matrix 作为唯一通信通道和 JSON 文件队列不直接照搬。
+
+## 12. 当前开发协作与运行时能力的边界
+
+当前项目的开发协作采用 Coordinator、Architect-Developer、Reviewer 三个逻辑角色，使用 Matrix、任务文档、`TASK_BOARD.md`、Git branch/worktree 和 Review 报告完成协作。详细规则见 [COLLABORATION.md](COLLABORATION.md)。
+
+结构化 `AgentTask`、Agent Bus、任务状态机和持久化协作是本项目完成后提供的运行时能力。现有 OpenCode、ACP 和 Matrix 工具尚不支持这些能力，因此实现前不能把 `AgentTask` 当作现有协作工具使用。
