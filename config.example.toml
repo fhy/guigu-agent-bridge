@@ -1,0 +1,23 @@
+# guigu-agent-bridge configuration example
+# Keep credentials in environment variables or a secret manager.
+
+[bridge]
+database = "~/.local/share/guigu-agent-bridge/state.db"
+session_root = "~/.cache/guigu-agent-bridge/sessions"
+max_task_depth = 8
+max_task_hops = 16
+default_timeout_seconds = 300
+
+[transports.matrix]
+enabled = false
+homeserver = "https://matrix.example"
+user_id = "{env:MATRIX_USER_ID}"
+access_token = "{env:MATRIX_ACCESS_TOKEN}"
+monitor_room = ""
+
+# Agent definitions are transport endpoints, not fixed business roles.
+[agents.example]
+transport = "acp"
+command = "/usr/local/bin/opencode"
+args = ["acp"]
+enabled = false
