@@ -6,6 +6,8 @@
 
 当前仓库处于 Rust 项目初始化和架构设计阶段，尚未提供可用的生产连接器。正式架构和分阶段实施计划见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
+Agent 开发入口协议见 [AGENTS.md](AGENTS.md)；协作流程和治理基线分别见 [docs/COLLABORATION.md](docs/COLLABORATION.md) 与 [docs/GOVERNANCE.md](docs/GOVERNANCE.md)。
+
 ## 设计边界
 
 Bridge 负责消息接入、Agent 路由、任务投递、会话管理、权限、超时、重试、取消、循环检测和状态观测；具体 Agent 负责模型、提示词、工具和业务逻辑。项目不固定 planner、worker、reviewer 等角色。

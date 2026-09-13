@@ -8,6 +8,8 @@ This document records the project-governance practices adopted from the `guigu`,
 - From `pcdn-codebase`: task registration, dependency/conflict assessment, branch/worktree handoff, explicit file staging, blocker escalation, and evidence-based verification.
 - From `opencode-chat-bridge`: incident-driven debugging of thread routing, allowlists, ACP permissions, session paths, process recovery, and observable tool events.
 
+The source projects also demonstrate two additional practices adopted here: a short agent-facing entry point that routes readers to current documents, and evidence-based release/recovery records. Large historical documents are references, not startup instructions.
+
 ## Task Board
 
 `docs/TASK_BOARD.md` is a short restart index, not a complete project history or runtime queue. Keep `Current`, `Queue`, `Blocked`, and `Recent` near the top. Detailed specifications live under `docs/tasks/`; completed history belongs in `docs/HISTORY.md`.
@@ -54,6 +56,14 @@ Never use blanket staging (`git add .`, `git add -A`, or `git add -u`) or `--no-
 ## Incident Learning
 
 Operational failures are treated as design input. Record symptom, impact, timeline, root cause, fix task, regression coverage, and prevention. Particularly important checks for this project are thread-to-session mapping, Agent allowlists, ACP option negotiation, session/workspace consistency, process exit propagation, task event delivery, and loop prevention.
+
+When a defect escapes helper-level tests, add a regression at the real entry point. Configuration, adapter, and routing tests must prove that production code actually invokes the tested path; string-only or unreachable tests are insufficient.
+
+## Documentation Navigation
+
+Keep a small `TASK_BOARD.md` and, when the repository grows, add a `docs/INDEX.md` that maps document categories without duplicating their contents. Agent startup should read the entry point, current task index, and only the relevant specification/review. Move completed task detail to `HISTORY.md` rather than expanding the startup path.
+
+For releases or operational changes, preserve evidence of the tested commit, changed files, impact, monitoring, and rollback. Do not treat a green feature branch as proof that the merged tree or runtime entrypoints are complete; verify the resulting integration target.
 
 ## Proportional Process
 
