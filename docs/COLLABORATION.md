@@ -35,6 +35,9 @@ Coordinator 不直接修改业务代码，也不替代 Reviewer 做技术审查�
 
 ### Architect-Developer
 
+- 接到任务后必须先阅读任务规格、架构文档、当前任务板和相关代码，提交实现前分析。
+- 分析应覆盖目标文件、现有接口、依赖、并发/错误路径、测试方案和潜在风险。
+- 发现事实不明确或规格有歧义时，必须先反馈 Coordinator，不得盲目编码或扩大范围。
 - 阅读任务规格并细化实现设计。
 - 修改代码和测试，处理普通 Bug。
 - 运行格式、编译、lint 和测试门禁。
@@ -65,6 +68,31 @@ Reviewer 不直接修改业务代码。
 ```
 
 普通任务可以简化为 `Coordinator -> Architect-Developer -> Reviewer -> Coordinator`。
+
+### 实现前分析和疑问升级
+
+Architect-Developer 的实现前分析至少确认：
+
+```text
+目标文件和排除文件
+现有接口和调用链
+依赖任务和共享接口
+错误、并发、恢复和兼容性影响
+测试和验收方式
+```
+
+分析中发现事实不明确、规格矛盾、接口不完整或存在多个行为选择时，任务应标记为 `needs_clarification` 或 `blocked`，并先反馈 Coordinator。Coordinator 应依据架构文档、任务规格、历史决策和 Review 结论解决；若仍无法判断，或问题涉及业务目标、公开 API、安全策略、兼容性或范围变化，必须升级给用户决定。决定记录后才能恢复实现。
+
+推荐反馈格式：
+
+```text
+Task: Txxx
+Question: 需要确认的具体问题
+Facts: 已确认事实
+Options: 可行选项及影响
+Recommendation: 技术建议（如有）
+Impact: 对文件、接口、测试和进度的影响
+```
 
 ## 4. 合并规则
 
