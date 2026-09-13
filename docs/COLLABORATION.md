@@ -1,6 +1,6 @@
 # 开发协作方案
 
-本文档描述 `guigu-agent-bridge` 在项目实现阶段采用的多 Agent 协作方式。它描述的是**如何开发本项目**，不是 Bridge 完成后提供的运行时 AgentTask 协议。
+本文档描述 `guigu-agent-bridge` 在项目实现阶段采用的多 Agent 协作方式。它描述的是**如何开发本项目**，不是 Bridge 完成后提供的运行时 AgentTask 协议。治理经验和门禁基线见 [GOVERNANCE.md](GOVERNANCE.md)。
 
 ## 1. 当前阶段的工具边界
 
