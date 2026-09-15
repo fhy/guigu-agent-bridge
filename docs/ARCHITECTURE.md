@@ -135,7 +135,7 @@ Matrix 是状态的投影和控制面，不是任务事实来源。Matrix 发送
 
 ### 阶段六：ACP Adapter
 
-完成 ACP 子进程、JSON-RPC、session、流式事件、取消和进程恢复。Transport 必须支持 ACP backend 实际使用的 JSONL 和 `Content-Length` 两种 framing，不能把 JSON-RPC 消息边界写死为换行符。连接建立时通过配置或可靠探测选择 codec；未知或混合 framing 必须明确失败并输出诊断信息。
+完成 ACP 子进程、JSON-RPC、session、流式事件、取消和进程恢复。最新版 `@agentclientprotocol/codex-acp` 的 ACP stdio 外层使用 JSONL，应作为必须通过的兼容目标。Transport 的 JSON-RPC 消息处理与字节 framing 仍需分层，避免未来 backend 使用不同 framing 时侵入 session 逻辑。
 
 ### 阶段七：生产化
 
