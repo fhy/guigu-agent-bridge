@@ -3,7 +3,7 @@
 ## 摘要
 
 - 项目：guigu-agent-bridge（通用 Agent 通信与任务路由基础设施）
-- 当前阶段：阶段一「模型和配置」；代码尚为空，`src/main.rs` 为 Hello world 模板
+- 当前阶段：阶段一「模型和配置」；T001 已建立 lib/bin 结构、tracing、顶层错误边界和 Ctrl-C 关闭生命周期
 - 架构：已确定，见 [docs/ARCHITECTURE.md](ARCHITECTURE.md)
 - 决策：ADR-001（ACP Transport Compatibility）已接受，见 [docs/decisions/ADR-001-acp-transport-compatibility.md](decisions/ADR-001-acp-transport-compatibility.md)
 - 当前工作：T001 已完成（Reviewer PASS @ f20c3d1，脚手架与基础设施就绪）；T002/T003 待用户确认后再指派。
