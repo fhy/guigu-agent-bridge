@@ -27,6 +27,7 @@
 | T015 | 流式事件 + 取消 + 进程恢复 | 六：ACP Adapter | 未指派 | T014 | queued | 待编写 |
 | T016 | 并发控制 + 健康检查 + 指标 | 七：生产化 | 未指派 | 阶段二~六完成 | queued | 待编写 |
 | T017 | 部署配置 + 热加载 + 集成测试 | 七：生产化 | 未指派 | T016 | queued | 待编写 |
+| T018 | 排他路由、投递确认与状态一致性端到端验收 | 七：可靠性验收 | 未指派 | T005, T009, T011, T014, T016 | queued | [spec](tasks/T018-routing-delivery-reliability.md) |
 
 ## Blocked
 

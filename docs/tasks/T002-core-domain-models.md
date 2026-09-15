@@ -30,6 +30,8 @@
   - `deadline` 使用 UTC 绝对时间的内存/序列化表示，及精度和时区规则。
   - `priority` 的有效范围、默认值和越界行为。
   - enum 的 serde 命名、未知值处理及向后兼容策略。
+  - `sender` / `recipient` 使用稳定 endpoint ID；明确单一收件人与广播/多播的边界，禁止用未解析自然语言 mention 代替 recipient。
+  - 为后续幂等和状态并发控制预留 event/delivery identity 与版本语义，但不在本任务实现状态机。
 - 排除：不实现 Bus 调度、状态机执行、存储、传输逻辑。
 
 ## 共享接口
@@ -47,6 +49,7 @@
 - [ ] 门禁（fmt / check / clippy / test）全部通过。
 - [ ] 模型为纯数据结构，不依赖传输/存储/调度模块。
 - [ ] 设计分析已经 Coordinator 确认，handoff 记录最终公共契约与精确 commit。
+- [ ] 测试证明不同显示名或 Matrix ID 可归一到稳定 endpoint ID，且未解析目标不会被误表示为广播。
 
 ## 门禁
 

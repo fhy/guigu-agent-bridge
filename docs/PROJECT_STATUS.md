@@ -6,7 +6,7 @@
 - 当前阶段：阶段一「模型和配置」；T001 已建立 lib/bin 结构、tracing、顶层错误边界和 Ctrl-C 关闭生命周期
 - 架构：已确定，见 [docs/ARCHITECTURE.md](ARCHITECTURE.md)
 - 决策：ADR-001（ACP Transport Compatibility）已接受，见 [docs/decisions/ADR-001-acp-transport-compatibility.md](decisions/ADR-001-acp-transport-compatibility.md)
-- 当前工作：T001 已完成（Reviewer PASS @ f20c3d1，脚手架与基础设施就绪）；T002/T003 待用户确认后再指派。
+- 当前工作：T001 已完成；用户已确认按 T002 → Review → T003 串行推进，下一项只指派 T002。
 
 ## 路线图与任务分解
 
@@ -18,7 +18,7 @@
 | 四 Matrix 用户入口 | 登录、sync、room/thread 解析、消息路由、权限、去重 | T010–T011 |
 | 五 Matrix Observer | 监控房间、任务摘要、告警、调用链、管理命令 | T012–T013 |
 | 六 ACP Adapter | 子进程、JSON-RPC、session、流式事件、取消、进程恢复 | T014–T015 |
-| 七 生产化 | 并发控制、健康检查、指标、部署配置、热加载、集成测试 | T016–T017 |
+| 七 生产化 | 并发控制、健康检查、指标、部署配置、热加载、集成与路由可靠性验收 | T016–T018 |
 
 关键依赖路径：
 
@@ -28,6 +28,7 @@ T001 ─┬─ T002 ─ T004 ─ T005 ─ T006
       └─ T003 ─ T004 / T010 ─ T011 ─ T012 ─ T013
 T004 / T009 ─ T014 ─ T015
 阶段二~六完成 ─ T016 ─ T017
+T005 / T009 / T011 / T014 / T016 ─ T018
 ```
 
 ## 待定决策
@@ -44,6 +45,7 @@ T004 / T009 ─ T014 ─ T015
 - Matrix 与 ACP 依赖外部服务/后端，无网络或凭据时无法真实联调，须以 Mock 与集成测试覆盖（对应 ADR-001）。
 - 并行任务不得同时修改同一公共接口/文件；当前阶段一按 T001 → T002/T003 串行推进。
 - 当前 Matrix 协作依赖显式通知与接收确认，不具备结构化 AgentTask 的可靠投递语义。
+- `opencode-chat-bridge` 共享房间曾将同一事件交给多个 backend，导致重复 session、越权执行和状态竞争；本项目必须以结构化 recipient、排他路由、认领确认和乐观并发控制从设计上阻断，见 [INC-001](incidents/INC-001-shared-room-routing.md) 与 T018。
 
 ## 运维观察
 
@@ -51,8 +53,7 @@ T004 / T009 ─ T014 ─ T015
 
 ## 下一步
 
-1. 审查并提交当前规划文档。
-2. Coordinator 明确指派 T001 并等待 Architect-Developer 确认 Task ID。
-3. Architect-Developer 提交实现前分析；Coordinator 确认设计后才进入实现。
-4. Developer 生成 handoff 并报告 `review_ready`；Coordinator 携带精确 commit 显式调度 Reviewer。
-5. Coordinator 根据 Review 结论更新状态、安排返工或标记完成。
+1. Coordinator 只指派 T002，并等待 Architect-Developer 以 Task ID 确认。
+2. Architect-Developer 先提交 T002 的公共模型设计分析；Coordinator 确认后才允许实现。
+3. T002 完成 handoff 和 Reviewer PASS 后，Coordinator 再指派 T003。
+4. 不并行修改领域模型与配置公共接口。
