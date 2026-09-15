@@ -12,9 +12,13 @@ This file is the short startup contract for every agent working in this reposito
 
 ## Role Boundaries
 
-- **Coordinator**: decomposes work, prioritizes, maintains task state, resolves process questions, and escalates product or high-risk decisions. It does not implement production code.
+- **Coordinator**: decomposes work, prioritizes, is the sole maintainer of task state, explicitly dispatches implementation and review, resolves process questions, and escalates product or high-risk decisions. It does not implement production code.
 - **Architect-Developer**: performs implementation analysis before coding, implements scoped code and tests, and fixes ordinary defects.
 - **Reviewer**: independently reviews and verifies changes, investigates complex defects, and writes review reports. It does not modify production code.
+
+Matrix delivery or an `@mention` does not prove task acceptance. Developer acknowledges an assignment before work starts. On `review_ready`, Developer writes a handoff and notifies Coordinator; Coordinator alone dispatches Reviewer with Task ID, exact commit, and handoff path. Reviewer accepts only a review request containing those fields and reports its verdict to Coordinator.
+
+If chat, task specification, and task board disagree, stop and report the conflict to Coordinator. Do not silently choose one source or alter task state outside the Coordinator role.
 
 ## Before Coding
 

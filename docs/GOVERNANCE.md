@@ -16,17 +16,23 @@ The source projects also demonstrate two additional practices adopted here: a sh
 
 An Agent restarting work must read the board first, then the Current task specification and the latest handoff/review. `git log` is historical evidence and must not be used as the source of current task status.
 
+`Current` contains only assigned or active work; unassigned `queued` tasks remain in `Queue`. Coordinator is the sole task-state writer and updates both the board and task specification on every transition. The fixed workflow states are `queued`, `assigned`, `analyzing`, `needs_clarification`, `implementing`, `review_ready`, `in_review`, `changes_requested`, `blocked`, and `done`.
+
 ## Task Registration
 
 Every non-trivial task records its ID, owner, status, goal, scope, excluded files, dependencies, shared interfaces, risks, and acceptance criteria. Cross-branch or cross-Agent work additionally records branch, worktree, base commit, and handoff information.
 
 Before implementation, check the current branch, worktrees, `git status`, target files, shared interfaces, unfinished dependencies, and possible conflicts. Tasks touching the same file, public interface, migration, or global configuration run serially unless explicitly coordinated.
 
+An assignment sent through Matrix is pending until the recipient explicitly acknowledges its Task ID. Message delivery and natural-language mentions are not treated as durable task acceptance.
+
 ## Implementation Analysis
 
 Architect-Developer must analyze before coding. The analysis covers existing call paths, concurrency and lock ordering, awaits while holding locks, task/channel lifecycle, cancellation and timeout races, resource cleanup, restart recovery, idempotency, testability, and failure behavior.
 
 Unclear facts, contradictory specifications, incomplete interfaces, multiple behavior choices, deadlock risks, races, leaks, or untestable designs must be reported before implementation. The Agent must not use “implement first and see what tests say” as a substitute for design analysis.
+
+For public or cross-module interfaces, Coordinator must accept the documented design choice before status moves from `analyzing` to `implementing`.
 
 ## Blockers and Decisions
 
@@ -37,6 +43,8 @@ Durable architectural choices go in `docs/decisions/ADR-*.md`; incident-specific
 ## Review and Verification
 
 Review reports are immutable per round (`docs/reviews/<id>-review-rN.md`) and identify the tested commit and environment. A report must include findings with file/location, impact, and required action, not only PASS/FAIL.
+
+Developer produces a handoff and reports `review_ready` to Coordinator. Coordinator verifies the exact commit, scope, and evidence, then explicitly dispatches Reviewer with Task ID, commit, specification, and handoff paths. Reviewer does not infer a review request from ordinary room conversation and reports its verdict back to Coordinator. A `PASS` is necessary but does not itself update task state or authorize merge.
 
 Every implementation must pass:
 
@@ -58,6 +66,8 @@ Never use blanket staging (`git add .`, `git add -A`, or `git add -u`) or `--no-
 Operational failures are treated as design input. Record symptom, impact, timeline, root cause, fix task, regression coverage, and prevention. Particularly important checks for this project are thread-to-session mapping, Agent allowlists, ACP option negotiation, session/workspace consistency, process exit propagation, task event delivery, and loop prevention.
 
 When a defect escapes helper-level tests, add a regression at the real entry point. Configuration, adapter, and routing tests must prove that production code actually invokes the tested path; string-only or unreachable tests are insufficient.
+
+The operations Observer is outside normal task approval. It may perform read-only diagnosis. Without user confirmation it may restart only one affected service that is already failed, abnormally terminated, or proven OOM-killed; it must record evidence and verify recovery. Restarting an active or merely suspected-hung service and every other state-changing action require user confirmation.
 
 ## Documentation Navigation
 

@@ -27,7 +27,8 @@ Review 报告
 - 理解用户目标，拆分任务并确定优先级。
 - 识别依赖、文件冲突和并行机会。
 - 创建任务规格，维护 `TASK_BOARD.md` 和项目状态。
-- 将任务交给 Architect-Developer。
+- 是任务状态的唯一维护者；将任务明确交给 Architect-Developer 并等待认领确认。
+- 核验 handoff 后明确调度 Reviewer，不依赖 Developer 的自然语言输出自动触发审查。
 - 汇总 Reviewer 结论并协调修复或合并。
 - 遇到业务决策、安全策略、公开 API 或重大兼容性变化时请求用户决定。
 
@@ -42,6 +43,7 @@ Coordinator 不直接修改业务代码，也不替代 Reviewer 做技术审查�
 - 修改代码和测试，处理普通 Bug。
 - 运行格式、编译、lint 和测试门禁。
 - 提交实现并根据 Review 报告修复。
+- 达到 `review_ready` 时写 handoff 并通知 Coordinator，不直接假设 Reviewer 已收到任务。
 
 当前项目规模较小时，Architect 和 Developer 合并为一个角色。
 
@@ -53,6 +55,8 @@ Coordinator 不直接修改业务代码，也不替代 Reviewer 做技术审查�
 - 生成审查报告，结论为 `PASS`、`CHANGES_REQUESTED` 或 `BLOCKED`。
 
 Reviewer 不直接修改业务代码。
+
+Observer 不进入正常开发审批链路。它默认只读诊断；仅当服务已经异常退出、failed 或有明确 OOM kill 证据时可自行重启受影响的单个服务，其他状态变更均需用户确认。
 
 ## 3. 任务流程
 
@@ -68,6 +72,56 @@ Reviewer 不直接修改业务代码。
 ```
 
 普通任务可以简化为 `Coordinator -> Architect-Developer -> Reviewer -> Coordinator`。
+
+### 任务状态机
+
+开发协作使用以下固定状态，禁止用自由文本创建同义状态：
+
+```text
+queued -> assigned -> analyzing -> implementing -> review_ready -> in_review -> done
+                           |              ^             |
+                           v              |             v
+                 needs_clarification      +--- changes_requested
+                           |
+                         blocked
+```
+
+- `queued`：规格已存在，但尚未指派；只出现在 Queue。
+- `assigned`：Coordinator 已发送明确指派，等待 Developer 确认。
+- `analyzing`：Developer 已确认并进行实现前分析。
+- `needs_clarification`：存在可解决的事实、规格或设计疑问。
+- `implementing`：分析结论已确认，允许编码。
+- `review_ready`：实现、提交、门禁和 handoff 已完成。
+- `in_review`：Coordinator 已携带 Task ID、精确 commit 和 handoff 明确调度 Reviewer。
+- `changes_requested`：Reviewer 要求修改；Coordinator 重新交给 Developer。
+- `blocked`：缺少用户决定、依赖、环境、凭据或外部服务，当前无法继续。
+- `done`：Reviewer 对精确 commit 给出 `PASS`，且 Coordinator 核验流程条件完成。
+
+Coordinator 是唯一可以修改任务状态的人。每次状态变化同时更新任务规格和 `TASK_BOARD.md`；`PROJECT_STATUS.md` 只在阶段、主要风险或项目级决策发生变化时更新。
+
+### 显式调度
+
+Matrix `@mention` 是当前的通知通道，不是可靠队列。消息发送成功不表示对方已认领；接收方必须回复 Task ID 和接受状态。没有确认时，Coordinator 保持任务为 `assigned` 并向用户报告，而不是重复创建任务。
+
+Developer 完成后：
+
+```text
+1. 写 docs/handoffs/<task-id>-handoff.md。
+2. 提供 exact commit、changed files、tests、risks 和 next action。
+3. 通知 Coordinator：任务已 review_ready，不直接宣称任务完成。
+```
+
+Coordinator 核对 handoff、commit、范围和工作区后，使用以下最小信息显式调度 Reviewer：
+
+```text
+Task: Txxx
+Review commit: <full SHA>
+Specification: docs/tasks/<task>.md
+Handoff: docs/handoffs/<handoff>.md
+Required verdict: PASS | CHANGES_REQUESTED | BLOCKED
+```
+
+Reviewer 将不可变报告写入 `docs/reviews/<task-id>-review-rN.md` 并通知 Coordinator。`PASS` 不自动合并或变更状态；Coordinator 核对精确 commit 和门禁后才标记 `done`。`CHANGES_REQUESTED` 由 Coordinator 转回 Developer，修复后必须生成新 handoff 或明确更新至新 commit，再进行新一轮审查。
 
 ### 实现前分析和疑问升级
 
@@ -131,6 +185,8 @@ docs/PROJECT_STATUS.md     项目整体状态和风险
 ```
 
 `TASK_BOARD.md` 必须保持短小，优先展示 `Current`、`Queue`、`Blocked` 和 `Recent`。Agent 重启后先读取该文件，再读取 Current 任务对应的规格和最近的审查/交接文档。
+
+`Current` 只包含 `assigned` 到 `in_review`、`changes_requested` 或 `needs_clarification` 的活跃任务。未指派的 `queued` 任务只放在 Queue；完成项只在 Recent 保留简短索引。
 
 ## 6. 任务注册信息
 
