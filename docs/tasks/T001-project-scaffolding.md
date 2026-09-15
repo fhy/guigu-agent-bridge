@@ -2,12 +2,12 @@
 
 ## 元数据
 
-- 状态：queued（待 Architect-Developer 认领）
+- 状态：in_review（已调度 Reviewer 审查 commit f20c3d1c0dca0e22c97dffc123551fbfb6f95297）
 - 阶段：一「模型和配置」
-- Owner：未指派
+- Owner：bridge-developer
 - 依赖：无
 - 阻塞：T002、T003
-- Base commit：`3a717d4`（main）
+- Base commit：`be00814`（main）
 - 工作区：单独推进时在 main 串行；若与其他任务并行需独立 branch/worktree 并在交接中登记
 - 设计门禁：Developer 先提交实现前分析，Coordinator 确认后才能进入 `implementing`
 

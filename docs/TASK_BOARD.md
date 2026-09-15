@@ -5,13 +5,14 @@
 
 ## Current
 
-（无。只有已指派或执行中的任务进入此处。）
+| ID | 任务 | 阶段 | Owner | 状态 | 分支/工作区 | Base commit | 规格 |
+|----|------|------|-------|------|-------------|-------------|------|
+| T001 | 项目脚手架与基础设施 | 一：模型和配置 | bridge-developer | in_review | main | be00814 | [spec](tasks/T001-project-scaffolding.md) |
 
 ## Queue
 
 | ID | 任务 | 阶段 | Owner | 依赖 | 状态 | 规格 |
 |----|------|------|-------|------|------|------|
-| T001 | 项目脚手架与基础设施 | 一：模型和配置 | 未指派 | — | queued | [spec](tasks/T001-project-scaffolding.md) |
 | T002 | 核心领域模型 | 一：模型和配置 | 未指派 | T001 | queued | [spec](tasks/T002-core-domain-models.md) |
 | T003 | 配置加载与校验 | 一：模型和配置 | 未指派 | T001 | queued | [spec](tasks/T003-config-loading-validation.md) |
 | T004 | Agent Bus 抽象 + 内存队列 + 任务提交 | 二：内存 Agent Bus | 未指派 | T002, T003 | queued | 待编写 |
