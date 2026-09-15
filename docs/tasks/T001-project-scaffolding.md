@@ -2,7 +2,7 @@
 
 ## 元数据
 
-- 状态：in_review（已调度 Reviewer 审查 commit f20c3d1c0dca0e22c97dffc123551fbfb6f95297）
+- 状态：done（Reviewer 对 f20c3d1 给出 PASS，Coordinator 核验流程完成）
 - 阶段：一「模型和配置」
 - Owner：bridge-developer
 - 依赖：无

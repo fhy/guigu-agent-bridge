@@ -6,7 +6,7 @@
 - 当前阶段：阶段一「模型和配置」；代码尚为空，`src/main.rs` 为 Hello world 模板
 - 架构：已确定，见 [docs/ARCHITECTURE.md](ARCHITECTURE.md)
 - 决策：ADR-001（ACP Transport Compatibility）已接受，见 [docs/decisions/ADR-001-acp-transport-compatibility.md](decisions/ADR-001-acp-transport-compatibility.md)
-- 当前工作：T001 已 review_ready，Coordinator 已调度 bridge-reviewer 审查 commit f20c3d1。
+- 当前工作：T001 已完成（Reviewer PASS @ f20c3d1，脚手架与基础设施就绪）；T002/T003 待用户确认后再指派。
 
 ## 路线图与任务分解
 
