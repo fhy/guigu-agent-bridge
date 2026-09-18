@@ -39,3 +39,6 @@ logs/
 .idea/
 .vscode/
 .DS_Store
+
+# Private sibling governance checkout link
+.agent-governance

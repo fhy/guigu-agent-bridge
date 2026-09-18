@@ -4,9 +4,9 @@
 
 项目的内部协作使用 Agent Bus，SQLite 保存任务和事件状态，Matrix 作为用户交互、可观察性和人工控制界面。外部 Agent 可以通过 ACP、Matrix、HTTP 等 Adapter 接入。
 
-当前仓库处于 Rust 项目初始化和架构设计阶段，尚未提供可用的生产连接器。正式架构和分阶段实施计划见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
+当前仓库已实现 Agent Bus、SQLite 持久化、Matrix 接入与观察、ACP Adapter、运行时恢复和可靠性验收。正式架构见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
-Agent 开发入口协议见 [AGENTS.md](AGENTS.md)；协作流程和治理基线分别见 [docs/COLLABORATION.md](docs/COLLABORATION.md) 与 [docs/GOVERNANCE.md](docs/GOVERNANCE.md)。
+Agent 开发入口协议见 [AGENTS.md](AGENTS.md)。动态任务状态、内部审查、交接和事件记录不属于公开代码仓库。
 
 ## 设计边界
 
@@ -33,8 +33,10 @@ cargo fmt --check
 ## 目录
 
 ```text
-src/main.rs              程序入口（当前为初始化模板）
+src/main.rs              程序入口
 docs/ARCHITECTURE.md     已确定的架构和实施方案
+docs/decisions/          架构决策记录
+docs/integrations/       外部集成边界
 Cargo.toml               Rust 项目清单
 ```
 

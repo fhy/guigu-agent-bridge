@@ -2,10 +2,45 @@
 name = "guigu-agent-bridge"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.85"
+rust-version = "1.88"
 
 [dependencies]
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+# `time` backs the production `Timer` (`TokioTimer`, T006 D1/Q2 = T-B): the
+# worker's timeout/backoff race needs `tokio::time::sleep`. `process` backs the
+# ACP adapter (T014 D2/Q3 = A): the child process needs `tokio::process`, and
+# `io-util` is declared explicitly because the framing layer reads and writes
+# pipes directly (it was only reachable through sqlx's features before). Features
+# are not crates, so `Cargo.lock` is unchanged.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "sync",
+    "time",
+    "process",
+    "io-util",
+    "net",
+] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+uuid = { version = "1", features = ["v7", "serde", "v5"] }
+chrono = { version = "0.4", features = ["serde"] }
+toml = "1.1.6"
+url = "2.5.8"
+matrix-sdk = { version = "=0.13.0", default-features = false, features = ["rustls-tls"] }
+# SQLite driver for the durable event store (ADR-002). `default-features = false`
+# avoids the `any`/`json` backends; `macros` is required for `sqlx::migrate!`, and
+# `sqlite` pulls `sqlx-sqlite/bundled`. Pinned to 0.8 because sqlx 0.9 declares
+# `rust-version = 1.94`, above this crate's 1.88.
+sqlx = { version = "0.8", default-features = false, features = [
+    "sqlite",
+    "runtime-tokio",
+    "migrate",
+    "macros",
+] }
+
+[dev-dependencies]
+wiremock = "0.6.5"

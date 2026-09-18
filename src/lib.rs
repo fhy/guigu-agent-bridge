@@ -3,7 +3,17 @@
 //! The binary (`src/main.rs`) is a thin wrapper; all entry logic lives here so
 //! integration tests can exercise the real call path through the public API.
 
+pub mod acp;
+pub mod agents;
+pub mod app;
+pub mod bus;
+pub mod config;
 pub mod error;
+pub mod matrix;
+pub mod models;
+pub mod observer;
+pub mod runtime;
+pub mod storage;
 
 use std::future::Future;
 
@@ -26,18 +36,28 @@ pub fn init_tracing() {
 pub async fn run() -> Result<(), Error> {
     init_tracing();
     info!("starting");
-    run_with_shutdown(tokio::signal::ctrl_c()).await
+    let path = std::env::args_os()
+        .nth(1)
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("GUIGU_CONFIG").map(std::path::PathBuf::from))
+        .ok_or(app::AppError::Assembly(
+            "configuration path required as argv[1] or GUIGU_CONFIG",
+        ))?;
+    run_with_shutdown(path, tokio::signal::ctrl_c()).await
 }
 
-/// Run until the given shutdown future resolves, then exit gracefully.
+/// Start the configured production runtime, then run until shutdown resolves.
 ///
-/// Separated from `run` so integration tests can inject an immediate or
-/// controllable signal instead of a real OS signal.
-pub async fn run_with_shutdown<F>(shutdown: F) -> Result<(), Error>
+/// The explicit path and injectable signal let integration tests exercise the
+/// same assembly and cleanup path as the binary without process-global state.
+pub async fn run_with_shutdown<F>(
+    config_path: impl AsRef<std::path::Path>,
+    shutdown: F,
+) -> Result<(), Error>
 where
     F: Future<Output = std::io::Result<()>>,
 {
-    shutdown.await.map_err(Error::Shutdown)?;
+    app::run_config_with_shutdown(config_path, shutdown).await?;
     info!("shutdown signal received, exiting gracefully");
     Ok(())
 }

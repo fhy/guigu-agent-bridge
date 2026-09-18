@@ -7,6 +7,18 @@ session_root = "~/.cache/guigu-agent-bridge/sessions"
 max_task_depth = 8
 max_task_hops = 16
 default_timeout_seconds = 300
+queue_capacity = 1024
+event_capacity = 1024
+shutdown_timeout_seconds = 30
+health_bind = "127.0.0.1:9090"
+
+[runtime]
+max_turns = 8
+max_wall_seconds = 900
+max_inactivity_seconds = 120
+max_no_progress = 2
+max_output_bytes = 1048576
+lease_ttl_seconds = 30
 
 [transports.matrix]
 enabled = false
@@ -14,6 +26,15 @@ homeserver = "https://matrix.example"
 user_id = "{env:MATRIX_USER_ID}"
 access_token = "{env:MATRIX_ACCESS_TOKEN}"
 monitor_room = ""
+sync_capacity = 256
+allowed_users = []
+admin_users = []
+admin_rooms = []
+
+[transports.matrix.routes]
+aliases = {}
+rooms = {}
+direct = {}
 
 # Agent definitions are transport endpoints, not fixed business roles.
 [agents.example]
@@ -21,3 +42,4 @@ transport = "acp"
 command = "/usr/local/bin/opencode"
 args = ["acp"]
 enabled = false
+workspace = ""

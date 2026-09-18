@@ -34,7 +34,7 @@ Bridge Core (消息、路由、权限、会话)
 Agent Bus       Event Store (SQLite)
   |
   v
-Agent Adapters (ACP / Matrix / HTTP)
+Agent Adapters (ACP / A2A / Matrix / HTTP)
   |
   v
 外部 Agent
@@ -47,7 +47,7 @@ Event Store -> Observer -> Matrix 监控房间
 - **Transport**：处理外部协议和连接生命周期，不包含业务路由。
 - **Bridge Core**：统一消息模型、路由、权限、幂等、循环检测和会话绑定。
 - **Agent Bus**：排队、投递、取消、超时、重试并发布任务事件。
-- **Agent Adapter**：把统一任务转换为 ACP、Matrix 或 HTTP 等协议。
+- **Agent Adapter**：把统一任务转换为 ACP、A2A、Matrix 或 HTTP 等协议。外部协议类型不得侵入内部 Agent Bus 的领域契约。
 - **Storage**：保存 Agent、会话、消息、任务、投递和事件状态。
 - **Observer**：订阅事件并向 Matrix/Web 等界面投影状态。
 
@@ -79,6 +79,8 @@ Event Store -> Observer -> Matrix 监控房间
 
 内部协作优先使用结构化任务；Matrix 中的 @mention 仅作为用户可见表达或兼容入口。
 
+A2A 用于 Bridge 与外部 Agent 系统之间的互操作，不替代内部 `AgentTask`。A2A task、message、artifact、状态和外部身份必须在 Adapter 边界显式映射并持久化关联；A2A SDK/wire 类型不得进入 Bus、Storage 或核心模型的公共接口。ACP 继续负责 Bridge 与具体 Agent 运行时进程之间的会话通信，两者职责不重叠。
+
 ## 6. Agent Bus
 
 第一版使用 `tokio::sync::mpsc` 实现内存队列，但通过抽象接口隔离具体实现。正式状态仍由 SQLite 保存。
@@ -92,6 +94,10 @@ Bus Worker 负责：
 5. 处理超时、取消和重试。
 
 任务投递与任务认领分开记录。发送成功不等于 Agent 已接受任务；只有带 `task_id` 和 delivery attempt 的明确确认才能把任务推进到运行态。状态更新必须校验当前状态和版本，防止多个执行者覆盖彼此结果。
+
+会话隔离不等于执行隔离。Matrix room/thread、conversation 和 ACP session 只描述上下文；它们不能作为共享仓库、worktree 或其他可变资源的并发锁。启动可执行 Agent 前，调度器必须按稳定的执行资源键（第一版至少为 `agent_id + repository/workspace_id`）原子获取执行租约。租约记录 `task_id`、session/process identity、owner token、version、acquired/heartbeat/deadline 时间。竞争请求必须按配置排队或明确拒绝，并返回当前占用者；在获得租约前不得创建 ACP 进程或写入工作区。
+
+租约释放必须校验 owner token/version，避免过期 session 释放新租约。正常完成、取消、超时、ACP 退出和 Bridge 重启都必须进入显式清理/恢复路径；重启时对持久化租约与实际进程进行 reconciliation。第一版默认同一执行资源串行运行，未来只有在不同 worktree/隔离 workspace 且策略明确允许时才并行。
 
 未来可将队列替换为 SQLite queue、Redis 或 NATS，而不修改 Bridge Core。
 
@@ -141,15 +147,19 @@ Matrix 是状态的投影和控制面，不是任务事实来源。Matrix 发送
 
 ### 阶段六：ACP Adapter
 
-完成 ACP 子进程、JSON-RPC、session、流式事件、取消和进程恢复。最新版 `@agentclientprotocol/codex-acp` 的 ACP stdio 外层使用 JSONL，应作为必须通过的兼容目标。Transport 的 JSON-RPC 消息处理与字节 framing 仍需分层，避免未来 backend 使用不同 framing 时侵入 session 逻辑。
+完成 ACP 子进程、JSON-RPC、session、流式事件、取消和进程恢复。最新版 `@agentclientprotocol/codex-acp` 的 ACP stdio 外层使用 JSONL，应作为必须通过的兼容目标。Transport 的 JSON-RPC 消息处理与字节 framing 仍需分层，避免未来 backend 使用不同 framing 时侵入 session 逻辑。ACP 的 `end_turn` 仅表示一次模型 turn 结束，不等于 `AgentTask` 完成；Adapter 必须输出结构化 `continue/completed/blocked/failed` 结果并保持 task/session 关联，禁止从自然语言尾句推断终态。
 
 ### 阶段七：生产化
 
-增加并发控制、健康检查、指标、部署配置、配置热加载和完整集成测试。
+增加并发控制、健康检查、指标、部署配置、配置热加载和完整集成测试。调度器对非终态 turn 进行有界自动续跑，保持执行租约，并以最大 turn 数、总 deadline、无进展检测和资源预算阻断死循环；状态与续跑计数必须支持持久化恢复和 Observer 告警。
+
+### 阶段八：A2A 外部互操作
+
+在内部任务语义、持久化、执行租约和端到端可靠性稳定后，T019 提供面向可信局域网的最小 A2A Server + Client。跨局域网优先由 T020 通过版本化 A2A envelope 复用第三方协议：Matrix 为必做 Transport，Redis Streams 为可选 Transport；这属于项目私有承载 profile，不冒充标准 A2A transport。Listener 默认关闭且仅允许私网/loopback。需要通用跨网互联时，单独创建中心化 `a2a-edge-gateway` Relay/Hub：各 Bridge 主动建立出站持久连接，无需公网地址或入站端口；Relay 负责连接路由、有限离线投递和传输确认，Nginx 仅负责公网 TLS、认证入口和限流。具体边界见 [A2A Relay / Edge Gateway 集成契约](integrations/A2A_EDGE_GATEWAY.md)。任务事实、授权、幂等、重放防护和状态机仍由 Bridge 掌握。A2A 和外部传输都不替换内部 Agent Bus；`guigu` 等执行后端继续通过 ACP 接入。
 
 ## 10. 第一版范围和验收
 
-第一版仅实现：Matrix 用户入口、内存 Agent Bus、SQLite、Mock Agent、一个 ACP Adapter 和 Matrix 监控房间。
+第一版仅实现：Matrix 用户入口、内存 Agent Bus、SQLite、Mock Agent、一个 ACP Adapter 和 Matrix 监控房间。A2A 属于第一版可靠性验收完成后的外部互操作阶段。
 
 验收闭环：
 
@@ -161,16 +171,16 @@ Agent B -> Agent A -> Matrix -> 用户
 
 同时必须满足：任务状态可查询、Agent 挂起或崩溃可告警、循环调用可阻断、服务重启后未完成任务可恢复。
 
-端到端验收还必须证明：同一共享房间事件最多启动一个目标 Agent；未点名消息只进入配置的默认入口；投递未确认不会被记为运行；重复事件、并发状态更新和进程重启不会产生重复执行或状态倒退。
+端到端验收还必须证明：同一共享房间事件最多启动一个目标 Agent；未点名消息只进入配置的默认入口；投递未确认不会被记为运行；重复事件、并发状态更新和进程重启不会产生重复执行或状态倒退；不同 room/thread 请求同一 Agent 操作同一 execution resource 时最多只有一个 ACP 执行者，竞争请求不会在获得租约前启动进程。
 
 ## 11. 参考项目
 
-`/home/fhy/opencode-chat-bridge` 主要参考其 ACP 封装、Connector/Core 分离、线程会话隔离、进程管理、流式事件、权限边界、限流去重、配置分层和测试结构。
+`opencode-chat-bridge` 主要参考其 ACP 封装、Connector/Core 分离、线程会话隔离、进程管理、流式事件、权限边界、限流去重、配置分层和测试结构。
 
 其固定触发词、固定 Agent 角色、Matrix 作为唯一通信通道和 JSON 文件队列不直接照搬。
 
 ## 12. 当前开发协作与运行时能力的边界
 
-当前项目的开发协作采用 Coordinator、Architect-Developer、Reviewer 三个逻辑角色，使用 Matrix、任务文档、`TASK_BOARD.md`、Git branch/worktree 和 Review 报告完成协作。详细规则见 [COLLABORATION.md](COLLABORATION.md)。
+当前项目的开发协作采用 Coordinator、Architect-Developer、Reviewer 三个逻辑角色，使用 Matrix、任务文档、Git branch/worktree 和 Review 报告完成协作。公开仓库仅保留 [AGENTS.md](../AGENTS.md) 启动入口；动态任务状态和项目专用治理规则由私有治理仓库维护。
 
 结构化 `AgentTask`、Agent Bus、任务状态机和持久化协作是本项目完成后提供的运行时能力。现有 OpenCode、ACP 和 Matrix 工具尚不支持这些能力，因此实现前不能把 `AgentTask` 当作现有协作工具使用。

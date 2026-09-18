@@ -1,0 +1,404 @@
+use std::{path::PathBuf, sync::Arc, time::Duration};
+
+use chrono::{DateTime, Utc};
+use guigu_agent_bridge::{
+    bus::derive_endpoint_id,
+    models::{DeliveryId, TaskId},
+    runtime::{
+        AcquireOutcome, ContinuationPolicy, ContinuationState, Degradation, ExecutionResourceKey,
+        Lease, Metric, PolicyLimit, Readiness, ReleaseDisposition, RuntimeError, RuntimeMetrics,
+        SqliteRuntimeStore, WorkspaceId, health_snapshot,
+    },
+    storage::{connect, migrate},
+};
+
+fn at() -> DateTime<Utc> {
+    "2026-09-17T12:00:00Z".parse().unwrap()
+}
+
+struct Db {
+    pool: sqlx::SqlitePool,
+    path: PathBuf,
+    task: TaskId,
+    delivery: DeliveryId,
+}
+impl Db {
+    async fn new() -> Self {
+        let path = std::env::temp_dir().join(format!("runtime-{}.db", uuid::Uuid::now_v7()));
+        let pool = connect(&path).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let task = TaskId::generate();
+        let delivery = DeliveryId::generate();
+        let from = derive_endpoint_id("from");
+        let to = derive_endpoint_id("to");
+        for (endpoint, name) in [(from, "from"), (to, "to")] {
+            sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,address_json,capabilities_json) VALUES(?,?,'acp',1,'{\"acp\":{\"command\":\"mock\",\"args\":[]}}','[]')").bind(endpoint.to_string()).bind(name).execute(&pool).await.unwrap();
+        }
+        let conversation = uuid::Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO conversations(conversation_id,participants_json) VALUES(?,'[]')")
+            .bind(&conversation)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES(?,?,?,?,?,'prompt',5,0,0,0)").bind(task.to_string()).bind(task.to_string()).bind(from.to_string()).bind(to.to_string()).bind(conversation).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at) VALUES(?,?,1,?,?,?)").bind(delivery.to_string()).bind(task.to_string()).bind(to.to_string()).bind(at().to_rfc3339()).bind(at().to_rfc3339()).execute(&pool).await.unwrap();
+        Self {
+            pool,
+            path,
+            task,
+            delivery,
+        }
+    }
+    async fn close(self) {
+        self.pool.close().await;
+        for suffix in ["", "-wal", "-shm"] {
+            let _ = std::fs::remove_file(format!("{}{}", self.path.display(), suffix));
+        }
+    }
+}
+
+fn key() -> ExecutionResourceKey {
+    ExecutionResourceKey::new(
+        derive_endpoint_id("to"),
+        WorkspaceId::from_canonical_path("/tmp").unwrap(),
+    )
+}
+
+#[derive(Clone, Copy)]
+enum ContinuationWrite {
+    Claim,
+    Activity,
+    Continue,
+    Finish,
+}
+
+async fn prepared_write(
+    write: ContinuationWrite,
+) -> (Db, SqliteRuntimeStore, SqliteRuntimeStore, Lease, u64) {
+    let db = Db::new().await;
+    let store = SqliteRuntimeStore::new(db.pool.clone());
+    let other_pool = connect(&db.path).await.unwrap();
+    migrate(&other_pool).await.unwrap();
+    let other = SqliteRuntimeStore::new(other_pool);
+    let lease = match store
+        .acquire(key(), db.task, at(), Duration::from_secs(1))
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Acquired(value) => value,
+        _ => panic!("acquire"),
+    };
+    store
+        .begin_continuation(&lease, db.delivery, "first", at())
+        .await
+        .unwrap();
+    let ready = store.continuation(db.task).await.unwrap().unwrap();
+    let revision = if matches!(write, ContinuationWrite::Claim) {
+        ready.revision
+    } else {
+        store
+            .claim_turn(&lease, ready.revision, at())
+            .await
+            .unwrap()
+            .revision
+    };
+    (db, store, other, lease, revision)
+}
+
+async fn attempt_write(
+    store: &SqliteRuntimeStore,
+    lease: &Lease,
+    revision: u64,
+    write: ContinuationWrite,
+    now: DateTime<Utc>,
+) -> Result<(), RuntimeError> {
+    match write {
+        ContinuationWrite::Claim => store.claim_turn(lease, revision, now).await.map(drop),
+        ContinuationWrite::Activity => store.record_activity(lease, revision, 1, now).await,
+        ContinuationWrite::Continue => store
+            .record_continue(lease, revision, "next", 1, now)
+            .await
+            .map(drop),
+        ContinuationWrite::Finish => {
+            store
+                .finish(lease, revision, ContinuationState::Terminal, 1, now)
+                .await
+        }
+    }
+}
+
+#[tokio::test]
+async fn every_continuation_write_is_fenced_after_cross_connection_recovery() {
+    for write in [
+        ContinuationWrite::Claim,
+        ContinuationWrite::Activity,
+        ContinuationWrite::Continue,
+        ContinuationWrite::Finish,
+    ] {
+        let (db, store, other, lease, revision) = prepared_write(write).await;
+        other
+            .release(&lease, ReleaseDisposition::RecoveryNeeded, at())
+            .await
+            .unwrap();
+        assert!(matches!(
+            attempt_write(&store, &lease, revision, write, at()).await,
+            Err(RuntimeError::Fenced)
+        ));
+        drop(other);
+        db.close().await;
+    }
+}
+
+#[tokio::test]
+async fn every_continuation_write_is_fenced_after_cross_connection_expiry() {
+    let expired_at = at() + chrono::Duration::seconds(2);
+    for write in [
+        ContinuationWrite::Claim,
+        ContinuationWrite::Activity,
+        ContinuationWrite::Continue,
+        ContinuationWrite::Finish,
+    ] {
+        let (db, store, other, lease, revision) = prepared_write(write).await;
+        assert_eq!(other.counts_at(expired_at).await.unwrap().expired_leases, 1);
+        assert!(matches!(
+            attempt_write(&store, &lease, revision, write, expired_at).await,
+            Err(RuntimeError::Fenced)
+        ));
+        drop(other);
+        db.close().await;
+    }
+}
+
+#[tokio::test]
+async fn concurrent_acquire_is_atomic_and_stale_owners_are_fenced() {
+    let db = Db::new().await;
+    let store = SqliteRuntimeStore::new(db.pool.clone());
+    let a = store.clone();
+    let b = store.clone();
+    let task = db.task;
+    let (left, right) = tokio::join!(
+        a.acquire(key(), task, at(), Duration::from_secs(30)),
+        b.acquire(key(), task, at(), Duration::from_secs(30))
+    );
+    let outcomes = [left.unwrap(), right.unwrap()];
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|v| matches!(v, AcquireOutcome::Acquired(_)))
+            .count(),
+        1
+    );
+    assert_eq!(
+        outcomes
+            .iter()
+            .filter(|v| matches!(v, AcquireOutcome::Busy))
+            .count(),
+        1
+    );
+    let first = outcomes
+        .into_iter()
+        .find_map(|v| match v {
+            AcquireOutcome::Acquired(v) => Some(v),
+            _ => None,
+        })
+        .unwrap();
+    store
+        .release(&first, ReleaseDisposition::Released, at())
+        .await
+        .unwrap();
+    let second = match store
+        .acquire(key(), task, at(), Duration::from_secs(30))
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Acquired(v) => v,
+        _ => panic!("reacquire"),
+    };
+    assert!(second.fence > first.fence);
+    assert!(matches!(
+        store
+            .release(&first, ReleaseDisposition::Released, at())
+            .await,
+        Err(RuntimeError::Fenced)
+    ));
+    store
+        .release(&second, ReleaseDisposition::RecoveryNeeded, at())
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .acquire(key(), task, at(), Duration::from_secs(30))
+            .await
+            .unwrap(),
+        AcquireOutcome::RecoveryNeeded
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn expired_active_lease_becomes_recovery_needed_without_takeover() {
+    let db = Db::new().await;
+    let store = SqliteRuntimeStore::new(db.pool.clone());
+    assert!(matches!(
+        store
+            .acquire(key(), db.task, at(), Duration::from_secs(1))
+            .await
+            .unwrap(),
+        AcquireOutcome::Acquired(_)
+    ));
+    let later = at() + chrono::Duration::seconds(2);
+    assert_eq!(
+        store
+            .acquire(key(), db.task, later, Duration::from_secs(30))
+            .await
+            .unwrap(),
+        AcquireOutcome::RecoveryNeeded
+    );
+    let counts = store.counts_at(later).await.unwrap();
+    assert_eq!(
+        (counts.active_leases, counts.recovery_needed_leases),
+        (0, 1)
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn continuation_transitions_are_revision_fenced_and_persist_bounds() {
+    let db = Db::new().await;
+    let store = SqliteRuntimeStore::new(db.pool.clone());
+    let lease = match store
+        .acquire(key(), db.task, at(), Duration::from_secs(30))
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Acquired(v) => v,
+        _ => panic!("acquire"),
+    };
+    store
+        .begin_continuation(&lease, db.delivery, "first", at())
+        .await
+        .unwrap();
+    let ready = store.continuation(db.task).await.unwrap().unwrap();
+    let running = store
+        .claim_turn(&lease, ready.revision, at())
+        .await
+        .unwrap();
+    assert_eq!(running.state, ContinuationState::InFlight);
+    assert!(matches!(
+        store.claim_turn(&lease, ready.revision, at()).await,
+        Err(RuntimeError::Fenced)
+    ));
+    let next = store
+        .record_continue(&lease, running.revision, "second", 12, at())
+        .await
+        .unwrap();
+    assert_eq!(
+        (
+            next.next_turn,
+            next.completed_turns,
+            next.consecutive_no_progress,
+            next.observed_output_bytes
+        ),
+        (2, 1, 1, 12)
+    );
+    let running = store.claim_turn(&lease, next.revision, at()).await.unwrap();
+    store
+        .finish(
+            &lease,
+            running.revision,
+            ContinuationState::Terminal,
+            4,
+            at(),
+        )
+        .await
+        .unwrap();
+    let final_state = store.continuation(db.task).await.unwrap().unwrap();
+    assert_eq!(
+        (
+            final_state.state,
+            final_state.completed_turns,
+            final_state.observed_output_bytes
+        ),
+        (ContinuationState::Terminal, 2, 16)
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn restart_snapshot_separates_ready_from_ambiguous_without_replay() {
+    let db = Db::new().await;
+    let store = SqliteRuntimeStore::new(db.pool.clone());
+    let lease = match store
+        .acquire(key(), db.task, at(), Duration::from_secs(30))
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Acquired(value) => value,
+        _ => panic!("acquire"),
+    };
+    store
+        .begin_continuation(&lease, db.delivery, "resume me", at())
+        .await
+        .unwrap();
+    assert_eq!(
+        store.recovery_snapshot(at(), 8).await.unwrap().ready,
+        vec![db.task]
+    );
+    let ready = store.continuation(db.task).await.unwrap().unwrap();
+    store
+        .claim_turn(&lease, ready.revision, at())
+        .await
+        .unwrap();
+    let snapshot = store.recovery_snapshot(at(), 8).await.unwrap();
+    assert!(snapshot.ready.is_empty());
+    assert_eq!(snapshot.ambiguous, vec![db.task]);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn policy_health_and_metrics_use_only_bounded_dimensions() {
+    let db = Db::new().await;
+    let store = SqliteRuntimeStore::new(db.pool.clone());
+    let lease = match store
+        .acquire(key(), db.task, at(), Duration::from_secs(30))
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Acquired(v) => v,
+        _ => panic!("acquire"),
+    };
+    store
+        .begin_continuation(&lease, db.delivery, "first", at())
+        .await
+        .unwrap();
+    let state = store.continuation(db.task).await.unwrap().unwrap();
+    let policy = ContinuationPolicy {
+        max_turns: 0,
+        max_wall_time: Duration::from_secs(60),
+        max_inactivity: Duration::from_secs(60),
+        max_consecutive_no_progress: 3,
+        max_observed_output_bytes: 100,
+        lease_ttl: Duration::from_secs(30),
+    };
+    assert!(matches!(
+        policy.check(&state, at(), None),
+        Err(RuntimeError::Exhausted(PolicyLimit::Turns))
+    ));
+    assert_eq!(
+        health_snapshot(&store, at(), true, true).await.readiness,
+        Readiness::Ready
+    );
+    store
+        .release(&lease, ReleaseDisposition::RecoveryNeeded, at())
+        .await
+        .unwrap();
+    let degraded = health_snapshot(&store, at(), true, true).await;
+    assert_eq!(degraded.readiness, Readiness::RecoveryBlocked);
+    assert!(degraded.degraded.contains(&Degradation::RecoveryBacklog));
+    let metrics = Arc::new(RuntimeMetrics::default());
+    metrics.increment(Metric::LeaseBusy);
+    metrics.increment(Metric::LeaseBusy);
+    metrics.set_gauges(store.counts().await.unwrap());
+    assert_eq!(metrics.snapshot().values.get(&Metric::LeaseBusy), Some(&2));
+    db.close().await;
+}
