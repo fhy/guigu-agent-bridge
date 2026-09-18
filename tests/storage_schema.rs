@@ -247,6 +247,11 @@ async fn an_empty_database_initializes_and_migrating_twice_is_idempotent() {
         "tasks",
         "task_events",
         "deliveries",
+        "a2a_exchanges",
+        "a2a_messages",
+        "a2a_message_parts",
+        "a2a_artifacts",
+        "a2a_artifact_parts",
     ] {
         assert!(
             tables.iter().any(|name| name == expected),
@@ -255,7 +260,7 @@ async fn an_empty_database_initializes_and_migrating_twice_is_idempotent() {
     }
 
     let applied = applied_migration_count(&pool).await;
-    assert_eq!(applied, 4, "the four migrations are recorded once each");
+    assert_eq!(applied, 5, "the five migrations are recorded once each");
 
     migrate(&pool).await.expect("second migrate is a no-op");
     assert_eq!(

@@ -103,6 +103,7 @@ pub(crate) fn encode_transport(transport: TransportType) -> &'static str {
         TransportType::Acp => "acp",
         TransportType::Matrix => "matrix",
         TransportType::Http => "http",
+        TransportType::A2a => "a2a",
     }
 }
 
@@ -120,6 +121,7 @@ pub(crate) fn decode_transport(
         "acp" => Ok(TransportType::Acp),
         "matrix" => Ok(TransportType::Matrix),
         "http" => Ok(TransportType::Http),
+        "a2a" => Ok(TransportType::A2a),
         _ => Err(malformed(field, "unknown transport")),
     }
 }

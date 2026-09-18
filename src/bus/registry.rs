@@ -252,6 +252,10 @@ fn derive_address(declared: &AgentEndpointConfig) -> Option<EndpointAddress> {
                 command: command.clone(),
                 args: declared.args.clone(),
             }),
+        TransportType::A2a => declared
+            .peer
+            .as_ref()
+            .map(|peer| EndpointAddress::A2a { peer: peer.clone() }),
         TransportType::Matrix | TransportType::Http => None,
     }
 }

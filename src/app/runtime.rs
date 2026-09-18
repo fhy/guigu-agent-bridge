@@ -10,6 +10,7 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 
 use crate::{
+    a2a::{A2aServerHandle, A2aStore, CleanupHandle, CleanupPolicy, start_cleanup},
     acp::{AcpDispatcher, SqliteSessionStore},
     bus::{
         Cancellation, Clock, DispatcherRegistry, EndpointRegistry, EventBroadcaster, EventConsumer,
@@ -66,6 +67,8 @@ pub struct AppRuntime {
     broadcaster: Option<tokio::task::JoinHandle<()>>,
     outbox: Option<crate::app::OutboxDrainHandle>,
     acp: Option<Arc<AcpDispatcherRouter>>,
+    a2a: Option<A2aServerHandle>,
+    a2a_cleanup: Option<CleanupHandle>,
     shutdown_timeout: Duration,
     reliability: crate::storage::ReliabilityStore,
     runtime_instance: Option<String>,
@@ -187,6 +190,8 @@ impl AppRuntime {
             broadcaster: None,
             outbox: None,
             acp: None,
+            a2a: None,
+            a2a_cleanup: None,
             shutdown_timeout: Duration::from_secs(config.bridge.shutdown_timeout_seconds),
             reliability: reliability.clone(),
             runtime_instance: owns_runtime.then_some(runtime_instance.clone()),
@@ -232,7 +237,13 @@ impl AppRuntime {
             );
         }
         let acp = Arc::new(AcpDispatcherRouter::new(endpoint_dispatchers));
-        let dispatchers = DispatcherRegistry::new().with(TransportType::Acp, acp.clone());
+        let mut dispatchers = DispatcherRegistry::new().with(TransportType::Acp, acp.clone());
+        if config.transports.a2a.enabled {
+            let a2a = crate::a2a::assembly::dispatchers(&config, pool.clone())
+                .await
+                .map_err(|_| AppError::Assembly("A2A peer startup failed"))?;
+            dispatchers = dispatchers.with(TransportType::A2a, Arc::new(a2a));
+        }
 
         let (event_sink, events) = MpscEventSink::new(config.bridge.event_capacity);
         let event_sink: Arc<dyn crate::bus::EventSink> = Arc::new(event_sink);
@@ -345,7 +356,7 @@ impl AppRuntime {
                 durable_bus.clone(),
                 matrix_sender,
                 Arc::clone(&runtime.reload),
-                cancellation,
+                cancellation.clone(),
                 Arc::new(crate::matrix::CommandLedger::new(4096)),
                 replies,
                 4096,
@@ -383,6 +394,38 @@ impl AppRuntime {
         }));
         runtime.bus = Some(bus);
         runtime.acp = Some(acp);
+        if config.transports.a2a.enabled {
+            runtime.a2a_cleanup = Some(
+                start_cleanup(
+                    A2aStore::new(pool.clone()),
+                    runtime_instance.clone(),
+                    CleanupPolicy {
+                        terminal_ttl: Duration::from_secs(
+                            config.transports.a2a.terminal_content_ttl_seconds,
+                        ),
+                        byte_ceiling: config.transports.a2a.retained_bytes_ceiling as i64,
+                        low_watermark: config.transports.a2a.retained_bytes_low_watermark as i64,
+                        batch: config.transports.a2a.cleanup_batch,
+                        interval: Duration::from_secs(60),
+                    },
+                )
+                .await
+                .map_err(|_| AppError::Assembly("A2A cleanup startup failed"))?,
+            );
+            runtime.a2a = Some(
+                crate::a2a::assembly::server(
+                    &config,
+                    pool.clone(),
+                    repository_trait.clone(),
+                    repository.as_ref().clone(),
+                    durable_bus,
+                    cancellation,
+                    Arc::clone(&registry),
+                )
+                .await
+                .map_err(|_| AppError::Assembly("A2A listener startup failed"))?,
+            );
+        }
         runtime.health_state.set_adapter_ready(true);
         runtime.health_state.set_owner(OwnerState::Running);
         Ok(runtime)
@@ -450,6 +493,16 @@ impl AppRuntime {
         }
         if let Some(acp) = self.acp.take() {
             acp.shutdown().await;
+        }
+        if let Some(a2a) = self.a2a.take()
+            && a2a.shutdown().await.is_err()
+        {
+            shutdown_error.get_or_insert(AppError::Assembly("A2A server join failed"));
+        }
+        if let Some(cleanup) = self.a2a_cleanup.take()
+            && cleanup.shutdown().await.is_err()
+        {
+            shutdown_error.get_or_insert(AppError::Assembly("A2A cleanup join failed"));
         }
         if let Some(outbox) = self.outbox.take()
             && outbox.shutdown().await.is_err()

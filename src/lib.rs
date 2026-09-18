@@ -3,6 +3,7 @@
 //! The binary (`src/main.rs`) is a thin wrapper; all entry logic lives here so
 //! integration tests can exercise the real call path through the public API.
 
+pub mod a2a;
 pub mod acp;
 pub mod agents;
 pub mod app;

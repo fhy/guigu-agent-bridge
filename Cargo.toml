@@ -31,6 +31,8 @@ chrono = { version = "0.4", features = ["serde"] }
 toml = "1.1.6"
 url = "2.5.8"
 matrix-sdk = { version = "=0.13.0", default-features = false, features = ["rustls-tls"] }
+axum = { version = "=0.8.6", default-features = false, features = ["http1", "json", "tokio"] }
+reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "json"] }
 # SQLite driver for the durable event store (ADR-002). `default-features = false`
 # avoids the `any`/`json` backends; `macros` is required for `sqlx::migrate!`, and
 # `sqlite` pulls `sqlx-sqlite/bundled`. Pinned to 0.8 because sqlx 0.9 declares

@@ -23,6 +23,8 @@ pub enum TransportType {
     Matrix,
     /// An HTTP endpoint.
     Http,
+    /// An A2A v0.3 peer configured by opaque peer key.
+    A2a,
 }
 
 /// Transport-specific address of an [`AgentEndpoint`].
@@ -49,6 +51,11 @@ pub enum EndpointAddress {
     Http {
         /// Endpoint URL.
         url: String,
+    },
+    /// Call a configured A2A peer. Network and credential policy stays adapter-owned.
+    A2a {
+        /// Opaque key into the A2A peer configuration.
+        peer: String,
     },
 }
 
@@ -132,6 +139,10 @@ mod tests {
         assert_eq!(
             serde_json::to_string(&TransportType::Http).unwrap(),
             "\"http\""
+        );
+        assert_eq!(
+            serde_json::to_string(&TransportType::A2a).unwrap(),
+            "\"a2a\""
         );
 
         assert_eq!(

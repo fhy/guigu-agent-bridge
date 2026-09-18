@@ -79,6 +79,31 @@ pub struct RuntimeConfig {
 pub struct TransportsConfig {
     /// Matrix transport settings.
     pub matrix: MatrixTransportConfig,
+    /// Trusted-LAN A2A adapter settings.
+    pub a2a: A2aTransportConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct A2aTransportConfig {
+    pub enabled: bool,
+    pub listen: String,
+    pub allow_private_plaintext: bool,
+    pub max_body_bytes: usize,
+    pub terminal_content_ttl_seconds: u64,
+    pub retained_bytes_ceiling: u64,
+    pub retained_bytes_low_watermark: u64,
+    pub cleanup_batch: u32,
+    pub exposed_endpoints: Vec<String>,
+    pub peers: BTreeMap<String, A2aPeerConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct A2aPeerConfig {
+    pub url: String,
+    pub expected_peer_id: String,
+    pub token: SecretString,
+    pub allowed_targets: Vec<String>,
+    pub private_ca: Option<PathBuf>,
 }
 
 /// Matrix transport settings.
@@ -131,6 +156,8 @@ pub struct AgentEndpointConfig {
     pub enabled: bool,
     /// Canonical ACP working directory. Required for enabled ACP endpoints.
     pub workspace: Option<PathBuf>,
+    /// Opaque configured peer key. Required only for A2A endpoints.
+    pub peer: Option<String>,
 }
 
 /// A secret string whose value is never rendered by `Debug` or `Display`.
@@ -303,6 +330,78 @@ struct RawRuntime {
 struct RawTransports {
     #[serde(default)]
     matrix: RawMatrix,
+    #[serde(default)]
+    a2a: RawA2a,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawA2a {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    listen: String,
+    #[serde(default)]
+    allow_private_plaintext: bool,
+    #[serde(default = "default_a2a_body")]
+    max_body_bytes: usize,
+    #[serde(default = "default_a2a_ttl")]
+    terminal_content_ttl_seconds: u64,
+    #[serde(default = "default_a2a_ceiling")]
+    retained_bytes_ceiling: u64,
+    #[serde(default = "default_a2a_low")]
+    retained_bytes_low_watermark: u64,
+    #[serde(default = "default_a2a_batch")]
+    cleanup_batch: u32,
+    #[serde(default)]
+    exposed_endpoints: Vec<String>,
+    #[serde(default)]
+    peers: BTreeMap<String, RawA2aPeer>,
+}
+
+impl Default for RawA2a {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            listen: String::new(),
+            allow_private_plaintext: false,
+            max_body_bytes: default_a2a_body(),
+            terminal_content_ttl_seconds: default_a2a_ttl(),
+            retained_bytes_ceiling: default_a2a_ceiling(),
+            retained_bytes_low_watermark: default_a2a_low(),
+            cleanup_batch: default_a2a_batch(),
+            exposed_endpoints: Vec::new(),
+            peers: BTreeMap::new(),
+        }
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawA2aPeer {
+    url: String,
+    expected_peer_id: String,
+    token: String,
+    #[serde(default)]
+    allowed_targets: Vec<String>,
+    #[serde(default)]
+    private_ca: String,
+}
+
+const fn default_a2a_body() -> usize {
+    1_048_576
+}
+const fn default_a2a_ttl() -> u64 {
+    86_400
+}
+const fn default_a2a_ceiling() -> u64 {
+    67_108_864
+}
+const fn default_a2a_low() -> u64 {
+    50_331_648
+}
+const fn default_a2a_batch() -> u32 {
+    32
 }
 
 #[derive(Deserialize)]
@@ -370,6 +469,8 @@ struct RawAgent {
     enabled: bool,
     #[serde(default)]
     workspace: String,
+    #[serde(default)]
+    peer: Option<String>,
 }
 
 impl Default for RawBridge {
@@ -528,6 +629,24 @@ fn enforce_secret_references(value: &toml::Value) -> Result<(), ConfigError> {
             }
         }
         _ => {}
+    }
+    if let Some(peers) = value
+        .get("transports")
+        .and_then(|v| v.get("a2a"))
+        .and_then(|v| v.get("peers"))
+        .and_then(toml::Value::as_table)
+    {
+        for (peer, fields) in peers {
+            let Some(token) = fields.get("token").and_then(toml::Value::as_str) else {
+                continue;
+            };
+            let field = format!("transports.a2a.peers.{peer}.token");
+            check_placeholders_well_formed(token, &field, true)?;
+            if !is_whole_env_reference(token) {
+                return Err(ConfigError::Validation { field,
+                    message: "must be a whole-value {env:VAR} reference; literal or embedded credentials are not allowed".into() });
+            }
+        }
     }
     Ok(())
 }
@@ -773,6 +892,7 @@ fn build_config(raw: RawConfig, env: &BTreeMap<String, String>) -> Result<Config
     let runtime = build_runtime(raw.runtime)?;
 
     let matrix = build_matrix(raw.transports.matrix)?;
+    let a2a = build_a2a(raw.transports.a2a, env)?;
 
     let mut agents = BTreeMap::new();
     for (id, raw_agent) in raw.agents {
@@ -797,9 +917,93 @@ fn build_config(raw: RawConfig, env: &BTreeMap<String, String>) -> Result<Config
             shutdown_timeout_seconds: raw.bridge.shutdown_timeout_seconds,
             health_bind,
         },
-        transports: TransportsConfig { matrix },
+        transports: TransportsConfig { matrix, a2a },
         runtime,
         agents,
+    })
+}
+
+fn build_a2a(
+    raw: RawA2a,
+    env: &BTreeMap<String, String>,
+) -> Result<A2aTransportConfig, ConfigError> {
+    if raw.enabled && raw.listen.is_empty() {
+        return Err(validation(
+            "transports.a2a.listen",
+            "is required when A2A is enabled",
+        ));
+    }
+    if !(1..=1_048_576).contains(&raw.max_body_bytes) {
+        return Err(validation(
+            "transports.a2a.max_body_bytes",
+            "must be in range 1..=1048576",
+        ));
+    }
+    if raw.cleanup_batch == 0 || raw.cleanup_batch > 256 {
+        return Err(validation(
+            "transports.a2a.cleanup_batch",
+            "must be in range 1..=256",
+        ));
+    }
+    if raw.retained_bytes_low_watermark >= raw.retained_bytes_ceiling {
+        return Err(validation(
+            "transports.a2a.retained_bytes_low_watermark",
+            "must be below retained_bytes_ceiling",
+        ));
+    }
+    let mut peers = BTreeMap::new();
+    for (id, peer) in raw.peers {
+        if id.is_empty() || peer.expected_peer_id.is_empty() || peer.token.is_empty() {
+            return Err(validation(
+                "transports.a2a.peers",
+                "peer id, expected_peer_id and token must not be empty",
+            ));
+        }
+        let url = url::Url::parse(&peer.url)
+            .map_err(|_| validation("transports.a2a.peers.url", "must be an absolute URL"))?;
+        if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+            return Err(validation(
+                "transports.a2a.peers.url",
+                "must use http or https and include a host",
+            ));
+        }
+        let private_ca = if peer.private_ca.is_empty() {
+            None
+        } else {
+            Some(expand_path(
+                &peer.private_ca,
+                "transports.a2a.peers.private_ca",
+                env,
+            )?)
+        };
+        if url.scheme() == "http" && private_ca.is_some() {
+            return Err(validation(
+                "transports.a2a.peers.private_ca",
+                "is valid only for HTTPS",
+            ));
+        }
+        peers.insert(
+            id,
+            A2aPeerConfig {
+                url: peer.url,
+                expected_peer_id: peer.expected_peer_id,
+                token: SecretString::new(peer.token),
+                allowed_targets: peer.allowed_targets,
+                private_ca,
+            },
+        );
+    }
+    Ok(A2aTransportConfig {
+        enabled: raw.enabled,
+        listen: raw.listen,
+        allow_private_plaintext: raw.allow_private_plaintext,
+        max_body_bytes: raw.max_body_bytes,
+        terminal_content_ttl_seconds: raw.terminal_content_ttl_seconds,
+        retained_bytes_ceiling: raw.retained_bytes_ceiling,
+        retained_bytes_low_watermark: raw.retained_bytes_low_watermark,
+        cleanup_batch: raw.cleanup_batch,
+        exposed_endpoints: raw.exposed_endpoints,
+        peers,
     })
 }
 
@@ -1017,6 +1221,7 @@ fn build_agent(
                 args: raw.args,
                 enabled: raw.enabled,
                 workspace,
+                peer: None,
             })
         }
         TransportType::Matrix | TransportType::Http => {
@@ -1032,6 +1237,29 @@ fn build_agent(
                 args: Vec::new(),
                 enabled: raw.enabled,
                 workspace: None,
+                peer: None,
+            })
+        }
+        TransportType::A2a => {
+            if raw.command.is_some() || !raw.args.is_empty() || !raw.workspace.is_empty() {
+                return Err(validation(
+                    &field,
+                    "command/args/workspace are only valid for transport \"acp\"",
+                ));
+            }
+            let peer = raw.peer.filter(|value| !value.is_empty()).ok_or_else(|| {
+                validation(
+                    &format!("{field}.peer"),
+                    "is required for transport \"a2a\"",
+                )
+            })?;
+            Ok(AgentEndpointConfig {
+                transport: TransportType::A2a,
+                command: None,
+                args: Vec::new(),
+                enabled: raw.enabled,
+                workspace: None,
+                peer: Some(peer),
             })
         }
     }
