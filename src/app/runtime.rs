@@ -177,6 +177,18 @@ impl AppRuntime {
             Arc::clone(&metrics),
             Arc::clone(&projection_metrics),
         ));
+        let insecure_a2a_peers = if config.transports.a2a.enabled {
+            config
+                .transports
+                .a2a
+                .peers
+                .values()
+                .filter(|peer| peer.danger_accept_invalid_certs)
+                .count()
+        } else {
+            0
+        };
+        health_state.set_insecure_a2a_peers(insecure_a2a_peers);
         health_state.set_recovery_blocked(recovery_blocked);
         let mut runtime = Self {
             pool: Some(pool.clone()),

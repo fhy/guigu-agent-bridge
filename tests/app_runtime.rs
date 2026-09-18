@@ -539,6 +539,7 @@ async fn loopback_health_reports_readiness_and_releases_listener() {
     ));
     state.set_owner(OwnerState::Running);
     state.set_adapter_ready(true);
+    state.set_insecure_a2a_peers(2);
     let required_owner = Arc::new(AtomicBool::new(true));
     state.register_required(Arc::clone(&required_owner));
     let server = HealthServer::start("127.0.0.1:0".parse().unwrap(), Arc::clone(&state))
@@ -554,6 +555,15 @@ async fn loopback_health_reports_readiness_and_releases_listener() {
     stream.read_to_string(&mut response).await.unwrap();
     assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     assert!(response.ends_with("ready=true\n"));
+
+    let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+    stream
+        .write_all(b"GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        .await
+        .unwrap();
+    let mut metrics = String::new();
+    stream.read_to_string(&mut metrics).await.unwrap();
+    assert!(metrics.contains("guigu_runtime_a2a_insecure_peers 2\n"));
 
     required_owner.store(false, Ordering::Release);
     assert_eq!(

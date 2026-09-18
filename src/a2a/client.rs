@@ -7,7 +7,9 @@ use serde_json::{Value, json};
 
 use crate::config::SecretString;
 
-use super::wire::{JsonRpcRequest, JsonRpcResponse, SendParams, TaskQuery, TaskSnapshot};
+use super::wire::{
+    AgentCard, JsonRpcRequest, JsonRpcResponse, SendParams, TaskQuery, TaskSnapshot,
+};
 use super::{A2aError, validate_peer_url};
 
 #[derive(Debug, Clone)]
@@ -23,6 +25,7 @@ pub struct ClientPeer {
     pub token: SecretString,
     pub resolved: Vec<SocketAddr>,
     pub trust: TrustPolicy,
+    pub danger_accept_invalid_certs: bool,
     pub timeout: Duration,
     pub max_response_bytes: usize,
 }
@@ -43,7 +46,8 @@ impl A2aClient {
         let mut builder = Client::builder()
             .redirect(reqwest::redirect::Policy::none())
             .no_proxy()
-            .timeout(peer.timeout);
+            .timeout(peer.timeout)
+            .danger_accept_invalid_certs(peer.danger_accept_invalid_certs);
         builder = builder.resolve_to_addrs(host, &peer.resolved);
         if let TrustPolicy::PrivateCa(pem) = &peer.trust {
             let certificate = Certificate::from_pem(pem)
@@ -65,6 +69,23 @@ impl A2aClient {
             ));
         }
         std::fs::read(path).map_err(|_| A2aError::Config("private CA unavailable"))
+    }
+
+    pub async fn agent_card(&self) -> Result<AgentCard, A2aError> {
+        let url = self
+            .peer
+            .rpc_url
+            .join("/.well-known/agent-card.json")
+            .map_err(|_| A2aError::Config("invalid Agent Card URL"))?;
+        let response = self.http.get(url).send().await?;
+        if !response.status().is_success() {
+            return Err(A2aError::Protocol("remote Agent Card HTTP status"));
+        }
+        let bytes = response.bytes().await?;
+        if bytes.len() > self.peer.max_response_bytes {
+            return Err(A2aError::TooLarge);
+        }
+        serde_json::from_slice(&bytes).map_err(|_| A2aError::Protocol("invalid Agent Card"))
     }
 
     pub async fn send(&self, params: SendParams) -> Result<TaskSnapshot, A2aError> {

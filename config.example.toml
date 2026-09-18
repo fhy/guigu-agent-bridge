@@ -36,6 +36,22 @@ aliases = {}
 rooms = {}
 direct = {}
 
+# A2A is disabled by default. Outbound non-loopback peers must use HTTPS.
+# [transports.a2a]
+# enabled = false
+# listen = "tcp:127.0.0.1:0"
+#
+# [transports.a2a.peers.example]
+# url = "https://a2a.internal.example/a2a/worker/rpc"
+# expected_peer_id = "trusted-peer"
+# token = "{env:A2A_PEER_TOKEN}"
+# allowed_targets = ["worker"]
+# private_ca = "/etc/guigu-agent-bridge/private-ca.pem"
+# DANGER: this defaults to false and is never enabled after a CA failure.
+# When true, HTTPS encrypts traffic but does not authenticate the peer. An
+# active MITM can read or modify bearer credentials and task data.
+# danger_accept_invalid_certs = false
+
 # Agent definitions are transport endpoints, not fixed business roles.
 [agents.example]
 transport = "acp"

@@ -2,7 +2,7 @@ use std::{
     net::SocketAddr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::Duration,
 };
@@ -41,6 +41,7 @@ pub struct HealthState {
     owner: AtomicU8,
     adapter_ready: AtomicBool,
     recovery_blocked: AtomicBool,
+    insecure_a2a_peers: AtomicU64,
     required: Mutex<Vec<Arc<AtomicBool>>>,
 }
 
@@ -57,6 +58,7 @@ impl HealthState {
             owner: AtomicU8::new(OwnerState::Starting as u8),
             adapter_ready: AtomicBool::new(false),
             recovery_blocked: AtomicBool::new(false),
+            insecure_a2a_peers: AtomicU64::new(0),
             required: Mutex::new(Vec::new()),
         }
     }
@@ -71,6 +73,15 @@ impl HealthState {
 
     pub fn set_recovery_blocked(&self, blocked: bool) {
         self.recovery_blocked.store(blocked, Ordering::Release);
+    }
+
+    pub fn set_insecure_a2a_peers(&self, count: usize) {
+        self.insecure_a2a_peers
+            .store(count.try_into().unwrap_or(u64::MAX), Ordering::Release);
+    }
+
+    pub fn insecure_a2a_peers(&self) -> u64 {
+        self.insecure_a2a_peers.load(Ordering::Acquire)
     }
 
     pub fn register_required(&self, alive: Arc<AtomicBool>) {
@@ -131,6 +142,7 @@ impl HealthState {
             ("in_flight_turns", gauges.in_flight_turns),
             ("recovery_backlog", gauges.recovery_backlog),
             ("projection_failures", self.projections.failures()),
+            ("a2a_insecure_peers", self.insecure_a2a_peers()),
         ] {
             body.push_str(&format!("guigu_runtime_{name} {value}\n"));
         }

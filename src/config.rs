@@ -104,6 +104,10 @@ pub struct A2aPeerConfig {
     pub token: SecretString,
     pub allowed_targets: Vec<String>,
     pub private_ca: Option<PathBuf>,
+    /// Disables HTTPS chain, hostname, and validity verification for this peer.
+    /// HTTPS then encrypts traffic without authenticating the peer, allowing an
+    /// active MITM to read or modify bearer credentials and task data.
+    pub danger_accept_invalid_certs: bool,
 }
 
 /// Matrix transport settings.
@@ -386,6 +390,8 @@ struct RawA2aPeer {
     allowed_targets: Vec<String>,
     #[serde(default)]
     private_ca: String,
+    #[serde(default)]
+    danger_accept_invalid_certs: bool,
 }
 
 const fn default_a2a_body() -> usize {
@@ -953,10 +959,10 @@ fn build_a2a(
     }
     let mut peers = BTreeMap::new();
     for (id, peer) in raw.peers {
-        if id.is_empty() || peer.expected_peer_id.is_empty() || peer.token.is_empty() {
+        if !is_safe_a2a_peer_key(&id) || peer.expected_peer_id.is_empty() || peer.token.is_empty() {
             return Err(validation(
                 "transports.a2a.peers",
-                "peer id, expected_peer_id and token must not be empty",
+                "peer key must be 1..=64 safe ASCII characters; expected_peer_id and token must not be empty",
             ));
         }
         let url = url::Url::parse(&peer.url)
@@ -965,6 +971,12 @@ fn build_a2a(
             return Err(validation(
                 "transports.a2a.peers.url",
                 "must use http or https and include a host",
+            ));
+        }
+        if !url.username().is_empty() || url.password().is_some() {
+            return Err(validation(
+                "transports.a2a.peers.url",
+                "must not contain user-info credentials",
             ));
         }
         let private_ca = if peer.private_ca.is_empty() {
@@ -990,6 +1002,7 @@ fn build_a2a(
                 token: SecretString::new(peer.token),
                 allowed_targets: peer.allowed_targets,
                 private_ca,
+                danger_accept_invalid_certs: peer.danger_accept_invalid_certs,
             },
         );
     }
@@ -1005,6 +1018,14 @@ fn build_a2a(
         exposed_endpoints: raw.exposed_endpoints,
         peers,
     })
+}
+
+fn is_safe_a2a_peer_key(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
 }
 
 fn validate_capacity(field: &str, value: usize) -> Result<(), ConfigError> {
