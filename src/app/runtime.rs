@@ -324,7 +324,13 @@ impl AppRuntime {
 
         let persistence: Arc<dyn EventConsumer> =
             Arc::new(RepositoryEventConsumer::new(repository_trait.clone()));
-        let siblings: Vec<Arc<dyn EventConsumer>> = Vec::new();
+        let siblings: Vec<Arc<dyn EventConsumer>> = if config.transports.a2a.enabled {
+            vec![Arc::new(crate::a2a::A2aTerminalProjection::new(
+                A2aStore::new(pool.clone()),
+            ))]
+        } else {
+            Vec::new()
+        };
 
         let matrix = if config.transports.matrix.enabled {
             let client = MatrixClient::restore(&config.transports.matrix)

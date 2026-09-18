@@ -135,6 +135,25 @@ impl A2aStore {
             == 1)
     }
 
+    pub async fn mark_acceptance_unknown(
+        &self,
+        exchange_id: &str,
+        expected_revision: i64,
+        now: DateTime<Utc>,
+    ) -> Result<bool, A2aError> {
+        Ok(sqlx::query(
+            "UPDATE a2a_exchanges SET state='acceptance_unknown',revision=revision+1,updated_at=? \
+             WHERE exchange_id=? AND revision=? AND state='reserved' AND external_task_id IS NULL",
+        )
+        .bind(now.to_rfc3339())
+        .bind(exchange_id)
+        .bind(expected_revision)
+        .execute(&self.pool)
+        .await?
+        .rows_affected()
+            == 1)
+    }
+
     pub async fn outbound_for_task(
         &self,
         peer_id: &str,
@@ -233,12 +252,26 @@ impl A2aStore {
             == 1)
     }
 
+    pub async fn project_task_terminal(&self, internal_task_id: &str) -> Result<u64, A2aError> {
+        let mut tx = self.pool.begin().await?;
+        let changed = project_one_terminal(&mut tx, internal_task_id).await?;
+        tx.commit().await?;
+        Ok(changed)
+    }
+
     pub async fn retained_terminal_bytes(&self) -> Result<i64, A2aError> {
+        let mut tx = self.pool.begin().await?;
+        reconcile_terminals(&mut tx).await?;
         let value: i64 = sqlx::query_scalar(
-            "SELECT COALESCE(SUM(content_bytes),0) FROM a2a_exchanges WHERE terminal_at IS NOT NULL AND cleanup_state != 'cleaned'",
+            "SELECT COALESCE(SUM(e.content_bytes),0) FROM a2a_exchanges e \
+             WHERE e.terminal_at IS NOT NULL AND e.cleanup_state != 'cleaned' \
+             AND EXISTS (SELECT 1 FROM task_events te WHERE te.task_id=e.internal_task_id \
+               AND te.seq=(SELECT MAX(last.seq) FROM task_events last WHERE last.task_id=e.internal_task_id) \
+               AND te.status IN ('completed','failed','timed_out','cancelled'))",
         )
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(value)
     }
 
@@ -253,10 +286,14 @@ impl A2aStore {
             return Err(A2aError::Config("cleanup batch must be 1..=256"));
         }
         let mut tx = self.pool.begin().await?;
+        reconcile_terminals(&mut tx).await?;
         let ids: Vec<(String, i64)> = sqlx::query_as(
             "SELECT e.exchange_id,e.cleanup_revision FROM a2a_exchanges e \
              LEFT JOIN runtime_instances r ON r.instance_token=e.cleanup_owner \
              WHERE e.terminal_at IS NOT NULL AND e.terminal_at <= ? \
+             AND EXISTS (SELECT 1 FROM task_events te WHERE te.task_id=e.internal_task_id \
+               AND te.seq=(SELECT MAX(last.seq) FROM task_events last WHERE last.task_id=e.internal_task_id) \
+               AND te.status IN ('completed','failed','timed_out','cancelled')) \
              AND (e.cleanup_state='pending' OR (e.cleanup_state='claimed' AND r.state='stopped')) \
              ORDER BY e.terminal_at,e.exchange_id LIMIT ?",
         )
@@ -270,6 +307,10 @@ impl A2aStore {
             let changed = sqlx::query(
                 "UPDATE a2a_exchanges SET cleanup_state='claimed',cleanup_owner=?,cleanup_revision=cleanup_revision+1,cleanup_claimed_at=?,updated_at=? \
                  WHERE exchange_id=? AND cleanup_revision=? \
+                 AND terminal_at IS NOT NULL AND EXISTS \
+                    (SELECT 1 FROM task_events te WHERE te.task_id=internal_task_id \
+                     AND te.seq=(SELECT MAX(last.seq) FROM task_events last WHERE last.task_id=internal_task_id) \
+                     AND te.status IN ('completed','failed','timed_out','cancelled')) \
                  AND (cleanup_state='pending' OR (cleanup_state='claimed' AND EXISTS \
                     (SELECT 1 FROM runtime_instances old WHERE old.instance_token=cleanup_owner AND old.state='stopped'))) \
                  AND EXISTS (SELECT 1 FROM runtime_instances WHERE instance_token=? AND state='active')",
@@ -304,7 +345,10 @@ impl A2aStore {
         let valid: Option<i64> = sqlx::query_scalar(
             "SELECT 1 FROM a2a_exchanges e JOIN runtime_instances r ON r.instance_token=e.cleanup_owner \
              WHERE e.exchange_id=? AND e.cleanup_state='claimed' AND e.cleanup_owner=? AND e.cleanup_revision=? \
-             AND e.terminal_at IS NOT NULL AND r.state='active'",
+             AND e.terminal_at IS NOT NULL AND r.state='active' \
+             AND EXISTS (SELECT 1 FROM task_events te WHERE te.task_id=e.internal_task_id \
+               AND te.seq=(SELECT MAX(last.seq) FROM task_events last WHERE last.task_id=e.internal_task_id) \
+               AND te.status IN ('completed','failed','timed_out','cancelled'))",
         )
         .bind(&claim.exchange_id)
         .bind(runtime)
@@ -326,7 +370,10 @@ impl A2aStore {
         let now = now.to_rfc3339();
         let changed = sqlx::query(
             "UPDATE a2a_exchanges SET cleanup_state='cleaned',content_bytes=0,content_cleaned_at=?,updated_at=? \
-             WHERE exchange_id=? AND cleanup_owner=? AND cleanup_revision=?",
+             WHERE exchange_id=? AND cleanup_owner=? AND cleanup_revision=? AND terminal_at IS NOT NULL \
+             AND EXISTS (SELECT 1 FROM task_events te WHERE te.task_id=internal_task_id \
+               AND te.seq=(SELECT MAX(last.seq) FROM task_events last WHERE last.task_id=internal_task_id) \
+               AND te.status IN ('completed','failed','timed_out','cancelled'))",
         )
         .bind(&now)
         .bind(&now)
@@ -339,6 +386,48 @@ impl A2aStore {
         tx.commit().await?;
         Ok(changed == 1)
     }
+}
+
+async fn reconcile_terminals(tx: &mut Transaction<'_, Sqlite>) -> Result<(), A2aError> {
+    sqlx::query(
+        "UPDATE a2a_exchanges SET \
+           state=CASE (SELECT te.status FROM task_events te WHERE te.task_id=internal_task_id ORDER BY te.seq DESC LIMIT 1) \
+             WHEN 'completed' THEN 'completed' WHEN 'cancelled' THEN 'canceled' ELSE 'failed' END, \
+           revision=revision+1, \
+           terminal_at=(SELECT te.timestamp FROM task_events te WHERE te.task_id=internal_task_id ORDER BY te.seq DESC LIMIT 1), \
+           updated_at=(SELECT te.timestamp FROM task_events te WHERE te.task_id=internal_task_id ORDER BY te.seq DESC LIMIT 1) \
+         WHERE terminal_at IS NULL AND internal_task_id IS NOT NULL \
+         AND (SELECT te.status FROM task_events te WHERE te.task_id=internal_task_id ORDER BY te.seq DESC LIMIT 1) \
+             IN ('completed','failed','timed_out','cancelled')",
+    )
+    .execute(&mut **tx)
+    .await?;
+    Ok(())
+}
+
+async fn project_one_terminal(
+    tx: &mut Transaction<'_, Sqlite>,
+    internal_task_id: &str,
+) -> Result<u64, A2aError> {
+    Ok(sqlx::query(
+        "UPDATE a2a_exchanges SET \
+           state=CASE (SELECT te.status FROM task_events te WHERE te.task_id=? ORDER BY te.seq DESC LIMIT 1) \
+             WHEN 'completed' THEN 'completed' WHEN 'cancelled' THEN 'canceled' ELSE 'failed' END, \
+           revision=revision+1, \
+           terminal_at=(SELECT te.timestamp FROM task_events te WHERE te.task_id=? ORDER BY te.seq DESC LIMIT 1), \
+           updated_at=(SELECT te.timestamp FROM task_events te WHERE te.task_id=? ORDER BY te.seq DESC LIMIT 1) \
+         WHERE internal_task_id=? AND terminal_at IS NULL \
+         AND (SELECT te.status FROM task_events te WHERE te.task_id=? ORDER BY te.seq DESC LIMIT 1) \
+             IN ('completed','failed','timed_out','cancelled')",
+    )
+    .bind(internal_task_id)
+    .bind(internal_task_id)
+    .bind(internal_task_id)
+    .bind(internal_task_id)
+    .bind(internal_task_id)
+    .execute(&mut **tx)
+    .await?
+    .rows_affected())
 }
 
 async fn read_request(

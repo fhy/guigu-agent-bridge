@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 use std::path::Path;
 use std::time::Duration;
 
-use reqwest::{Certificate, Client, Url};
+use reqwest::{Certificate, Client, Response, Url};
 use serde_json::{Value, json};
 
 use crate::config::SecretString;
@@ -81,10 +81,7 @@ impl A2aClient {
         if !response.status().is_success() {
             return Err(A2aError::Protocol("remote Agent Card HTTP status"));
         }
-        let bytes = response.bytes().await?;
-        if bytes.len() > self.peer.max_response_bytes {
-            return Err(A2aError::TooLarge);
-        }
+        let bytes = bounded_body(response, self.peer.max_response_bytes).await?;
         serde_json::from_slice(&bytes).map_err(|_| A2aError::Protocol("invalid Agent Card"))
     }
 
@@ -141,10 +138,7 @@ impl A2aClient {
                 A2aError::Protocol("remote HTTP status")
             });
         }
-        let bytes = response.bytes().await?;
-        if bytes.len() > self.peer.max_response_bytes {
-            return Err(A2aError::TooLarge);
-        }
+        let bytes = bounded_body(response, self.peer.max_response_bytes).await?;
         let envelope: JsonRpcResponse = serde_json::from_slice(&bytes)
             .map_err(|_| A2aError::Protocol("invalid JSON-RPC response"))?;
         if envelope.error.is_some() {
@@ -157,4 +151,25 @@ impl A2aClient {
         )
         .map_err(|_| A2aError::Protocol("invalid task result"))
     }
+}
+
+async fn bounded_body(mut response: Response, limit: usize) -> Result<Vec<u8>, A2aError> {
+    if response
+        .content_length()
+        .is_some_and(|length| usize::try_from(length).map_or(true, |length| length > limit))
+    {
+        return Err(A2aError::TooLarge);
+    }
+    let capacity = response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .unwrap_or_default();
+    let mut body = Vec::with_capacity(capacity.min(limit));
+    while let Some(chunk) = response.chunk().await? {
+        if chunk.len() > limit.saturating_sub(body.len()) {
+            return Err(A2aError::TooLarge);
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }

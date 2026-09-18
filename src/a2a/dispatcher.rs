@@ -74,10 +74,26 @@ impl TaskDispatcher for A2aDispatcher {
                         }],
                     },
                 })
-                .await
-                .map_err(|error| DispatchError::NotAccepted {
-                    reason: error.to_string(),
-                })?;
+                .await;
+            let snapshot = match snapshot {
+                Ok(snapshot) => snapshot,
+                Err(super::A2aError::Unauthorized) => {
+                    return Err(DispatchError::NotAccepted {
+                        reason: "A2A authentication failed".into(),
+                    });
+                }
+                Err(_) => {
+                    self.store
+                        .mark_acceptance_unknown(
+                            &exchange.exchange_id,
+                            exchange.revision,
+                            chrono::Utc::now(),
+                        )
+                        .await
+                        .map_err(|_| DispatchError::AcceptanceUnknown)?;
+                    return Err(DispatchError::AcceptanceUnknown);
+                }
+            };
             if !matches!(snapshot.status, TaskState::Submitted | TaskState::Working) {
                 return Err(DispatchError::NotAccepted {
                     reason: "remote did not accept task".into(),
