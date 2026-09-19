@@ -227,7 +227,8 @@ impl GatewayStore {
     }
 
     #[allow(clippy::too_many_arguments)]
-    pub async fn admit_inbound(
+    #[allow(dead_code)]
+    async fn admit_inbound(
         &self,
         envelope: &GatewayEnvelope,
         canonical_json: &[u8],
@@ -300,6 +301,12 @@ impl GatewayStore {
                 return Err(sqlx::Error::Protocol(
                     "gateway idempotency collision".into(),
                 ));
+            }
+            let siblings: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM gateway_deliveries WHERE envelope_id=?), (SELECT COUNT(*) FROM tasks WHERE task_id=?), (SELECT COUNT(*) FROM task_admissions WHERE task_id=? AND state IN ('ready','enqueued'))")
+                .bind(envelope.envelope_id.to_string()).bind(&task_id).bind(&task_id).fetch_one(&mut *tx).await?;
+            if siblings != (1, 1, 1) {
+                tx.rollback().await?;
+                return Err(sqlx::Error::Protocol("gateway sibling corruption".into()));
             }
             tx.commit().await?;
             return Ok(TaskWinner::Replay(task_id));
