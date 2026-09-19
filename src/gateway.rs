@@ -269,6 +269,28 @@ impl GatewayStore {
     ) -> Result<String, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         let task_id = envelope.correlation_id.to_string();
+        let inserted = sqlx::query("INSERT OR IGNORE INTO gateway_envelopes (envelope_id,version,direction,peer_id,sender_user_id,idempotency_key,sender_endpoint,recipient_endpoint,conversation_id,correlation_id,internal_task_id,kind,canonical_json,payload_sha256,created_at,route_generation,state,retained_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(envelope.envelope_id.to_string()).bind(&envelope.version).bind("inbound")
+            .bind(&envelope.peer_id).bind(&envelope.sender.peer_id).bind(&envelope.idempotency_key)
+            .bind(envelope.sender.endpoint_id.to_string()).bind(envelope.recipient.endpoint_id.to_string())
+            .bind(envelope.conversation_id.to_string()).bind(envelope.correlation_id.to_string()).bind(&task_id)
+            .bind(format!("{:?}", envelope.kind).to_lowercase()).bind(serde_json::to_vec(envelope).map_err(|_| sqlx::Error::Protocol("envelope encode".into()))?)
+            .bind(&envelope.payload_sha256).bind(now).bind(0_i64).bind("received").bind(0_i64)
+            .execute(&mut *tx).await?.rows_affected() == 1;
+        if !inserted {
+            let existing: (String, String) = sqlx::query_as("SELECT internal_task_id,payload_sha256 FROM gateway_envelopes WHERE peer_id=? AND sender_user_id=? AND direction='inbound' AND idempotency_key=?")
+                .bind(&envelope.peer_id).bind(&envelope.sender.peer_id).bind(&envelope.idempotency_key).fetch_one(&mut *tx).await?;
+            if existing.0 != task_id || existing.1 != envelope.payload_sha256 {
+                tx.rollback().await?;
+                return Err(sqlx::Error::Protocol(
+                    "gateway idempotency collision".into(),
+                ));
+            }
+            tx.commit().await?;
+            return Ok(task_id);
+        }
+        sqlx::query("INSERT INTO gateway_deliveries (envelope_id,direction,transport,phase,attempt,room_id) VALUES (?,'inbound','matrix','transport_acked',0,'gateway')")
+            .bind(envelope.envelope_id.to_string()).execute(&mut *tx).await?;
         sqlx::query("INSERT OR IGNORE INTO tasks (task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,deadline,version) VALUES (?,?,?,?,?,?,?,?,?,?,0)")
             .bind(&task_id).bind(&task_id).bind(envelope.sender.endpoint_id.to_string())
             .bind(envelope.recipient.endpoint_id.to_string()).bind(conversation_id)
