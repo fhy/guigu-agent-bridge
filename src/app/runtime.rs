@@ -365,7 +365,7 @@ impl AppRuntime {
                         remote_endpoint_id: config.transports.gateway.remote_endpoint_id.clone(),
                         generation: config.transports.gateway.generation,
                         max_payload_bytes: config.transports.gateway.max_payload_bytes,
-                        deadline_seconds: config.bridge.default_timeout_seconds,
+                        deadline_seconds: config.transports.gateway.deadline_seconds,
                         allowed_senders: config.transports.gateway.allowed_senders.clone(),
                         own_user: config.transports.matrix.user_id.clone(),
                     },

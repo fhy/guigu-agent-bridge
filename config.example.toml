@@ -47,6 +47,7 @@ remote_endpoint_id = "00000000-0000-0000-0000-000000000002"
 allowed_senders = []
 generation = 0
 max_payload_bytes = 262144
+deadline_seconds = 300
 
 # A2A is disabled by default. Outbound non-loopback peers must use HTTPS.
 # [transports.a2a]

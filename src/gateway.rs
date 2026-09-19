@@ -326,6 +326,39 @@ impl MatrixGateway {
                 .any(|s| s == &event.sender)
     }
 
+    pub fn decode_event(&self, raw: &str) -> Result<Option<GatewayEnvelope>, EnvelopeError> {
+        let value: serde_json::Value =
+            serde_json::from_str(raw).map_err(|_| EnvelopeError::Shape)?;
+        if value.get("type").and_then(|v| v.as_str()) != Some("m.room.message") {
+            return Ok(None);
+        }
+        let content = value
+            .get("content")
+            .and_then(|v| v.as_object())
+            .ok_or(EnvelopeError::Shape)?;
+        if content.get("msgtype").and_then(|v| v.as_str()) != Some("com.guigu.bridge.a2a.v1") {
+            return Ok(None);
+        }
+        let envelope: GatewayEnvelope = content
+            .get("com.guigu.bridge.a2a.v1")
+            .and_then(|v| v.get("envelope"))
+            .cloned()
+            .ok_or(EnvelopeError::Shape)
+            .and_then(|v| serde_json::from_value(v).map_err(|_| EnvelopeError::Shape))?;
+        envelope.validate()?;
+        if envelope.peer_id != self.route.peer_id
+            || envelope.sender.peer_id != self.route.peer_id
+            || envelope.recipient.peer_id != self.route.peer_id
+            || envelope.sender.endpoint_id.to_string() != self.route.remote_endpoint_id
+            || envelope.recipient.endpoint_id.to_string() != self.route.local_endpoint_id
+            || envelope.encoded_len().map_err(|_| EnvelopeError::Bounds)?
+                > self.route.max_payload_bytes
+        {
+            return Err(EnvelopeError::Peer);
+        }
+        Ok(Some(envelope))
+    }
+
     pub fn encode_event(
         envelope: &GatewayEnvelope,
         thread_root: Option<&str>,

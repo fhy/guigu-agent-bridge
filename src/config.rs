@@ -94,6 +94,7 @@ pub struct GatewayTransportConfig {
     pub allowed_senders: Vec<String>,
     pub generation: u64,
     pub max_payload_bytes: usize,
+    pub deadline_seconds: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -372,10 +373,15 @@ struct RawGateway {
     generation: u64,
     #[serde(default = "default_gateway_payload")]
     max_payload_bytes: usize,
+    #[serde(default = "default_gateway_deadline")]
+    deadline_seconds: u64,
 }
 
 fn default_gateway_payload() -> usize {
     256 * 1024
+}
+fn default_gateway_deadline() -> u64 {
+    300
 }
 
 #[derive(Deserialize)]
@@ -1147,6 +1153,12 @@ fn build_gateway(raw: RawGateway) -> Result<GatewayTransportConfig, ConfigError>
             "must be in range 1..=262144",
         ));
     }
+    if raw.deadline_seconds == 0 || raw.deadline_seconds > 86_400 {
+        return Err(validation(
+            "transports.gateway.deadline_seconds",
+            "must be in range 1..=86400",
+        ));
+    }
     if raw.enabled {
         if uuid::Uuid::parse_str(&raw.local_endpoint_id).is_err()
             || uuid::Uuid::parse_str(&raw.remote_endpoint_id).is_err()
@@ -1176,6 +1188,7 @@ fn build_gateway(raw: RawGateway) -> Result<GatewayTransportConfig, ConfigError>
         allowed_senders: raw.allowed_senders,
         generation: raw.generation,
         max_payload_bytes: raw.max_payload_bytes,
+        deadline_seconds: raw.deadline_seconds,
     })
 }
 
