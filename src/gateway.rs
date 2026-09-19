@@ -281,21 +281,18 @@ impl GatewayStore {
         route_generation: u64,
     ) -> Result<TaskWinner, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
+        let fenced = sqlx::query("UPDATE runtime_instances SET heartbeat_at=heartbeat_at WHERE instance_token=? AND state='active'")
+            .bind(runtime_instance).execute(&mut *tx).await?.rows_affected() == 1;
+        if !fenced {
+            tx.rollback().await?;
+            return Err(sqlx::Error::Protocol(
+                "gateway runtime is not active".into(),
+            ));
+        }
         let task_id = envelope.correlation_id.to_string();
-        let canonical_len = serde_json::to_vec(envelope)
-            .map_err(|_| sqlx::Error::Protocol("envelope encode".into()))?
-            .len() as i64;
-        let inserted = sqlx::query("INSERT OR IGNORE INTO gateway_envelopes (envelope_id,version,direction,peer_id,sender_user_id,idempotency_key,sender_endpoint,recipient_endpoint,conversation_id,correlation_id,internal_task_id,kind,canonical_json,payload_sha256,created_at,route_generation,state,retained_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
-            .bind(envelope.envelope_id.to_string()).bind(&envelope.version).bind("inbound")
-            .bind(&envelope.peer_id).bind(sender_user).bind(&envelope.idempotency_key)
-            .bind(envelope.sender.endpoint_id.to_string()).bind(envelope.recipient.endpoint_id.to_string())
-            .bind(envelope.conversation_id.to_string()).bind(envelope.correlation_id.to_string()).bind(&task_id)
-            .bind(format!("{:?}", envelope.kind).to_lowercase()).bind(serde_json::to_vec(envelope).map_err(|_| sqlx::Error::Protocol("envelope encode".into()))?)
-            .bind(&envelope.payload_sha256).bind(now).bind(route_generation as i64).bind("received").bind(canonical_len)
-            .execute(&mut *tx).await?.rows_affected() == 1;
-        if !inserted {
-            let existing: (String, String) = sqlx::query_as("SELECT internal_task_id,payload_sha256 FROM gateway_envelopes WHERE peer_id=? AND sender_user_id=? AND direction='inbound' AND idempotency_key=?")
-                .bind(&envelope.peer_id).bind(sender_user).bind(&envelope.idempotency_key).fetch_one(&mut *tx).await?;
+        let existing: Option<(String, String)> = sqlx::query_as("SELECT internal_task_id,payload_sha256 FROM gateway_envelopes WHERE peer_id=? AND sender_user_id=? AND direction='inbound' AND idempotency_key=?")
+            .bind(&envelope.peer_id).bind(sender_user).bind(&envelope.idempotency_key).fetch_optional(&mut *tx).await?;
+        if let Some(existing) = existing {
             if existing.0 != task_id || existing.1 != envelope.payload_sha256 {
                 tx.rollback().await?;
                 return Err(sqlx::Error::Protocol(
@@ -311,19 +308,28 @@ impl GatewayStore {
             tx.commit().await?;
             return Ok(TaskWinner::Replay(task_id));
         }
-        sqlx::query("INSERT INTO gateway_deliveries (envelope_id,direction,transport,phase,attempt,event_id,room_id,thread_root) VALUES (?,'inbound','matrix','transport_acked',0,?,?,?)")
-            .bind(envelope.envelope_id.to_string()).bind(event_id).bind(room_id).bind(thread_root).execute(&mut *tx).await?;
         sqlx::query("INSERT INTO tasks (task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,deadline,version) VALUES (?,?,?,?,?,?,?,?,?,?,0)")
             .bind(&task_id).bind(&task_id).bind(envelope.sender.endpoint_id.to_string())
             .bind(envelope.recipient.endpoint_id.to_string()).bind(conversation_id)
             .bind(envelope.payload.as_ref().map(|p| String::from_utf8_lossy(p).to_string()).unwrap_or_default())
             .bind(5_i64).bind(0_i64).bind(0_i64).bind(envelope.deadline.clone())
             .execute(&mut *tx).await?;
+        let queued = serde_json::to_string(&crate::models::TaskEventPayload::Queued)
+            .map_err(|_| sqlx::Error::Protocol("queued event encode".into()))?;
         sqlx::query("INSERT INTO task_events (event_id,task_id,seq,status,timestamp,payload) VALUES (?,?,?,?,?,json(?))")
-            .bind(envelope.envelope_id.to_string()).bind(&task_id).bind(1_i64).bind("queued").bind(now).bind("{\"gateway\":true}")
+            .bind(envelope.envelope_id.to_string()).bind(&task_id).bind(1_i64).bind("queued").bind(now).bind(queued)
             .execute(&mut *tx).await?;
         sqlx::query("INSERT INTO task_admissions (task_id,state,revision,runtime_instance,created_at,updated_at) VALUES (?,'ready',0,?,?,?)")
             .bind(&task_id).bind(runtime_instance).bind(now).bind(now).execute(&mut *tx).await?;
+        let canonical = serde_json::to_vec(envelope)
+            .map_err(|_| sqlx::Error::Protocol("envelope encode".into()))?;
+        sqlx::query("INSERT INTO gateway_envelopes (envelope_id,version,direction,peer_id,sender_user_id,idempotency_key,sender_endpoint,recipient_endpoint,conversation_id,correlation_id,internal_task_id,kind,canonical_json,payload_sha256,created_at,route_generation,state,retained_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(envelope.envelope_id.to_string()).bind(&envelope.version).bind("inbound").bind(&envelope.peer_id).bind(sender_user).bind(&envelope.idempotency_key)
+            .bind(envelope.sender.endpoint_id.to_string()).bind(envelope.recipient.endpoint_id.to_string()).bind(envelope.conversation_id.to_string()).bind(envelope.correlation_id.to_string()).bind(&task_id)
+            .bind(format!("{:?}", envelope.kind).to_lowercase()).bind(&canonical).bind(&envelope.payload_sha256).bind(now).bind(route_generation as i64).bind("received").bind(canonical.len() as i64)
+            .execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO gateway_deliveries (envelope_id,direction,transport,phase,attempt,event_id,room_id,thread_root) VALUES (?,'inbound','matrix','transport_acked',0,?,?,?)")
+            .bind(envelope.envelope_id.to_string()).bind(event_id).bind(room_id).bind(thread_root).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(TaskWinner::Inserted(task_id))
     }
