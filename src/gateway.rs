@@ -260,22 +260,31 @@ impl GatewayStore {
 
     /// Gateway-private admission: task, queued event, receipt and ready lease
     /// are committed before the caller attempts an in-memory enqueue.
+    #[allow(clippy::too_many_arguments)]
     pub async fn admit_task_ready(
         &self,
         envelope: &GatewayEnvelope,
         conversation_id: &str,
         now: &str,
         runtime_instance: &str,
+        sender_user: &str,
+        event_id: &str,
+        room_id: &str,
+        thread_root: Option<&str>,
+        route_generation: u64,
     ) -> Result<String, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         let task_id = envelope.correlation_id.to_string();
+        let canonical_len = serde_json::to_vec(envelope)
+            .map_err(|_| sqlx::Error::Protocol("envelope encode".into()))?
+            .len() as i64;
         let inserted = sqlx::query("INSERT OR IGNORE INTO gateway_envelopes (envelope_id,version,direction,peer_id,sender_user_id,idempotency_key,sender_endpoint,recipient_endpoint,conversation_id,correlation_id,internal_task_id,kind,canonical_json,payload_sha256,created_at,route_generation,state,retained_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(envelope.envelope_id.to_string()).bind(&envelope.version).bind("inbound")
-            .bind(&envelope.peer_id).bind(&envelope.sender.peer_id).bind(&envelope.idempotency_key)
+            .bind(&envelope.peer_id).bind(sender_user).bind(&envelope.idempotency_key)
             .bind(envelope.sender.endpoint_id.to_string()).bind(envelope.recipient.endpoint_id.to_string())
             .bind(envelope.conversation_id.to_string()).bind(envelope.correlation_id.to_string()).bind(&task_id)
             .bind(format!("{:?}", envelope.kind).to_lowercase()).bind(serde_json::to_vec(envelope).map_err(|_| sqlx::Error::Protocol("envelope encode".into()))?)
-            .bind(&envelope.payload_sha256).bind(now).bind(0_i64).bind("received").bind(0_i64)
+            .bind(&envelope.payload_sha256).bind(now).bind(route_generation as i64).bind("received").bind(canonical_len)
             .execute(&mut *tx).await?.rows_affected() == 1;
         if !inserted {
             let existing: (String, String) = sqlx::query_as("SELECT internal_task_id,payload_sha256 FROM gateway_envelopes WHERE peer_id=? AND sender_user_id=? AND direction='inbound' AND idempotency_key=?")
@@ -289,8 +298,8 @@ impl GatewayStore {
             tx.commit().await?;
             return Ok(task_id);
         }
-        sqlx::query("INSERT INTO gateway_deliveries (envelope_id,direction,transport,phase,attempt,room_id) VALUES (?,'inbound','matrix','transport_acked',0,'gateway')")
-            .bind(envelope.envelope_id.to_string()).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO gateway_deliveries (envelope_id,direction,transport,phase,attempt,event_id,room_id,thread_root) VALUES (?,'inbound','matrix','transport_acked',0,?,?,?)")
+            .bind(envelope.envelope_id.to_string()).bind(event_id).bind(room_id).bind(thread_root).execute(&mut *tx).await?;
         sqlx::query("INSERT OR IGNORE INTO tasks (task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,deadline,version) VALUES (?,?,?,?,?,?,?,?,?,?,0)")
             .bind(&task_id).bind(&task_id).bind(envelope.sender.endpoint_id.to_string())
             .bind(envelope.recipient.endpoint_id.to_string()).bind(conversation_id)
@@ -509,10 +518,13 @@ impl MatrixGateway {
             return Err(EnvelopeError::Peer);
         }
         let canonical = serde_json::to_vec(&envelope).map_err(|_| EnvelopeError::Shape)?;
-        let _ = store
-            .admit_inbound(
+        let _ = canonical;
+        store
+            .admit_task_ready(
                 &envelope,
-                &canonical,
+                &envelope.conversation_id.to_string(),
+                &envelope.created_at,
+                "gateway",
                 sender_user,
                 event_id,
                 &self.route.room_id,
