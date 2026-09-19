@@ -368,6 +368,7 @@ impl AppRuntime {
                         deadline_seconds: config.transports.gateway.deadline_seconds,
                         allowed_senders: config.transports.gateway.allowed_senders.clone(),
                         own_user: config.transports.matrix.user_id.clone(),
+                        runtime_instance: runtime_instance.clone(),
                     },
                 ));
             }

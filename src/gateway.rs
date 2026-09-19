@@ -199,6 +199,12 @@ pub enum InboundAdmission {
     Replay { envelope_id: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TaskWinner {
+    Inserted(String),
+    Replay(String),
+}
+
 impl GatewayStore {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -272,7 +278,7 @@ impl GatewayStore {
         room_id: &str,
         thread_root: Option<&str>,
         route_generation: u64,
-    ) -> Result<String, sqlx::Error> {
+    ) -> Result<TaskWinner, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
         let task_id = envelope.correlation_id.to_string();
         let canonical_len = serde_json::to_vec(envelope)
@@ -288,7 +294,7 @@ impl GatewayStore {
             .execute(&mut *tx).await?.rows_affected() == 1;
         if !inserted {
             let existing: (String, String) = sqlx::query_as("SELECT internal_task_id,payload_sha256 FROM gateway_envelopes WHERE peer_id=? AND sender_user_id=? AND direction='inbound' AND idempotency_key=?")
-                .bind(&envelope.peer_id).bind(&envelope.sender.peer_id).bind(&envelope.idempotency_key).fetch_one(&mut *tx).await?;
+                .bind(&envelope.peer_id).bind(sender_user).bind(&envelope.idempotency_key).fetch_one(&mut *tx).await?;
             if existing.0 != task_id || existing.1 != envelope.payload_sha256 {
                 tx.rollback().await?;
                 return Err(sqlx::Error::Protocol(
@@ -296,23 +302,23 @@ impl GatewayStore {
                 ));
             }
             tx.commit().await?;
-            return Ok(task_id);
+            return Ok(TaskWinner::Replay(task_id));
         }
         sqlx::query("INSERT INTO gateway_deliveries (envelope_id,direction,transport,phase,attempt,event_id,room_id,thread_root) VALUES (?,'inbound','matrix','transport_acked',0,?,?,?)")
             .bind(envelope.envelope_id.to_string()).bind(event_id).bind(room_id).bind(thread_root).execute(&mut *tx).await?;
-        sqlx::query("INSERT OR IGNORE INTO tasks (task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,deadline,version) VALUES (?,?,?,?,?,?,?,?,?,?,0)")
+        sqlx::query("INSERT INTO tasks (task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,deadline,version) VALUES (?,?,?,?,?,?,?,?,?,?,0)")
             .bind(&task_id).bind(&task_id).bind(envelope.sender.endpoint_id.to_string())
             .bind(envelope.recipient.endpoint_id.to_string()).bind(conversation_id)
             .bind(envelope.payload.as_ref().map(|p| String::from_utf8_lossy(p).to_string()).unwrap_or_default())
             .bind(5_i64).bind(0_i64).bind(0_i64).bind(envelope.deadline.clone())
             .execute(&mut *tx).await?;
-        sqlx::query("INSERT OR IGNORE INTO task_events (event_id,task_id,seq,status,timestamp,payload) VALUES (?,?,?,?,?,json(?))")
+        sqlx::query("INSERT INTO task_events (event_id,task_id,seq,status,timestamp,payload) VALUES (?,?,?,?,?,json(?))")
             .bind(envelope.envelope_id.to_string()).bind(&task_id).bind(1_i64).bind("queued").bind(now).bind("{\"gateway\":true}")
             .execute(&mut *tx).await?;
-        sqlx::query("INSERT OR IGNORE INTO task_admissions (task_id,state,revision,runtime_instance,created_at,updated_at) VALUES (?,'ready',0,?,?,?)")
+        sqlx::query("INSERT INTO task_admissions (task_id,state,revision,runtime_instance,created_at,updated_at) VALUES (?,'ready',0,?,?,?)")
             .bind(&task_id).bind(runtime_instance).bind(now).bind(now).execute(&mut *tx).await?;
         tx.commit().await?;
-        Ok(task_id)
+        Ok(TaskWinner::Inserted(task_id))
     }
 
     pub async fn transition_delivery(
@@ -397,6 +403,7 @@ pub struct MatrixRoute {
     pub deadline_seconds: u64,
     pub allowed_senders: Vec<String>,
     pub own_user: String,
+    pub runtime_instance: String,
 }
 
 pub struct MatrixGateway {
@@ -524,7 +531,7 @@ impl MatrixGateway {
                 &envelope,
                 &envelope.conversation_id.to_string(),
                 &envelope.created_at,
-                "gateway",
+                &self.route.runtime_instance,
                 sender_user,
                 event_id,
                 &self.route.room_id,
