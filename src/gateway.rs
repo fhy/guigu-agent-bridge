@@ -3,6 +3,7 @@
 //! Matrix SDK and optional transports remain outside these types. SQLite is the
 //! authority; this module only validates the bounded envelope and its phases.
 
+use crate::matrix::{InboundMatrixEvent, MatrixSender, ReplyContext};
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use std::sync::Arc;
@@ -282,6 +283,73 @@ impl GatewayStore {
 /// Deterministic bounded transport fake for contract and recovery tests.
 pub struct MemoryTransport {
     tx: mpsc::Sender<GatewayEnvelope>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MatrixRoute {
+    pub room_id: String,
+    pub peer_id: String,
+    pub allowed_senders: Vec<String>,
+    pub own_user: String,
+}
+
+pub struct MatrixGateway {
+    sender: std::sync::Arc<dyn MatrixSender>,
+    route: MatrixRoute,
+}
+
+impl MatrixGateway {
+    pub fn new(sender: std::sync::Arc<dyn MatrixSender>, route: MatrixRoute) -> Self {
+        Self { sender, route }
+    }
+
+    pub fn accept_event(&self, event: &InboundMatrixEvent) -> bool {
+        event.room_id == self.route.room_id
+            && event.sender != self.route.own_user
+            && self
+                .route
+                .allowed_senders
+                .iter()
+                .any(|s| s == &event.sender)
+    }
+
+    pub fn encode_event(
+        envelope: &GatewayEnvelope,
+        thread_root: Option<&str>,
+    ) -> Result<serde_json::Value, serde_json::Error> {
+        let mut content = serde_json::json!({
+            "msgtype": "com.guigu.bridge.a2a.v1",
+            "body": PROFILE,
+            "com.guigu.bridge.a2a.v1": {"envelope": envelope},
+        });
+        if let Some(root) = thread_root {
+            content["m.relates_to"] = serde_json::json!({"rel_type":"m.thread","event_id":root});
+        }
+        Ok(serde_json::json!({"type":"m.room.message","content":content}))
+    }
+
+    pub async fn send(
+        &self,
+        envelope: &GatewayEnvelope,
+        event_id: &str,
+        thread_root: Option<String>,
+    ) -> Result<(), crate::matrix::ReplyError> {
+        let body = serde_json::to_string(
+            &Self::encode_event(envelope, thread_root.as_deref())
+                .map_err(|_| crate::matrix::ReplyError)?,
+        )
+        .map_err(|_| crate::matrix::ReplyError)?;
+        self.sender
+            .send_reply(
+                &ReplyContext {
+                    room_id: self.route.room_id.clone(),
+                    thread_root,
+                    event_id: event_id.to_owned(),
+                },
+                &body,
+            )
+            .await
+    }
 }
 
 impl MemoryTransport {
