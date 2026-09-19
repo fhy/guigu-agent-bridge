@@ -4,6 +4,8 @@
 //! authority; this module only validates the bounded envelope and its phases.
 
 use serde::{Deserialize, Serialize};
+use std::sync::Arc;
+use tokio::sync::mpsc;
 use uuid::Uuid;
 
 pub const PROFILE: &str = "a2a-matrix/1";
@@ -173,5 +175,40 @@ impl DeliveryPhase {
                 Self::TaskAccepted | Self::Stale | Self::RecoveryNeeded
             ) | (Self::TaskAccepted, Self::Terminal | Self::Stale)
         )
+    }
+}
+
+/// Private transport seam used by Matrix and the deferred Redis adapter.
+pub trait GatewayTransport: Send + Sync {
+    fn send<'a>(
+        &'a self,
+        envelope: &'a GatewayEnvelope,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), EnvelopeError>> + Send + 'a>>;
+}
+
+/// Deterministic bounded transport fake for contract and recovery tests.
+pub struct MemoryTransport {
+    tx: mpsc::Sender<GatewayEnvelope>,
+}
+
+impl MemoryTransport {
+    pub fn new(capacity: usize) -> (Arc<Self>, mpsc::Receiver<GatewayEnvelope>) {
+        let (tx, rx) = mpsc::channel(capacity.max(1));
+        (Arc::new(Self { tx }), rx)
+    }
+}
+
+impl GatewayTransport for MemoryTransport {
+    fn send<'a>(
+        &'a self,
+        envelope: &'a GatewayEnvelope,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), EnvelopeError>> + Send + 'a>>
+    {
+        Box::pin(async move {
+            envelope.validate()?;
+            self.tx
+                .try_send(envelope.clone())
+                .map_err(|_| EnvelopeError::Bounds)
+        })
     }
 }
