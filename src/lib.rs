@@ -10,6 +10,7 @@ pub mod app;
 pub mod bus;
 pub mod config;
 pub mod error;
+pub mod gateway;
 pub mod matrix;
 pub mod models;
 pub mod observer;
