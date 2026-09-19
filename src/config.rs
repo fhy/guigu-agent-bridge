@@ -81,6 +81,19 @@ pub struct TransportsConfig {
     pub matrix: MatrixTransportConfig,
     /// Trusted-LAN A2A adapter settings.
     pub a2a: A2aTransportConfig,
+    pub gateway: GatewayTransportConfig,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GatewayTransportConfig {
+    pub enabled: bool,
+    pub room_id: String,
+    pub peer_id: String,
+    pub local_endpoint_id: String,
+    pub remote_endpoint_id: String,
+    pub allowed_senders: Vec<String>,
+    pub generation: u64,
+    pub max_payload_bytes: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -336,6 +349,33 @@ struct RawTransports {
     matrix: RawMatrix,
     #[serde(default)]
     a2a: RawA2a,
+    #[serde(default)]
+    gateway: RawGateway,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct RawGateway {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    room_id: String,
+    #[serde(default)]
+    peer_id: String,
+    #[serde(default)]
+    local_endpoint_id: String,
+    #[serde(default)]
+    remote_endpoint_id: String,
+    #[serde(default)]
+    allowed_senders: Vec<String>,
+    #[serde(default)]
+    generation: u64,
+    #[serde(default = "default_gateway_payload")]
+    max_payload_bytes: usize,
+}
+
+fn default_gateway_payload() -> usize {
+    256 * 1024
 }
 
 #[derive(Deserialize)]
@@ -899,6 +939,7 @@ fn build_config(raw: RawConfig, env: &BTreeMap<String, String>) -> Result<Config
 
     let matrix = build_matrix(raw.transports.matrix)?;
     let a2a = build_a2a(raw.transports.a2a, env)?;
+    let gateway = build_gateway(raw.transports.gateway)?;
 
     let mut agents = BTreeMap::new();
     for (id, raw_agent) in raw.agents {
@@ -923,7 +964,11 @@ fn build_config(raw: RawConfig, env: &BTreeMap<String, String>) -> Result<Config
             shutdown_timeout_seconds: raw.bridge.shutdown_timeout_seconds,
             health_bind,
         },
-        transports: TransportsConfig { matrix, a2a },
+        transports: TransportsConfig {
+            matrix,
+            a2a,
+            gateway,
+        },
         runtime,
         agents,
     })
@@ -1080,6 +1125,37 @@ fn build_runtime(raw: RawRuntime) -> Result<RuntimeConfig, ConfigError> {
         max_no_progress: raw.max_no_progress,
         max_output_bytes: raw.max_output_bytes,
         lease_ttl_seconds: raw.lease_ttl_seconds,
+    })
+}
+
+fn build_gateway(raw: RawGateway) -> Result<GatewayTransportConfig, ConfigError> {
+    if raw.enabled
+        && (raw.room_id.is_empty()
+            || raw.peer_id.is_empty()
+            || raw.local_endpoint_id.is_empty()
+            || raw.remote_endpoint_id.is_empty()
+            || raw.allowed_senders.is_empty())
+    {
+        return Err(validation(
+            "transports.gateway",
+            "room, peer, endpoints and sender allowlist are required when enabled",
+        ));
+    }
+    if !(1..=256 * 1024).contains(&raw.max_payload_bytes) {
+        return Err(validation(
+            "transports.gateway.max_payload_bytes",
+            "must be in range 1..=262144",
+        ));
+    }
+    Ok(GatewayTransportConfig {
+        enabled: raw.enabled,
+        room_id: raw.room_id,
+        peer_id: raw.peer_id,
+        local_endpoint_id: raw.local_endpoint_id,
+        remote_endpoint_id: raw.remote_endpoint_id,
+        allowed_senders: raw.allowed_senders,
+        generation: raw.generation,
+        max_payload_bytes: raw.max_payload_bytes,
     })
 }
 

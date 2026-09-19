@@ -355,15 +355,17 @@ impl AppRuntime {
 
         if let Some((sdk, sync)) = matrix {
             let matrix_sender: Arc<dyn crate::matrix::MatrixSender> = sdk.clone();
-            runtime.gateway = Some(MatrixGateway::new(
-                Arc::clone(&matrix_sender),
-                MatrixRoute {
-                    room_id: config.transports.matrix.monitor_room.clone(),
-                    peer_id: "matrix".to_owned(),
-                    allowed_senders: config.transports.matrix.allowed_users.clone(),
-                    own_user: config.transports.matrix.user_id.clone(),
-                },
-            ));
+            if config.transports.gateway.enabled {
+                runtime.gateway = Some(MatrixGateway::new(
+                    Arc::clone(&matrix_sender),
+                    MatrixRoute {
+                        room_id: config.transports.gateway.room_id.clone(),
+                        peer_id: config.transports.gateway.peer_id.clone(),
+                        allowed_senders: config.transports.gateway.allowed_senders.clone(),
+                        own_user: config.transports.matrix.user_id.clone(),
+                    },
+                ));
+            }
             let outbox_sender: Arc<dyn crate::matrix::MatrixOutboxSender> = sdk.clone();
             let outbox = crate::app::OutboxDrain::new(reliability.clone(), outbox_sender, 64);
             let outbox_owner = outbox.clone().start(Duration::from_secs(1));
