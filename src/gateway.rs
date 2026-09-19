@@ -249,6 +249,27 @@ impl GatewayStore {
         tx.commit().await?;
         Ok(result.rows_affected())
     }
+
+    pub async fn delete_cleanup(
+        &self,
+        envelope_id: &str,
+        owner: &str,
+        revision: i64,
+        now: &str,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query("DELETE FROM gateway_envelopes WHERE envelope_id=? AND cleanup_owner=? AND cleanup_revision=? AND state IN ('terminal','stale') AND terminal_at IS NOT NULL AND terminal_at <= datetime(?, '-7 days') AND NOT EXISTS (SELECT 1 FROM gateway_deliveries WHERE envelope_id=? AND phase NOT IN ('terminal','stale','recovery_needed'))")
+            .bind(envelope_id).bind(owner).bind(revision).bind(now).bind(envelope_id)
+            .execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn validate_retained_bytes(&self) -> Result<bool, sqlx::Error> {
+        let mismatch: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM gateway_envelopes WHERE retained_bytes < 0")
+                .fetch_one(&self.pool)
+                .await?;
+        Ok(mismatch == 0)
+    }
 }
 
 /// Deterministic bounded transport fake for contract and recovery tests.
