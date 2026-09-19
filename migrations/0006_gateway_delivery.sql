@@ -2,7 +2,7 @@ CREATE TABLE gateway_envelopes(
  envelope_id TEXT PRIMARY KEY NOT NULL, version TEXT NOT NULL, direction TEXT NOT NULL,
  peer_id TEXT NOT NULL, sender_user_id TEXT NOT NULL, idempotency_key TEXT NOT NULL,
  sender_endpoint TEXT NOT NULL, recipient_endpoint TEXT NOT NULL, conversation_id TEXT NOT NULL,
- correlation_id TEXT NOT NULL, kind TEXT NOT NULL, canonical_json BLOB NOT NULL,
+ correlation_id TEXT NOT NULL, internal_task_id TEXT REFERENCES tasks(task_id), kind TEXT NOT NULL, canonical_json BLOB NOT NULL,
  payload_sha256 TEXT NOT NULL, created_at TEXT NOT NULL, deadline TEXT,
  route_generation INTEGER NOT NULL, state TEXT NOT NULL, owner_runtime TEXT,
  owner_revision INTEGER NOT NULL DEFAULT 0, cleanup_owner TEXT, cleanup_revision INTEGER NOT NULL DEFAULT 0,

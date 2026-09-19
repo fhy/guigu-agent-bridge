@@ -257,15 +257,22 @@ impl GatewayStore {
         revision: i64,
         now: &str,
     ) -> Result<bool, sqlx::Error> {
-        let result = sqlx::query("DELETE FROM gateway_envelopes WHERE envelope_id=? AND cleanup_owner=? AND cleanup_revision=? AND state IN ('terminal','stale') AND terminal_at IS NOT NULL AND terminal_at <= datetime(?, '-7 days') AND NOT EXISTS (SELECT 1 FROM gateway_deliveries WHERE envelope_id=? AND phase NOT IN ('terminal','stale','recovery_needed'))")
-            .bind(envelope_id).bind(owner).bind(revision).bind(now).bind(envelope_id)
-            .execute(&self.pool).await?;
+        let mut tx = self.pool.begin().await?;
+        let eligible: Option<i64> = sqlx::query_scalar("SELECT 1 FROM gateway_envelopes e WHERE e.envelope_id=? AND e.cleanup_owner=? AND e.cleanup_revision=? AND e.state IN ('terminal','stale') AND e.terminal_at IS NOT NULL AND e.terminal_at <= datetime(?, '-7 days') AND NOT EXISTS (SELECT 1 FROM gateway_deliveries d WHERE d.envelope_id=e.envelope_id AND d.phase NOT IN ('terminal','stale','recovery_needed')) AND (e.internal_task_id IS NULL OR EXISTS (SELECT 1 FROM task_events te WHERE te.task_id=e.internal_task_id AND te.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=e.internal_task_id) AND te.payload_json LIKE '%completed%'))")
+            .bind(envelope_id).bind(owner).bind(revision).bind(now).fetch_optional(&mut *tx).await?;
+        if eligible.is_none() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let result = sqlx::query("DELETE FROM gateway_envelopes WHERE envelope_id=? AND cleanup_owner=? AND cleanup_revision=?")
+            .bind(envelope_id).bind(owner).bind(revision).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
     pub async fn validate_retained_bytes(&self) -> Result<bool, sqlx::Error> {
         let mismatch: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM gateway_envelopes WHERE retained_bytes < 0")
+            sqlx::query_scalar("SELECT COUNT(*) FROM gateway_envelopes e WHERE e.retained_bytes != length(e.canonical_json) + COALESCE((SELECT SUM(a.byte_len) FROM gateway_artifacts a WHERE a.envelope_id=e.envelope_id),0)")
                 .fetch_one(&self.pool)
                 .await?;
         Ok(mismatch == 0)
