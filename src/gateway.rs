@@ -193,6 +193,12 @@ pub struct GatewayStore {
     pool: SqlitePool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InboundAdmission {
+    Inserted { envelope_id: String },
+    Replay { envelope_id: String },
+}
+
 impl GatewayStore {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -212,6 +218,44 @@ impl GatewayStore {
             .bind(format!("{:?}", envelope.kind).to_lowercase()).bind(canonical_json).bind(&envelope.payload_sha256)
             .bind(&envelope.created_at).bind(0_i64).bind("received").bind(retained_bytes)
             .execute(&self.pool).await.map(|_| ())
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn admit_inbound(
+        &self,
+        envelope: &GatewayEnvelope,
+        canonical_json: &[u8],
+        sender_user: &str,
+        event_id: &str,
+        room_id: &str,
+        thread_root: Option<&str>,
+        route_generation: u64,
+    ) -> Result<InboundAdmission, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query("INSERT OR IGNORE INTO gateway_envelopes (envelope_id,version,direction,peer_id,sender_user_id,idempotency_key,sender_endpoint,recipient_endpoint,conversation_id,correlation_id,kind,canonical_json,payload_sha256,created_at,route_generation,state,retained_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(envelope.envelope_id.to_string()).bind(&envelope.version).bind("inbound")
+            .bind(&envelope.peer_id).bind(sender_user).bind(&envelope.idempotency_key)
+            .bind(envelope.sender.endpoint_id.to_string()).bind(envelope.recipient.endpoint_id.to_string())
+            .bind(envelope.conversation_id.to_string()).bind(envelope.correlation_id.to_string())
+            .bind(format!("{:?}", envelope.kind).to_lowercase()).bind(canonical_json).bind(&envelope.payload_sha256)
+            .bind(&envelope.created_at).bind(route_generation as i64).bind("received").bind(canonical_json.len() as i64)
+            .execute(&mut *tx).await?.rows_affected() == 1;
+        let winner: String = sqlx::query_scalar("SELECT envelope_id FROM gateway_envelopes WHERE peer_id=? AND sender_user_id=? AND direction='inbound' AND idempotency_key=?")
+            .bind(&envelope.peer_id).bind(sender_user).bind(&envelope.idempotency_key).fetch_one(&mut *tx).await?;
+        if inserted {
+            sqlx::query("INSERT INTO gateway_deliveries (envelope_id,direction,transport,phase,attempt,event_id,room_id,thread_root) VALUES (?,'inbound','matrix','transport_acked',0,?,?,?)")
+                .bind(&winner).bind(event_id).bind(room_id).bind(thread_root).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(if inserted {
+            InboundAdmission::Inserted {
+                envelope_id: winner,
+            }
+        } else {
+            InboundAdmission::Replay {
+                envelope_id: winner,
+            }
+        })
     }
 
     pub async fn transition_delivery(
@@ -417,11 +461,18 @@ impl MatrixGateway {
             return Err(EnvelopeError::Peer);
         }
         let canonical = serde_json::to_vec(&envelope).map_err(|_| EnvelopeError::Shape)?;
-        store
-            .insert_envelope(&envelope, &canonical, canonical.len() as i64)
+        let _ = store
+            .admit_inbound(
+                &envelope,
+                &canonical,
+                sender_user,
+                event_id,
+                &self.route.room_id,
+                thread_root,
+                self.route.generation,
+            )
             .await
             .map_err(|_| EnvelopeError::Shape)?;
-        let _ = (event_id, thread_root);
         Ok(true)
     }
 }
