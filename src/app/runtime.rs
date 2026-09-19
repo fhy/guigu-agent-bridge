@@ -17,6 +17,7 @@ use crate::{
         MpscEventSink, TokioTimer, Worker, WorkerConfig,
     },
     config::{Config, ConfigError},
+    gateway::{MatrixGateway, MatrixRoute},
     matrix::{MatrixClient, MatrixSync, MatrixSyncHandle, MemorySyncTokenStore, SdkMatrixSender},
     models::TransportType,
     runtime::{
@@ -69,6 +70,7 @@ pub struct AppRuntime {
     acp: Option<Arc<AcpDispatcherRouter>>,
     a2a: Option<A2aServerHandle>,
     a2a_cleanup: Option<CleanupHandle>,
+    gateway: Option<MatrixGateway>,
     shutdown_timeout: Duration,
     reliability: crate::storage::ReliabilityStore,
     runtime_instance: Option<String>,
@@ -204,6 +206,7 @@ impl AppRuntime {
             acp: None,
             a2a: None,
             a2a_cleanup: None,
+            gateway: None,
             shutdown_timeout: Duration::from_secs(config.bridge.shutdown_timeout_seconds),
             reliability: reliability.clone(),
             runtime_instance: owns_runtime.then_some(runtime_instance.clone()),
@@ -352,6 +355,15 @@ impl AppRuntime {
 
         if let Some((sdk, sync)) = matrix {
             let matrix_sender: Arc<dyn crate::matrix::MatrixSender> = sdk.clone();
+            runtime.gateway = Some(MatrixGateway::new(
+                Arc::clone(&matrix_sender),
+                MatrixRoute {
+                    room_id: config.transports.matrix.monitor_room.clone(),
+                    peer_id: "matrix".to_owned(),
+                    allowed_senders: config.transports.matrix.allowed_users.clone(),
+                    own_user: config.transports.matrix.user_id.clone(),
+                },
+            ));
             let outbox_sender: Arc<dyn crate::matrix::MatrixOutboxSender> = sdk.clone();
             let outbox = crate::app::OutboxDrain::new(reliability.clone(), outbox_sender, 64);
             let outbox_owner = outbox.clone().start(Duration::from_secs(1));
@@ -527,6 +539,7 @@ impl AppRuntime {
         {
             shutdown_error.get_or_insert(AppError::Assembly("outbox owner join failed"));
         }
+        self.gateway.take();
         if let Some(sync) = self.matrix_sync.take() {
             let _ = sync.shutdown().await;
         }
