@@ -302,9 +302,9 @@ impl GatewayStore {
                     "gateway idempotency collision".into(),
                 ));
             }
-            let siblings: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM gateway_deliveries WHERE envelope_id=?), (SELECT COUNT(*) FROM tasks WHERE task_id=?), (SELECT COUNT(*) FROM task_admissions WHERE task_id=? AND state IN ('ready','enqueued'))")
-                .bind(envelope.envelope_id.to_string()).bind(&task_id).bind(&task_id).fetch_one(&mut *tx).await?;
-            if siblings != (1, 1, 1) {
+            let siblings: (i64, i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM gateway_deliveries WHERE envelope_id=? AND direction='inbound' AND event_id IS NOT NULL), (SELECT COUNT(*) FROM tasks WHERE task_id=? AND root_task_id=?), (SELECT COUNT(*) FROM task_events WHERE task_id=? AND seq=1 AND status='queued' AND event_id=?), (SELECT COUNT(*) FROM task_admissions WHERE task_id=? AND state IN ('ready','enqueued') AND runtime_instance=?)")
+                .bind(envelope.envelope_id.to_string()).bind(&task_id).bind(&task_id).bind(&task_id).bind(envelope.envelope_id.to_string()).bind(&task_id).bind(runtime_instance).fetch_one(&mut *tx).await?;
+            if siblings != (1, 1, 1, 1) {
                 tx.rollback().await?;
                 return Err(sqlx::Error::Protocol("gateway sibling corruption".into()));
             }
@@ -338,6 +338,28 @@ impl GatewayStore {
         let phase = format!("{phase:?}").to_lowercase();
         let result = sqlx::query("UPDATE gateway_deliveries SET phase=?, owner_runtime=?, owner_revision=owner_revision+1 WHERE envelope_id=? AND owner_runtime=? AND owner_revision=?")
             .bind(phase).bind(owner_runtime).bind(envelope_id).bind(owner_runtime).bind(owner_revision).execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn enqueue_ready(
+        &self,
+        task_id: &str,
+        runtime: &str,
+        revision: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query("UPDATE task_admissions SET state='enqueued', revision=revision+1, updated_at=datetime('now') WHERE task_id=? AND state='ready' AND runtime_instance=? AND revision=?")
+            .bind(task_id).bind(runtime).bind(revision).execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn restore_ready(
+        &self,
+        task_id: &str,
+        runtime: &str,
+        revision: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let result = sqlx::query("UPDATE task_admissions SET state='ready', revision=revision+1, updated_at=datetime('now') WHERE task_id=? AND state='enqueued' AND runtime_instance=? AND revision=?")
+            .bind(task_id).bind(runtime).bind(revision).execute(&self.pool).await?;
         Ok(result.rows_affected() == 1)
     }
 
