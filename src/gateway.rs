@@ -225,6 +225,30 @@ impl GatewayStore {
             .bind(phase).bind(owner_runtime).bind(envelope_id).bind(owner_runtime).bind(owner_revision).execute(&self.pool).await?;
         Ok(result.rows_affected() == 1)
     }
+
+    pub async fn retained_bytes(&self) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("SELECT COALESCE(SUM(retained_bytes),0) FROM gateway_envelopes")
+            .fetch_one(&self.pool)
+            .await
+    }
+
+    pub async fn pressure_ok(&self, high: i64) -> Result<bool, sqlx::Error> {
+        Ok(self.retained_bytes().await? < high)
+    }
+
+    pub async fn claim_cleanup(
+        &self,
+        owner: &str,
+        now: &str,
+        limit: i64,
+    ) -> Result<u64, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query("UPDATE gateway_envelopes SET cleanup_owner=?, cleanup_revision=cleanup_revision+1, cleanup_claimed_at=? WHERE envelope_id IN (SELECT envelope_id FROM gateway_envelopes WHERE state IN ('terminal','stale') AND terminal_at IS NOT NULL AND terminal_at <= datetime(?, '-7 days') AND (cleanup_claimed_at IS NULL OR cleanup_claimed_at <= datetime(?, '-900 seconds')) LIMIT ?) AND (cleanup_owner IS NULL OR cleanup_owner=? OR cleanup_claimed_at <= datetime(?, '-900 seconds'))")
+            .bind(owner).bind(now).bind(now).bind(now).bind(limit).bind(owner).bind(now)
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
+    }
 }
 
 /// Deterministic bounded transport fake for contract and recovery tests.
