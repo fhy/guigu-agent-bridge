@@ -289,6 +289,11 @@ pub struct MemoryTransport {
 pub struct MatrixRoute {
     pub room_id: String,
     pub peer_id: String,
+    pub local_endpoint_id: String,
+    pub remote_endpoint_id: String,
+    pub generation: u64,
+    pub max_payload_bytes: usize,
+    pub deadline_seconds: u64,
     pub allowed_senders: Vec<String>,
     pub own_user: String,
 }
@@ -304,7 +309,15 @@ impl MatrixGateway {
     }
 
     pub fn accept_event(&self, event: &InboundMatrixEvent) -> bool {
-        event.room_id == self.route.room_id
+        !self.route.room_id.is_empty()
+            && !self.route.local_endpoint_id.is_empty()
+            && !self.route.remote_endpoint_id.is_empty()
+            && uuid::Uuid::parse_str(&self.route.local_endpoint_id).is_ok()
+            && uuid::Uuid::parse_str(&self.route.remote_endpoint_id).is_ok()
+            && self.route.max_payload_bytes <= MAX_INLINE_BYTES
+            && self.route.deadline_seconds > 0
+            && event.body.len() <= self.route.max_payload_bytes
+            && event.room_id == self.route.room_id
             && event.sender != self.route.own_user
             && self
                 .route

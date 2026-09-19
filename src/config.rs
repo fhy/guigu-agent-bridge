@@ -1147,6 +1147,26 @@ fn build_gateway(raw: RawGateway) -> Result<GatewayTransportConfig, ConfigError>
             "must be in range 1..=262144",
         ));
     }
+    if raw.enabled {
+        if uuid::Uuid::parse_str(&raw.local_endpoint_id).is_err()
+            || uuid::Uuid::parse_str(&raw.remote_endpoint_id).is_err()
+        {
+            return Err(validation(
+                "transports.gateway",
+                "endpoint IDs must be UUIDs",
+            ));
+        }
+        if raw
+            .allowed_senders
+            .iter()
+            .any(|user| matrix_sdk::ruma::OwnedUserId::try_from(user.as_str()).is_err())
+        {
+            return Err(validation(
+                "transports.gateway.allowed_senders",
+                "entries must be Matrix user IDs",
+            ));
+        }
+    }
     Ok(GatewayTransportConfig {
         enabled: raw.enabled,
         room_id: raw.room_id,

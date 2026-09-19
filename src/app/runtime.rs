@@ -361,6 +361,11 @@ impl AppRuntime {
                     MatrixRoute {
                         room_id: config.transports.gateway.room_id.clone(),
                         peer_id: config.transports.gateway.peer_id.clone(),
+                        local_endpoint_id: config.transports.gateway.local_endpoint_id.clone(),
+                        remote_endpoint_id: config.transports.gateway.remote_endpoint_id.clone(),
+                        generation: config.transports.gateway.generation,
+                        max_payload_bytes: config.transports.gateway.max_payload_bytes,
+                        deadline_seconds: config.bridge.default_timeout_seconds,
                         allowed_senders: config.transports.gateway.allowed_senders.clone(),
                         own_user: config.transports.matrix.user_id.clone(),
                     },

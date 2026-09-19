@@ -36,6 +36,18 @@ aliases = {}
 rooms = {}
 direct = {}
 
+# A2A-over-Matrix gateway is independently disabled by default. It never
+# reuses monitor_room or the ordinary Matrix user allowlist.
+[transports.gateway]
+enabled = false
+room_id = "!gateway:example"
+peer_id = "peer-a"
+local_endpoint_id = "00000000-0000-0000-0000-000000000001"
+remote_endpoint_id = "00000000-0000-0000-0000-000000000002"
+allowed_senders = []
+generation = 0
+max_payload_bytes = 262144
+
 # A2A is disabled by default. Outbound non-loopback peers must use HTTPS.
 # [transports.a2a]
 # enabled = false
