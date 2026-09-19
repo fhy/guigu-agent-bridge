@@ -396,6 +396,34 @@ impl MatrixGateway {
             )
             .await
     }
+
+    pub async fn admit_raw(
+        &self,
+        store: &GatewayStore,
+        raw: &str,
+        event_id: &str,
+        sender_user: &str,
+        thread_root: Option<&str>,
+    ) -> Result<bool, EnvelopeError> {
+        let Some(envelope) = self.decode_event(raw)? else {
+            return Ok(false);
+        };
+        if !self
+            .route
+            .allowed_senders
+            .iter()
+            .any(|user| user == sender_user)
+        {
+            return Err(EnvelopeError::Peer);
+        }
+        let canonical = serde_json::to_vec(&envelope).map_err(|_| EnvelopeError::Shape)?;
+        store
+            .insert_envelope(&envelope, &canonical, canonical.len() as i64)
+            .await
+            .map_err(|_| EnvelopeError::Shape)?;
+        let _ = (event_id, thread_root);
+        Ok(true)
+    }
 }
 
 impl MemoryTransport {
