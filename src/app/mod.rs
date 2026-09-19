@@ -2,6 +2,7 @@
 
 mod admission;
 mod dispatcher;
+pub mod gateway_handoff;
 mod health;
 mod ingress;
 mod outbox;
