@@ -258,6 +258,32 @@ impl GatewayStore {
         })
     }
 
+    /// Gateway-private admission: task, queued event, receipt and ready lease
+    /// are committed before the caller attempts an in-memory enqueue.
+    pub async fn admit_task_ready(
+        &self,
+        envelope: &GatewayEnvelope,
+        conversation_id: &str,
+        now: &str,
+        runtime_instance: &str,
+    ) -> Result<String, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let task_id = envelope.correlation_id.to_string();
+        sqlx::query("INSERT OR IGNORE INTO tasks (task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,deadline,version) VALUES (?,?,?,?,?,?,?,?,?,?,0)")
+            .bind(&task_id).bind(&task_id).bind(envelope.sender.endpoint_id.to_string())
+            .bind(envelope.recipient.endpoint_id.to_string()).bind(conversation_id)
+            .bind(envelope.payload.as_ref().map(|p| String::from_utf8_lossy(p).to_string()).unwrap_or_default())
+            .bind(5_i64).bind(0_i64).bind(0_i64).bind(envelope.deadline.clone())
+            .execute(&mut *tx).await?;
+        sqlx::query("INSERT OR IGNORE INTO task_events (event_id,task_id,seq,status,timestamp,payload) VALUES (?,?,?,?,?,json(?))")
+            .bind(envelope.envelope_id.to_string()).bind(&task_id).bind(1_i64).bind("queued").bind(now).bind("{\"gateway\":true}")
+            .execute(&mut *tx).await?;
+        sqlx::query("INSERT OR IGNORE INTO task_admissions (task_id,state,revision,runtime_instance,created_at,updated_at) VALUES (?,'ready',0,?,?,?)")
+            .bind(&task_id).bind(runtime_instance).bind(now).bind(now).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(task_id)
+    }
+
     pub async fn transition_delivery(
         &self,
         envelope_id: &str,
