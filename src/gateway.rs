@@ -4,6 +4,7 @@
 //! authority; this module only validates the bounded envelope and its phases.
 
 use serde::{Deserialize, Serialize};
+use sqlx::SqlitePool;
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use uuid::Uuid;
@@ -184,6 +185,46 @@ pub trait GatewayTransport: Send + Sync {
         &'a self,
         envelope: &'a GatewayEnvelope,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), EnvelopeError>> + Send + 'a>>;
+}
+
+#[derive(Clone)]
+pub struct GatewayStore {
+    pool: SqlitePool,
+}
+
+impl GatewayStore {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+
+    pub async fn insert_envelope(
+        &self,
+        envelope: &GatewayEnvelope,
+        canonical_json: &[u8],
+        retained_bytes: i64,
+    ) -> Result<(), sqlx::Error> {
+        sqlx::query("INSERT INTO gateway_envelopes (envelope_id,version,direction,peer_id,sender_user_id,idempotency_key,sender_endpoint,recipient_endpoint,conversation_id,correlation_id,kind,canonical_json,payload_sha256,created_at,route_generation,state,retained_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(envelope.envelope_id.to_string()).bind(&envelope.version).bind(match envelope.direction { Direction::Inbound => "inbound", Direction::Outbound => "outbound" })
+            .bind(&envelope.peer_id).bind(&envelope.sender.peer_id).bind(&envelope.idempotency_key)
+            .bind(envelope.sender.endpoint_id.to_string()).bind(envelope.recipient.endpoint_id.to_string())
+            .bind(envelope.conversation_id.to_string()).bind(envelope.correlation_id.to_string())
+            .bind(format!("{:?}", envelope.kind).to_lowercase()).bind(canonical_json).bind(&envelope.payload_sha256)
+            .bind(&envelope.created_at).bind(0_i64).bind("received").bind(retained_bytes)
+            .execute(&self.pool).await.map(|_| ())
+    }
+
+    pub async fn transition_delivery(
+        &self,
+        envelope_id: &str,
+        phase: DeliveryPhase,
+        owner_runtime: &str,
+        owner_revision: i64,
+    ) -> Result<bool, sqlx::Error> {
+        let phase = format!("{phase:?}").to_lowercase();
+        let result = sqlx::query("UPDATE gateway_deliveries SET phase=?, owner_runtime=?, owner_revision=owner_revision+1 WHERE envelope_id=? AND owner_runtime=? AND owner_revision=?")
+            .bind(phase).bind(owner_runtime).bind(envelope_id).bind(owner_runtime).bind(owner_revision).execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
 }
 
 /// Deterministic bounded transport fake for contract and recovery tests.
