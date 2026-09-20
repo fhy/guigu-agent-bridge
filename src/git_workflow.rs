@@ -14,6 +14,7 @@ pub const MAX_PATHS: usize = 256;
 pub const MAX_PATH_BYTES: usize = 16 * 1024;
 pub const MAX_COMMIT_MESSAGE_BYTES: usize = 8 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
+pub const MAX_RECEIPT_LINE_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Role {
@@ -242,20 +243,36 @@ impl ReceiptStore {
         if existing.len() >= 10_000 {
             existing.drain(..existing.len() - 9_999);
         }
-        let temp = self.path.with_extension("jsonl.tmp");
+        let temp = self
+            .path
+            .with_extension(format!("jsonl.tmp.{}", uuid::Uuid::now_v7()));
         let mut file = OpenOptions::new()
-            .create(true)
+            .create_new(true)
             .write(true)
-            .truncate(true)
             .open(&temp)
             .map_err(ReceiptError::Io)?;
         for item in existing {
             let line = serde_json::to_string(&item).map_err(ReceiptError::Json)?;
+            if line.len() > MAX_RECEIPT_LINE_BYTES {
+                let _ = std::fs::remove_file(&temp);
+                return Err(ReceiptError::Invalid(PolicyError::MessageTooLarge));
+            }
             writeln!(file, "{line}").map_err(ReceiptError::Io)?;
+        }
+        if encoded.len() > MAX_RECEIPT_LINE_BYTES {
+            let _ = std::fs::remove_file(&temp);
+            return Err(ReceiptError::Invalid(PolicyError::MessageTooLarge));
         }
         writeln!(file, "{encoded}").map_err(ReceiptError::Io)?;
         file.sync_all().map_err(ReceiptError::Io)?;
-        std::fs::rename(temp, &self.path).map_err(ReceiptError::Io)
+        std::fs::rename(&temp, &self.path).map_err(ReceiptError::Io)?;
+        if let Some(parent) = self.path.parent() {
+            std::fs::File::open(parent)
+                .map_err(ReceiptError::Io)?
+                .sync_all()
+                .map_err(ReceiptError::Io)?;
+        }
+        Ok(())
     }
 
     pub fn load(&self) -> Result<Vec<WorkflowReceipt>, ReceiptError> {
@@ -267,6 +284,9 @@ impl ReceiptStore {
         let mut lines = BufReader::new(file).lines().peekable();
         while let Some(line) = lines.next() {
             let line = line.map_err(ReceiptError::Io)?;
+            if line.len() > MAX_RECEIPT_LINE_BYTES {
+                return Err(ReceiptError::Invalid(PolicyError::MessageTooLarge));
+            }
             match serde_json::from_str(&line) {
                 Ok(receipt) => {
                     receipts.push_back(receipt);
