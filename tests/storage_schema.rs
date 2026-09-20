@@ -260,7 +260,7 @@ async fn an_empty_database_initializes_and_migrating_twice_is_idempotent() {
     }
 
     let applied = applied_migration_count(&pool).await;
-    assert_eq!(applied, 5, "the five migrations are recorded once each");
+    assert_eq!(applied, 6, "the six migrations are recorded once each");
 
     migrate(&pool).await.expect("second migrate is a no-op");
     assert_eq!(

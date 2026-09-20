@@ -174,6 +174,14 @@ mod tests {
             version: 0,
         };
         sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,deadline,version) VALUES (?,?,?,?,?,'work',5,0,0,NULL,0)").bind(task_id.to_string()).bind(task_id.to_string()).bind(from.to_string()).bind(target.to_string()).bind(conversation.to_string()).execute(&pool).await.unwrap();
+        let queued = serde_json::to_string(&crate::models::TaskEventPayload::Queued).unwrap();
+        sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES (?, ?, 1, 'queued', '2026-01-01T00:00:00Z', json(?))")
+            .bind(crate::models::EventId::generate().to_string())
+            .bind(task_id.to_string())
+            .bind(queued)
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,created_at,updated_at) VALUES (?,'ready',0,'runtime','x','x')").bind(task_id.to_string()).execute(&pool).await.unwrap();
         let registry = Arc::new(EndpointRegistry::from_config(&config(&root)));
         let (sink, _events) = MpscEventSink::new(4);

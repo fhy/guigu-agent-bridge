@@ -102,6 +102,31 @@ impl MatrixOutboxSender for SdkMatrixSender {
     }
 }
 
+impl crate::gateway::GatewayMatrixSender for SdkMatrixSender {
+    fn send_gateway<'a>(
+        &'a self,
+        room_id: &'a str,
+        content: &'a Value,
+        txn_id: &'a str,
+    ) -> crate::gateway::GatewaySendFuture<'a> {
+        Box::pin(async move {
+            let room_id: OwnedRoomId = room_id.parse().map_err(|_| super::ReplyError)?;
+            let txn_id: &TransactionId = txn_id.into();
+            let room = self
+                .client
+                .inner
+                .get_room(&room_id)
+                .ok_or(super::ReplyError)?;
+            let response = room
+                .send_raw("m.room.message", content.clone())
+                .with_transaction_id(txn_id)
+                .await
+                .map_err(|_| super::ReplyError)?;
+            Ok(response.event_id.to_string())
+        })
+    }
+}
+
 impl MonitorSender for SdkMatrixSender {
     fn send<'a>(&'a self, room_id: &'a str, message: &'a ObserverMessage) -> ObserverFuture<'a> {
         Box::pin(async move {

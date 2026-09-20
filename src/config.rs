@@ -354,7 +354,7 @@ struct RawTransports {
     gateway: RawGateway,
 }
 
-#[derive(Deserialize, Default)]
+#[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawGateway {
     #[serde(default)]
@@ -375,6 +375,22 @@ struct RawGateway {
     max_payload_bytes: usize,
     #[serde(default = "default_gateway_deadline")]
     deadline_seconds: u64,
+}
+
+impl Default for RawGateway {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            room_id: String::new(),
+            peer_id: String::new(),
+            local_endpoint_id: String::new(),
+            remote_endpoint_id: String::new(),
+            allowed_senders: Vec::new(),
+            generation: 0,
+            max_payload_bytes: default_gateway_payload(),
+            deadline_seconds: default_gateway_deadline(),
+        }
+    }
 }
 
 fn default_gateway_payload() -> usize {

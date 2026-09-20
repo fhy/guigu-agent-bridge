@@ -71,6 +71,7 @@ pub struct AppRuntime {
     a2a: Option<A2aServerHandle>,
     a2a_cleanup: Option<CleanupHandle>,
     gateway: Option<Arc<MatrixGateway>>,
+    gateway_cleanup: Option<crate::gateway::GatewayCleanupHandle>,
     shutdown_timeout: Duration,
     reliability: crate::storage::ReliabilityStore,
     runtime_instance: Option<String>,
@@ -207,6 +208,7 @@ impl AppRuntime {
             a2a: None,
             a2a_cleanup: None,
             gateway: None,
+            gateway_cleanup: None,
             shutdown_timeout: Duration::from_secs(config.bridge.shutdown_timeout_seconds),
             reliability: reliability.clone(),
             runtime_instance: owns_runtime.then_some(runtime_instance.clone()),
@@ -281,6 +283,16 @@ impl AppRuntime {
             Arc::clone(&durable_bus),
             runtime_instance.clone(),
         );
+        if config.transports.gateway.enabled
+            && !crate::gateway::GatewayStore::new(pool.clone())
+                .validate_retained_bytes()
+                .await
+                .map_err(|_| AppError::Assembly("gateway retained-byte validation failed"))?
+        {
+            return Err(AppError::Assembly(
+                "gateway retained-byte validation failed",
+            ));
+        }
         for (task_id, revision) in admission_recovery.eligible {
             let parsed = task_id.parse().map_err(|_| AppError::Runtime)?;
             if let Some(task) = repository_trait.get_task(parsed).await? {
@@ -400,6 +412,12 @@ impl AppRuntime {
         if let Some((sdk, sync, gateway)) = matrix {
             let matrix_sender: Arc<dyn crate::matrix::MatrixSender> = sdk.clone();
             runtime.gateway = gateway;
+            if runtime.gateway.is_some() {
+                runtime.gateway_cleanup = Some(crate::gateway::GatewayCleanupHandle::start(
+                    GatewayStore::new(pool.clone()),
+                    runtime_instance.clone(),
+                ));
+            }
             let outbox_sender: Arc<dyn crate::matrix::MatrixOutboxSender> = sdk.clone();
             let outbox = crate::app::OutboxDrain::new(reliability.clone(), outbox_sender, 64);
             let outbox_owner = outbox.clone().start(Duration::from_secs(1));
@@ -569,6 +587,11 @@ impl AppRuntime {
             && cleanup.shutdown().await.is_err()
         {
             shutdown_error.get_or_insert(AppError::Assembly("A2A cleanup join failed"));
+        }
+        if let Some(cleanup) = self.gateway_cleanup.take()
+            && cleanup.shutdown().await.is_err()
+        {
+            shutdown_error.get_or_insert(AppError::Assembly("gateway cleanup join failed"));
         }
         if let Some(outbox) = self.outbox.take()
             && outbox.shutdown().await.is_err()
