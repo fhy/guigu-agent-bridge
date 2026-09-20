@@ -4,6 +4,7 @@
 //! trusted ACP/full-access deployment; these checks are not an OS sandbox.
 
 use std::collections::BTreeSet;
+use std::sync::{Arc, Mutex};
 
 pub const MAX_PATHS: usize = 256;
 pub const MAX_PATH_BYTES: usize = 16 * 1024;
@@ -66,6 +67,93 @@ pub enum PolicyError {
     TooManyPaths,
     PathsTooLarge,
     MessageTooLarge,
+    EmptyAdd,
+    WrongRemote,
+    MissingCommitAuthorization,
+    ResultMismatch,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitAuthorization {
+    pub task_id: String,
+    pub base_commit: String,
+    pub allowed_paths: BTreeSet<String>,
+    pub expected_remote: String,
+    pub expected_ref: String,
+}
+
+pub struct CommitRequest<'a> {
+    pub repository: Repository,
+    pub ref_name: &'a str,
+    pub remote: &'a str,
+    pub staged: &'a [String],
+    pub result_paths: &'a [String],
+    pub result_commit: &'a str,
+    pub commit_message: &'a str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuditRecord {
+    pub role: Role,
+    pub repository: Repository,
+    pub operation: Operation,
+    pub ref_name: String,
+    pub result: Readback,
+    pub detail: String,
+}
+
+#[derive(Clone, Default)]
+pub struct WorkflowCapability {
+    audit: Arc<Mutex<Vec<AuditRecord>>>,
+}
+
+impl WorkflowCapability {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn authorize_commit(
+        &self,
+        allowlist: &Allowlist,
+        auth: &CommitAuthorization,
+        request: CommitRequest<'_>,
+    ) -> Result<(), PolicyError> {
+        authorize(
+            allowlist,
+            request.repository,
+            request.ref_name,
+            Operation::Commit,
+            request.staged,
+            Some(request.commit_message),
+        )?;
+        if request.remote != auth.expected_remote || request.ref_name != auth.expected_ref {
+            return Err(PolicyError::WrongRemote);
+        }
+        check_staged_paths(
+            request.staged,
+            &auth.allowed_paths.iter().cloned().collect::<Vec<_>>(),
+        )?;
+        check_staged_paths(
+            request.result_paths,
+            &auth.allowed_paths.iter().cloned().collect::<Vec<_>>(),
+        )?;
+        if request.result_commit.is_empty() || auth.base_commit.is_empty() {
+            return Err(PolicyError::ResultMismatch);
+        }
+        Ok(())
+    }
+
+    pub fn record_readback(&self, record: AuditRecord) {
+        let mut audit = self.audit.lock().expect("workflow audit mutex");
+        if audit.len() >= 10_000 {
+            audit.remove(0);
+        }
+        audit.push(record);
+    }
+
+    pub fn audit_snapshot(&self) -> Vec<AuditRecord> {
+        self.audit.lock().expect("workflow audit mutex").clone()
+    }
 }
 
 pub fn normalize_path(path: &str) -> Result<String, PolicyError> {
@@ -117,6 +205,9 @@ pub fn authorize(
     if paths.len() > MAX_PATHS {
         return Err(PolicyError::TooManyPaths);
     }
+    if operation == Operation::Add && paths.is_empty() {
+        return Err(PolicyError::EmptyAdd);
+    }
     let total = paths.iter().map(|path| path.len()).sum::<usize>();
     if total > MAX_PATH_BYTES {
         return Err(PolicyError::PathsTooLarge);
@@ -166,9 +257,27 @@ pub fn classify_readback(
 
 pub fn redact_output(output: &[u8]) -> String {
     let bounded = &output[..output.len().min(MAX_OUTPUT_BYTES)];
-    String::from_utf8_lossy(bounded)
-        .replace("Authorization:", "Authorization: <redacted>")
-        .replace("token=", "token=<redacted>")
+    let mut rendered = String::from_utf8_lossy(bounded).into_owned();
+    for marker in [
+        "Authorization:",
+        "authorization:",
+        "token=",
+        "password=",
+        "secret=",
+    ] {
+        while let Some(start) = rendered.find(marker) {
+            let value_start = start + marker.len();
+            let value_end = rendered[value_start..]
+                .find(char::is_whitespace)
+                .map(|offset| value_start + offset)
+                .unwrap_or(rendered.len());
+            rendered.replace_range(value_start..value_end, "<redacted>");
+            if value_end == value_start {
+                break;
+            }
+        }
+    }
+    rendered
 }
 
 #[cfg(test)]
