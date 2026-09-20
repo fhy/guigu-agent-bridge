@@ -14,8 +14,7 @@ CREATE TABLE workflow_envelopes (
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,
     PRIMARY KEY (transport, external_event_id),
-    UNIQUE (sender_endpoint_id, idempotency_key),
-    FOREIGN KEY (task_id) REFERENCES tasks(task_id)
+    UNIQUE (sender_endpoint_id, idempotency_key)
 );
 
 CREATE INDEX workflow_envelopes_task_correlation

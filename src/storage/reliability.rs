@@ -10,7 +10,7 @@ use crate::{
     models::{AgentTask, TaskEvent},
 };
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct WorkflowAdmission<'a> {
     pub transport: &'a str,
     pub external_event_id: &'a str,
@@ -115,11 +115,39 @@ impl ReliabilityStore {
             .bind(input.transport).bind(input.external_event_id).bind(input.sender_endpoint_id)
             .bind(input.target_endpoint_id).bind(input.task_id).bind(input.correlation_id)
             .bind(input.idempotency_key).bind(input.kind).bind(input.body_hash)
-            .bind(input.now).bind(input.now).execute(&mut *tx).await?;
+            .bind(input.now).bind(input.now).execute(&mut *tx).await;
+        let inserted = match inserted {
+            Ok(result) => result,
+            Err(error) => {
+                let row = sqlx::query("SELECT task_id,outcome,body_hash,sender_endpoint_id,target_endpoint_id,correlation_id,idempotency_key,schema,kind FROM workflow_envelopes WHERE sender_endpoint_id=? AND idempotency_key=?")
+                    .bind(input.sender_endpoint_id).bind(input.idempotency_key).fetch_optional(&mut *tx).await?;
+                let Some(row) = row else {
+                    return Err(ReliabilityError::Sql(error));
+                };
+                let same = row.try_get::<String, _>("schema")? == "workflow.v1"
+                    && row.try_get::<String, _>("kind")? == input.kind
+                    && row.try_get::<String, _>("task_id")? == input.task_id
+                    && row.try_get::<String, _>("body_hash")? == input.body_hash
+                    && row.try_get::<String, _>("target_endpoint_id")? == input.target_endpoint_id
+                    && row.try_get::<String, _>("correlation_id")? == input.correlation_id;
+                if !same {
+                    return Err(ReliabilityError::WorkflowConflict);
+                }
+                return Ok(ReceiptOutcome::Replay {
+                    task_id: Some(row.try_get("task_id")?),
+                    result_code: row
+                        .try_get::<Option<String>, _>("outcome")?
+                        .unwrap_or_else(|| "reserved".into()),
+                });
+            }
+        };
         if inserted.rows_affected() == 0 {
-            let row = sqlx::query("SELECT task_id,outcome,body_hash,sender_endpoint_id,target_endpoint_id,correlation_id,idempotency_key FROM workflow_envelopes WHERE transport=? AND external_event_id=?")
+            let row = sqlx::query("SELECT task_id,outcome,body_hash,sender_endpoint_id,target_endpoint_id,correlation_id,idempotency_key,schema,kind FROM workflow_envelopes WHERE transport=? AND external_event_id=?")
                 .bind(input.transport).bind(input.external_event_id).fetch_one(&mut *tx).await?;
-            let same = row.try_get::<String, _>("body_hash")? == input.body_hash
+            let same = row.try_get::<String, _>("schema")? == "workflow.v1"
+                && row.try_get::<String, _>("kind")? == input.kind
+                && row.try_get::<String, _>("task_id")? == input.task_id
+                && row.try_get::<String, _>("body_hash")? == input.body_hash
                 && row.try_get::<String, _>("sender_endpoint_id")? == input.sender_endpoint_id
                 && row.try_get::<String, _>("target_endpoint_id")? == input.target_endpoint_id
                 && row.try_get::<String, _>("correlation_id")? == input.correlation_id

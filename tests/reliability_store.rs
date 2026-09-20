@@ -4,6 +4,7 @@ use guigu_agent_bridge::storage::{
 use guigu_agent_bridge::{
     app::OutboxDrain,
     matrix::{MatrixOutboxSender, ReplyError, ReplyFuture},
+    models::{AgentTask, ConversationId, EndpointId, Priority, TaskId},
 };
 use sqlx::{Row, SqlitePool};
 use std::sync::Mutex;
@@ -30,6 +31,80 @@ async fn seed(pool: &SqlitePool, status: &str) -> (String, String, String, Strin
     sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES (?,?,1,?,'2026-09-18T00:00:00.000000000Z','{}')")
         .bind(&event).bind(&task).bind(status).execute(pool).await.expect("event");
     (endpoint, conversation, task, event)
+}
+
+fn workflow_task(from: &str, to: &str, conversation: &str, task: &str) -> AgentTask {
+    AgentTask {
+        task_id: TaskId::from_uuid(Uuid::parse_str(task).unwrap()),
+        root_task_id: TaskId::from_uuid(Uuid::parse_str(task).unwrap()),
+        parent_task_id: None,
+        from_agent: EndpointId::from_uuid(Uuid::parse_str(from).unwrap()),
+        to_agent: EndpointId::from_uuid(Uuid::parse_str(to).unwrap()),
+        conversation_id: ConversationId::from_uuid(Uuid::parse_str(conversation).unwrap()),
+        reply_to: None,
+        text: "workflow".into(),
+        priority: Priority::DEFAULT,
+        depth: 0,
+        hops: 1,
+        deadline: None,
+        version: 0,
+    }
+}
+
+#[tokio::test]
+async fn workflow_replay_compares_identity_and_classifies_idempotency_conflict() {
+    let pool = database().await;
+    let (endpoint, conversation, _, _) = seed(&pool, "completed").await;
+    let store = ReliabilityStore::new(pool);
+    let task_id = Uuid::now_v7().to_string();
+    let task = workflow_task(&endpoint, &endpoint, &conversation, &task_id);
+    let sender = endpoint.clone();
+    let task_key = task.task_id.to_string();
+    let delivery = Uuid::now_v7().to_string();
+    let input = guigu_agent_bridge::storage::WorkflowAdmission {
+        transport: "matrix-workflow",
+        external_event_id: "event-1",
+        sender_endpoint_id: &sender,
+        target_endpoint_id: &sender,
+        task_id: &task_key,
+        correlation_id: "corr",
+        idempotency_key: "idem-1",
+        kind: "dispatch",
+        body_hash: "hash-1",
+        now: "2026-09-20T00:00:00Z",
+        task: &task,
+        delivery_id: &delivery,
+    };
+    assert_eq!(
+        store.admit_workflow(input).await.unwrap(),
+        ReceiptOutcome::Inserted
+    );
+    let changed_delivery = Uuid::now_v7().to_string();
+    let changed = guigu_agent_bridge::storage::WorkflowAdmission {
+        body_hash: "changed",
+        delivery_id: &changed_delivery,
+        ..input
+    };
+    assert!(matches!(
+        store.admit_workflow(changed).await,
+        Err(ReliabilityError::WorkflowConflict)
+    ));
+    let other_task_id = Uuid::now_v7().to_string();
+    let other = workflow_task(&endpoint, &endpoint, &conversation, &other_task_id);
+    let other_key = other.task_id.to_string();
+    let other_delivery = Uuid::now_v7().to_string();
+    let collision = guigu_agent_bridge::storage::WorkflowAdmission {
+        external_event_id: "event-2",
+        task_id: &other_key,
+        task: &other,
+        body_hash: "hash-2",
+        delivery_id: &other_delivery,
+        ..input
+    };
+    assert!(matches!(
+        store.admit_workflow(collision).await,
+        Err(ReliabilityError::WorkflowConflict)
+    ));
 }
 
 fn retry<'a>(

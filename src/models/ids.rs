@@ -46,6 +46,7 @@ macro_rules! define_id {
             pub const fn as_uuid(self) -> Uuid {
                 self.0
             }
+
         }
 
         impl fmt::Display for $name {
@@ -102,6 +103,18 @@ impl EndpointId {
     /// UUIDv5 namespace (ADR-003). Additive constructor (T004 Q2): it does not
     /// weaken any invariant — `FromStr` already yields arbitrary UUIDs — but it
     /// keeps the derivation allocation-free and free of string round-trips.
+    pub const fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl ConversationId {
+    pub const fn from_uuid(uuid: Uuid) -> Self {
+        Self(uuid)
+    }
+}
+
+impl TaskId {
     pub const fn from_uuid(uuid: Uuid) -> Self {
         Self(uuid)
     }
