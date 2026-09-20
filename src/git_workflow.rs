@@ -171,13 +171,20 @@ impl CommitAuthorization {
         if allowlist.remote.is_empty() || allowlist.path_prefixes.is_empty() {
             return Err(PolicyError::InvalidAuthorization);
         }
+        let mut normalized_paths = BTreeSet::new();
+        for prefix in &allowlist.path_prefixes {
+            let normalized = normalize_path(prefix)?;
+            if normalized != *prefix || !normalized_paths.insert(normalized) {
+                return Err(PolicyError::InvalidAuthorization);
+            }
+        }
         let issuer_nonce = Uuid::now_v7().to_string();
         let authorization = Self {
             role: allowlist.role,
             repository: allowlist.repository,
             task_id: task_id.clone(),
             base_commit: base_commit.clone(),
-            allowed_paths: allowlist.path_prefixes.clone(),
+            allowed_paths: normalized_paths,
             expected_remote: allowlist.remote.clone(),
             expected_ref: allowlist.ref_name.clone(),
             capability_id: format!("cap-{}", Uuid::now_v7()),
@@ -887,6 +894,38 @@ mod tests {
             .is_err()
         );
         assert!(CommitAuthorization::issue(&policy, "T024", "not-an-oid").is_err());
+    }
+
+    #[test]
+    fn authorization_issue_rejects_noncanonical_allowlist_prefixes() {
+        let mut malformed = policy(Role::Developer);
+        malformed.path_prefixes = ["./src".into()].into_iter().collect();
+        assert!(
+            CommitAuthorization::issue(
+                &malformed,
+                "T024",
+                "0123456789abcdef0123456789abcdef01234567"
+            )
+            .is_err()
+        );
+        malformed.path_prefixes = ["src/../secret".into()].into_iter().collect();
+        assert!(
+            CommitAuthorization::issue(
+                &malformed,
+                "T024",
+                "0123456789abcdef0123456789abcdef01234567"
+            )
+            .is_err()
+        );
+        malformed.path_prefixes = ["src".into(), "src/".into()].into_iter().collect();
+        assert!(
+            CommitAuthorization::issue(
+                &malformed,
+                "T024",
+                "0123456789abcdef0123456789abcdef01234567"
+            )
+            .is_err()
+        );
     }
 
     #[test]
