@@ -28,7 +28,7 @@ pub enum Repository {
     Governance,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Operation {
     Status,
     Diff,
@@ -128,6 +128,13 @@ pub struct WorkflowReceipt {
     pub remote: String,
     pub base_commit: String,
     pub result_commit: String,
+    pub parent_commit: String,
+    pub operation: Operation,
+    pub review_owner: String,
+    pub expires_at_unix: i64,
+    pub expected_old: String,
+    pub expected_new: String,
+    pub observed: Option<String>,
     pub readback: Readback,
     pub output: String,
 }
@@ -144,12 +151,14 @@ pub enum ReceiptError {
 
 pub struct ReceiptStore {
     path: PathBuf,
+    append_lock: Arc<Mutex<()>>,
 }
 
 impl ReceiptStore {
     pub fn open(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
+            append_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -167,19 +176,28 @@ impl ReceiptStore {
             allowlist,
             receipt.repository,
             &receipt.ref_name,
-            Operation::Commit,
+            receipt.operation,
             &paths,
             None,
         )?;
-        if receipt.task_id.is_empty()
+        if receipt.role != allowlist.role
+            || receipt.task_id.is_empty()
             || receipt.remote != allowlist.remote
             || receipt.base_commit.is_empty()
             || receipt.result_commit.is_empty()
+            || receipt.parent_commit != receipt.base_commit
+            || receipt.review_owner.is_empty()
+            || receipt.expires_at_unix <= chrono::Utc::now().timestamp()
         {
             return Err(ReceiptError::Invalid(PolicyError::ResultMismatch));
         }
         let mut safe = receipt.clone();
         safe.paths = paths;
+        safe.readback = classify_readback(
+            &receipt.expected_old,
+            receipt.observed.as_deref(),
+            &receipt.expected_new,
+        );
         safe.output = redact_output(receipt.output.as_bytes());
         if safe.output.len() > MAX_OUTPUT_BYTES {
             safe.output.truncate(MAX_OUTPUT_BYTES);
@@ -188,12 +206,14 @@ impl ReceiptStore {
         if encoded.len() > 4 * 1024 {
             return Err(ReceiptError::Invalid(PolicyError::MessageTooLarge));
         }
+        let _guard = self.append_lock.lock().expect("receipt append mutex");
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
             .map_err(ReceiptError::Io)?;
-        writeln!(file, "{encoded}").map_err(ReceiptError::Io)
+        writeln!(file, "{encoded}").map_err(ReceiptError::Io)?;
+        file.sync_all().map_err(ReceiptError::Io)
     }
 
     pub fn load(&self) -> Result<Vec<WorkflowReceipt>, ReceiptError> {
@@ -202,13 +222,25 @@ impl ReceiptStore {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
             Err(error) => return Err(ReceiptError::Io(error)),
         };
-        BufReader::new(file)
+        let lines: Vec<String> = BufReader::new(file)
             .lines()
-            .map(|line| {
-                line.map_err(ReceiptError::Io)
-                    .and_then(|line| serde_json::from_str(&line).map_err(ReceiptError::Json))
-            })
-            .collect()
+            .collect::<Result<_, _>>()
+            .map_err(ReceiptError::Io)?;
+        let mut receipts = Vec::new();
+        for (index, line) in lines.iter().enumerate() {
+            match serde_json::from_str(line) {
+                Ok(receipt) => receipts.push(receipt),
+                Err(error) if index + 1 == lines.len() => {
+                    let _ = error;
+                    break;
+                }
+                Err(error) => return Err(ReceiptError::Json(error)),
+            }
+        }
+        if receipts.len() > 10_000 {
+            receipts.drain(..receipts.len() - 10_000);
+        }
+        Ok(receipts)
     }
 }
 
@@ -513,6 +545,13 @@ mod tests {
             remote: "origin".into(),
             base_commit: "base".into(),
             result_commit: "result".into(),
+            parent_commit: "base".into(),
+            operation: Operation::Commit,
+            review_owner: "coordinator".into(),
+            expires_at_unix: chrono::Utc::now().timestamp() + 3600,
+            expected_old: "old".into(),
+            expected_new: "result".into(),
+            observed: Some("result".into()),
             readback: Readback::Confirmed,
             output: "token=secret".into(),
         };
