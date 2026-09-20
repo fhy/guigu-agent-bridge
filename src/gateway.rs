@@ -931,8 +931,9 @@ impl MatrixGateway {
         {
             return Err(EnvelopeError::Peer);
         }
-        let canonical = serde_json::to_vec(&envelope).map_err(|_| EnvelopeError::Shape)?;
-        let _ = canonical;
+        if envelope.kind != EnvelopeKind::Request {
+            return Err(EnvelopeError::Shape);
+        }
         let winner = store
             .admit_task_ready(
                 &envelope,
@@ -1120,6 +1121,88 @@ mod tests {
             state,
             ("transport_acked".into(), 2, "$accepted:test".into())
         );
+        pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn raw_matrix_non_request_kinds_never_create_executable_tasks() {
+        let (_dir, pool, request) = fixture().await;
+        let gateway = MatrixGateway::new(
+            Arc::new(StableSender::default()),
+            MatrixRoute {
+                room_id: "!gateway:test".into(),
+                peer_id: "peer".into(),
+                local_endpoint_id: request.recipient.endpoint_id.to_string(),
+                remote_endpoint_id: request.sender.endpoint_id.to_string(),
+                generation: 1,
+                max_payload_bytes: MAX_INLINE_BYTES,
+                deadline_seconds: 300,
+                allowed_senders: vec!["@peer:test".into()],
+                own_user: "@bridge:test".into(),
+                runtime_instance: "runtime".into(),
+            },
+        );
+        let store = GatewayStore::new(pool.clone());
+        for (index, kind) in [
+            EnvelopeKind::Ack,
+            EnvelopeKind::Acceptance,
+            EnvelopeKind::Status,
+            EnvelopeKind::Cancel,
+            EnvelopeKind::Artifact,
+            EnvelopeKind::Error,
+            EnvelopeKind::Retry,
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let mut envelope = request.clone();
+            envelope.envelope_id = Uuid::from_u128(100 + index as u128);
+            envelope.idempotency_key = format!("non-request-{index}");
+            envelope.kind = kind;
+            envelope.payload = (kind == EnvelopeKind::Artifact).then(|| vec![1]);
+            envelope.artifact = (kind == EnvelopeKind::Artifact).then(|| ArtifactMeta {
+                artifact_id: Uuid::from_u128(200 + index as u128),
+                media_type: "application/octet-stream".into(),
+                byte_len: 1,
+                sha256: "c".repeat(64),
+            });
+            let event_id = format!("$event-{index}:test");
+            let raw = serde_json::json!({
+                "type": "m.room.message",
+                "event_id": event_id,
+                "sender": "@peer:test",
+                "content": {
+                    "msgtype": "com.guigu.bridge.a2a.v1",
+                    "body": PROFILE,
+                    "com.guigu.bridge.a2a.v1": {"envelope": envelope}
+                }
+            })
+            .to_string();
+            assert_eq!(
+                gateway
+                    .admit_raw(&store, &raw, &event_id, "@peer:test", None)
+                    .await,
+                Err(EnvelopeError::Shape),
+                "{kind:?} must not enter task admission"
+            );
+        }
+        for table in [
+            "gateway_envelopes",
+            "gateway_deliveries",
+            "tasks",
+            "task_events",
+            "task_admissions",
+        ] {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(&sql)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                0,
+                "{table} must remain empty"
+            );
+        }
         pool.close().await;
     }
 
