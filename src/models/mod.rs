@@ -24,6 +24,6 @@ pub use ids::{ConversationId, DeliveryId, EndpointId, EventId, MessageId, TaskId
 pub use message::Message;
 pub use task::{AgentTask, Priority, TaskStatus};
 pub use workflow::{
-    WorkflowEnvelope, WorkflowError, WorkflowKind, WorkflowState, canonical_metadata,
-    parse_workflow,
+    AuthenticatedWorkflowIngress, WorkflowEnvelope, WorkflowError, WorkflowKind, WorkflowRole,
+    WorkflowState, authorize_workflow, canonical_metadata, kind_name, parse_workflow,
 };

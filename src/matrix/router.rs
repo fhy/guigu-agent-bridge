@@ -3,7 +3,10 @@ use std::collections::BTreeMap;
 use super::{EventDedup, InboundMatrixEvent, PermissionPolicy, derive_matrix_user_id};
 use crate::{
     bus::{AdmissionContext, Bus, BusError, EndpointRegistry},
-    models::{AgentTask, ConversationId, Priority, TaskId, WorkflowEnvelope},
+    models::{
+        AgentTask, AuthenticatedWorkflowIngress, ConversationId, Priority, TaskId,
+        WorkflowEnvelope, authorize_workflow, kind_name,
+    },
     storage::{ReliabilityError, ReliabilityStore, WorkflowAdmission},
 };
 
@@ -85,6 +88,7 @@ pub async fn route_workflow(
     registry: &EndpointRegistry,
     reliability: &ReliabilityStore,
     bus: &dyn Bus,
+    ingress: AuthenticatedWorkflowIngress,
 ) -> Result<AgentTask, RouteError> {
     if envelope.schema != crate::models::workflow::WORKFLOW_SCHEMA
         || envelope.from == envelope.to
@@ -94,6 +98,9 @@ pub async fn route_workflow(
         )
     {
         return Err(RouteError::Workflow);
+    }
+    if envelope.from != ingress.endpoint || !authorize_workflow(ingress.role, envelope.kind) {
+        return Err(RouteError::Forbidden);
     }
     registry
         .validate_target(envelope.to)
@@ -129,7 +136,7 @@ pub async fn route_workflow(
             task_id: &task_id,
             correlation_id: &envelope.correlation_id,
             idempotency_key: &envelope.idempotency_key,
-            kind: "dispatch",
+            kind: kind_name(envelope.kind),
             body_hash: &body_hash,
             now: &now,
             task: &task,

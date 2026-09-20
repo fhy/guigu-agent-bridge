@@ -55,7 +55,7 @@ fn workflow_task(from: &str, to: &str, conversation: &str, task: &str) -> AgentT
 async fn workflow_replay_compares_identity_and_classifies_idempotency_conflict() {
     let pool = database().await;
     let (endpoint, conversation, _, _) = seed(&pool, "completed").await;
-    let store = ReliabilityStore::new(pool);
+    let store = ReliabilityStore::new(pool.clone());
     let task_id = Uuid::now_v7().to_string();
     let task = workflow_task(&endpoint, &endpoint, &conversation, &task_id);
     let sender = endpoint.clone();
@@ -89,6 +89,30 @@ async fn workflow_replay_compares_identity_and_classifies_idempotency_conflict()
         store.admit_workflow(changed).await,
         Err(ReliabilityError::WorkflowConflict)
     ));
+    let handoff_task_id = Uuid::now_v7().to_string();
+    let handoff_task = workflow_task(&endpoint, &endpoint, &conversation, &handoff_task_id);
+    let handoff_key = handoff_task.task_id.to_string();
+    let handoff_delivery = Uuid::now_v7().to_string();
+    let handoff = guigu_agent_bridge::storage::WorkflowAdmission {
+        external_event_id: "event-3",
+        idempotency_key: "idem-3",
+        kind: "handoff",
+        body_hash: "hash-3",
+        task_id: &handoff_key,
+        task: &handoff_task,
+        delivery_id: &handoff_delivery,
+        ..input
+    };
+    assert_eq!(
+        store.admit_workflow(handoff).await.unwrap(),
+        ReceiptOutcome::Inserted
+    );
+    let persisted_kind: String =
+        sqlx::query_scalar("SELECT kind FROM workflow_envelopes WHERE external_event_id='event-3'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(persisted_kind, "handoff");
     let other_task_id = Uuid::now_v7().to_string();
     let other = workflow_task(&endpoint, &endpoint, &conversation, &other_task_id);
     let other_key = other.task_id.to_string();

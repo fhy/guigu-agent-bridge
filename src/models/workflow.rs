@@ -29,6 +29,42 @@ pub enum WorkflowState {
     Unavailable,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkflowRole {
+    Coordinator,
+    Developer,
+    Reviewer,
+    Observer,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthenticatedWorkflowIngress {
+    pub endpoint: EndpointId,
+    pub role: WorkflowRole,
+}
+
+pub fn authorize_workflow(role: WorkflowRole, kind: WorkflowKind) -> bool {
+    match role {
+        WorkflowRole::Coordinator => matches!(
+            kind,
+            WorkflowKind::Dispatch | WorkflowKind::Handoff | WorkflowKind::Ack
+        ),
+        WorkflowRole::Developer | WorkflowRole::Reviewer => {
+            matches!(kind, WorkflowKind::Handoff | WorkflowKind::Ack)
+        }
+        WorkflowRole::Observer => false,
+    }
+}
+
+pub const fn kind_name(kind: WorkflowKind) -> &'static str {
+    match kind {
+        WorkflowKind::Dispatch => "dispatch",
+        WorkflowKind::Ack => "ack",
+        WorkflowKind::Handoff => "handoff",
+        WorkflowKind::Command => "command",
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct WorkflowEnvelope {
     pub schema: String,
@@ -249,5 +285,25 @@ mod tests {
             parse_workflow(&duplicate),
             Err(WorkflowError::DuplicateField)
         );
+    }
+
+    #[test]
+    fn role_matrix_rejects_observer_and_allows_handoff_owners() {
+        assert!(!authorize_workflow(
+            WorkflowRole::Observer,
+            WorkflowKind::Dispatch
+        ));
+        assert!(authorize_workflow(
+            WorkflowRole::Coordinator,
+            WorkflowKind::Dispatch
+        ));
+        assert!(authorize_workflow(
+            WorkflowRole::Developer,
+            WorkflowKind::Handoff
+        ));
+        assert!(authorize_workflow(
+            WorkflowRole::Reviewer,
+            WorkflowKind::Ack
+        ));
     }
 }
