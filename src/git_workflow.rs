@@ -4,10 +4,11 @@
 //! trusted ACP/full-access deployment; these checks are not an OS sandbox.
 
 use std::collections::BTreeSet;
+use std::collections::HashMap;
 use std::fs::{File, OpenOptions};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 pub const MAX_PATHS: usize = 256;
 pub const MAX_PATH_BYTES: usize = 16 * 1024;
@@ -137,6 +138,7 @@ pub struct WorkflowReceipt {
     pub observed: Option<String>,
     pub readback: Readback,
     pub output: String,
+    pub recorded_at_unix: i64,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -151,14 +153,14 @@ pub enum ReceiptError {
 
 pub struct ReceiptStore {
     path: PathBuf,
-    append_lock: Arc<Mutex<()>>,
 }
+
+static RECEIPT_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
 
 impl ReceiptStore {
     pub fn open(path: impl AsRef<Path>) -> Self {
         Self {
             path: path.as_ref().to_path_buf(),
-            append_lock: Arc::new(Mutex::new(())),
         }
     }
 
@@ -186,8 +188,11 @@ impl ReceiptStore {
             || receipt.base_commit.is_empty()
             || receipt.result_commit.is_empty()
             || receipt.parent_commit != receipt.base_commit
+            || receipt.expected_old != receipt.base_commit
+            || receipt.expected_new != receipt.result_commit
             || receipt.review_owner.is_empty()
             || receipt.expires_at_unix <= chrono::Utc::now().timestamp()
+            || (receipt.role == Role::Reviewer && !paths.iter().all(|p| p.starts_with("reviews/")))
         {
             return Err(ReceiptError::Invalid(PolicyError::ResultMismatch));
         }
@@ -199,6 +204,9 @@ impl ReceiptStore {
             &receipt.expected_new,
         );
         safe.output = redact_output(receipt.output.as_bytes());
+        if safe.output.contains("<bounded-error>") {
+            safe.output = "<bounded-error>".into();
+        }
         if safe.output.len() > MAX_OUTPUT_BYTES {
             safe.output.truncate(MAX_OUTPUT_BYTES);
         }
@@ -206,7 +214,14 @@ impl ReceiptStore {
         if encoded.len() > 4 * 1024 {
             return Err(ReceiptError::Invalid(PolicyError::MessageTooLarge));
         }
-        let _guard = self.append_lock.lock().expect("receipt append mutex");
+        let locks = RECEIPT_LOCKS.get_or_init(|| Mutex::new(HashMap::new()));
+        let lock = locks
+            .lock()
+            .expect("receipt lock map")
+            .entry(self.path.clone())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone();
+        let _guard = lock.lock().expect("receipt append mutex");
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -230,13 +245,15 @@ impl ReceiptStore {
         for (index, line) in lines.iter().enumerate() {
             match serde_json::from_str(line) {
                 Ok(receipt) => receipts.push(receipt),
-                Err(error) if index + 1 == lines.len() => {
+                Err(error) if index > 0 && index + 1 == lines.len() => {
                     let _ = error;
                     break;
                 }
                 Err(error) => return Err(ReceiptError::Json(error)),
             }
         }
+        let cutoff = chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60;
+        receipts.retain(|receipt: &WorkflowReceipt| receipt.recorded_at_unix >= cutoff);
         if receipts.len() > 10_000 {
             receipts.drain(..receipts.len() - 10_000);
         }
@@ -408,6 +425,9 @@ pub fn classify_readback(
 }
 
 pub fn redact_output(output: &[u8]) -> String {
+    if std::str::from_utf8(output).is_err() {
+        return "<bounded-error>".into();
+    }
     let bounded = &output[..output.len().min(MAX_OUTPUT_BYTES)];
     let mut rendered = String::new();
     for line in String::from_utf8_lossy(bounded).lines() {
@@ -434,6 +454,9 @@ pub fn redact_output(output: &[u8]) -> String {
         rendered.push('\n');
     }
     rendered.truncate(rendered.len().min(MAX_OUTPUT_BYTES));
+    if rendered.contains("PRIVATE") || rendered.contains("BEGIN ") {
+        return "<bounded-error>".into();
+    }
     rendered
 }
 
@@ -549,11 +572,12 @@ mod tests {
             operation: Operation::Commit,
             review_owner: "coordinator".into(),
             expires_at_unix: chrono::Utc::now().timestamp() + 3600,
-            expected_old: "old".into(),
+            expected_old: "base".into(),
             expected_new: "result".into(),
             observed: Some("result".into()),
             readback: Readback::Confirmed,
             output: "token=secret".into(),
+            recorded_at_unix: chrono::Utc::now().timestamp(),
         };
         store
             .append(&policy(Role::Developer), &receipt)
