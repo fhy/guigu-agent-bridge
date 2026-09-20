@@ -3,8 +3,13 @@ use guigu_agent_bridge::storage::{
 };
 use guigu_agent_bridge::{
     app::OutboxDrain,
-    matrix::{MatrixOutboxSender, ReplyError, ReplyFuture},
-    models::{AgentTask, ConversationId, EndpointId, Priority, TaskId},
+    bus::MemoryBus,
+    config::load_from_str,
+    matrix::{MatrixOutboxSender, ReplyError, ReplyFuture, RouteError, route_workflow},
+    models::{
+        AgentTask, AuthenticatedWorkflowIngress, ConversationId, EndpointId, Priority, TaskId,
+        WorkflowEnvelope, WorkflowKind, WorkflowRole,
+    },
 };
 use sqlx::{Row, SqlitePool};
 use std::sync::Mutex;
@@ -129,6 +134,134 @@ async fn workflow_replay_compares_identity_and_classifies_idempotency_conflict()
         store.admit_workflow(collision).await,
         Err(ReliabilityError::WorkflowConflict)
     ));
+}
+
+#[tokio::test]
+async fn workflow_authorization_reads_durable_owner_and_review_namespace() {
+    let pool = database().await;
+    let (endpoint, conversation, _, _) = seed(&pool, "completed").await;
+    let store = ReliabilityStore::new(pool);
+    let task_id = Uuid::now_v7().to_string();
+    let task = workflow_task(&endpoint, &endpoint, &conversation, &task_id);
+    let task_key = task.task_id.to_string();
+    let delivery = Uuid::now_v7().to_string();
+    let input = guigu_agent_bridge::storage::WorkflowAdmission {
+        transport: "matrix-workflow",
+        external_event_id: "owner-event",
+        sender_endpoint_id: &endpoint,
+        target_endpoint_id: &endpoint,
+        task_id: &task_key,
+        correlation_id: "review:case-1",
+        idempotency_key: "owner-idem",
+        kind: "handoff",
+        body_hash: "owner-hash",
+        now: "2026-09-20T00:00:00Z",
+        task: &task,
+        delivery_id: &delivery,
+    };
+    assert_eq!(
+        store.admit_workflow(input).await.unwrap(),
+        ReceiptOutcome::Inserted
+    );
+    assert!(
+        store
+            .authorize_workflow_task(&task_key, &endpoint, WorkflowRole::Developer, "work:case")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .authorize_workflow_task(&task_key, "other", WorkflowRole::Developer, "work:case")
+            .await
+            .unwrap()
+    );
+    assert!(
+        store
+            .authorize_workflow_task(&task_key, &endpoint, WorkflowRole::Reviewer, "review:case")
+            .await
+            .unwrap()
+    );
+    assert!(
+        !store
+            .authorize_workflow_task(&task_key, &endpoint, WorkflowRole::Reviewer, "work:case")
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn route_workflow_rejects_spoofed_sender_and_unauthorized_role_before_admission() {
+    let pool = database().await;
+    let reliability = ReliabilityStore::new(pool);
+    let config = load_from_str("").unwrap();
+    let (bus, _receivers) = MemoryBus::from_config(&config, 2);
+    let from = EndpointId::generate();
+    let to = EndpointId::generate();
+    let envelope = WorkflowEnvelope {
+        schema: "workflow.v1".into(),
+        kind: WorkflowKind::Handoff,
+        message_id: "route-negative".into(),
+        from,
+        to,
+        task_id: TaskId::generate(),
+        correlation_id: "review:case".into(),
+        idempotency_key: "route-negative-idem".into(),
+        state: None,
+        body: "handoff".into(),
+        mention: None,
+    };
+    assert_eq!(
+        route_workflow(
+            &envelope,
+            ConversationId::generate(),
+            bus.registry(),
+            &reliability,
+            &bus,
+            AuthenticatedWorkflowIngress {
+                endpoint: EndpointId::generate(),
+                role: WorkflowRole::Developer,
+            },
+        )
+        .await
+        .unwrap_err(),
+        RouteError::Forbidden
+    );
+    let mut unauthorized = envelope.clone();
+    unauthorized.message_id = "route-role-negative".into();
+    assert_eq!(
+        route_workflow(
+            &unauthorized,
+            ConversationId::generate(),
+            bus.registry(),
+            &reliability,
+            &bus,
+            AuthenticatedWorkflowIngress {
+                endpoint: from,
+                role: WorkflowRole::Observer,
+            },
+        )
+        .await
+        .unwrap_err(),
+        RouteError::Forbidden
+    );
+    let mut cross_task = envelope;
+    cross_task.message_id = "route-task-negative".into();
+    assert_eq!(
+        route_workflow(
+            &cross_task,
+            ConversationId::generate(),
+            bus.registry(),
+            &reliability,
+            &bus,
+            AuthenticatedWorkflowIngress {
+                endpoint: from,
+                role: WorkflowRole::Developer,
+            },
+        )
+        .await
+        .unwrap_err(),
+        RouteError::Forbidden
+    );
 }
 
 fn retry<'a>(

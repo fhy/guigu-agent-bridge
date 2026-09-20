@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::{
     bus::AdmissionContext,
-    models::{AgentTask, TaskEvent},
+    models::{AgentTask, TaskEvent, WorkflowRole},
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -102,6 +102,31 @@ pub struct ReliabilityStore {
 impl ReliabilityStore {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    /// Checks the durable task owner before accepting a transition. The review
+    /// namespace is carried by the persisted correlation id (`review:`).
+    pub async fn authorize_workflow_task(
+        &self,
+        task_id: &str,
+        endpoint: &str,
+        role: WorkflowRole,
+        correlation_id: &str,
+    ) -> Result<bool, ReliabilityError> {
+        let row = sqlx::query("SELECT from_agent,to_agent FROM tasks WHERE task_id=?")
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        let Some(row) = row else { return Ok(false) };
+        let from_agent: String = row.try_get("from_agent")?;
+        let to_agent: String = row.try_get("to_agent")?;
+        let allowed = match role {
+            WorkflowRole::Coordinator => true,
+            WorkflowRole::Developer => to_agent == endpoint,
+            WorkflowRole::Reviewer => to_agent == endpoint && correlation_id.starts_with("review:"),
+            WorkflowRole::Observer => false,
+        };
+        Ok(allowed && !from_agent.is_empty())
     }
 
     /// Atomically reserves one workflow envelope. Identical keys replay; a
