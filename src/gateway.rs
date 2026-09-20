@@ -600,3 +600,184 @@ impl GatewayTransport for MemoryTransport {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    struct TestDir(std::path::PathBuf);
+    impl Drop for TestDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    async fn fixture() -> (TestDir, SqlitePool, GatewayEnvelope) {
+        let path = std::env::temp_dir().join(format!("guigu-gateway-{}", Uuid::now_v7()));
+        std::fs::create_dir(&path).unwrap();
+        let dir = TestDir(path);
+        let path = dir.0.join("gateway.db");
+        let pool = crate::storage::connect(&path).await.unwrap();
+        crate::storage::migrate(&pool).await.unwrap();
+        let sender = Uuid::from_u128(1);
+        let recipient = Uuid::from_u128(2);
+        for (id, name) in [(sender, "sender"), (recipient, "recipient")] {
+            sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,address_json,capabilities_json) VALUES (?,?,'acp',1,NULL,'[]')")
+                .bind(id.to_string()).bind(name).execute(&pool).await.unwrap();
+        }
+        let conversation = Uuid::from_u128(3);
+        sqlx::query("INSERT INTO conversations(conversation_id,transport,external_id,thread_ref,participants_json) VALUES (?,NULL,NULL,NULL,'[]')")
+            .bind(conversation.to_string()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES ('runtime','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','active','test')")
+            .execute(&pool).await.unwrap();
+        let envelope = GatewayEnvelope {
+            version: PROFILE.into(),
+            envelope_id: Uuid::from_u128(4),
+            idempotency_key: "key".into(),
+            direction: Direction::Inbound,
+            peer_id: "peer".into(),
+            sender: EndpointRef {
+                endpoint_id: sender,
+                peer_id: "peer".into(),
+            },
+            recipient: EndpointRef {
+                endpoint_id: recipient,
+                peer_id: "peer".into(),
+            },
+            conversation_id: conversation,
+            correlation_id: Uuid::from_u128(5),
+            causal_seq: 1,
+            created_at: "2026-01-01T00:00:00Z".into(),
+            deadline: None,
+            kind: EnvelopeKind::Request,
+            content_type: "text/plain".into(),
+            payload: Some(b"work".to_vec()),
+            payload_sha256: "a".repeat(64),
+            artifact: None,
+            integrity: Integrity {
+                algorithm: "sha256".into(),
+                digest: "b".repeat(64),
+            },
+        };
+        (dir, pool, envelope)
+    }
+
+    async fn admit(
+        store: &GatewayStore,
+        envelope: &GatewayEnvelope,
+        conversation: &str,
+    ) -> Result<TaskWinner, sqlx::Error> {
+        store
+            .admit_task_ready(
+                envelope,
+                conversation,
+                "2026-01-01T00:00:00Z",
+                "runtime",
+                "@peer:test",
+                "$event",
+                "!gateway:test",
+                None,
+                1,
+            )
+            .await
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_admission_replays_one_complete_winner() {
+        let (_dir, pool, envelope) = fixture().await;
+        let store = GatewayStore::new(pool.clone());
+        let conversation = envelope.conversation_id.to_string();
+        assert!(matches!(
+            admit(&store, &envelope, &conversation).await.unwrap(),
+            TaskWinner::Inserted(_)
+        ));
+        assert!(matches!(
+            admit(&store, &envelope, &conversation).await.unwrap(),
+            TaskWinner::Replay(_)
+        ));
+        for table in [
+            "gateway_envelopes",
+            "gateway_deliveries",
+            "tasks",
+            "task_events",
+            "task_admissions",
+        ] {
+            let sql = format!("SELECT COUNT(*) FROM {table}");
+            assert_eq!(
+                sqlx::query_scalar::<_, i64>(&sql)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap(),
+                1
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn collision_and_fk_failure_leave_no_partial_siblings() {
+        let (_dir, pool, envelope) = fixture().await;
+        let store = GatewayStore::new(pool.clone());
+        let conversation = envelope.conversation_id.to_string();
+        admit(&store, &envelope, &conversation).await.unwrap();
+        let mut collision = envelope.clone();
+        collision.payload_sha256 = "c".repeat(64);
+        assert!(admit(&store, &collision, &conversation).await.is_err());
+        let mut invalid = envelope.clone();
+        invalid.envelope_id = Uuid::from_u128(6);
+        invalid.idempotency_key = "invalid".into();
+        invalid.correlation_id = Uuid::from_u128(7);
+        assert!(
+            admit(&store, &invalid, &Uuid::from_u128(99).to_string())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM gateway_envelopes")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tasks")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn two_connections_observe_one_scoped_winner() {
+        let (_dir, pool, envelope) = fixture().await;
+        let a = GatewayStore::new(pool.clone());
+        let b = GatewayStore::new(pool.clone());
+        let conversation = envelope.conversation_id.to_string();
+        let (left, right) = tokio::join!(
+            admit(&a, &envelope, &conversation),
+            admit(&b, &envelope, &conversation)
+        );
+        let results = [left.unwrap(), right.unwrap()];
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, TaskWinner::Inserted(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            results
+                .iter()
+                .filter(|r| matches!(r, TaskWinner::Replay(_)))
+                .count(),
+            1
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tasks")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            1
+        );
+    }
+}

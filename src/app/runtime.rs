@@ -275,10 +275,29 @@ impl AppRuntime {
         let bus = bus
             .with_default_timeout(default_timeout)
             .with_reliability(reliability.clone(), runtime_instance.clone());
-        let durable_bus = bus.clone();
+        let durable_bus = Arc::new(bus);
+        let gateway_handoff = crate::app::gateway_handoff::GatewayHandoff::new(
+            crate::gateway::GatewayStore::new(pool.clone()),
+            Arc::clone(&durable_bus),
+            runtime_instance.clone(),
+        );
         for (task_id, revision) in admission_recovery.eligible {
             let parsed = task_id.parse().map_err(|_| AppError::Runtime)?;
             if let Some(task) = repository_trait.get_task(parsed).await? {
+                let gateway_task: bool = sqlx::query_scalar(
+                    "SELECT EXISTS(SELECT 1 FROM gateway_envelopes WHERE internal_task_id=?)",
+                )
+                .bind(&task_id)
+                .fetch_one(&pool)
+                .await
+                .map_err(|_| AppError::Runtime)?;
+                if gateway_task {
+                    gateway_handoff
+                        .handoff(task, revision)
+                        .await
+                        .map_err(|_| AppError::Runtime)?;
+                    continue;
+                }
                 let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
                 let state: Option<String> =
                     sqlx::query_scalar("SELECT state FROM task_admissions WHERE task_id=?")
@@ -304,7 +323,6 @@ impl AppRuntime {
                 }
             }
         }
-        let durable_bus = Arc::new(bus);
         let bus: Arc<dyn crate::bus::Bus> = durable_bus.clone();
         let cancellation = Cancellation::new();
         let worker = Worker::builder(
