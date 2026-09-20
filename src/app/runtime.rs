@@ -17,7 +17,7 @@ use crate::{
         MpscEventSink, TokioTimer, Worker, WorkerConfig,
     },
     config::{Config, ConfigError},
-    gateway::{MatrixGateway, MatrixRoute},
+    gateway::{GatewayRawConsumer, GatewayStore, MatrixGateway, MatrixRoute},
     matrix::{MatrixClient, MatrixSync, MatrixSyncHandle, MemorySyncTokenStore, SdkMatrixSender},
     models::TransportType,
     runtime::{
@@ -70,7 +70,7 @@ pub struct AppRuntime {
     acp: Option<Arc<AcpDispatcherRouter>>,
     a2a: Option<A2aServerHandle>,
     a2a_cleanup: Option<CleanupHandle>,
-    gateway: Option<MatrixGateway>,
+    gateway: Option<Arc<MatrixGateway>>,
     shutdown_timeout: Duration,
     reliability: crate::storage::ReliabilityStore,
     runtime_instance: Option<String>,
@@ -358,24 +358,15 @@ impl AppRuntime {
                 .await
                 .map_err(|_| AppError::Matrix)?;
             let sdk = Arc::new(SdkMatrixSender::new(client.clone()));
-            let sync = MatrixSync::new(
+            let mut sync = MatrixSync::new(
                 client,
                 Arc::new(MemorySyncTokenStore::default()),
                 config.transports.matrix.sync_capacity,
             )
             .map_err(|_| AppError::Matrix)?;
-            Some((sdk, sync))
-        } else {
-            None
-        };
-
-        runtime.health = start_health(config.bridge.health_bind, &runtime.health_state).await?;
-
-        if let Some((sdk, sync)) = matrix {
-            let matrix_sender: Arc<dyn crate::matrix::MatrixSender> = sdk.clone();
-            if config.transports.gateway.enabled {
-                runtime.gateway = Some(MatrixGateway::new(
-                    Arc::clone(&matrix_sender),
+            let gateway = if config.transports.gateway.enabled {
+                let gateway = Arc::new(MatrixGateway::new(
+                    sdk.clone(),
                     MatrixRoute {
                         room_id: config.transports.gateway.room_id.clone(),
                         peer_id: config.transports.gateway.peer_id.clone(),
@@ -389,7 +380,24 @@ impl AppRuntime {
                         runtime_instance: runtime_instance.clone(),
                     },
                 ));
-            }
+                sync = sync.with_raw_consumer(Arc::new(GatewayRawConsumer::new(
+                    Arc::clone(&gateway),
+                    GatewayStore::new(pool.clone()),
+                )));
+                Some(gateway)
+            } else {
+                None
+            };
+            Some((sdk, sync, gateway))
+        } else {
+            None
+        };
+
+        runtime.health = start_health(config.bridge.health_bind, &runtime.health_state).await?;
+
+        if let Some((sdk, sync, gateway)) = matrix {
+            let matrix_sender: Arc<dyn crate::matrix::MatrixSender> = sdk.clone();
+            runtime.gateway = gateway;
             let outbox_sender: Arc<dyn crate::matrix::MatrixOutboxSender> = sdk.clone();
             let outbox = crate::app::OutboxDrain::new(reliability.clone(), outbox_sender, 64);
             let outbox_owner = outbox.clone().start(Duration::from_secs(1));

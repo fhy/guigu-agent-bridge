@@ -22,6 +22,14 @@ use super::{InboundMatrixEvent, MatrixClient, MatrixError, event::decode_event};
 /// Boxed future returned by [`SyncTokenStore`].
 pub type SyncTokenFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
+pub trait RawMatrixEventConsumer: Send + Sync {
+    fn consume<'a>(
+        &'a self,
+        raw: &'a str,
+        room_id: &'a str,
+    ) -> SyncTokenFuture<'a, Result<bool, MatrixError>>;
+}
+
 /// Adapter-owned checkpoint storage. T017 supplies durable production storage.
 pub trait SyncTokenStore: Send + Sync {
     /// Load the last token committed after successful event delivery.
@@ -60,6 +68,7 @@ pub struct MatrixSync {
     tokens: Arc<dyn SyncTokenStore>,
     capacity: usize,
     server_timeout: Duration,
+    raw_consumer: Option<Arc<dyn RawMatrixEventConsumer>>,
 }
 
 impl std::fmt::Debug for MatrixSync {
@@ -86,7 +95,13 @@ impl MatrixSync {
             tokens,
             capacity,
             server_timeout: Duration::from_secs(30),
+            raw_consumer: None,
         })
+    }
+
+    pub fn with_raw_consumer(mut self, consumer: Arc<dyn RawMatrixEventConsumer>) -> Self {
+        self.raw_consumer = Some(consumer);
+        self
     }
 
     /// Spawn the single sync owner task.
@@ -130,6 +145,12 @@ impl MatrixSync {
         for (room_id, update) in response.rooms.joined {
             for timeline in update.timeline.events {
                 let raw = timeline.kind.raw().json().get();
+                if let Some(consumer) = &self.raw_consumer
+                    && consumer.consume(raw, room_id.as_str()).await?
+                {
+                    delivered += 1;
+                    continue;
+                }
                 if let Some(event) = decode_event(raw, room_id.as_str(), &self.client.user_id)? {
                     events.try_send(event).map_err(|error| match error {
                         mpsc::error::TrySendError::Full(_) => MatrixError::Backpressure,

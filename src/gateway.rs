@@ -446,6 +446,61 @@ pub struct MatrixGateway {
     route: MatrixRoute,
 }
 
+pub struct GatewayRawConsumer {
+    gateway: Arc<MatrixGateway>,
+    store: GatewayStore,
+}
+
+impl GatewayRawConsumer {
+    pub fn new(gateway: Arc<MatrixGateway>, store: GatewayStore) -> Self {
+        Self { gateway, store }
+    }
+}
+
+impl crate::matrix::RawMatrixEventConsumer for GatewayRawConsumer {
+    fn consume<'a>(
+        &'a self,
+        raw: &'a str,
+        room_id: &'a str,
+    ) -> crate::matrix::SyncTokenFuture<'a, Result<bool, crate::matrix::MatrixError>> {
+        Box::pin(async move {
+            let value: serde_json::Value =
+                serde_json::from_str(raw).map_err(|_| crate::matrix::MatrixError::Protocol {
+                    detail: "malformed gateway event",
+                })?;
+            let content = value.get("content").and_then(|v| v.as_object());
+            if content
+                .and_then(|v| v.get("msgtype"))
+                .and_then(|v| v.as_str())
+                != Some("com.guigu.bridge.a2a.v1")
+            {
+                return Ok(false);
+            }
+            let sender = value.get("sender").and_then(|v| v.as_str()).ok_or(
+                crate::matrix::MatrixError::Protocol {
+                    detail: "gateway sender missing",
+                },
+            )?;
+            if sender == self.gateway.route.own_user || room_id != self.gateway.route.room_id {
+                return Ok(true);
+            }
+            let event_id = value.get("event_id").and_then(|v| v.as_str()).ok_or(
+                crate::matrix::MatrixError::Protocol {
+                    detail: "gateway event id missing",
+                },
+            )?;
+            let thread = content
+                .and_then(|v| v.get("m.relates_to"))
+                .and_then(|v| v.get("event_id"))
+                .and_then(|v| v.as_str());
+            self.gateway
+                .admit_raw(&self.store, raw, event_id, sender, thread)
+                .await
+                .map_err(|_| crate::matrix::MatrixError::Storage)
+        })
+    }
+}
+
 impl MatrixGateway {
     pub fn new(sender: std::sync::Arc<dyn MatrixSender>, route: MatrixRoute) -> Self {
         Self { sender, route }
