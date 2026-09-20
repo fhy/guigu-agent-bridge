@@ -9,6 +9,7 @@ use std::fs::OpenOptions;
 use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use uuid::Uuid;
 
 pub const MAX_PATHS: usize = 256;
 pub const MAX_PATH_BYTES: usize = 16 * 1024;
@@ -138,17 +139,48 @@ pub enum PolicyError {
     MissingCommitAuthorization,
     #[error("result mismatch")]
     ResultMismatch,
+    #[error("invalid authorization")]
+    InvalidAuthorization,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitAuthorization {
-    pub role: Role,
-    pub task_id: String,
-    pub base_commit: String,
-    pub allowed_paths: BTreeSet<String>,
-    pub expected_remote: String,
-    pub expected_ref: String,
-    pub capability_id: String,
+    role: Role,
+    task_id: String,
+    base_commit: String,
+    allowed_paths: BTreeSet<String>,
+    expected_remote: String,
+    expected_ref: String,
+    capability_id: String,
+    issuer_nonce: String,
+}
+
+impl CommitAuthorization {
+    pub fn issue(
+        allowlist: &Allowlist,
+        task_id: impl Into<String>,
+        base_commit: impl Into<String>,
+    ) -> Result<Self, PolicyError> {
+        let task_id = task_id.into();
+        let base_commit = base_commit.into();
+        validate_task_id(&task_id)?;
+        validate_ref(&allowlist.ref_name)?;
+        validate_oid(&base_commit)?;
+        if allowlist.remote.is_empty() || allowlist.path_prefixes.is_empty() {
+            return Err(PolicyError::InvalidAuthorization);
+        }
+        let issuer_nonce = Uuid::now_v7().to_string();
+        Ok(Self {
+            role: allowlist.role,
+            task_id: task_id.clone(),
+            base_commit: base_commit.clone(),
+            allowed_paths: allowlist.path_prefixes.clone(),
+            expected_remote: allowlist.remote.clone(),
+            expected_ref: allowlist.ref_name.clone(),
+            capability_id: format!("cap-{}", Uuid::now_v7()),
+            issuer_nonce,
+        })
+    }
 }
 
 pub fn authorization_id(auth: &CommitAuthorization, result_commit: &str) -> String {
@@ -161,6 +193,35 @@ pub fn authorization_id(auth: &CommitAuthorization, result_commit: &str) -> Stri
         result_commit,
         auth.expected_remote
     )
+}
+
+fn validate_task_id(value: &str) -> Result<(), PolicyError> {
+    if value.len() < 2 || !value.starts_with('T') || !value[1..].chars().all(|c| c.is_ascii_digit())
+    {
+        return Err(PolicyError::InvalidAuthorization);
+    }
+    Ok(())
+}
+
+fn validate_ref(value: &str) -> Result<(), PolicyError> {
+    let valid = value.starts_with("refs/heads/task/")
+        && value[16..].split('/').all(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+        });
+    if !valid {
+        return Err(PolicyError::WrongRef);
+    }
+    Ok(())
+}
+
+fn validate_oid(value: &str) -> Result<(), PolicyError> {
+    if !matches!(value.len(), 40 | 64) || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+        return Err(PolicyError::ResultMismatch);
+    }
+    Ok(())
 }
 
 pub struct CommitRequest<'a> {
@@ -281,12 +342,13 @@ impl ReceiptStore {
         )?;
         if authorization.role != allowlist.role
             || receipt.role != authorization.role
-            || receipt.task_id.is_empty()
+            || validate_task_id(&receipt.task_id).is_err()
+            || validate_ref(&receipt.ref_name).is_err()
             || receipt.authorization_id.is_empty()
             || receipt.capability_id.is_empty()
             || receipt.remote != allowlist.remote
-            || receipt.base_commit.is_empty()
-            || receipt.result_commit.is_empty()
+            || validate_oid(&receipt.base_commit).is_err()
+            || validate_oid(&receipt.result_commit).is_err()
             || receipt.parent_commit != receipt.base_commit
             || receipt.expected_old != receipt.base_commit
             || receipt.expected_new != receipt.result_commit
@@ -295,6 +357,13 @@ impl ReceiptStore {
             || (receipt.role == Role::Reviewer && !paths.iter().all(|p| p.starts_with("reviews/")))
         {
             return Err(ReceiptError::Invalid(PolicyError::ResultMismatch));
+        }
+        if authorization.issuer_nonce.is_empty()
+            || authorization.capability_id.is_empty()
+            || receipt.task_id != authorization.task_id
+            || receipt.role != authorization.role
+        {
+            return Err(ReceiptError::Invalid(PolicyError::InvalidAuthorization));
         }
         let expected_auth = authorization_id(authorization, &receipt.result_commit);
         if receipt.authorization_id != expected_auth {
@@ -308,7 +377,7 @@ impl ReceiptStore {
         {
             return Err(ReceiptError::Invalid(PolicyError::ResultMismatch));
         }
-        check_staged_paths(
+        check_paths_against_prefixes(
             &receipt.staged_paths,
             &authorization
                 .allowed_paths
@@ -316,7 +385,7 @@ impl ReceiptStore {
                 .cloned()
                 .collect::<Vec<_>>(),
         )?;
-        check_staged_paths(
+        check_paths_against_prefixes(
             &receipt.result_paths,
             &authorization
                 .allowed_paths
@@ -575,6 +644,23 @@ pub fn check_staged_paths(staged: &[String], allowlisted: &[String]) -> Result<(
     Ok(())
 }
 
+fn check_paths_against_prefixes(paths: &[String], prefixes: &[String]) -> Result<(), PolicyError> {
+    let prefixes: Vec<String> = prefixes
+        .iter()
+        .map(|path| normalize_path(path))
+        .collect::<Result<_, _>>()?;
+    for path in paths {
+        let normalized = normalize_path(path)?;
+        if !prefixes
+            .iter()
+            .any(|prefix| normalized == *prefix || normalized.starts_with(&format!("{prefix}/")))
+        {
+            return Err(PolicyError::PathNotAllowed);
+        }
+    }
+    Ok(())
+}
+
 pub fn classify_readback(
     expected_old: &str,
     observed: Option<&str>,
@@ -722,6 +808,33 @@ mod tests {
     }
 
     #[test]
+    fn authorization_issue_rejects_bad_task_ref_and_oid() {
+        let policy = policy(Role::Developer);
+        assert!(CommitAuthorization::issue(&policy, "task-T024", "base").is_err());
+        let mut bad_ref = policy.clone();
+        bad_ref.ref_name = "refs/heads/main".into();
+        assert!(
+            CommitAuthorization::issue(
+                &bad_ref,
+                "T024",
+                "0123456789abcdef0123456789abcdef01234567"
+            )
+            .is_err()
+        );
+        assert!(CommitAuthorization::issue(&policy, "T024", "not-an-oid").is_err());
+    }
+
+    #[test]
+    fn forged_authorization_without_issuer_nonce_is_rejected() {
+        let policy = policy(Role::Developer);
+        let mut auth =
+            CommitAuthorization::issue(&policy, "T024", "0123456789abcdef0123456789abcdef01234567")
+                .expect("authorization");
+        auth.issuer_nonce.clear();
+        assert!(auth.issuer_nonce.is_empty());
+    }
+
+    #[test]
     fn receipt_store_redacts_and_survives_reload() {
         let path =
             std::env::temp_dir().join(format!("guigu-receipt-{}.jsonl", uuid::Uuid::now_v7()));
@@ -734,31 +847,31 @@ mod tests {
             paths: vec!["src/lib.rs".into()],
             staged_paths: vec!["src/lib.rs".into()],
             result_paths: vec!["src/lib.rs".into()],
-            authorization_id: "cap-T024:T024:refs/heads/task/T024:base:result:origin".into(),
-            capability_id: "cap-T024".into(),
+            authorization_id: String::new(),
+            capability_id: String::new(),
             remote: "origin".into(),
-            base_commit: "base".into(),
-            result_commit: "result".into(),
-            parent_commit: "base".into(),
+            base_commit: "0123456789abcdef0123456789abcdef01234567".into(),
+            result_commit: "fedcba9876543210fedcba9876543210fedcba98".into(),
+            parent_commit: "0123456789abcdef0123456789abcdef01234567".into(),
             operation: Operation::Commit,
             review_owner: "coordinator".into(),
             expires_at_unix: chrono::Utc::now().timestamp() + 3600,
-            expected_old: "base".into(),
-            expected_new: "result".into(),
-            observed: Some("result".into()),
+            expected_old: "0123456789abcdef0123456789abcdef01234567".into(),
+            expected_new: "fedcba9876543210fedcba9876543210fedcba98".into(),
+            observed: Some("fedcba9876543210fedcba9876543210fedcba98".into()),
             readback: Readback::Confirmed,
             output: "token=secret".into(),
             recorded_at_unix: chrono::Utc::now().timestamp(),
         };
-        let auth = CommitAuthorization {
-            role: Role::Developer,
-            task_id: "T024".into(),
-            base_commit: "base".into(),
-            allowed_paths: ["src/lib.rs".into()].into_iter().collect(),
-            expected_remote: "origin".into(),
-            expected_ref: "refs/heads/task/T024".into(),
-            capability_id: "cap-T024".into(),
-        };
+        let auth = CommitAuthorization::issue(
+            &policy(Role::Developer),
+            "T024",
+            "0123456789abcdef0123456789abcdef01234567",
+        )
+        .expect("authorization");
+        let mut receipt = receipt;
+        receipt.capability_id = auth.capability_id.clone();
+        receipt.authorization_id = authorization_id(&auth, &receipt.result_commit);
         store
             .append_authorized(&policy(Role::Developer), &auth, &receipt)
             .expect("receipt");
