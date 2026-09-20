@@ -174,6 +174,8 @@ pub struct AgentEndpointConfig {
     pub enabled: bool,
     /// Canonical ACP working directory. Required for enabled ACP endpoints.
     pub workspace: Option<PathBuf>,
+    /// Explicit additional canonical workspace roots granted to ACP.
+    pub additional_workspaces: Vec<PathBuf>,
     /// Opaque configured peer key. Required only for A2A endpoints.
     pub peer: Option<String>,
 }
@@ -537,6 +539,8 @@ struct RawAgent {
     enabled: bool,
     #[serde(default)]
     workspace: String,
+    #[serde(default)]
+    additional_workspaces: Vec<String>,
     #[serde(default)]
     peer: Option<String>,
 }
@@ -1361,12 +1365,42 @@ fn build_agent(
                 }
                 Some(canonical)
             };
+            const MAX_ADDITIONAL_WORKSPACES: usize = 16;
+            if raw.additional_workspaces.len() > MAX_ADDITIONAL_WORKSPACES {
+                return Err(validation(
+                    &format!("{field}.additional_workspaces"),
+                    "contains too many entries",
+                ));
+            }
+            let mut additional_workspaces = Vec::with_capacity(raw.additional_workspaces.len());
+            for (index, value) in raw.additional_workspaces.iter().enumerate() {
+                let item_field = format!("{field}.additional_workspaces[{index}]");
+                if Path::new(value).is_relative() {
+                    return Err(validation(&item_field, "must be absolute"));
+                }
+                let canonical = std::fs::canonicalize(value)
+                    .map_err(|_| validation(&item_field, "must name an existing directory"))?;
+                if !canonical.is_dir() || canonical.to_str().is_none() {
+                    return Err(validation(
+                        &item_field,
+                        "must name an existing UTF-8 directory",
+                    ));
+                }
+                if Some(&canonical) == workspace.as_ref()
+                    || additional_workspaces.contains(&canonical)
+                {
+                    return Err(validation(&item_field, "duplicates another workspace"));
+                }
+                additional_workspaces.push(canonical);
+            }
+            additional_workspaces.sort();
             Ok(AgentEndpointConfig {
                 transport: TransportType::Acp,
                 command,
                 args: raw.args,
                 enabled: raw.enabled,
                 workspace,
+                additional_workspaces,
                 peer: None,
             })
         }
@@ -1383,6 +1417,7 @@ fn build_agent(
                 args: Vec::new(),
                 enabled: raw.enabled,
                 workspace: None,
+                additional_workspaces: Vec::new(),
                 peer: None,
             })
         }
@@ -1405,6 +1440,7 @@ fn build_agent(
                 args: Vec::new(),
                 enabled: raw.enabled,
                 workspace: None,
+                additional_workspaces: Vec::new(),
                 peer: Some(peer),
             })
         }

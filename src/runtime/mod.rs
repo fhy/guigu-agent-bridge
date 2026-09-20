@@ -68,6 +68,8 @@ pub enum RuntimeError {
     Malformed,
     #[error("runtime owner was fenced")]
     Fenced,
+    #[error("workspace claim is busy")]
+    Busy,
     #[error("runtime lease expired")]
     Expired,
     #[error("continuation policy exhausted: {0}")]
@@ -178,6 +180,28 @@ pub struct RecoverySnapshot {
 pub struct SqliteRuntimeStore {
     pool: SqlitePool,
 }
+
+fn path_components(path: &Path) -> Result<Vec<String>, RuntimeError> {
+    let canonical = std::fs::canonicalize(path).map_err(|_| RuntimeError::Workspace)?;
+    if !canonical.is_dir() {
+        return Err(RuntimeError::Workspace);
+    }
+    canonical
+        .components()
+        .map(|component| {
+            let text = component
+                .as_os_str()
+                .to_str()
+                .ok_or(RuntimeError::Workspace)?;
+            Ok(text.to_owned())
+        })
+        .collect()
+}
+
+fn overlaps(left: &[String], right: &[String]) -> bool {
+    left.starts_with(right) || right.starts_with(left)
+}
+
 impl SqliteRuntimeStore {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
@@ -278,6 +302,59 @@ impl SqliteRuntimeStore {
         Ok(next)
     }
 
+    pub async fn claim_workspaces(
+        &self,
+        lease: &Lease,
+        paths: &[std::path::PathBuf],
+    ) -> Result<(), RuntimeError> {
+        let mut candidates = Vec::with_capacity(paths.len());
+        for path in paths {
+            candidates.push((path.to_string_lossy().into_owned(), path_components(path)?));
+        }
+        let mut tx = self.pool.begin().await?;
+        let rows = sqlx::query(
+            "SELECT canonical_path,path_components_json FROM workspace_claims WHERE state='active'",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+        for (_, components) in &candidates {
+            for row in &rows {
+                let existing: String = row
+                    .try_get("path_components_json")
+                    .map_err(|_| RuntimeError::Malformed)?;
+                let existing: Vec<String> =
+                    serde_json::from_str(&existing).map_err(|_| RuntimeError::Malformed)?;
+                if overlaps(components, &existing) {
+                    return Err(RuntimeError::Busy);
+                }
+            }
+        }
+        for (path, components) in candidates {
+            sqlx::query("INSERT INTO workspace_claims(claim_id,runtime_owner,task_id,canonical_path,path_components_json,owner_fence,revision,state,created_at,updated_at) VALUES(?,?,?,?,?,?,1,'active',?,?)")
+                .bind(Uuid::now_v7().to_string()).bind(lease.owner.to_string()).bind(lease.task_id.to_string())
+                .bind(path).bind(serde_json::to_string(&components).map_err(|_| RuntimeError::Malformed)?)
+                .bind(to_i64(lease.fence)?).bind(ts(lease.expires_at)).bind(ts(lease.expires_at)).execute(&mut *tx).await?;
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn release_workspace_claims(
+        &self,
+        lease: &Lease,
+        disposition: ReleaseDisposition,
+        now: DateTime<Utc>,
+    ) -> Result<(), RuntimeError> {
+        if disposition == ReleaseDisposition::Released {
+            sqlx::query("DELETE FROM workspace_claims WHERE runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'")
+                .bind(lease.owner.to_string()).bind(lease.task_id.to_string()).bind(to_i64(lease.fence)?).execute(&self.pool).await?;
+        } else {
+            sqlx::query("UPDATE workspace_claims SET state='recovery_needed',revision=revision+1,updated_at=? WHERE runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'")
+                .bind(ts(now)).bind(lease.owner.to_string()).bind(lease.task_id.to_string()).bind(to_i64(lease.fence)?).execute(&self.pool).await?;
+        }
+        Ok(())
+    }
+
     pub async fn release(
         &self,
         lease: &Lease,
@@ -291,7 +368,7 @@ impl SqliteRuntimeStore {
         let result=sqlx::query("UPDATE execution_leases SET state=?,heartbeat_at=?,expires_at=? WHERE resource_key=? AND owner_token=? AND fence=? AND state='active'")
             .bind(state).bind(ts(now)).bind(ts(now)).bind(lease.resource.to_string()).bind(lease.owner.to_string()).bind(to_i64(lease.fence)?).execute(&self.pool).await?;
         if result.rows_affected() == 1 {
-            Ok(())
+            self.release_workspace_claims(lease, disposition, now).await
         } else {
             Err(RuntimeError::Fenced)
         }
@@ -485,10 +562,22 @@ impl SqliteRuntimeStore {
         };
         let payload = serde_json::to_string(&event.payload).map_err(|_| RuntimeError::Malformed)?;
         sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES (?,?,?,?,?,?)").bind(event.id.to_string()).bind(event.task_id.to_string()).bind(to_i64(event.seq)?).bind(status).bind(ts(event.timestamp)).bind(payload).execute(&mut *tx).await?;
-        let lease = sqlx::query("UPDATE execution_leases SET state='released',heartbeat_at=?,expires_at=? WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
+        let lease_update = sqlx::query("UPDATE execution_leases SET state='released',heartbeat_at=?,expires_at=? WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
             .bind(ts(now)).bind(ts(now)).bind(lease.resource.to_string()).bind(lease.task_id.to_string()).bind(lease.owner.to_string()).bind(to_i64(lease.fence)?).bind(ts(now)).execute(&mut *tx).await?;
-        if lease.rows_affected() != 1 {
+        if lease_update.rows_affected() != 1 {
             return Ok(FinalizeResult::Fenced);
+        }
+        let claim_state = if state == ContinuationState::RecoveryNeeded {
+            "recovery_needed"
+        } else {
+            "released"
+        };
+        if claim_state == "released" {
+            sqlx::query("DELETE FROM workspace_claims WHERE runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'")
+                .bind(lease.owner.to_string()).bind(lease.task_id.to_string()).bind(to_i64(lease.fence)?).execute(&mut *tx).await?;
+        } else {
+            sqlx::query("UPDATE workspace_claims SET state='recovery_needed',revision=revision+1,updated_at=? WHERE runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'")
+                .bind(ts(now)).bind(lease.owner.to_string()).bind(lease.task_id.to_string()).bind(to_i64(lease.fence)?).execute(&mut *tx).await?;
         }
         let admission = sqlx::query("UPDATE task_admissions SET state='terminal',revision=revision+1,updated_at=? WHERE task_id=? AND state IN ('enqueued','dispatching','running')").bind(ts(now)).bind(event.task_id.to_string()).execute(&mut *tx).await?;
         if admission.rows_affected() != 1 {
@@ -920,6 +1009,7 @@ pub struct LeasedAcpDispatcher {
     dispatcher: AcpDispatcher,
     store: SqliteRuntimeStore,
     workspace: WorkspaceId,
+    workspace_paths: Vec<std::path::PathBuf>,
     policy: ContinuationPolicy,
     clock: Arc<dyn RuntimeClock>,
     timer: Arc<dyn RuntimeTimer>,
@@ -967,10 +1057,34 @@ impl LeasedAcpDispatcher {
         timer: Arc<dyn RuntimeTimer>,
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
+        Self::new_with_paths(
+            dispatcher,
+            store,
+            workspace,
+            Vec::new(),
+            policy,
+            clock,
+            timer,
+            metrics,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn new_with_paths(
+        dispatcher: AcpDispatcher,
+        store: SqliteRuntimeStore,
+        workspace: WorkspaceId,
+        workspace_paths: Vec<std::path::PathBuf>,
+        policy: ContinuationPolicy,
+        clock: Arc<dyn RuntimeClock>,
+        timer: Arc<dyn RuntimeTimer>,
+        metrics: Arc<RuntimeMetrics>,
+    ) -> Self {
         Self {
             dispatcher,
             store,
             workspace,
+            workspace_paths,
             policy,
             clock,
             timer,
@@ -1383,6 +1497,17 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                     });
                 }
             };
+            if let Err(error) = self
+                .store
+                .claim_workspaces(&lease, &self.workspace_paths)
+                .await
+            {
+                let _ = self
+                    .store
+                    .release(&lease, ReleaseDisposition::Released, self.clock.now())
+                    .await;
+                return Err(Self::execution_error(error));
+            }
             if let Err(error) = self.dispatcher.deliver(request.clone()).await {
                 let _ = self
                     .store

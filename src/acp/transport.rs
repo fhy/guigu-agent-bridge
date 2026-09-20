@@ -712,14 +712,13 @@ fn accumulate(
         if entry.session.as_deref() != Some(notification.session_id.as_str()) {
             continue;
         }
-        if let Some(updates) = &entry.updates {
-            if updates
+        if let Some(updates) = &entry.updates
+            && updates
                 .try_send(TurnUpdate::AgentMessageChunk(text.to_owned()))
                 .is_err()
-            {
-                overflowed.push(*id);
-                continue;
-            }
+        {
+            overflowed.push(*id);
+            continue;
         }
         if entry.output.len() + text.len() <= limits.max_output_bytes {
             entry.output.push_str(text);

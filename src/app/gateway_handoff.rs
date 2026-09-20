@@ -76,6 +76,7 @@ mod tests {
                 args: vec![],
                 enabled: true,
                 workspace: Some(root.to_path_buf()),
+                additional_workspaces: Vec::new(),
                 peer: None,
             },
         );

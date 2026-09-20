@@ -228,11 +228,19 @@ impl AppRuntime {
                 .workspace
                 .as_ref()
                 .ok_or(AppError::Assembly("enabled ACP workspace missing"))?;
+            let workspace_path = workspace.clone();
             let endpoint = registry
                 .get_by_agent_id(agent_id)
                 .ok_or(AppError::Assembly("configured endpoint missing"))?;
             let dispatcher = AcpDispatcher::builder()
                 .cwd(workspace)
+                .additional_directories(
+                    declared
+                        .additional_workspaces
+                        .iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect(),
+                )
                 .sessions(sessions.clone())
                 .repository(repository_trait.clone())
                 .reliability(reliability.clone())
@@ -242,10 +250,13 @@ impl AppRuntime {
                 WorkspaceId::from_canonical_path(workspace).map_err(|_| AppError::Runtime)?;
             endpoint_dispatchers.insert(
                 endpoint.id(),
-                Arc::new(LeasedAcpDispatcher::new(
+                Arc::new(LeasedAcpDispatcher::new_with_paths(
                     dispatcher,
                     runtime_store.clone(),
                     workspace,
+                    std::iter::once(workspace_path.clone())
+                        .chain(declared.additional_workspaces.iter().cloned())
+                        .collect(),
                     continuation_policy(&config),
                     Arc::new(SystemRuntimeClock),
                     Arc::new(TokioRuntimeTimer),
@@ -602,10 +613,10 @@ impl AppRuntime {
         if let Some(sync) = self.matrix_sync.take() {
             let _ = sync.shutdown().await;
         }
-        if let Some(health) = self.health.take() {
-            if let Err(error) = health.shutdown().await {
-                shutdown_error.get_or_insert(AppError::Health(error));
-            }
+        if let Some(health) = self.health.take()
+            && let Err(error) = health.shutdown().await
+        {
+            shutdown_error.get_or_insert(AppError::Health(error));
         }
         self.health_state.set_owner(OwnerState::Stopped);
         if shutdown_error.is_none()
@@ -639,10 +650,10 @@ fn continuation_policy(config: &Config) -> ContinuationPolicy {
 }
 
 fn prepare_directories(config: &Config) -> std::io::Result<()> {
-    if let Some(parent) = config.bridge.database.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = config.bridge.database.parent()
+        && !parent.as_os_str().is_empty()
+    {
+        std::fs::create_dir_all(parent)?;
     }
     std::fs::create_dir_all(&config.bridge.session_root)
 }

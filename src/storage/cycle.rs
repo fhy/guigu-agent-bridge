@@ -276,17 +276,17 @@ pub async fn detect(
         let over_chain_limit = steps > limits.max_chain;
         let ancestor = repository.get_task(ancestor_id).await?;
 
-        if let Some(ancestor) = &ancestor {
-            if ancestor.to_agent == task.to_agent {
-                return Ok(Some(hit(
-                    task,
-                    parent,
-                    CycleKind::VisitedAgent,
-                    steps,
-                    limits.max_chain,
-                    Some(ancestor.to_agent),
-                )));
-            }
+        if let Some(ancestor) = &ancestor
+            && ancestor.to_agent == task.to_agent
+        {
+            return Ok(Some(hit(
+                task,
+                parent,
+                CycleKind::VisitedAgent,
+                steps,
+                limits.max_chain,
+                Some(ancestor.to_agent),
+            )));
         }
         if over_chain_limit {
             return Ok(Some(hit(

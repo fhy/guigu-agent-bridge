@@ -20,6 +20,7 @@ impl OutboxDrain {
         }
     }
 
+    #[allow(clippy::result_unit_err)]
     pub async fn drain_once(&self) -> Result<usize, ()> {
         let now = chrono::Utc::now();
         let stale = now - chrono::Duration::minutes(5);

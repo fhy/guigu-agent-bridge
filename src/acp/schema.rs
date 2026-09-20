@@ -127,14 +127,20 @@ pub struct NewSessionParams {
     pub cwd: String,
     /// MCP servers to attach; empty because v1 serves no MCP endpoints.
     pub mcp_servers: Vec<Value>,
+    pub additional_directories: Vec<String>,
 }
 
 impl NewSessionParams {
     /// Parameters for `cwd` with no MCP servers.
     pub fn new(cwd: &str) -> Self {
+        Self::new_with_workspaces(cwd, &[])
+    }
+
+    pub fn new_with_workspaces(cwd: &str, additional_directories: &[String]) -> Self {
         Self {
             cwd: cwd.to_owned(),
             mcp_servers: Vec::new(),
+            additional_directories: additional_directories.to_vec(),
         }
     }
 }
@@ -149,6 +155,7 @@ pub struct ResumeSessionParams {
     pub cwd: String,
     /// MCP servers to attach; empty.
     pub mcp_servers: Vec<Value>,
+    pub additional_directories: Vec<String>,
 }
 
 /// Result of `session/new` and `session/resume`.
@@ -574,6 +581,7 @@ mod tests {
             session_id: "s1".to_owned(),
             cwd: "/tmp/work".to_owned(),
             mcp_servers: Vec::new(),
+            additional_directories: Vec::new(),
         })
         .expect("encode");
         assert_eq!(value["sessionId"], "s1");

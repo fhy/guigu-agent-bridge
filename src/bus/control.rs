@@ -237,10 +237,10 @@ impl Cancellation {
             if state.active.contains_key(&task_id) {
                 // The worker owns this task, so the reason belongs to the owned
                 // record — it can never be displaced by the pre-arm cap.
-                if let Some(slot) = state.active.get_mut(&task_id) {
-                    if slot.is_none() {
-                        *slot = Some(bounded_reason(reason.into()));
-                    }
+                if let Some(slot) = state.active.get_mut(&task_id)
+                    && slot.is_none()
+                {
+                    *slot = Some(bounded_reason(reason.into()));
                 }
             } else if !state.retired.contains_key(&task_id) && !state.pending.contains_key(&task_id)
             {

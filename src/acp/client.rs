@@ -155,7 +155,18 @@ impl AcpClient {
     /// A transport/agent/schema failure, or [`AcpError::SessionId`] when the
     /// returned session id is unusable.
     pub async fn new_session(&self, cwd: &str) -> Result<String, AcpError> {
-        let params = encode(schema::METHOD_SESSION_NEW, &NewSessionParams::new(cwd))?;
+        self.new_session_with_workspaces(cwd, &[]).await
+    }
+
+    pub async fn new_session_with_workspaces(
+        &self,
+        cwd: &str,
+        additional_directories: &[String],
+    ) -> Result<String, AcpError> {
+        let params = encode(
+            schema::METHOD_SESSION_NEW,
+            &NewSessionParams::new_with_workspaces(cwd, additional_directories),
+        )?;
         let completed = self
             .transport
             .request(
@@ -181,6 +192,16 @@ impl AcpClient {
     /// As [`AcpClient::new_session`], plus a mismatch between the requested and
     /// returned session ids.
     pub async fn resume_session(&self, session_id: &str, cwd: &str) -> Result<String, AcpError> {
+        self.resume_session_with_workspaces(session_id, cwd, &[])
+            .await
+    }
+
+    pub async fn resume_session_with_workspaces(
+        &self,
+        session_id: &str,
+        cwd: &str,
+        additional_directories: &[String],
+    ) -> Result<String, AcpError> {
         let requested = validate_session_id(session_id.to_owned())?;
         let params = encode(
             schema::METHOD_SESSION_RESUME,
@@ -188,6 +209,7 @@ impl AcpClient {
                 session_id: requested.clone(),
                 cwd: cwd.to_owned(),
                 mcp_servers: Vec::new(),
+                additional_directories: additional_directories.to_vec(),
             },
         )?;
         let completed = self

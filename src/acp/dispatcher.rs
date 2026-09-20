@@ -57,6 +57,7 @@ use crate::storage::{Delivery, Repository};
 /// panicking.
 pub struct AcpDispatcherBuilder {
     cwd: Option<PathBuf>,
+    additional_directories: Vec<String>,
     limits: AcpLimits,
     clock: Clock,
     store: Option<SqliteSessionStore>,
@@ -76,6 +77,7 @@ impl AcpDispatcherBuilder {
     pub fn new() -> Self {
         Self {
             cwd: None,
+            additional_directories: Vec::new(),
             limits: AcpLimits::default(),
             clock: Clock::system(),
             store: None,
@@ -88,6 +90,11 @@ impl AcpDispatcherBuilder {
     /// The working directory for backend processes and ACP sessions.
     pub fn cwd(mut self, cwd: impl Into<PathBuf>) -> Self {
         self.cwd = Some(cwd.into());
+        self
+    }
+
+    pub fn additional_directories(mut self, directories: Vec<String>) -> Self {
+        self.additional_directories = directories;
         self
     }
 
@@ -133,6 +140,7 @@ impl AcpDispatcherBuilder {
     pub fn build(self) -> Result<AcpDispatcher, &'static str> {
         let Self {
             cwd,
+            additional_directories,
             limits,
             clock,
             store,
@@ -150,6 +158,7 @@ impl AcpDispatcherBuilder {
         Ok(AcpDispatcher {
             inner: Arc::new(DispatcherInner {
                 cwd,
+                additional_directories,
                 limits,
                 clock,
                 store,
@@ -181,6 +190,7 @@ pub struct AcpDispatcher {
 
 struct DispatcherInner {
     cwd: String,
+    additional_directories: Vec<String>,
     limits: AcpLimits,
     clock: Clock,
     store: SqliteSessionStore,
@@ -235,7 +245,11 @@ impl AcpStructuredTurn {
             Err(AcpError::Exited { .. } | AcpError::TransportClosed) => {
                 let recovered = self.dispatcher.ensure_client(&self.target).await?;
                 recovered
-                    .resume_session(&self.session_id, &self.dispatcher.inner.cwd)
+                    .resume_session_with_workspaces(
+                        &self.session_id,
+                        &self.dispatcher.inner.cwd,
+                        &self.dispatcher.inner.additional_directories,
+                    )
                     .await?;
                 Err(AcpError::RecoveryNeeded)
             }
@@ -308,10 +322,21 @@ impl AcpDispatcher {
         capacity: usize,
     ) -> Result<AcpStructuredTurn, AcpError> {
         let endpoint = request.target.id();
+        let lookup_backend = self
+            .client_slot()
+            .filter(|client| client.is_alive())
+            .map(|client| client.backend_id().to_owned())
+            .unwrap_or_default();
         let stored = self
             .inner
             .store
-            .live_session(endpoint, request.task.conversation_id, &self.inner.cwd)
+            .live_session_with_workspaces(
+                endpoint,
+                request.task.conversation_id,
+                &self.inner.cwd,
+                &self.inner.additional_directories,
+                &lookup_backend,
+            )
             .await?
             .ok_or(AcpError::SessionId {
                 detail: "no live session for this delivery".to_owned(),
@@ -321,7 +346,13 @@ impl AcpDispatcher {
             Some(client) => client,
             None => {
                 let client = self.ensure_client(request.target).await?;
-                client.resume_session(&session_id, &self.inner.cwd).await?;
+                client
+                    .resume_session_with_workspaces(
+                        &session_id,
+                        &self.inner.cwd,
+                        &self.inner.additional_directories,
+                    )
+                    .await?;
                 return Err(AcpError::RecoveryNeeded);
             }
         };
@@ -371,7 +402,13 @@ impl AcpDispatcher {
         let existing = self
             .inner
             .store
-            .live_session(endpoint, conversation, &self.inner.cwd)
+            .live_session_with_workspaces(
+                endpoint,
+                conversation,
+                &self.inner.cwd,
+                &self.inner.additional_directories,
+                client.backend_id(),
+            )
             .await?;
         let session_id = match existing {
             Some(stored) => {
@@ -379,13 +416,18 @@ impl AcpDispatcher {
                 // `resume` is this attempt's acknowledgement, and it is what makes a
                 // second task in one conversation still have an explicit round trip.
                 let session_id = client
-                    .resume_session(stored.session_id(), &self.inner.cwd)
+                    .resume_session_with_workspaces(
+                        stored.session_id(),
+                        &self.inner.cwd,
+                        &self.inner.additional_directories,
+                    )
                     .await?;
-                let refreshed = StoredSession::new(
+                let refreshed = StoredSession::new_with_workspaces(
                     session_id.clone(),
                     endpoint,
                     conversation,
                     &self.inner.cwd,
+                    &self.inner.additional_directories,
                     client.backend_id(),
                     self.inner.clock.now(),
                 )?;
@@ -393,12 +435,18 @@ impl AcpDispatcher {
                 session_id
             }
             None => {
-                let session_id = client.new_session(&self.inner.cwd).await?;
-                let stored = StoredSession::new(
+                let session_id = client
+                    .new_session_with_workspaces(
+                        &self.inner.cwd,
+                        &self.inner.additional_directories,
+                    )
+                    .await?;
+                let stored = StoredSession::new_with_workspaces(
                     session_id.clone(),
                     endpoint,
                     conversation,
                     &self.inner.cwd,
+                    &self.inner.additional_directories,
                     client.backend_id(),
                     self.inner.clock.now(),
                 )?;
@@ -480,10 +528,21 @@ impl AcpDispatcher {
     ) -> Result<client::PromptTurn, AcpError> {
         let endpoint = request.target.id();
         let conversation = request.task.conversation_id;
+        let lookup_backend = self
+            .client_slot()
+            .filter(|client| client.is_alive())
+            .map(|client| client.backend_id().to_owned())
+            .unwrap_or_default();
         let stored = self
             .inner
             .store
-            .live_session(endpoint, conversation, &self.inner.cwd)
+            .live_session_with_workspaces(
+                endpoint,
+                conversation,
+                &self.inner.cwd,
+                &self.inner.additional_directories,
+                &lookup_backend,
+            )
             .await?
             .ok_or(AcpError::SessionId {
                 detail: "no live session for this delivery".to_owned(),
@@ -493,7 +552,13 @@ impl AcpDispatcher {
             Some(client) => client,
             None => {
                 let client = self.ensure_client(request.target).await?;
-                client.resume_session(&session_id, &self.inner.cwd).await?;
+                client
+                    .resume_session_with_workspaces(
+                        &session_id,
+                        &self.inner.cwd,
+                        &self.inner.additional_directories,
+                    )
+                    .await?;
                 return Err(AcpError::RecoveryNeeded);
             }
         };
@@ -532,7 +597,11 @@ impl AcpDispatcher {
             Err(AcpError::Exited { .. } | AcpError::TransportClosed) => {
                 let recovered = self.ensure_client(request.target).await?;
                 recovered
-                    .resume_session(&session_id, &self.inner.cwd)
+                    .resume_session_with_workspaces(
+                        &session_id,
+                        &self.inner.cwd,
+                        &self.inner.additional_directories,
+                    )
                     .await?;
                 Err(AcpError::RecoveryNeeded)
             }
@@ -542,10 +611,10 @@ impl AcpDispatcher {
 
     /// The running backend, spawning and negotiating one when needed.
     async fn ensure_client(&self, target: &RegisteredEndpoint) -> Result<Arc<AcpClient>, AcpError> {
-        if let Some(client) = self.client_slot() {
-            if client.is_alive() {
-                return Ok(client);
-            }
+        if let Some(client) = self.client_slot()
+            && client.is_alive()
+        {
+            return Ok(client);
         }
         let address = target.address().ok_or(AcpError::UnsupportedAddress {
             phase: Phase::Spawn,

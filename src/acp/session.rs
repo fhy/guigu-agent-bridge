@@ -45,6 +45,7 @@
 //! [`StorageError::IntegrityViolation`] rather than silently rewritten.
 
 use chrono::{DateTime, Utc};
+use sha2::{Digest, Sha256};
 use sqlx::{Row, SqlitePool};
 
 use crate::models::{ConversationId, EndpointId};
@@ -98,6 +99,9 @@ pub struct StoredSession {
     endpoint_id: EndpointId,
     conversation_id: ConversationId,
     cwd: String,
+    additional_directories: String,
+    compatibility_version: u16,
+    compatibility_hash: String,
     backend_id: String,
     protocol_version: u16,
     state: SessionState,
@@ -121,6 +125,26 @@ impl StoredSession {
         backend_id: impl Into<String>,
         at: DateTime<Utc>,
     ) -> Result<Self, StorageError> {
+        Self::new_with_workspaces(
+            session_id,
+            endpoint_id,
+            conversation_id,
+            cwd,
+            &[],
+            backend_id,
+            at,
+        )
+    }
+
+    pub fn new_with_workspaces(
+        session_id: impl Into<String>,
+        endpoint_id: EndpointId,
+        conversation_id: ConversationId,
+        cwd: impl Into<String>,
+        additional_directories: &[String],
+        backend_id: impl Into<String>,
+        at: DateTime<Utc>,
+    ) -> Result<Self, StorageError> {
         let session_id = session_id.into();
         if session_id.is_empty() || session_id.len() > MAX_SESSION_ID_BYTES {
             return Err(StorageError::Malformed {
@@ -128,12 +152,28 @@ impl StoredSession {
                 detail: "session id is empty or too long".to_owned(),
             });
         }
+        let cwd = cwd.into();
+        let backend_id = backend_id.into();
+        let compatibility_hash = compatibility_hash(
+            &backend_id,
+            crate::acp::PROTOCOL_VERSION,
+            &cwd,
+            additional_directories,
+        );
         Ok(Self {
             session_id,
             endpoint_id,
             conversation_id,
-            cwd: cwd.into(),
-            backend_id: backend_id.into(),
+            cwd,
+            additional_directories: serde_json::to_string(additional_directories).map_err(
+                |_| StorageError::Malformed {
+                    field: "sessions.additional_directories",
+                    detail: "invalid workspace identity".to_owned(),
+                },
+            )?,
+            compatibility_version: 1,
+            compatibility_hash,
+            backend_id,
             protocol_version: crate::acp::PROTOCOL_VERSION,
             state: SessionState::Ready,
             created_at: at,
@@ -159,6 +199,10 @@ impl StoredSession {
     /// The working directory the session was created with.
     pub fn cwd(&self) -> &str {
         &self.cwd
+    }
+
+    pub fn additional_directories(&self) -> &str {
+        &self.additional_directories
     }
 
     /// The compatibility identity of the backend (ADR-001).
@@ -212,10 +256,43 @@ impl SqliteSessionStore {
         conversation: ConversationId,
         cwd: &str,
     ) -> Result<Option<StoredSession>, StorageError> {
+        let row = sqlx::query(SELECT_LIVE_SESSION_LEGACY)
+            .bind(encode_id(endpoint))
+            .bind(encode_id(conversation))
+            .bind(cwd)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(StorageError::from)?;
+        row.as_ref().map(session_from_row).transpose()
+    }
+
+    pub async fn live_session_with_workspaces(
+        &self,
+        endpoint: EndpointId,
+        conversation: ConversationId,
+        cwd: &str,
+        additional_directories: &[String],
+        backend_id: &str,
+    ) -> Result<Option<StoredSession>, StorageError> {
+        let hash = compatibility_hash(
+            backend_id,
+            crate::acp::PROTOCOL_VERSION,
+            cwd,
+            additional_directories,
+        );
         let row = sqlx::query(SELECT_LIVE_SESSION)
             .bind(encode_id(endpoint))
             .bind(encode_id(conversation))
             .bind(cwd)
+            .bind(serde_json::to_string(additional_directories).map_err(|_| {
+                StorageError::Malformed {
+                    field: "sessions.additional_directories",
+                    detail: "invalid workspace identity".to_owned(),
+                }
+            })?)
+            .bind(hash)
+            .bind(backend_id)
+            .bind(i64::from(crate::acp::PROTOCOL_VERSION))
             .fetch_optional(&self.pool)
             .await
             .map_err(StorageError::from)?;
@@ -235,6 +312,9 @@ impl SqliteSessionStore {
             .bind(encode_id(session.endpoint_id))
             .bind(encode_id(session.conversation_id))
             .bind(&session.cwd)
+            .bind(&session.additional_directories)
+            .bind(i64::from(session.compatibility_version))
+            .bind(&session.compatibility_hash)
             .bind(&session.backend_id)
             .bind(i64::from(session.protocol_version))
             .bind(session.state.as_str())
@@ -284,23 +364,31 @@ impl SqliteSessionStore {
 }
 
 const SELECT_LIVE_SESSION: &str = "\
-    SELECT session_id, endpoint_id, conversation_id, cwd, backend_id, protocol_version, \
+    SELECT session_id, endpoint_id, conversation_id, cwd, additional_directories, compatibility_version, compatibility_hash, backend_id, protocol_version, \
            state, created_at, updated_at \
     FROM sessions \
+    WHERE endpoint_id = ? AND conversation_id = ? AND cwd = ? AND additional_directories = ? AND state <> 'closed' \
+      AND ((compatibility_version = 1 AND compatibility_hash = ?) \
+        OR (compatibility_version = 0 AND additional_directories = '[]' AND backend_id = ? AND protocol_version = ?))";
+const SELECT_LIVE_SESSION_LEGACY: &str = "\
+    SELECT session_id, endpoint_id, conversation_id, cwd, additional_directories, compatibility_version, compatibility_hash, backend_id, protocol_version, \
+           state, created_at, updated_at FROM sessions \
     WHERE endpoint_id = ? AND conversation_id = ? AND cwd = ? AND state <> 'closed'";
 
 /// `created_at` is deliberately not refreshed: the first acceptance of a session
 /// is a fact, while its state and last-touch time are not.
 const UPSERT_SESSION: &str = "\
-    INSERT INTO sessions (session_id, endpoint_id, conversation_id, cwd, backend_id, \
+    INSERT INTO sessions (session_id, endpoint_id, conversation_id, cwd, additional_directories, compatibility_version, compatibility_hash, backend_id, \
                           protocol_version, state, created_at, updated_at) \
-    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?) \
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
     ON CONFLICT (session_id, endpoint_id) DO UPDATE SET \
         backend_id = excluded.backend_id, \
         protocol_version = excluded.protocol_version, \
+        compatibility_version = excluded.compatibility_version, \
+        compatibility_hash = excluded.compatibility_hash, \
         state = excluded.state, \
         updated_at = excluded.updated_at \
-    WHERE sessions.conversation_id = excluded.conversation_id AND sessions.cwd = excluded.cwd";
+    WHERE sessions.conversation_id = excluded.conversation_id AND sessions.cwd = excluded.cwd AND sessions.additional_directories = excluded.additional_directories";
 
 const UPDATE_SESSION_STATE: &str =
     "UPDATE sessions SET state = ?, updated_at = ? WHERE session_id = ? AND endpoint_id = ?";
@@ -322,12 +410,42 @@ fn session_from_row(row: &sqlx::sqlite::SqliteRow) -> Result<StoredSession, Stor
         endpoint_id: decode_id(&text("endpoint_id")?, "sessions.endpoint_id")?,
         conversation_id: decode_id(&text("conversation_id")?, "sessions.conversation_id")?,
         cwd: text("cwd")?,
+        additional_directories: text("additional_directories")?,
+        compatibility_version: u16::try_from(
+            row.try_get::<i64, _>("compatibility_version")
+                .map_err(StorageError::from)?,
+        )
+        .map_err(|_| StorageError::Malformed {
+            field: "sessions.compatibility_version",
+            detail: "value does not fit in u16".to_owned(),
+        })?,
+        compatibility_hash: text("compatibility_hash")?,
         backend_id: text("backend_id")?,
         protocol_version: version,
         state: SessionState::from_text(&text("state")?, "sessions.state")?,
         created_at: decode_timestamp(&text("created_at")?, "sessions.created_at")?,
         updated_at: decode_timestamp(&text("updated_at")?, "sessions.updated_at")?,
     })
+}
+
+fn compatibility_hash(backend_id: &str, protocol: u16, cwd: &str, roots: &[String]) -> String {
+    let mut digest = Sha256::new();
+    for value in [
+        backend_id.as_bytes(),
+        &protocol.to_be_bytes(),
+        cwd.as_bytes(),
+    ]
+    .into_iter()
+    .chain(roots.iter().map(String::as_bytes))
+    {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value);
+    }
+    digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
 }
 
 #[cfg(test)]

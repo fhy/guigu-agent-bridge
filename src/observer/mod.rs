@@ -68,10 +68,10 @@ impl Dedup {
     fn mark(&mut self, id: EventId) {
         if self.seen.insert(id) {
             self.order.push_back(id);
-            if self.order.len() > self.cap {
-                if let Some(old) = self.order.pop_front() {
-                    self.seen.remove(&old);
-                }
+            if self.order.len() > self.cap
+                && let Some(old) = self.order.pop_front()
+            {
+                self.seen.remove(&old);
             }
         }
     }
