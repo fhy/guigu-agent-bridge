@@ -1,3 +1,4 @@
+use serde::de::{Deserializer as _, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -61,6 +62,7 @@ pub fn parse_workflow(raw: &str) -> Result<WorkflowEnvelope, WorkflowError> {
     if raw.len() > MAX_WORKFLOW_BYTES {
         return Err(WorkflowError::TooLarge);
     }
+    reject_duplicate_keys(raw)?;
     let value: Value = serde_json::from_str(raw).map_err(|_| WorkflowError::InvalidJson)?;
     let object = value.as_object().ok_or(WorkflowError::InvalidEnvelope)?;
     let allowed = [
@@ -90,6 +92,37 @@ pub fn parse_workflow(raw: &str) -> Result<WorkflowEnvelope, WorkflowError> {
         return Err(WorkflowError::InvalidEnvelope);
     }
     Ok(envelope)
+}
+
+fn reject_duplicate_keys(raw: &str) -> Result<(), WorkflowError> {
+    struct Root;
+    impl<'de> Visitor<'de> for Root {
+        type Value = ();
+        fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            formatter.write_str("a JSON object")
+        }
+        fn visit_map<A>(self, mut map: A) -> Result<(), A::Error>
+        where
+            A: MapAccess<'de>,
+        {
+            let mut keys = std::collections::BTreeSet::new();
+            while let Some(key) = map.next_key::<String>()? {
+                if !keys.insert(key) {
+                    return Err(serde::de::Error::custom("duplicate key"));
+                }
+                map.next_value::<serde_json::Value>()?;
+            }
+            Ok(())
+        }
+    }
+    let mut deserializer = serde_json::Deserializer::from_str(raw);
+    deserializer.deserialize_any(Root).map_err(|error| {
+        if error.to_string().contains("duplicate key") {
+            WorkflowError::DuplicateField
+        } else {
+            WorkflowError::InvalidJson
+        }
+    })
 }
 
 pub fn canonical_metadata(envelope: &WorkflowEnvelope) -> Result<Vec<u8>, WorkflowError> {
@@ -143,5 +176,16 @@ mod tests {
         let bytes = canonical_metadata(&sample()).unwrap();
         assert!(bytes.starts_with(b"{"));
         assert!(bytes.len() <= MAX_METADATA_BYTES);
+    }
+
+    #[test]
+    fn rejects_duplicate_top_level_keys() {
+        let e = sample();
+        let raw = serde_json::to_string(&e).unwrap();
+        let duplicate = raw.replacen("{", "{\"kind\":\"dispatch\",", 1);
+        assert_eq!(
+            parse_workflow(&duplicate),
+            Err(WorkflowError::DuplicateField)
+        );
     }
 }
