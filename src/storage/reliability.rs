@@ -10,6 +10,20 @@ use crate::{
     models::{AgentTask, TaskEvent},
 };
 
+#[derive(Debug, Clone)]
+pub struct WorkflowAdmission<'a> {
+    pub transport: &'a str,
+    pub external_event_id: &'a str,
+    pub sender_endpoint_id: &'a str,
+    pub target_endpoint_id: &'a str,
+    pub task_id: &'a str,
+    pub correlation_id: &'a str,
+    pub idempotency_key: &'a str,
+    pub kind: &'a str,
+    pub body_hash: &'a str,
+    pub now: &'a str,
+}
+
 const OUTBOX_BODY_NAMESPACE: Uuid = Uuid::from_u128(0x7297ec04_1338_57b4_9bc4_f0ff9f84fa5a);
 
 #[derive(Debug, Error)]
@@ -84,6 +98,32 @@ pub struct ReliabilityStore {
 impl ReliabilityStore {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    /// Atomically reserves one workflow envelope. Identical keys replay; a
+    /// conflicting key is rejected by SQLite uniqueness without mutation.
+    pub async fn admit_workflow(
+        &self,
+        input: WorkflowAdmission<'_>,
+    ) -> Result<ReceiptOutcome, ReliabilityError> {
+        let mut tx = self.pool.begin().await?;
+        let inserted = sqlx::query("INSERT INTO workflow_envelopes(transport,external_event_id,sender_endpoint_id,target_endpoint_id,task_id,correlation_id,idempotency_key,schema,kind,state,outcome,body_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'workflow.v1',?,'reserved',NULL,?,?,?) ON CONFLICT(transport,external_event_id) DO NOTHING")
+            .bind(input.transport).bind(input.external_event_id).bind(input.sender_endpoint_id)
+            .bind(input.target_endpoint_id).bind(input.task_id).bind(input.correlation_id)
+            .bind(input.idempotency_key).bind(input.kind).bind(input.body_hash)
+            .bind(input.now).bind(input.now).execute(&mut *tx).await?;
+        if inserted.rows_affected() == 0 {
+            let row = sqlx::query("SELECT task_id,outcome FROM workflow_envelopes WHERE transport=? AND external_event_id=?")
+                .bind(input.transport).bind(input.external_event_id).fetch_one(&mut *tx).await?;
+            return Ok(ReceiptOutcome::Replay {
+                task_id: Some(row.try_get("task_id")?),
+                result_code: row
+                    .try_get::<Option<String>, _>("outcome")?
+                    .unwrap_or_else(|| "reserved".into()),
+            });
+        }
+        tx.commit().await?;
+        Ok(ReceiptOutcome::Inserted)
     }
 
     /// Persist queue admission before making the reserved in-memory slot visible.

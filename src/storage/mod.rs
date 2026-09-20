@@ -153,6 +153,6 @@ pub use pool::{DEFAULT_BUSY_TIMEOUT, MAX_CONNECTIONS, connect, migrate};
 pub use recovery::{RecoveryPlan, plan_recovery, sync_agents};
 pub use reliability::{
     AdmissionRecovery, PendingProjection, ReceiptOutcome, ReliabilityError, ReliabilityStore,
-    RetryTaskInput,
+    RetryTaskInput, WorkflowAdmission,
 };
 pub use repository::{AckOutcome, Delivery, Repository, SqliteRepository, StorageFuture};

@@ -3,7 +3,7 @@ use std::collections::BTreeMap;
 use super::{EventDedup, InboundMatrixEvent, PermissionPolicy, derive_matrix_user_id};
 use crate::{
     bus::{AdmissionContext, Bus, BusError, EndpointRegistry},
-    models::{AgentTask, ConversationId, Priority, TaskId},
+    models::{AgentTask, ConversationId, Priority, TaskId, WorkflowEnvelope},
 };
 
 pub type MatrixAdmissionFuture<'a, T> =
@@ -72,6 +72,60 @@ pub enum RouteError {
     Bus,
     #[error("invalid sender identity")]
     Identity,
+    #[error("invalid workflow envelope")]
+    Workflow,
+}
+
+/// Routes a parsed workflow envelope using its typed recipient. Mentions are not
+/// consulted; ordinary text remains on the legacy route_event path.
+pub async fn route_workflow(
+    envelope: &WorkflowEnvelope,
+    conversation_id: ConversationId,
+    registry: &EndpointRegistry,
+    bus: &dyn Bus,
+) -> Result<AgentTask, RouteError> {
+    if envelope.schema != crate::models::workflow::WORKFLOW_SCHEMA
+        || envelope.from == envelope.to
+        || !matches!(
+            envelope.kind,
+            crate::models::WorkflowKind::Dispatch | crate::models::WorkflowKind::Handoff
+        )
+    {
+        return Err(RouteError::Workflow);
+    }
+    registry
+        .validate_target(envelope.to)
+        .map_err(|_| RouteError::Target)?;
+    let task = AgentTask {
+        task_id: envelope.task_id,
+        root_task_id: envelope.task_id,
+        parent_task_id: None,
+        from_agent: envelope.from,
+        to_agent: envelope.to,
+        conversation_id,
+        reply_to: None,
+        text: envelope.body.clone(),
+        priority: Priority::DEFAULT,
+        depth: 0,
+        hops: 1,
+        deadline: None,
+        version: 0,
+    };
+    bus.submit_with_context(
+        task.clone(),
+        AdmissionContext {
+            transport: "matrix-workflow".into(),
+            external_event_id: envelope.message_id.clone(),
+            room_id: "workflow".into(),
+            thread_root: Some(envelope.correlation_id.clone()),
+            reply_event_id: envelope.message_id.clone(),
+            monitor_room: None,
+            monitor_generation: 0,
+        },
+    )
+    .await
+    .map_err(|_| RouteError::Bus)?;
+    Ok(task)
 }
 
 pub async fn route_event(

@@ -15,6 +15,7 @@ pub mod event;
 pub mod ids;
 pub mod message;
 pub mod task;
+pub mod workflow;
 
 pub use agent::{AgentEndpoint, Capability, EndpointAddress, TransportType};
 pub use conversation::{Conversation, ExternalRef};
@@ -22,3 +23,7 @@ pub use event::{TaskEvent, TaskEventPayload};
 pub use ids::{ConversationId, DeliveryId, EndpointId, EventId, MessageId, TaskId};
 pub use message::Message;
 pub use task::{AgentTask, Priority, TaskStatus};
+pub use workflow::{
+    WorkflowEnvelope, WorkflowError, WorkflowKind, WorkflowState, canonical_metadata,
+    parse_workflow,
+};
