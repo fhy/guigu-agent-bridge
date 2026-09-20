@@ -238,8 +238,15 @@ fn validate_oid(value: &str) -> Result<(), PolicyError> {
 }
 
 fn authorization_fingerprint(auth: &CommitAuthorization) -> String {
+    let paths = auth
+        .allowed_paths
+        .iter()
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("\0");
     format!(
-        "{:?}|{:?}|{}|{}|{}|{}|{}|{}",
+        "{}|{:?}|{:?}|{}|{}|{}|{}|{}|{}|{}",
+        auth.issuer_nonce,
         auth.role,
         auth.repository,
         auth.task_id,
@@ -247,7 +254,8 @@ fn authorization_fingerprint(auth: &CommitAuthorization) -> String {
         auth.expected_ref,
         auth.expected_remote,
         auth.capability_id,
-        auth.expires_at_unix
+        auth.expires_at_unix,
+        paths
     )
 }
 
@@ -383,6 +391,9 @@ impl ReceiptStore {
         )?;
         if authorization.role != allowlist.role
             || authorization.repository != allowlist.repository
+            || authorization.expected_ref != allowlist.ref_name
+            || authorization.expected_remote != allowlist.remote
+            || authorization.allowed_paths != allowlist.path_prefixes
             || receipt.role != authorization.role
             || validate_task_id(&receipt.task_id).is_err()
             || validate_ref(&receipt.ref_name).is_err()
@@ -944,6 +955,22 @@ mod tests {
             store.append_authorized(&policy(Role::Developer), &forged, &receipt),
             Err(ReceiptError::Invalid(PolicyError::InvalidAuthorization))
         ));
+        let mut altered_paths = auth.clone();
+        altered_paths.allowed_paths.insert("README.md".into());
+        assert!(
+            store
+                .append_authorized(&policy(Role::Developer), &altered_paths, &receipt)
+                .is_err()
+        );
+        let mut altered_context = auth.clone();
+        altered_context.role = Role::Coordinator;
+        altered_context.repository = Repository::Governance;
+        altered_context.expires_at_unix += 1;
+        assert!(
+            store
+                .append_authorized(&policy(Role::Developer), &altered_context, &receipt)
+                .is_err()
+        );
         store
             .append_authorized(&policy(Role::Developer), &auth, &receipt)
             .expect("receipt");
