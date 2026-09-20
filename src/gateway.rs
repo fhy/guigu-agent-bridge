@@ -369,6 +369,20 @@ impl GatewayStore {
         Ok(result.rows_affected() == 1)
     }
 
+    pub async fn ready_revision(
+        &self,
+        task_id: &str,
+        runtime: &str,
+    ) -> Result<Option<i64>, sqlx::Error> {
+        sqlx::query_scalar(
+            "SELECT revision FROM task_admissions WHERE task_id=? AND state='ready' AND runtime_instance=?",
+        )
+        .bind(task_id)
+        .bind(runtime)
+        .fetch_optional(&self.pool)
+        .await
+    }
+
     pub async fn retained_bytes(&self) -> Result<i64, sqlx::Error> {
         sqlx::query_scalar("SELECT COALESCE(SUM(retained_bytes),0) FROM gateway_envelopes")
             .fetch_one(&self.pool)
@@ -401,7 +415,7 @@ impl GatewayStore {
         now: &str,
     ) -> Result<bool, sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        let eligible: Option<i64> = sqlx::query_scalar("SELECT 1 FROM gateway_envelopes e WHERE e.envelope_id=? AND e.cleanup_owner=? AND e.cleanup_revision=? AND e.state IN ('terminal','stale') AND e.terminal_at IS NOT NULL AND e.terminal_at <= datetime(?, '-7 days') AND NOT EXISTS (SELECT 1 FROM gateway_deliveries d WHERE d.envelope_id=e.envelope_id AND d.phase NOT IN ('terminal','stale','recovery_needed')) AND (e.internal_task_id IS NULL OR EXISTS (SELECT 1 FROM task_events te WHERE te.task_id=e.internal_task_id AND te.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=e.internal_task_id) AND te.payload_json LIKE '%completed%'))")
+        let eligible: Option<i64> = sqlx::query_scalar("SELECT 1 FROM gateway_envelopes e WHERE e.envelope_id=? AND e.cleanup_owner=? AND e.cleanup_revision=? AND e.state IN ('terminal','stale') AND e.terminal_at IS NOT NULL AND e.terminal_at <= datetime(?, '-7 days') AND NOT EXISTS (SELECT 1 FROM gateway_deliveries d WHERE d.envelope_id=e.envelope_id AND d.phase NOT IN ('terminal','stale','recovery_needed')) AND (e.internal_task_id IS NULL OR EXISTS (SELECT 1 FROM task_events te WHERE te.task_id=e.internal_task_id AND te.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=e.internal_task_id) AND te.status IN ('completed','failed','timed_out','cancelled')))")
             .bind(envelope_id).bind(owner).bind(revision).bind(now).fetch_optional(&mut *tx).await?;
         if eligible.is_none() {
             tx.rollback().await?;
@@ -449,11 +463,23 @@ pub struct MatrixGateway {
 pub struct GatewayRawConsumer {
     gateway: Arc<MatrixGateway>,
     store: GatewayStore,
+    repository: crate::storage::SqliteRepository,
+    handoff: crate::app::gateway_handoff::GatewayHandoff,
 }
 
 impl GatewayRawConsumer {
-    pub fn new(gateway: Arc<MatrixGateway>, store: GatewayStore) -> Self {
-        Self { gateway, store }
+    pub fn new(
+        gateway: Arc<MatrixGateway>,
+        store: GatewayStore,
+        repository: crate::storage::SqliteRepository,
+        handoff: crate::app::gateway_handoff::GatewayHandoff,
+    ) -> Self {
+        Self {
+            gateway,
+            store,
+            repository,
+            handoff,
+        }
     }
 }
 
@@ -493,10 +519,39 @@ impl crate::matrix::RawMatrixEventConsumer for GatewayRawConsumer {
                 .and_then(|v| v.get("m.relates_to"))
                 .and_then(|v| v.get("event_id"))
                 .and_then(|v| v.as_str());
-            self.gateway
+            let winner = self
+                .gateway
                 .admit_raw(&self.store, raw, event_id, sender, thread)
                 .await
-                .map_err(|_| crate::matrix::MatrixError::Storage)
+                .map_err(|_| crate::matrix::MatrixError::Storage)?;
+            let Some(winner) = winner else {
+                return Ok(false);
+            };
+            let task_id = match winner {
+                TaskWinner::Inserted(task_id) | TaskWinner::Replay(task_id) => task_id,
+            };
+            if let Some(revision) = self
+                .store
+                .ready_revision(&task_id, &self.gateway.route.runtime_instance)
+                .await
+                .map_err(|_| crate::matrix::MatrixError::Storage)?
+            {
+                use crate::storage::Repository;
+                let parsed = task_id
+                    .parse()
+                    .map_err(|_| crate::matrix::MatrixError::Storage)?;
+                let task = self
+                    .repository
+                    .get_task(parsed)
+                    .await
+                    .map_err(|_| crate::matrix::MatrixError::Storage)?
+                    .ok_or(crate::matrix::MatrixError::Storage)?;
+                self.handoff
+                    .handoff(task, revision)
+                    .await
+                    .map_err(|_| crate::matrix::MatrixError::Backpressure)?;
+            }
+            Ok(true)
         })
     }
 }
@@ -602,9 +657,9 @@ impl MatrixGateway {
         event_id: &str,
         sender_user: &str,
         thread_root: Option<&str>,
-    ) -> Result<bool, EnvelopeError> {
+    ) -> Result<Option<TaskWinner>, EnvelopeError> {
         let Some(envelope) = self.decode_event(raw)? else {
-            return Ok(false);
+            return Ok(None);
         };
         if !self
             .route
@@ -616,7 +671,7 @@ impl MatrixGateway {
         }
         let canonical = serde_json::to_vec(&envelope).map_err(|_| EnvelopeError::Shape)?;
         let _ = canonical;
-        store
+        let winner = store
             .admit_task_ready(
                 &envelope,
                 &envelope.conversation_id.to_string(),
@@ -630,7 +685,7 @@ impl MatrixGateway {
             )
             .await
             .map_err(|_| EnvelopeError::Shape)?;
-        Ok(true)
+        Ok(Some(winner))
     }
 }
 

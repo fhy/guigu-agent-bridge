@@ -383,6 +383,8 @@ impl AppRuntime {
                 sync = sync.with_raw_consumer(Arc::new(GatewayRawConsumer::new(
                     Arc::clone(&gateway),
                     GatewayStore::new(pool.clone()),
+                    repository.as_ref().clone(),
+                    gateway_handoff.clone(),
                 )));
                 Some(gateway)
             } else {
