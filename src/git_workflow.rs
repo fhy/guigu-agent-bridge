@@ -142,6 +142,7 @@ pub enum PolicyError {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitAuthorization {
+    pub role: Role,
     pub task_id: String,
     pub base_commit: String,
     pub allowed_paths: BTreeSet<String>,
@@ -252,6 +253,19 @@ impl ReceiptStore {
         allowlist: &Allowlist,
         receipt: &WorkflowReceipt,
     ) -> Result<(), ReceiptError> {
+        let _ = allowlist;
+        let _ = receipt;
+        Err(ReceiptError::Invalid(
+            PolicyError::MissingCommitAuthorization,
+        ))
+    }
+
+    pub fn append_authorized(
+        &self,
+        allowlist: &Allowlist,
+        authorization: &CommitAuthorization,
+        receipt: &WorkflowReceipt,
+    ) -> Result<(), ReceiptError> {
         let paths: Vec<String> = receipt
             .paths
             .iter()
@@ -265,7 +279,8 @@ impl ReceiptStore {
             &paths,
             None,
         )?;
-        if receipt.role != allowlist.role
+        if authorization.role != allowlist.role
+            || receipt.role != authorization.role
             || receipt.task_id.is_empty()
             || receipt.authorization_id.is_empty()
             || receipt.capability_id.is_empty()
@@ -281,18 +296,34 @@ impl ReceiptStore {
         {
             return Err(ReceiptError::Invalid(PolicyError::ResultMismatch));
         }
-        let expected_auth = format!(
-            "{}:{}:{}:{}:{}:{}",
-            receipt.capability_id,
-            receipt.task_id,
-            receipt.ref_name,
-            receipt.base_commit,
-            receipt.result_commit,
-            receipt.remote
-        );
+        let expected_auth = authorization_id(authorization, &receipt.result_commit);
         if receipt.authorization_id != expected_auth {
             return Err(ReceiptError::Invalid(PolicyError::ResultMismatch));
         }
+        if receipt.task_id != authorization.task_id
+            || receipt.ref_name != authorization.expected_ref
+            || receipt.base_commit != authorization.base_commit
+            || receipt.remote != authorization.expected_remote
+            || receipt.capability_id != authorization.capability_id
+        {
+            return Err(ReceiptError::Invalid(PolicyError::ResultMismatch));
+        }
+        check_staged_paths(
+            &receipt.staged_paths,
+            &authorization
+                .allowed_paths
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+        )?;
+        check_staged_paths(
+            &receipt.result_paths,
+            &authorization
+                .allowed_paths
+                .iter()
+                .cloned()
+                .collect::<Vec<_>>(),
+        )?;
         check_staged_paths(&receipt.staged_paths, &paths)?;
         check_staged_paths(&receipt.result_paths, &paths)?;
         let mut safe = receipt.clone();
@@ -719,8 +750,17 @@ mod tests {
             output: "token=secret".into(),
             recorded_at_unix: chrono::Utc::now().timestamp(),
         };
+        let auth = CommitAuthorization {
+            role: Role::Developer,
+            task_id: "T024".into(),
+            base_commit: "base".into(),
+            allowed_paths: ["src/lib.rs".into()].into_iter().collect(),
+            expected_remote: "origin".into(),
+            expected_ref: "refs/heads/task/T024".into(),
+            capability_id: "cap-T024".into(),
+        };
         store
-            .append(&policy(Role::Developer), &receipt)
+            .append_authorized(&policy(Role::Developer), &auth, &receipt)
             .expect("receipt");
         let loaded = store.load().expect("reload");
         assert_eq!(loaded.len(), 1);
