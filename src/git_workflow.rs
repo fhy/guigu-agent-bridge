@@ -146,6 +146,7 @@ pub enum PolicyError {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommitAuthorization {
     role: Role,
+    repository: Repository,
     task_id: String,
     base_commit: String,
     allowed_paths: BTreeSet<String>,
@@ -153,6 +154,7 @@ pub struct CommitAuthorization {
     expected_ref: String,
     capability_id: String,
     issuer_nonce: String,
+    expires_at_unix: i64,
 }
 
 impl CommitAuthorization {
@@ -170,8 +172,9 @@ impl CommitAuthorization {
             return Err(PolicyError::InvalidAuthorization);
         }
         let issuer_nonce = Uuid::now_v7().to_string();
-        Ok(Self {
+        let authorization = Self {
             role: allowlist.role,
+            repository: allowlist.repository,
             task_id: task_id.clone(),
             base_commit: base_commit.clone(),
             allowed_paths: allowlist.path_prefixes.clone(),
@@ -179,7 +182,17 @@ impl CommitAuthorization {
             expected_ref: allowlist.ref_name.clone(),
             capability_id: format!("cap-{}", Uuid::now_v7()),
             issuer_nonce,
-        })
+            expires_at_unix: chrono::Utc::now().timestamp() + 3600,
+        };
+        ISSUED_AUTHORIZATIONS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("authorization registry")
+            .insert(
+                authorization.issuer_nonce.clone(),
+                authorization_fingerprint(&authorization),
+            );
+        Ok(authorization)
     }
 }
 
@@ -222,6 +235,33 @@ fn validate_oid(value: &str) -> Result<(), PolicyError> {
         return Err(PolicyError::ResultMismatch);
     }
     Ok(())
+}
+
+fn authorization_fingerprint(auth: &CommitAuthorization) -> String {
+    format!(
+        "{:?}|{:?}|{}|{}|{}|{}|{}|{}",
+        auth.role,
+        auth.repository,
+        auth.task_id,
+        auth.base_commit,
+        auth.expected_ref,
+        auth.expected_remote,
+        auth.capability_id,
+        auth.expires_at_unix
+    )
+}
+
+fn valid_reviewer_path(path: &str, task_id: &str) -> bool {
+    let mut parts = path.split('/');
+    matches!(parts.next(), Some("reviews"))
+        && parts.next() == Some(task_id)
+        && parts.next().is_some_and(|part| {
+            !part.is_empty()
+                && part
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.')
+        })
+        && parts.next().is_none()
 }
 
 pub struct CommitRequest<'a> {
@@ -287,6 +327,7 @@ pub struct ReceiptStore {
 }
 
 static RECEIPT_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLock::new();
+static ISSUED_AUTHORIZATIONS: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
 
 impl ReceiptStore {
     pub fn open(path: impl AsRef<Path>) -> Self {
@@ -341,11 +382,13 @@ impl ReceiptStore {
             None,
         )?;
         if authorization.role != allowlist.role
+            || authorization.repository != allowlist.repository
             || receipt.role != authorization.role
             || validate_task_id(&receipt.task_id).is_err()
             || validate_ref(&receipt.ref_name).is_err()
             || receipt.authorization_id.is_empty()
             || receipt.capability_id.is_empty()
+            || receipt.repository != authorization.repository
             || receipt.remote != allowlist.remote
             || validate_oid(&receipt.base_commit).is_err()
             || validate_oid(&receipt.result_commit).is_err()
@@ -353,12 +396,23 @@ impl ReceiptStore {
             || receipt.expected_old != receipt.base_commit
             || receipt.expected_new != receipt.result_commit
             || receipt.review_owner.is_empty()
+            || receipt.expires_at_unix != authorization.expires_at_unix
             || receipt.expires_at_unix <= chrono::Utc::now().timestamp()
-            || (receipt.role == Role::Reviewer && !paths.iter().all(|p| p.starts_with("reviews/")))
+            || (receipt.role == Role::Reviewer
+                && !paths
+                    .iter()
+                    .all(|p| valid_reviewer_path(p, &receipt.task_id)))
         {
             return Err(ReceiptError::Invalid(PolicyError::ResultMismatch));
         }
-        if authorization.issuer_nonce.is_empty()
+        let issued = ISSUED_AUTHORIZATIONS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .expect("authorization registry")
+            .get(&authorization.issuer_nonce)
+            .cloned();
+        if issued.as_deref() != Some(&authorization_fingerprint(authorization))
+            || authorization.issuer_nonce.is_empty()
             || authorization.capability_id.is_empty()
             || receipt.task_id != authorization.task_id
             || receipt.role != authorization.role
@@ -835,6 +889,17 @@ mod tests {
     }
 
     #[test]
+    fn reviewer_namespace_requires_task_and_single_report_name() {
+        assert!(valid_reviewer_path("reviews/T024/report.md", "T024"));
+        assert!(!valid_reviewer_path("reviews/T025/report.md", "T024"));
+        assert!(!valid_reviewer_path(
+            "reviews/T024/nested/report.md",
+            "T024"
+        ));
+        assert!(!valid_reviewer_path("reviews/T024/../report.md", "T024"));
+    }
+
+    #[test]
     fn receipt_store_redacts_and_survives_reload() {
         let path =
             std::env::temp_dir().join(format!("guigu-receipt-{}.jsonl", uuid::Uuid::now_v7()));
@@ -872,6 +937,13 @@ mod tests {
         let mut receipt = receipt;
         receipt.capability_id = auth.capability_id.clone();
         receipt.authorization_id = authorization_id(&auth, &receipt.result_commit);
+        receipt.expires_at_unix = auth.expires_at_unix;
+        let mut forged = auth.clone();
+        forged.issuer_nonce = Uuid::now_v7().to_string();
+        assert!(matches!(
+            store.append_authorized(&policy(Role::Developer), &forged, &receipt),
+            Err(ReceiptError::Invalid(PolicyError::InvalidAuthorization))
+        ));
         store
             .append_authorized(&policy(Role::Developer), &auth, &receipt)
             .expect("receipt");
