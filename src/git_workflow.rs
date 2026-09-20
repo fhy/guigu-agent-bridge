@@ -178,6 +178,16 @@ pub fn authorize(
     paths: &[String],
     commit_message: Option<&str>,
 ) -> Result<(), PolicyError> {
+    let role_repository_ok = matches!(
+        (allowlist.role, repository),
+        (Role::Developer, Repository::Code)
+            | (Role::Coordinator, Repository::Governance)
+            | (Role::Reviewer, Repository::Governance)
+            | (Role::Observer, Repository::Code | Repository::Governance)
+    );
+    if !role_repository_ok {
+        return Err(PolicyError::WrongRepository);
+    }
     if allowlist.repository != repository {
         return Err(PolicyError::WrongRepository);
     }
@@ -257,26 +267,31 @@ pub fn classify_readback(
 
 pub fn redact_output(output: &[u8]) -> String {
     let bounded = &output[..output.len().min(MAX_OUTPUT_BYTES)];
-    let mut rendered = String::from_utf8_lossy(bounded).into_owned();
-    for marker in [
-        "Authorization:",
-        "authorization:",
-        "token=",
-        "password=",
-        "secret=",
-    ] {
-        while let Some(start) = rendered.find(marker) {
-            let value_start = start + marker.len();
-            let value_end = rendered[value_start..]
-                .find(char::is_whitespace)
-                .map(|offset| value_start + offset)
-                .unwrap_or(rendered.len());
-            rendered.replace_range(value_start..value_end, "<redacted>");
-            if value_end == value_start {
-                break;
+    let mut rendered = String::new();
+    for line in String::from_utf8_lossy(bounded).lines() {
+        let mut auth_words = 0_u8;
+        let mut words = Vec::new();
+        for word in line.split_whitespace() {
+            let lower = word.to_ascii_lowercase();
+            let sensitive = auth_words > 0
+                || lower.contains("token=")
+                || lower.contains("password=")
+                || lower.contains("secret=");
+            if lower == "authorization:" || lower.starts_with("authorization:") {
+                auth_words = 2;
+                words.push(word.to_string());
+            } else if sensitive {
+                auth_words = auth_words.saturating_sub(1);
+                words.push("<redacted>".to_string());
+            } else {
+                auth_words = auth_words.saturating_sub(1);
+                words.push(word.to_string());
             }
         }
+        rendered.push_str(&words.join(" "));
+        rendered.push('\n');
     }
+    rendered.truncate(rendered.len().min(MAX_OUTPUT_BYTES));
     rendered
 }
 
@@ -346,6 +361,31 @@ mod tests {
                 &["src/lib.rs".into()]
             ),
             Err(PolicyError::PathNotAllowed)
+        );
+    }
+
+    #[test]
+    fn redaction_does_not_loop_or_leak_bearer_values() {
+        let value = redact_output(b"token=secret Authorization: Bearer hidden");
+        assert!(!value.contains("secret"));
+        assert!(!value.contains("hidden"));
+        assert!(value.contains("<redacted>"));
+    }
+
+    #[test]
+    fn role_matrix_rejects_developer_governance_mutation() {
+        let mut governance = policy(Role::Developer);
+        governance.repository = Repository::Governance;
+        assert_eq!(
+            authorize(
+                &governance,
+                Repository::Governance,
+                "refs/heads/task/T024",
+                Operation::Commit,
+                &["src/lib.rs".into()],
+                Some("x")
+            ),
+            Err(PolicyError::WrongRepository)
         );
     }
 }
