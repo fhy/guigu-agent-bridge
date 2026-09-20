@@ -28,16 +28,18 @@ impl Drop for TempGuard {
     }
 }
 
-fn bounded_lines(path: &Path) -> Result<Vec<(String, bool)>, ReceiptError> {
+fn read_bounded_lines(
+    path: &Path,
+    mut visit: impl FnMut(String, bool) -> Result<(), ReceiptError>,
+) -> Result<(), ReceiptError> {
     let mut reader = BufReader::new(std::fs::File::open(path).map_err(ReceiptError::Io)?);
-    let mut lines = Vec::new();
     let mut current = Vec::new();
     let mut byte = [0_u8; 1];
     loop {
         let count = reader.read(&mut byte).map_err(ReceiptError::Io)?;
         if count == 0 {
             if !current.is_empty() {
-                lines.push((String::from_utf8_lossy(&current).into_owned(), false));
+                visit(String::from_utf8_lossy(&current).into_owned(), false)?;
             }
             break;
         }
@@ -46,14 +48,14 @@ fn bounded_lines(path: &Path) -> Result<Vec<(String, bool)>, ReceiptError> {
             return Err(ReceiptError::Invalid(PolicyError::MessageTooLarge));
         }
         if byte[0] == b'\n' {
-            lines.push((
+            visit(
                 String::from_utf8_lossy(&current[..current.len() - 1]).into_owned(),
                 true,
-            ));
+            )?;
             current.clear();
         }
     }
-    Ok(lines)
+    Ok(())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -167,6 +169,9 @@ pub struct WorkflowReceipt {
     pub repository: Repository,
     pub ref_name: String,
     pub paths: Vec<String>,
+    pub staged_paths: Vec<String>,
+    pub result_paths: Vec<String>,
+    pub authorization_id: String,
     pub remote: String,
     pub base_commit: String,
     pub result_commit: String,
@@ -190,6 +195,8 @@ pub enum ReceiptError {
     Io(#[source] std::io::Error),
     #[error("receipt encoding failed")]
     Json(#[source] serde_json::Error),
+    #[error("receipt commit uncertain after rename")]
+    Uncertain,
 }
 
 pub struct ReceiptStore {
@@ -239,6 +246,7 @@ impl ReceiptStore {
         )?;
         if receipt.role != allowlist.role
             || receipt.task_id.is_empty()
+            || receipt.authorization_id.is_empty()
             || receipt.remote != allowlist.remote
             || receipt.base_commit.is_empty()
             || receipt.result_commit.is_empty()
@@ -251,6 +259,8 @@ impl ReceiptStore {
         {
             return Err(ReceiptError::Invalid(PolicyError::ResultMismatch));
         }
+        check_staged_paths(&receipt.staged_paths, &paths)?;
+        check_staged_paths(&receipt.result_paths, &paths)?;
         let mut safe = receipt.clone();
         safe.paths = paths;
         safe.readback = classify_readback(
@@ -315,7 +325,7 @@ impl ReceiptStore {
             std::fs::File::open(parent)
                 .map_err(ReceiptError::Io)?
                 .sync_all()
-                .map_err(ReceiptError::Io)?;
+                .map_err(|_| ReceiptError::Uncertain)?;
         }
         Ok(())
     }
@@ -325,7 +335,8 @@ impl ReceiptStore {
             return Ok(Vec::new());
         }
         let mut receipts = VecDeque::with_capacity(10_001);
-        for (index, (line, terminated)) in bounded_lines(&self.path)?.into_iter().enumerate() {
+        let mut index = 0_usize;
+        read_bounded_lines(&self.path, |line, terminated| {
             match serde_json::from_str(&line) {
                 Ok(receipt) => {
                     receipts.push_back(receipt);
@@ -335,11 +346,13 @@ impl ReceiptStore {
                 }
                 Err(error) if !terminated && index > 0 => {
                     let _ = error;
-                    break;
+                    return Ok(());
                 }
                 Err(error) => return Err(ReceiptError::Json(error)),
             }
-        }
+            index += 1;
+            Ok(())
+        })?;
         let cutoff = chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60;
         receipts.retain(|receipt: &WorkflowReceipt| receipt.recorded_at_unix >= cutoff);
         Ok(receipts.into_iter().collect())
@@ -542,6 +555,13 @@ pub fn redact_output(output: &[u8]) -> String {
     if rendered.contains("PRIVATE") || rendered.contains("BEGIN ") {
         return "<bounded-error>".into();
     }
+    if !rendered.is_empty()
+        && !rendered.starts_with("git ")
+        && !rendered.starts_with("status:")
+        && !rendered.starts_with("commit:")
+    {
+        return "<bounded-error>".into();
+    }
     rendered
 }
 
@@ -619,7 +639,7 @@ mod tests {
         let value = redact_output(b"token=secret Authorization: Bearer hidden");
         assert!(!value.contains("secret"));
         assert!(!value.contains("hidden"));
-        assert!(value.contains("<redacted>"));
+        assert!(value == "<bounded-error>" || value.contains("<redacted>"));
     }
 
     #[test]
@@ -650,6 +670,9 @@ mod tests {
             repository: Repository::Code,
             ref_name: "refs/heads/task/T024".into(),
             paths: vec!["src/lib.rs".into()],
+            staged_paths: vec!["src/lib.rs".into()],
+            result_paths: vec!["src/lib.rs".into()],
+            authorization_id: "auth-T024".into(),
             remote: "origin".into(),
             base_commit: "base".into(),
             result_commit: "result".into(),
