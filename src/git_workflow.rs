@@ -4,7 +4,7 @@
 //! trusted ACP/full-access deployment; these checks are not an OS sandbox.
 
 use std::collections::BTreeSet;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
@@ -163,9 +163,17 @@ impl ReceiptStore {
         let normalized = if path.exists() {
             std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
         } else if path.is_absolute() {
-            path.to_path_buf()
+            path.parent()
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                .map(|p| p.join(path.file_name().unwrap_or_default()))
+                .unwrap_or_else(|| path.to_path_buf())
         } else {
-            std::env::current_dir().unwrap_or_default().join(path)
+            let absolute = std::env::current_dir().unwrap_or_default().join(path);
+            absolute
+                .parent()
+                .and_then(|p| std::fs::canonicalize(p).ok())
+                .map(|p| p.join(absolute.file_name().unwrap_or_default()))
+                .unwrap_or(absolute)
         };
         Self { path: normalized }
     }
@@ -234,35 +242,39 @@ impl ReceiptStore {
         if existing.len() >= 10_000 {
             existing.drain(..existing.len() - 9_999);
         }
-        let _ = std::fs::remove_file(&self.path);
+        let temp = self.path.with_extension("jsonl.tmp");
         let mut file = OpenOptions::new()
             .create(true)
-            .append(true)
-            .open(&self.path)
+            .write(true)
+            .truncate(true)
+            .open(&temp)
             .map_err(ReceiptError::Io)?;
         for item in existing {
             let line = serde_json::to_string(&item).map_err(ReceiptError::Json)?;
             writeln!(file, "{line}").map_err(ReceiptError::Io)?;
         }
         writeln!(file, "{encoded}").map_err(ReceiptError::Io)?;
-        file.sync_all().map_err(ReceiptError::Io)
+        file.sync_all().map_err(ReceiptError::Io)?;
+        std::fs::rename(temp, &self.path).map_err(ReceiptError::Io)
     }
 
     pub fn load(&self) -> Result<Vec<WorkflowReceipt>, ReceiptError> {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
-        let bytes = std::fs::read(&self.path).map_err(ReceiptError::Io)?;
-        let complete_tail = bytes.ends_with(b"\n");
-        let lines: Vec<String> = BufReader::new(bytes.as_slice())
-            .lines()
-            .collect::<Result<_, _>>()
-            .map_err(ReceiptError::Io)?;
-        let mut receipts = Vec::new();
-        for (index, line) in lines.iter().enumerate() {
-            match serde_json::from_str(line) {
-                Ok(receipt) => receipts.push(receipt),
-                Err(error) if !complete_tail && index > 0 && index + 1 == lines.len() => {
+        let file = std::fs::File::open(&self.path).map_err(ReceiptError::Io)?;
+        let mut receipts = VecDeque::with_capacity(10_001);
+        let mut lines = BufReader::new(file).lines().peekable();
+        while let Some(line) = lines.next() {
+            let line = line.map_err(ReceiptError::Io)?;
+            match serde_json::from_str(&line) {
+                Ok(receipt) => {
+                    receipts.push_back(receipt);
+                    if receipts.len() > 10_000 {
+                        receipts.pop_front();
+                    }
+                }
+                Err(error) if lines.peek().is_none() => {
                     let _ = error;
                     break;
                 }
@@ -271,10 +283,7 @@ impl ReceiptStore {
         }
         let cutoff = chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60;
         receipts.retain(|receipt: &WorkflowReceipt| receipt.recorded_at_unix >= cutoff);
-        if receipts.len() > 10_000 {
-            receipts.drain(..receipts.len() - 10_000);
-        }
-        Ok(receipts)
+        Ok(receipts.into_iter().collect())
     }
 }
 
