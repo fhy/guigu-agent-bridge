@@ -30,7 +30,7 @@ impl Drop for TempGuard {
 
 fn read_bounded_lines(
     path: &Path,
-    mut visit: impl FnMut(String, bool) -> Result<(), ReceiptError>,
+    mut visit: impl FnMut(String, bool) -> Result<bool, ReceiptError>,
 ) -> Result<(), ReceiptError> {
     let mut reader = BufReader::new(std::fs::File::open(path).map_err(ReceiptError::Io)?);
     let mut current = Vec::new();
@@ -39,7 +39,11 @@ fn read_bounded_lines(
         let count = reader.read(&mut byte).map_err(ReceiptError::Io)?;
         if count == 0 {
             if !current.is_empty() {
-                visit(String::from_utf8_lossy(&current).into_owned(), false)?;
+                let _ = visit(
+                    String::from_utf8(current.clone())
+                        .map_err(|_| ReceiptError::Invalid(PolicyError::MessageTooLarge))?,
+                    false,
+                )?;
             }
             break;
         }
@@ -48,10 +52,13 @@ fn read_bounded_lines(
             return Err(ReceiptError::Invalid(PolicyError::MessageTooLarge));
         }
         if byte[0] == b'\n' {
-            visit(
-                String::from_utf8_lossy(&current[..current.len() - 1]).into_owned(),
+            if !visit(
+                String::from_utf8(current[..current.len() - 1].to_vec())
+                    .map_err(|_| ReceiptError::Invalid(PolicyError::MessageTooLarge))?,
                 true,
-            )?;
+            )? {
+                break;
+            }
             current.clear();
         }
     }
@@ -140,6 +147,19 @@ pub struct CommitAuthorization {
     pub allowed_paths: BTreeSet<String>,
     pub expected_remote: String,
     pub expected_ref: String,
+    pub capability_id: String,
+}
+
+pub fn authorization_id(auth: &CommitAuthorization, result_commit: &str) -> String {
+    format!(
+        "{}:{}:{}:{}:{}:{}",
+        auth.capability_id,
+        auth.task_id,
+        auth.expected_ref,
+        auth.base_commit,
+        result_commit,
+        auth.expected_remote
+    )
 }
 
 pub struct CommitRequest<'a> {
@@ -172,6 +192,7 @@ pub struct WorkflowReceipt {
     pub staged_paths: Vec<String>,
     pub result_paths: Vec<String>,
     pub authorization_id: String,
+    pub capability_id: String,
     pub remote: String,
     pub base_commit: String,
     pub result_commit: String,
@@ -247,6 +268,7 @@ impl ReceiptStore {
         if receipt.role != allowlist.role
             || receipt.task_id.is_empty()
             || receipt.authorization_id.is_empty()
+            || receipt.capability_id.is_empty()
             || receipt.remote != allowlist.remote
             || receipt.base_commit.is_empty()
             || receipt.result_commit.is_empty()
@@ -257,6 +279,18 @@ impl ReceiptStore {
             || receipt.expires_at_unix <= chrono::Utc::now().timestamp()
             || (receipt.role == Role::Reviewer && !paths.iter().all(|p| p.starts_with("reviews/")))
         {
+            return Err(ReceiptError::Invalid(PolicyError::ResultMismatch));
+        }
+        let expected_auth = format!(
+            "{}:{}:{}:{}:{}:{}",
+            receipt.capability_id,
+            receipt.task_id,
+            receipt.ref_name,
+            receipt.base_commit,
+            receipt.result_commit,
+            receipt.remote
+        );
+        if receipt.authorization_id != expected_auth {
             return Err(ReceiptError::Invalid(PolicyError::ResultMismatch));
         }
         check_staged_paths(&receipt.staged_paths, &paths)?;
@@ -346,12 +380,12 @@ impl ReceiptStore {
                 }
                 Err(error) if !terminated && index > 0 => {
                     let _ = error;
-                    return Ok(());
+                    return Ok(false);
                 }
                 Err(error) => return Err(ReceiptError::Json(error)),
             }
             index += 1;
-            Ok(())
+            Ok(true)
         })?;
         let cutoff = chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60;
         receipts.retain(|receipt: &WorkflowReceipt| receipt.recorded_at_unix >= cutoff);
@@ -555,14 +589,11 @@ pub fn redact_output(output: &[u8]) -> String {
     if rendered.contains("PRIVATE") || rendered.contains("BEGIN ") {
         return "<bounded-error>".into();
     }
-    if !rendered.is_empty()
-        && !rendered.starts_with("git ")
-        && !rendered.starts_with("status:")
-        && !rendered.starts_with("commit:")
-    {
-        return "<bounded-error>".into();
+    if rendered.trim().is_empty() {
+        String::new()
+    } else {
+        "<bounded-error>".into()
     }
-    rendered
 }
 
 #[cfg(test)]
@@ -672,7 +703,8 @@ mod tests {
             paths: vec!["src/lib.rs".into()],
             staged_paths: vec!["src/lib.rs".into()],
             result_paths: vec!["src/lib.rs".into()],
-            authorization_id: "auth-T024".into(),
+            authorization_id: "cap-T024:T024:refs/heads/task/T024:base:result:origin".into(),
+            capability_id: "cap-T024".into(),
             remote: "origin".into(),
             base_commit: "base".into(),
             result_commit: "result".into(),
