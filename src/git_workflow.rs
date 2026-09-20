@@ -6,7 +6,7 @@
 use std::collections::BTreeSet;
 use std::collections::{HashMap, VecDeque};
 use std::fs::OpenOptions;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufReader, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -15,6 +15,46 @@ pub const MAX_PATH_BYTES: usize = 16 * 1024;
 pub const MAX_COMMIT_MESSAGE_BYTES: usize = 8 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 pub const MAX_RECEIPT_LINE_BYTES: usize = 64 * 1024;
+
+struct TempGuard {
+    path: PathBuf,
+    committed: bool,
+}
+impl Drop for TempGuard {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+fn bounded_lines(path: &Path) -> Result<Vec<(String, bool)>, ReceiptError> {
+    let mut reader = BufReader::new(std::fs::File::open(path).map_err(ReceiptError::Io)?);
+    let mut lines = Vec::new();
+    let mut current = Vec::new();
+    let mut byte = [0_u8; 1];
+    loop {
+        let count = reader.read(&mut byte).map_err(ReceiptError::Io)?;
+        if count == 0 {
+            if !current.is_empty() {
+                lines.push((String::from_utf8_lossy(&current).into_owned(), false));
+            }
+            break;
+        }
+        current.push(byte[0]);
+        if current.len() > MAX_RECEIPT_LINE_BYTES {
+            return Err(ReceiptError::Invalid(PolicyError::MessageTooLarge));
+        }
+        if byte[0] == b'\n' {
+            lines.push((
+                String::from_utf8_lossy(&current[..current.len() - 1]).into_owned(),
+                true,
+            ));
+            current.clear();
+        }
+    }
+    Ok(lines)
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Role {
@@ -246,6 +286,10 @@ impl ReceiptStore {
         let temp = self
             .path
             .with_extension(format!("jsonl.tmp.{}", uuid::Uuid::now_v7()));
+        let mut guard = TempGuard {
+            path: temp.clone(),
+            committed: false,
+        };
         let mut file = OpenOptions::new()
             .create_new(true)
             .write(true)
@@ -266,6 +310,7 @@ impl ReceiptStore {
         writeln!(file, "{encoded}").map_err(ReceiptError::Io)?;
         file.sync_all().map_err(ReceiptError::Io)?;
         std::fs::rename(&temp, &self.path).map_err(ReceiptError::Io)?;
+        guard.committed = true;
         if let Some(parent) = self.path.parent() {
             std::fs::File::open(parent)
                 .map_err(ReceiptError::Io)?
@@ -279,14 +324,8 @@ impl ReceiptStore {
         if !self.path.exists() {
             return Ok(Vec::new());
         }
-        let file = std::fs::File::open(&self.path).map_err(ReceiptError::Io)?;
         let mut receipts = VecDeque::with_capacity(10_001);
-        let mut lines = BufReader::new(file).lines().peekable();
-        while let Some(line) = lines.next() {
-            let line = line.map_err(ReceiptError::Io)?;
-            if line.len() > MAX_RECEIPT_LINE_BYTES {
-                return Err(ReceiptError::Invalid(PolicyError::MessageTooLarge));
-            }
+        for (index, (line, terminated)) in bounded_lines(&self.path)?.into_iter().enumerate() {
             match serde_json::from_str(&line) {
                 Ok(receipt) => {
                     receipts.push_back(receipt);
@@ -294,7 +333,7 @@ impl ReceiptStore {
                         receipts.pop_front();
                     }
                 }
-                Err(error) if lines.peek().is_none() => {
+                Err(error) if !terminated && index > 0 => {
                     let _ = error;
                     break;
                 }
