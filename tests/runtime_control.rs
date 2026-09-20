@@ -299,6 +299,109 @@ async fn equal_and_nested_workspace_claims_conflict_until_atomic_release() {
 }
 
 #[tokio::test]
+async fn workspace_claim_batch_failure_rolls_back_all_rows_and_reuses_connection() {
+    let db = Db::new().await;
+    let store = SqliteRuntimeStore::new(db.pool.clone());
+    let root = std::env::temp_dir().join(format!("claims-fault-{}", uuid::Uuid::now_v7()));
+    let failed = root.join("failed");
+    std::fs::create_dir_all(&failed).unwrap();
+    sqlx::query("CREATE TRIGGER fail_workspace_claim AFTER INSERT ON workspace_claims WHEN NEW.canonical_path LIKE '%/failed' BEGIN SELECT RAISE(ABORT, 'injected claim failure'); END")
+        .execute(&db.pool).await.unwrap();
+    let lease = match store
+        .acquire(key(), db.task, at(), Duration::from_secs(30))
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Acquired(value) => value,
+        _ => panic!("lease"),
+    };
+    assert!(
+        store
+            .claim_workspaces(&lease, &[root.clone(), failed.clone()])
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM workspace_claims WHERE task_id=?")
+            .bind(db.task.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        0
+    );
+    sqlx::query("DROP TRIGGER fail_workspace_claim")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    store
+        .claim_workspaces(&lease, std::slice::from_ref(&root))
+        .await
+        .unwrap();
+    store
+        .release(&lease, ReleaseDisposition::Released, at())
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    db.close().await;
+}
+
+#[tokio::test]
+async fn release_failure_rolls_back_lease_and_claims_for_connection_reuse() {
+    let db = Db::new().await;
+    let store = SqliteRuntimeStore::new(db.pool.clone());
+    let root = std::env::temp_dir().join(format!("claims-release-fault-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&root).unwrap();
+    let lease = match store
+        .acquire(key(), db.task, at(), Duration::from_secs(30))
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Acquired(value) => value,
+        _ => panic!("lease"),
+    };
+    store
+        .claim_workspaces(&lease, std::slice::from_ref(&root))
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER fail_claim_delete BEFORE DELETE ON workspace_claims BEGIN SELECT RAISE(ABORT, 'injected release failure'); END")
+        .execute(&db.pool).await.unwrap();
+    assert!(
+        store
+            .release(&lease, ReleaseDisposition::Released, at())
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM execution_leases WHERE resource_key=?")
+            .bind(lease.resource.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap(),
+        "active"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM workspace_claims WHERE task_id=? AND state='active'"
+        )
+        .bind(db.task.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap(),
+        1
+    );
+    sqlx::query("DROP TRIGGER fail_claim_delete")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    store
+        .release(&lease, ReleaseDisposition::Released, at())
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    db.close().await;
+}
+
+#[tokio::test]
 async fn expired_active_lease_becomes_recovery_needed_without_takeover() {
     let db = Db::new().await;
     let store = SqliteRuntimeStore::new(db.pool.clone());
