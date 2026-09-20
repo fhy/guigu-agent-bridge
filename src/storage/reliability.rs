@@ -22,6 +22,8 @@ pub struct WorkflowAdmission<'a> {
     pub kind: &'a str,
     pub body_hash: &'a str,
     pub now: &'a str,
+    pub task: &'a AgentTask,
+    pub delivery_id: &'a str,
 }
 
 const OUTBOX_BODY_NAMESPACE: Uuid = Uuid::from_u128(0x7297ec04_1338_57b4_9bc4_f0ff9f84fa5a);
@@ -36,6 +38,8 @@ pub enum ReliabilityError {
     NotTerminal,
     #[error("retry input does not match the immutable source task")]
     SourceMismatch,
+    #[error("workflow envelope conflicts with immutable winner")]
+    WorkflowConflict,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -113,8 +117,16 @@ impl ReliabilityStore {
             .bind(input.idempotency_key).bind(input.kind).bind(input.body_hash)
             .bind(input.now).bind(input.now).execute(&mut *tx).await?;
         if inserted.rows_affected() == 0 {
-            let row = sqlx::query("SELECT task_id,outcome FROM workflow_envelopes WHERE transport=? AND external_event_id=?")
+            let row = sqlx::query("SELECT task_id,outcome,body_hash,sender_endpoint_id,target_endpoint_id,correlation_id,idempotency_key FROM workflow_envelopes WHERE transport=? AND external_event_id=?")
                 .bind(input.transport).bind(input.external_event_id).fetch_one(&mut *tx).await?;
+            let same = row.try_get::<String, _>("body_hash")? == input.body_hash
+                && row.try_get::<String, _>("sender_endpoint_id")? == input.sender_endpoint_id
+                && row.try_get::<String, _>("target_endpoint_id")? == input.target_endpoint_id
+                && row.try_get::<String, _>("correlation_id")? == input.correlation_id
+                && row.try_get::<String, _>("idempotency_key")? == input.idempotency_key;
+            if !same {
+                return Err(ReliabilityError::WorkflowConflict);
+            }
             return Ok(ReceiptOutcome::Replay {
                 task_id: Some(row.try_get("task_id")?),
                 result_code: row
@@ -122,6 +134,27 @@ impl ReliabilityStore {
                     .unwrap_or_else(|| "reserved".into()),
             });
         }
+        sqlx::query("INSERT INTO tasks(task_id,root_task_id,parent_task_id,from_agent,to_agent,conversation_id,reply_to,text,priority,depth,hops,deadline,version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(input.task.task_id.to_string()).bind(input.task.root_task_id.to_string())
+            .bind(input.task.parent_task_id.map(|value| value.to_string()))
+            .bind(input.task.from_agent.to_string()).bind(input.task.to_agent.to_string())
+            .bind(input.task.conversation_id.to_string()).bind(input.task.reply_to.map(|value| value.to_string()))
+            .bind(&input.task.text).bind(i64::from(input.task.priority.value()))
+            .bind(i64::from(input.task.depth)).bind(i64::from(input.task.hops))
+            .bind(input.task.deadline.map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)))
+            .bind(i64::try_from(input.task.version).map_err(|_| ReliabilityError::Malformed)?)
+            .execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,1,'queued',?,?)")
+            .bind(Uuid::now_v7().to_string()).bind(input.task.task_id.to_string()).bind(input.now).bind("\"queued\"")
+            .execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,reply_room,reply_thread_root,reply_event_id,monitor_room,monitor_generation,render_version,created_at,updated_at) VALUES(?,'enqueued',0,NULL,NULL,?,?,NULL,0,'v1',?,?)")
+            .bind(input.task.task_id.to_string()).bind(input.external_event_id).bind(input.external_event_id)
+            .bind(input.now).bind(input.now).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at) VALUES(?,?,1,?,?,NULL)")
+            .bind(input.delivery_id).bind(input.task.task_id.to_string()).bind(input.target_endpoint_id).bind(input.now)
+            .execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state) VALUES(?,?,1,'prepared')")
+            .bind(input.delivery_id).bind(input.task.task_id.to_string()).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(ReceiptOutcome::Inserted)
     }

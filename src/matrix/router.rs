@@ -4,6 +4,7 @@ use super::{EventDedup, InboundMatrixEvent, PermissionPolicy, derive_matrix_user
 use crate::{
     bus::{AdmissionContext, Bus, BusError, EndpointRegistry},
     models::{AgentTask, ConversationId, Priority, TaskId, WorkflowEnvelope},
+    storage::{ReliabilityError, ReliabilityStore, WorkflowAdmission},
 };
 
 pub type MatrixAdmissionFuture<'a, T> =
@@ -82,6 +83,7 @@ pub async fn route_workflow(
     envelope: &WorkflowEnvelope,
     conversation_id: ConversationId,
     registry: &EndpointRegistry,
+    reliability: &ReliabilityStore,
     bus: &dyn Bus,
 ) -> Result<AgentTask, RouteError> {
     if envelope.schema != crate::models::workflow::WORKFLOW_SCHEMA
@@ -111,6 +113,36 @@ pub async fn route_workflow(
         deadline: None,
         version: 0,
     };
+    let now = chrono::Utc::now().to_rfc3339();
+    let body_hash =
+        uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, envelope.body.as_bytes()).to_string();
+    let sender_id = envelope.from.to_string();
+    let target_id = envelope.to.to_string();
+    let task_id = envelope.task_id.to_string();
+    let delivery_id = uuid::Uuid::now_v7().to_string();
+    let admission = reliability
+        .admit_workflow(WorkflowAdmission {
+            transport: "matrix-workflow",
+            external_event_id: &envelope.message_id,
+            sender_endpoint_id: &sender_id,
+            target_endpoint_id: &target_id,
+            task_id: &task_id,
+            correlation_id: &envelope.correlation_id,
+            idempotency_key: &envelope.idempotency_key,
+            kind: "dispatch",
+            body_hash: &body_hash,
+            now: &now,
+            task: &task,
+            delivery_id: &delivery_id,
+        })
+        .await
+        .map_err(|error| match error {
+            ReliabilityError::WorkflowConflict => RouteError::Duplicate,
+            _ => RouteError::Bus,
+        })?;
+    if matches!(admission, crate::storage::ReceiptOutcome::Replay { .. }) {
+        return Ok(task);
+    }
     bus.submit_with_context(
         task.clone(),
         AdmissionContext {

@@ -1,4 +1,4 @@
-use serde::de::{Deserializer as _, MapAccess, Visitor};
+use serde::de::{DeserializeSeed, Deserializer as _, MapAccess, Visitor};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -110,7 +110,7 @@ fn reject_duplicate_keys(raw: &str) -> Result<(), WorkflowError> {
                 if !keys.insert(key) {
                     return Err(serde::de::Error::custom("duplicate key"));
                 }
-                map.next_value::<serde_json::Value>()?;
+                map.next_value_seed(RecursiveValue)?;
             }
             Ok(())
         }
@@ -123,6 +123,68 @@ fn reject_duplicate_keys(raw: &str) -> Result<(), WorkflowError> {
             WorkflowError::InvalidJson
         }
     })
+}
+
+struct RecursiveValue;
+impl<'de> DeserializeSeed<'de> for RecursiveValue {
+    type Value = Value;
+    fn deserialize<D: serde::Deserializer<'de>>(
+        self,
+        deserializer: D,
+    ) -> Result<Self::Value, D::Error> {
+        struct Nested;
+        impl<'de> Visitor<'de> for Nested {
+            type Value = Value;
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("JSON value")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Value, A::Error> {
+                let mut out = serde_json::Map::new();
+                while let Some(key) = map.next_key::<String>()? {
+                    if out.contains_key(&key) {
+                        return Err(serde::de::Error::custom("duplicate key"));
+                    }
+                    let value = map.next_value_seed(RecursiveValue)?;
+                    out.insert(key, value);
+                }
+                Ok(Value::Object(out))
+            }
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Value, A::Error> {
+                let mut out = Vec::new();
+                while let Some(value) = seq.next_element_seed(RecursiveValue)? {
+                    out.push(value);
+                }
+                Ok(Value::Array(out))
+            }
+            fn visit_bool<E: serde::de::Error>(self, value: bool) -> Result<Value, E> {
+                Ok(Value::Bool(value))
+            }
+            fn visit_i64<E: serde::de::Error>(self, value: i64) -> Result<Value, E> {
+                Ok(Value::Number(value.into()))
+            }
+            fn visit_u64<E: serde::de::Error>(self, value: u64) -> Result<Value, E> {
+                Ok(Value::Number(value.into()))
+            }
+            fn visit_f64<E: serde::de::Error>(self, value: f64) -> Result<Value, E> {
+                serde_json::Number::from_f64(value)
+                    .map(Value::Number)
+                    .ok_or_else(|| serde::de::Error::custom("invalid number"))
+            }
+            fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Value, E> {
+                Ok(Value::String(value.into()))
+            }
+            fn visit_none<E: serde::de::Error>(self) -> Result<Value, E> {
+                Ok(Value::Null)
+            }
+            fn visit_unit<E: serde::de::Error>(self) -> Result<Value, E> {
+                Ok(Value::Null)
+            }
+        }
+        deserializer.deserialize_any(Nested)
+    }
 }
 
 pub fn canonical_metadata(envelope: &WorkflowEnvelope) -> Result<Vec<u8>, WorkflowError> {
