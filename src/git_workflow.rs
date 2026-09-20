@@ -4,6 +4,9 @@
 //! trusted ACP/full-access deployment; these checks are not an OS sandbox.
 
 use std::collections::BTreeSet;
+use std::fs::{File, OpenOptions};
+use std::io::{BufRead, BufReader, Write};
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
 pub const MAX_PATHS: usize = 256;
@@ -11,7 +14,7 @@ pub const MAX_PATH_BYTES: usize = 16 * 1024;
 pub const MAX_COMMIT_MESSAGE_BYTES: usize = 8 * 1024;
 pub const MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Role {
     Developer,
     Coordinator,
@@ -19,7 +22,7 @@ pub enum Role {
     Observer,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Repository {
     Code,
     Governance,
@@ -40,7 +43,7 @@ pub enum Operation {
     Release,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum Readback {
     Confirmed,
     Uncertain,
@@ -56,20 +59,33 @@ pub struct Allowlist {
     pub remote: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
 pub enum PolicyError {
+    #[error("wrong repository")]
     WrongRepository,
+    #[error("wrong ref")]
     WrongRef,
+    #[error("observer mutation")]
     ObserverMutation,
+    #[error("operation denied")]
     OperationDenied,
+    #[error("invalid path")]
     InvalidPath,
+    #[error("path not allowed")]
     PathNotAllowed,
+    #[error("too many paths")]
     TooManyPaths,
+    #[error("paths too large")]
     PathsTooLarge,
+    #[error("message too large")]
     MessageTooLarge,
+    #[error("empty add")]
     EmptyAdd,
+    #[error("wrong remote")]
     WrongRemote,
+    #[error("missing commit authorization")]
     MissingCommitAuthorization,
+    #[error("result mismatch")]
     ResultMismatch,
 }
 
@@ -100,6 +116,100 @@ pub struct AuditRecord {
     pub ref_name: String,
     pub result: Readback,
     pub detail: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct WorkflowReceipt {
+    pub task_id: String,
+    pub role: Role,
+    pub repository: Repository,
+    pub ref_name: String,
+    pub paths: Vec<String>,
+    pub remote: String,
+    pub base_commit: String,
+    pub result_commit: String,
+    pub readback: Readback,
+    pub output: String,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReceiptError {
+    #[error("invalid receipt: {0}")]
+    Invalid(#[from] PolicyError),
+    #[error("receipt persistence failed")]
+    Io(#[source] std::io::Error),
+    #[error("receipt encoding failed")]
+    Json(#[source] serde_json::Error),
+}
+
+pub struct ReceiptStore {
+    path: PathBuf,
+}
+
+impl ReceiptStore {
+    pub fn open(path: impl AsRef<Path>) -> Self {
+        Self {
+            path: path.as_ref().to_path_buf(),
+        }
+    }
+
+    pub fn append(
+        &self,
+        allowlist: &Allowlist,
+        receipt: &WorkflowReceipt,
+    ) -> Result<(), ReceiptError> {
+        let paths: Vec<String> = receipt
+            .paths
+            .iter()
+            .map(|p| normalize_path(p))
+            .collect::<Result<_, _>>()?;
+        authorize(
+            allowlist,
+            receipt.repository,
+            &receipt.ref_name,
+            Operation::Commit,
+            &paths,
+            None,
+        )?;
+        if receipt.task_id.is_empty()
+            || receipt.remote != allowlist.remote
+            || receipt.base_commit.is_empty()
+            || receipt.result_commit.is_empty()
+        {
+            return Err(ReceiptError::Invalid(PolicyError::ResultMismatch));
+        }
+        let mut safe = receipt.clone();
+        safe.paths = paths;
+        safe.output = redact_output(receipt.output.as_bytes());
+        if safe.output.len() > MAX_OUTPUT_BYTES {
+            safe.output.truncate(MAX_OUTPUT_BYTES);
+        }
+        let encoded = serde_json::to_string(&safe).map_err(ReceiptError::Json)?;
+        if encoded.len() > 4 * 1024 {
+            return Err(ReceiptError::Invalid(PolicyError::MessageTooLarge));
+        }
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.path)
+            .map_err(ReceiptError::Io)?;
+        writeln!(file, "{encoded}").map_err(ReceiptError::Io)
+    }
+
+    pub fn load(&self) -> Result<Vec<WorkflowReceipt>, ReceiptError> {
+        let file = match File::open(&self.path) {
+            Ok(file) => file,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(error) => return Err(ReceiptError::Io(error)),
+        };
+        BufReader::new(file)
+            .lines()
+            .map(|line| {
+                line.map_err(ReceiptError::Io)
+                    .and_then(|line| serde_json::from_str(&line).map_err(ReceiptError::Json))
+            })
+            .collect()
+    }
 }
 
 #[derive(Clone, Default)]
@@ -387,5 +497,31 @@ mod tests {
             ),
             Err(PolicyError::WrongRepository)
         );
+    }
+
+    #[test]
+    fn receipt_store_redacts_and_survives_reload() {
+        let path =
+            std::env::temp_dir().join(format!("guigu-receipt-{}.jsonl", uuid::Uuid::now_v7()));
+        let store = ReceiptStore::open(&path);
+        let receipt = WorkflowReceipt {
+            task_id: "T024".into(),
+            role: Role::Developer,
+            repository: Repository::Code,
+            ref_name: "refs/heads/task/T024".into(),
+            paths: vec!["src/lib.rs".into()],
+            remote: "origin".into(),
+            base_commit: "base".into(),
+            result_commit: "result".into(),
+            readback: Readback::Confirmed,
+            output: "token=secret".into(),
+        };
+        store
+            .append(&policy(Role::Developer), &receipt)
+            .expect("receipt");
+        let loaded = store.load().expect("reload");
+        assert_eq!(loaded.len(), 1);
+        assert!(!loaded[0].output.contains("secret"));
+        let _ = std::fs::remove_file(path);
     }
 }
