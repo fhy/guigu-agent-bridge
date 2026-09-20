@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 use std::collections::HashMap;
-use std::fs::{File, OpenOptions};
+use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -159,9 +159,15 @@ static RECEIPT_LOCKS: OnceLock<Mutex<HashMap<PathBuf, Arc<Mutex<()>>>>> = OnceLo
 
 impl ReceiptStore {
     pub fn open(path: impl AsRef<Path>) -> Self {
-        Self {
-            path: path.as_ref().to_path_buf(),
-        }
+        let path = path.as_ref();
+        let normalized = if path.exists() {
+            std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+        } else if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            std::env::current_dir().unwrap_or_default().join(path)
+        };
+        Self { path: normalized }
     }
 
     pub fn append(
@@ -222,22 +228,33 @@ impl ReceiptStore {
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone();
         let _guard = lock.lock().expect("receipt append mutex");
+        let mut existing = self.load()?;
+        let cutoff = chrono::Utc::now().timestamp() - 30 * 24 * 60 * 60;
+        existing.retain(|item| item.recorded_at_unix >= cutoff);
+        if existing.len() >= 10_000 {
+            existing.drain(..existing.len() - 9_999);
+        }
+        let _ = std::fs::remove_file(&self.path);
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
             .open(&self.path)
             .map_err(ReceiptError::Io)?;
+        for item in existing {
+            let line = serde_json::to_string(&item).map_err(ReceiptError::Json)?;
+            writeln!(file, "{line}").map_err(ReceiptError::Io)?;
+        }
         writeln!(file, "{encoded}").map_err(ReceiptError::Io)?;
         file.sync_all().map_err(ReceiptError::Io)
     }
 
     pub fn load(&self) -> Result<Vec<WorkflowReceipt>, ReceiptError> {
-        let file = match File::open(&self.path) {
-            Ok(file) => file,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-            Err(error) => return Err(ReceiptError::Io(error)),
-        };
-        let lines: Vec<String> = BufReader::new(file)
+        if !self.path.exists() {
+            return Ok(Vec::new());
+        }
+        let bytes = std::fs::read(&self.path).map_err(ReceiptError::Io)?;
+        let complete_tail = bytes.ends_with(b"\n");
+        let lines: Vec<String> = BufReader::new(bytes.as_slice())
             .lines()
             .collect::<Result<_, _>>()
             .map_err(ReceiptError::Io)?;
@@ -245,7 +262,7 @@ impl ReceiptStore {
         for (index, line) in lines.iter().enumerate() {
             match serde_json::from_str(line) {
                 Ok(receipt) => receipts.push(receipt),
-                Err(error) if index > 0 && index + 1 == lines.len() => {
+                Err(error) if !complete_tail && index > 0 && index + 1 == lines.len() => {
                     let _ = error;
                     break;
                 }
