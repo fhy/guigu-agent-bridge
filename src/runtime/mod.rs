@@ -216,11 +216,30 @@ impl SqliteRuntimeStore {
     ) -> Result<AcquireOutcome, RuntimeError> {
         let owner = Uuid::now_v7();
         let expires = add(now, ttl)?;
-        let mut tx = self.pool.begin().await?;
-        let inserted=sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES(?,?,?,1,'active',?,?,?) ON CONFLICT(resource_key) DO NOTHING")
-            .bind(resource.to_string()).bind(task_id.to_string()).bind(owner.to_string()).bind(ts(now)).bind(ts(now)).bind(ts(expires)).execute(&mut *tx).await?;
+        let mut conn = match self.pool.acquire().await {
+            Ok(value) => value,
+            Err(error) => return Err(error.into()),
+        };
+        if let Err(error) = sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await {
+            if error.to_string().contains("database is locked") {
+                return Ok(AcquireOutcome::Busy);
+            }
+            return Err(error.into());
+        }
+        let inserted = match sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES(?,?,?,1,'active',?,?,?) ON CONFLICT(resource_key) DO NOTHING")
+            .bind(resource.to_string()).bind(task_id.to_string()).bind(owner.to_string()).bind(ts(now)).bind(ts(now)).bind(ts(expires)).execute(&mut *conn).await {
+            Ok(value) => value,
+            Err(error) if error.to_string().contains("database is locked") => return Ok(AcquireOutcome::Busy),
+            Err(error) => return Err(error.into()),
+        };
         if inserted.rows_affected() == 1 {
-            tx.commit().await?;
+            if let Err(error) = sqlx::query("COMMIT").execute(&mut *conn).await {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                if error.to_string().contains("database is locked") {
+                    return Ok(AcquireOutcome::Busy);
+                }
+                return Err(error.into());
+            }
             return Ok(AcquireOutcome::Acquired(Lease {
                 resource,
                 task_id,
@@ -229,11 +248,19 @@ impl SqliteRuntimeStore {
                 expires_at: expires,
             }));
         }
-        let row =
-            sqlx::query("SELECT fence,state,expires_at FROM execution_leases WHERE resource_key=?")
-                .bind(resource.to_string())
-                .fetch_optional(&mut *tx)
-                .await?;
+        let row = match sqlx::query(
+            "SELECT fence,state,expires_at FROM execution_leases WHERE resource_key=?",
+        )
+        .bind(resource.to_string())
+        .fetch_optional(&mut *conn)
+        .await
+        {
+            Ok(value) => value,
+            Err(error) if error.to_string().contains("database is locked") => {
+                return Ok(AcquireOutcome::Busy);
+            }
+            Err(error) => return Err(error.into()),
+        };
         let outcome = if let Some(row) = row {
             let state: String = row.try_get("state").map_err(|_| RuntimeError::Malformed)?;
             match state.as_str() {
@@ -246,8 +273,11 @@ impl SqliteRuntimeStore {
                     if expired <= now {
                         let fence: i64 =
                             row.try_get("fence").map_err(|_| RuntimeError::Malformed)?;
-                        sqlx::query("UPDATE execution_leases SET state='recovery_needed',heartbeat_at=? WHERE resource_key=? AND state='active' AND fence=?")
-                            .bind(ts(now)).bind(resource.to_string()).bind(fence).execute(&mut *tx).await?;
+                        if let Err(error) = sqlx::query("UPDATE execution_leases SET state='recovery_needed',heartbeat_at=? WHERE resource_key=? AND state='active' AND fence=?")
+                            .bind(ts(now)).bind(resource.to_string()).bind(fence).execute(&mut *conn).await {
+                            if error.to_string().contains("database is locked") { return Ok(AcquireOutcome::Busy); }
+                            return Err(error.into());
+                        }
                         AcquireOutcome::RecoveryNeeded
                     } else {
                         AcquireOutcome::Busy
@@ -260,8 +290,12 @@ impl SqliteRuntimeStore {
                         .ok()
                         .and_then(|v| v.checked_add(1))
                         .ok_or(RuntimeError::Malformed)?;
-                    let result=sqlx::query("UPDATE execution_leases SET task_id=?,owner_token=?,fence=?,state='active',acquired_at=?,heartbeat_at=?,expires_at=? WHERE resource_key=? AND state='released' AND fence=?")
-                        .bind(task_id.to_string()).bind(owner.to_string()).bind(to_i64(fence)?).bind(ts(now)).bind(ts(now)).bind(ts(expires)).bind(resource.to_string()).bind(old).execute(&mut *tx).await?;
+                    let result=match sqlx::query("UPDATE execution_leases SET task_id=?,owner_token=?,fence=?,state='active',acquired_at=?,heartbeat_at=?,expires_at=? WHERE resource_key=? AND state='released' AND fence=?")
+                        .bind(task_id.to_string()).bind(owner.to_string()).bind(to_i64(fence)?).bind(ts(now)).bind(ts(now)).bind(ts(expires)).bind(resource.to_string()).bind(old).execute(&mut *conn).await {
+                        Ok(value) => value,
+                        Err(error) if error.to_string().contains("database is locked") => return Ok(AcquireOutcome::Busy),
+                        Err(error) => return Err(error.into()),
+                    };
                     if result.rows_affected() != 1 {
                         return Err(RuntimeError::Fenced);
                     }
@@ -278,7 +312,13 @@ impl SqliteRuntimeStore {
         } else {
             return Err(RuntimeError::Malformed);
         };
-        tx.commit().await?;
+        if let Err(error) = sqlx::query("COMMIT").execute(&mut *conn).await {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            if error.to_string().contains("database is locked") {
+                return Ok(AcquireOutcome::Busy);
+            }
+            return Err(error.into());
+        }
         Ok(outcome)
     }
 
@@ -311,11 +351,12 @@ impl SqliteRuntimeStore {
         for path in paths {
             candidates.push((path.to_string_lossy().into_owned(), path_components(path)?));
         }
-        let mut tx = self.pool.begin().await?;
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
         let rows = sqlx::query(
             "SELECT canonical_path,path_components_json FROM workspace_claims WHERE state='active'",
         )
-        .fetch_all(&mut *tx)
+        .fetch_all(&mut *conn)
         .await?;
         for (_, components) in &candidates {
             for row in &rows {
@@ -325,6 +366,7 @@ impl SqliteRuntimeStore {
                 let existing: Vec<String> =
                     serde_json::from_str(&existing).map_err(|_| RuntimeError::Malformed)?;
                 if overlaps(components, &existing) {
+                    let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
                     return Err(RuntimeError::Busy);
                 }
             }
@@ -333,25 +375,9 @@ impl SqliteRuntimeStore {
             sqlx::query("INSERT INTO workspace_claims(claim_id,runtime_owner,task_id,canonical_path,path_components_json,owner_fence,revision,state,created_at,updated_at) VALUES(?,?,?,?,?,?,1,'active',?,?)")
                 .bind(Uuid::now_v7().to_string()).bind(lease.owner.to_string()).bind(lease.task_id.to_string())
                 .bind(path).bind(serde_json::to_string(&components).map_err(|_| RuntimeError::Malformed)?)
-                .bind(to_i64(lease.fence)?).bind(ts(lease.expires_at)).bind(ts(lease.expires_at)).execute(&mut *tx).await?;
+                .bind(to_i64(lease.fence)?).bind(ts(lease.expires_at)).bind(ts(lease.expires_at)).execute(&mut *conn).await?;
         }
-        tx.commit().await?;
-        Ok(())
-    }
-
-    async fn release_workspace_claims(
-        &self,
-        lease: &Lease,
-        disposition: ReleaseDisposition,
-        now: DateTime<Utc>,
-    ) -> Result<(), RuntimeError> {
-        if disposition == ReleaseDisposition::Released {
-            sqlx::query("DELETE FROM workspace_claims WHERE runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'")
-                .bind(lease.owner.to_string()).bind(lease.task_id.to_string()).bind(to_i64(lease.fence)?).execute(&self.pool).await?;
-        } else {
-            sqlx::query("UPDATE workspace_claims SET state='recovery_needed',revision=revision+1,updated_at=? WHERE runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'")
-                .bind(ts(now)).bind(lease.owner.to_string()).bind(lease.task_id.to_string()).bind(to_i64(lease.fence)?).execute(&self.pool).await?;
-        }
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
         Ok(())
     }
 
@@ -365,13 +391,23 @@ impl SqliteRuntimeStore {
             ReleaseDisposition::Released => "released",
             ReleaseDisposition::RecoveryNeeded => "recovery_needed",
         };
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
         let result=sqlx::query("UPDATE execution_leases SET state=?,heartbeat_at=?,expires_at=? WHERE resource_key=? AND owner_token=? AND fence=? AND state='active'")
-            .bind(state).bind(ts(now)).bind(ts(now)).bind(lease.resource.to_string()).bind(lease.owner.to_string()).bind(to_i64(lease.fence)?).execute(&self.pool).await?;
-        if result.rows_affected() == 1 {
-            self.release_workspace_claims(lease, disposition, now).await
-        } else {
-            Err(RuntimeError::Fenced)
+            .bind(state).bind(ts(now)).bind(ts(now)).bind(lease.resource.to_string()).bind(lease.owner.to_string()).bind(to_i64(lease.fence)?).execute(&mut *conn).await?;
+        if result.rows_affected() != 1 {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+            return Err(RuntimeError::Fenced);
         }
+        if disposition == ReleaseDisposition::Released {
+            sqlx::query("DELETE FROM workspace_claims WHERE runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'")
+                .bind(lease.owner.to_string()).bind(lease.task_id.to_string()).bind(to_i64(lease.fence)?).execute(&mut *conn).await?;
+        } else {
+            sqlx::query("UPDATE workspace_claims SET state='recovery_needed',revision=revision+1,updated_at=? WHERE runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'")
+                .bind(ts(now)).bind(lease.owner.to_string()).bind(lease.task_id.to_string()).bind(to_i64(lease.fence)?).execute(&mut *conn).await?;
+        }
+        sqlx::query("COMMIT").execute(&mut *conn).await?;
+        Ok(())
     }
 
     pub async fn begin_continuation(

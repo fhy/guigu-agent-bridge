@@ -236,6 +236,69 @@ async fn concurrent_acquire_is_atomic_and_stale_owners_are_fenced() {
 }
 
 #[tokio::test]
+async fn equal_and_nested_workspace_claims_conflict_until_atomic_release() {
+    let db = Db::new().await;
+    let store = SqliteRuntimeStore::new(db.pool.clone());
+    let root = std::env::temp_dir().join(format!("claims-{}", uuid::Uuid::now_v7()));
+    let nested = root.join("nested");
+    std::fs::create_dir_all(&nested).unwrap();
+    let first_key = ExecutionResourceKey::new(
+        derive_endpoint_id("to"),
+        WorkspaceId::from_canonical_path(&root).unwrap(),
+    );
+    let second_key = ExecutionResourceKey::new(
+        derive_endpoint_id("from"),
+        WorkspaceId::from_canonical_path(&nested).unwrap(),
+    );
+    let first = match store
+        .acquire(first_key, db.task, at(), Duration::from_secs(30))
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Acquired(value) => value,
+        _ => panic!("first lease"),
+    };
+    let second = match store
+        .acquire(second_key, db.task, at(), Duration::from_secs(30))
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Acquired(value) => value,
+        _ => panic!("second lease"),
+    };
+    store
+        .claim_workspaces(&first, std::slice::from_ref(&root))
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .claim_workspaces(&second, std::slice::from_ref(&root))
+            .await,
+        Err(RuntimeError::Busy)
+    ));
+    assert!(matches!(
+        store
+            .claim_workspaces(&second, std::slice::from_ref(&nested))
+            .await,
+        Err(RuntimeError::Busy)
+    ));
+    store
+        .release(&first, ReleaseDisposition::Released, at())
+        .await
+        .unwrap();
+    store
+        .claim_workspaces(&second, std::slice::from_ref(&nested))
+        .await
+        .unwrap();
+    store
+        .release(&second, ReleaseDisposition::Released, at())
+        .await
+        .unwrap();
+    std::fs::remove_dir_all(root).unwrap();
+    db.close().await;
+}
+
+#[tokio::test]
 async fn expired_active_lease_becomes_recovery_needed_without_takeover() {
     let db = Db::new().await;
     let store = SqliteRuntimeStore::new(db.pool.clone());
