@@ -20,7 +20,7 @@ Matrix      用户交互、观测和人工控制界面
 
 ## 开发准备
 
-需要 Rust stable toolchain。初始化项目后可运行：
+需要 Rust 1.88 或更新的 stable toolchain。初始化项目后可运行：
 
 ```bash
 cargo check
@@ -30,11 +30,18 @@ cargo fmt --check
 
 推荐先阅读架构文档，再按其中的阶段顺序实现模型、内存 Bus、SQLite、Matrix Observer 和 ACP Adapter。
 
+## 发布与替换
+
+v0.1.0 的配置核验、SQLite 迁移、`opencode-chat-bridge` 替换、健康检查、
+监控和回滚步骤见 [docs/RELEASE.md](docs/RELEASE.md)。迁移由进程启动时自动执行；
+发布前必须备份数据库，并且不得让新旧 Bridge 同时消费同一 Matrix 账户或房间。
+
 ## 目录
 
 ```text
 src/main.rs              程序入口
 docs/ARCHITECTURE.md     已确定的架构和实施方案
+docs/RELEASE.md          部署、监控、迁移和回滚清单
 docs/decisions/          架构决策记录
 docs/integrations/       外部集成边界
 Cargo.toml               Rust 项目清单

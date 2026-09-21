@@ -268,6 +268,22 @@ async fn authenticated_pause_uses_real_router_and_marks_running_queue_paused() {
             .await
             .unwrap();
     }
+    tokio::time::timeout(Duration::from_secs(30), async {
+        loop {
+            let state: Option<String> =
+                sqlx::query_scalar("SELECT state FROM task_continuations WHERE task_id=?")
+                    .bind(task.task_id.to_string())
+                    .fetch_optional(&harness.pool)
+                    .await
+                    .unwrap();
+            if state.as_deref() == Some("in_flight") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("prepared execution entered an in-flight turn");
     let mut endpoints = std::collections::HashMap::new();
     endpoints.insert(task.to_agent, leased);
     let router = Arc::new(AcpDispatcherRouter::new(endpoints));
