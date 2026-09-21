@@ -3,7 +3,7 @@ use guigu_agent_bridge::storage::{
 };
 use guigu_agent_bridge::{
     app::OutboxDrain,
-    bus::MemoryBus,
+    bus::{MemoryBus, derive_endpoint_id},
     config::load_from_str,
     matrix::{MatrixOutboxSender, ReplyError, ReplyFuture, RouteError, route_workflow},
     models::{
@@ -79,6 +79,7 @@ async fn workflow_replay_compares_identity_and_classifies_idempotency_conflict()
         now: "2026-09-20T00:00:00Z",
         task: &task,
         delivery_id: &delivery,
+        authorization: None,
     };
     assert_eq!(
         store.admit_workflow(input).await.unwrap(),
@@ -106,6 +107,7 @@ async fn workflow_replay_compares_identity_and_classifies_idempotency_conflict()
         task_id: &handoff_key,
         task: &handoff_task,
         delivery_id: &handoff_delivery,
+        authorization: None,
         ..input
     };
     assert_eq!(
@@ -139,11 +141,18 @@ async fn workflow_replay_compares_identity_and_classifies_idempotency_conflict()
 #[tokio::test]
 async fn workflow_authorization_reads_durable_owner_and_review_namespace() {
     let pool = database().await;
-    let (endpoint, conversation, _, _) = seed(&pool, "completed").await;
-    let store = ReliabilityStore::new(pool);
-    let task_id = Uuid::now_v7().to_string();
+    let (endpoint, conversation, seeded_task_id, _) = seed(&pool, "completed").await;
+    let store = ReliabilityStore::new(pool.clone());
+    let task_id = seeded_task_id;
     let task = workflow_task(&endpoint, &endpoint, &conversation, &task_id);
     let task_key = task.task_id.to_string();
+    sqlx::query("INSERT INTO task_admissions(task_id,state,revision,created_at,updated_at) VALUES (?,'enqueued',0,?,?)")
+        .bind(&task_key)
+        .bind("2026-09-20T00:00:00Z")
+        .bind("2026-09-20T00:00:00Z")
+        .execute(&pool)
+        .await
+        .unwrap();
     let delivery = Uuid::now_v7().to_string();
     let input = guigu_agent_bridge::storage::WorkflowAdmission {
         transport: "matrix-workflow",
@@ -158,34 +167,15 @@ async fn workflow_authorization_reads_durable_owner_and_review_namespace() {
         now: "2026-09-20T00:00:00Z",
         task: &task,
         delivery_id: &delivery,
+        authorization: Some(guigu_agent_bridge::storage::WorkflowAuthorization {
+            endpoint: &endpoint,
+            role: WorkflowRole::Developer,
+            expected_revision: 0,
+        }),
     };
     assert_eq!(
         store.admit_workflow(input).await.unwrap(),
         ReceiptOutcome::Inserted
-    );
-    assert!(
-        store
-            .authorize_workflow_task(&task_key, &endpoint, WorkflowRole::Developer, "work:case")
-            .await
-            .unwrap()
-    );
-    assert!(
-        !store
-            .authorize_workflow_task(&task_key, "other", WorkflowRole::Developer, "work:case")
-            .await
-            .unwrap()
-    );
-    assert!(
-        store
-            .authorize_workflow_task(&task_key, &endpoint, WorkflowRole::Reviewer, "review:case")
-            .await
-            .unwrap()
-    );
-    assert!(
-        !store
-            .authorize_workflow_task(&task_key, &endpoint, WorkflowRole::Reviewer, "work:case")
-            .await
-            .unwrap()
     );
 }
 
@@ -193,10 +183,10 @@ async fn workflow_authorization_reads_durable_owner_and_review_namespace() {
 async fn route_workflow_rejects_spoofed_sender_and_unauthorized_role_before_admission() {
     let pool = database().await;
     let reliability = ReliabilityStore::new(pool);
-    let config = load_from_str("").unwrap();
+    let config = load_from_str("[agents.worker]\ntransport=\"acp\"\ncommand=\"worker\"\nworkspace=\"/tmp\"\nenabled=true\n[agents.other]\ntransport=\"acp\"\ncommand=\"other\"\nworkspace=\"/tmp\"\nenabled=true\n").unwrap();
     let (bus, _receivers) = MemoryBus::from_config(&config, 2);
-    let from = EndpointId::generate();
-    let to = EndpointId::generate();
+    let from = derive_endpoint_id("worker");
+    let to = derive_endpoint_id("other");
     let envelope = WorkflowEnvelope {
         schema: "workflow.v1".into(),
         kind: WorkflowKind::Handoff,
@@ -262,6 +252,49 @@ async fn route_workflow_rejects_spoofed_sender_and_unauthorized_role_before_admi
         .unwrap_err(),
         RouteError::Forbidden
     );
+}
+
+#[tokio::test]
+async fn workflow_owner_revision_cas_allows_one_concurrent_transition() {
+    let pool = database().await;
+    let (endpoint, conversation, task_id, _) = seed(&pool, "completed").await;
+    sqlx::query("INSERT INTO task_admissions(task_id,state,revision,created_at,updated_at) VALUES (?,'enqueued',0,?,?)")
+        .bind(&task_id).bind("2026-09-20T00:00:00Z").bind("2026-09-20T00:00:00Z")
+        .execute(&pool).await.unwrap();
+    let task = workflow_task(&endpoint, &endpoint, &conversation, &task_id);
+    let a = ReliabilityStore::new(pool.clone());
+    let b = ReliabilityStore::new(pool);
+    let make = |event: &'static str, idem: &'static str, delivery: String| {
+        guigu_agent_bridge::storage::WorkflowAdmission {
+            transport: "matrix-workflow",
+            external_event_id: event,
+            sender_endpoint_id: &endpoint,
+            target_endpoint_id: &endpoint,
+            task_id: &task_id,
+            correlation_id: "review:cas",
+            idempotency_key: idem,
+            kind: "handoff",
+            body_hash: event,
+            now: "2026-09-20T00:00:00Z",
+            task: &task,
+            delivery_id: Box::leak(delivery.into_boxed_str()),
+            authorization: Some(guigu_agent_bridge::storage::WorkflowAuthorization {
+                endpoint: &endpoint,
+                role: WorkflowRole::Reviewer,
+                expected_revision: 0,
+            }),
+        }
+    };
+    let (left, right) = tokio::join!(
+        a.admit_workflow(make("cas-a", "cas-a", Uuid::now_v7().to_string())),
+        b.admit_workflow(make("cas-b", "cas-b", Uuid::now_v7().to_string()))
+    );
+    assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
+    assert!(left.is_err() || right.is_err());
+    let stale = a
+        .admit_workflow(make("cas-stale", "cas-stale", Uuid::now_v7().to_string()))
+        .await;
+    assert!(matches!(stale, Err(ReliabilityError::WorkflowUnauthorized)));
 }
 
 fn retry<'a>(

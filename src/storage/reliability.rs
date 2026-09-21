@@ -24,6 +24,14 @@ pub struct WorkflowAdmission<'a> {
     pub now: &'a str,
     pub task: &'a AgentTask,
     pub delivery_id: &'a str,
+    pub authorization: Option<WorkflowAuthorization<'a>>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WorkflowAuthorization<'a> {
+    pub endpoint: &'a str,
+    pub role: WorkflowRole,
+    pub expected_revision: i64,
 }
 
 const OUTBOX_BODY_NAMESPACE: Uuid = Uuid::from_u128(0x7297ec04_1338_57b4_9bc4_f0ff9f84fa5a);
@@ -40,6 +48,8 @@ pub enum ReliabilityError {
     SourceMismatch,
     #[error("workflow envelope conflicts with immutable winner")]
     WorkflowConflict,
+    #[error("workflow authorization does not match durable task state")]
+    WorkflowUnauthorized,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -104,31 +114,6 @@ impl ReliabilityStore {
         Self { pool }
     }
 
-    /// Checks the durable task owner before accepting a transition. The review
-    /// namespace is carried by the persisted correlation id (`review:`).
-    pub async fn authorize_workflow_task(
-        &self,
-        task_id: &str,
-        endpoint: &str,
-        role: WorkflowRole,
-        correlation_id: &str,
-    ) -> Result<bool, ReliabilityError> {
-        let row = sqlx::query("SELECT from_agent,to_agent FROM tasks WHERE task_id=?")
-            .bind(task_id)
-            .fetch_optional(&self.pool)
-            .await?;
-        let Some(row) = row else { return Ok(false) };
-        let from_agent: String = row.try_get("from_agent")?;
-        let to_agent: String = row.try_get("to_agent")?;
-        let allowed = match role {
-            WorkflowRole::Coordinator => true,
-            WorkflowRole::Developer => to_agent == endpoint,
-            WorkflowRole::Reviewer => to_agent == endpoint && correlation_id.starts_with("review:"),
-            WorkflowRole::Observer => false,
-        };
-        Ok(allowed && !from_agent.is_empty())
-    }
-
     /// Atomically reserves one workflow envelope. Identical keys replay; a
     /// conflicting key is rejected by SQLite uniqueness without mutation.
     pub async fn admit_workflow(
@@ -136,6 +121,44 @@ impl ReliabilityStore {
         input: WorkflowAdmission<'_>,
     ) -> Result<ReceiptOutcome, ReliabilityError> {
         let mut tx = self.pool.begin().await?;
+        if let Some(auth) = &input.authorization {
+            let task_row = sqlx::query("SELECT from_agent,to_agent FROM tasks WHERE task_id=?")
+                .bind(input.task_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+            let Some(task_row) = task_row else {
+                return Err(ReliabilityError::WorkflowUnauthorized);
+            };
+            let from_agent: String = task_row.try_get("from_agent")?;
+            let to_agent: String = task_row.try_get("to_agent")?;
+            let owner_allowed = match auth.role {
+                WorkflowRole::Coordinator => true,
+                WorkflowRole::Developer => to_agent == auth.endpoint,
+                WorkflowRole::Reviewer => {
+                    to_agent == auth.endpoint && input.correlation_id.starts_with("review:")
+                }
+                WorkflowRole::Observer => false,
+            };
+            if from_agent.is_empty() || !owner_allowed {
+                return Err(ReliabilityError::WorkflowUnauthorized);
+            }
+            let admission =
+                sqlx::query("SELECT state,revision FROM task_admissions WHERE task_id=?")
+                    .bind(input.task_id)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+            let Some(admission) = admission else {
+                return Err(ReliabilityError::WorkflowUnauthorized);
+            };
+            let revision: i64 = admission.try_get("revision")?;
+            let state: String = admission.try_get("state")?;
+            if revision != auth.expected_revision
+                || state == "terminal"
+                || state == "recovery_needed"
+            {
+                return Err(ReliabilityError::WorkflowUnauthorized);
+            }
+        }
         let inserted = sqlx::query("INSERT INTO workflow_envelopes(transport,external_event_id,sender_endpoint_id,target_endpoint_id,task_id,correlation_id,idempotency_key,schema,kind,state,outcome,body_hash,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'workflow.v1',?,'reserved',NULL,?,?,?) ON CONFLICT(transport,external_event_id) DO NOTHING")
             .bind(input.transport).bind(input.external_event_id).bind(input.sender_endpoint_id)
             .bind(input.target_endpoint_id).bind(input.task_id).bind(input.correlation_id)
@@ -187,7 +210,8 @@ impl ReliabilityStore {
                     .unwrap_or_else(|| "reserved".into()),
             });
         }
-        sqlx::query("INSERT INTO tasks(task_id,root_task_id,parent_task_id,from_agent,to_agent,conversation_id,reply_to,text,priority,depth,hops,deadline,version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
+        if input.authorization.is_none() {
+            sqlx::query("INSERT INTO tasks(task_id,root_task_id,parent_task_id,from_agent,to_agent,conversation_id,reply_to,text,priority,depth,hops,deadline,version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(input.task.task_id.to_string()).bind(input.task.root_task_id.to_string())
             .bind(input.task.parent_task_id.map(|value| value.to_string()))
             .bind(input.task.from_agent.to_string()).bind(input.task.to_agent.to_string())
@@ -197,12 +221,17 @@ impl ReliabilityStore {
             .bind(input.task.deadline.map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)))
             .bind(i64::try_from(input.task.version).map_err(|_| ReliabilityError::Malformed)?)
             .execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,1,'queued',?,?)")
+            sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,1,'queued',?,?)")
             .bind(Uuid::now_v7().to_string()).bind(input.task.task_id.to_string()).bind(input.now).bind("\"queued\"")
             .execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,reply_room,reply_thread_root,reply_event_id,monitor_room,monitor_generation,render_version,created_at,updated_at) VALUES(?,'enqueued',0,NULL,NULL,?,?,NULL,0,'v1',?,?)")
+            sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,reply_room,reply_thread_root,reply_event_id,monitor_room,monitor_generation,render_version,created_at,updated_at) VALUES(?,'enqueued',0,NULL,NULL,?,?,NULL,0,'v1',?,?)")
             .bind(input.task.task_id.to_string()).bind(input.external_event_id).bind(input.external_event_id)
             .bind(input.now).bind(input.now).execute(&mut *tx).await?;
+        } else if let Some(auth) = &input.authorization {
+            sqlx::query("UPDATE task_admissions SET revision=revision+1,updated_at=? WHERE task_id=? AND revision=?")
+                .bind(input.now).bind(input.task_id).bind(auth.expected_revision)
+                .execute(&mut *tx).await?;
+        }
         sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at) VALUES(?,?,1,?,?,NULL)")
             .bind(input.delivery_id).bind(input.task.task_id.to_string()).bind(input.target_endpoint_id).bind(input.now)
             .execute(&mut *tx).await?;

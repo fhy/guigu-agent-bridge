@@ -7,7 +7,7 @@ use crate::{
         AgentTask, AuthenticatedWorkflowIngress, ConversationId, Priority, TaskId,
         WorkflowEnvelope, authorize_workflow, kind_name,
     },
-    storage::{ReliabilityError, ReliabilityStore, WorkflowAdmission},
+    storage::{ReliabilityError, ReliabilityStore, WorkflowAdmission, WorkflowAuthorization},
 };
 
 pub type MatrixAdmissionFuture<'a, T> =
@@ -102,19 +102,6 @@ pub async fn route_workflow(
     if envelope.from != ingress.endpoint || !authorize_workflow(ingress.role, envelope.kind) {
         return Err(RouteError::Forbidden);
     }
-    if !matches!(envelope.kind, crate::models::WorkflowKind::Dispatch)
-        && !reliability
-            .authorize_workflow_task(
-                &envelope.task_id.to_string(),
-                &ingress.endpoint.to_string(),
-                ingress.role,
-                &envelope.correlation_id,
-            )
-            .await
-            .map_err(|_| RouteError::Bus)?
-    {
-        return Err(RouteError::Forbidden);
-    }
     registry
         .validate_target(envelope.to)
         .map_err(|_| RouteError::Target)?;
@@ -154,10 +141,18 @@ pub async fn route_workflow(
             now: &now,
             task: &task,
             delivery_id: &delivery_id,
+            authorization: (!matches!(envelope.kind, crate::models::WorkflowKind::Dispatch)).then(
+                || WorkflowAuthorization {
+                    endpoint: &sender_id,
+                    role: ingress.role,
+                    expected_revision: 0,
+                },
+            ),
         })
         .await
         .map_err(|error| match error {
             ReliabilityError::WorkflowConflict => RouteError::Duplicate,
+            ReliabilityError::WorkflowUnauthorized => RouteError::Forbidden,
             _ => RouteError::Bus,
         })?;
     if matches!(admission, crate::storage::ReceiptOutcome::Replay { .. }) {
