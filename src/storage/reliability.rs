@@ -230,6 +230,7 @@ impl ReliabilityStore {
     pub async fn claim_next(
         &self,
         target_endpoint_id: &str,
+        resource_key: &str,
         runtime_owner: &str,
         owner_fence: i64,
         now: &str,
@@ -237,15 +238,21 @@ impl ReliabilityStore {
         let mut conn = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
         let result = async {
+            let lease = sqlx::query("SELECT task_id FROM execution_leases WHERE resource_key=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
+                .bind(resource_key).bind(runtime_owner).bind(owner_fence).bind(now).fetch_optional(&mut *conn).await?;
+            let Some(lease) = lease else { return Err(ReliabilityError::WorkflowConflict); };
+            let lease_task: String = lease.try_get("task_id")?;
             let row = sqlx::query("SELECT queue_id,task_id,revision FROM agent_work_queue WHERE target_endpoint_id=? AND lane='ordinary' AND state='queued' ORDER BY sequence LIMIT 1")
                 .bind(target_endpoint_id).fetch_optional(&mut *conn).await?;
             let Some(row) = row else { return Ok(None); };
             let queue_id: String = row.try_get("queue_id")?;
+            let task_id: String = row.try_get("task_id")?;
+            if task_id != lease_task { return Err(ReliabilityError::WorkflowConflict); }
             let revision: i64 = row.try_get("revision")?;
             let next = sqlx::query("UPDATE agent_work_queue SET state='claimed',revision=revision+1,claimed_at=?,runtime_owner=?,owner_fence=?,updated_at=? WHERE queue_id=? AND state='queued' AND revision=?")
                 .bind(now).bind(runtime_owner).bind(owner_fence).bind(now).bind(&queue_id).bind(revision).execute(&mut *conn).await?;
             if next.rows_affected() != 1 { return Err(ReliabilityError::WorkflowConflict); }
-            Ok(Some(QueueClaim { queue_id, task_id: row.try_get("task_id")?, revision: revision + 1, owner_fence }))
+            Ok(Some(QueueClaim { queue_id, task_id, revision: revision + 1, owner_fence }))
         }.await;
         match result {
             Ok(v) => {
@@ -262,16 +269,38 @@ impl ReliabilityStore {
     pub async fn mark_send_started(
         &self,
         claim: &QueueClaim,
+        resource_key: &str,
         runtime_owner: &str,
         now: &str,
     ) -> Result<(), ReliabilityError> {
-        let changed = sqlx::query("UPDATE agent_work_queue SET state='running',send_started=1,updated_at=? WHERE queue_id=? AND state='claimed' AND revision=? AND runtime_owner=? AND owner_fence=?")
-            .bind(now).bind(&claim.queue_id).bind(claim.revision).bind(runtime_owner).bind(claim.owner_fence).execute(&self.pool).await?;
-        if changed.rows_affected() == 1 {
-            Ok(())
-        } else {
-            Err(ReliabilityError::WorkflowConflict)
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let lease: i64 = sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
+            .bind(resource_key).bind(&claim.task_id).bind(runtime_owner).bind(claim.owner_fence).bind(now).fetch_one(&mut *tx).await?;
+        if lease != 1 {
+            return Err(ReliabilityError::WorkflowConflict);
         }
+        let changed = sqlx::query("UPDATE agent_work_queue SET state='running',send_started=1,revision=revision+1,updated_at=? WHERE queue_id=? AND task_id=? AND state='claimed' AND send_started=0 AND revision=? AND runtime_owner=? AND owner_fence=?")
+            .bind(now).bind(&claim.queue_id).bind(&claim.task_id).bind(claim.revision).bind(runtime_owner).bind(claim.owner_fence).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            return Err(ReliabilityError::WorkflowConflict);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub async fn pause_queue(&self, target: &str, now: &str) -> Result<u64, ReliabilityError> {
+        Ok(sqlx::query("UPDATE agent_work_queue SET state='paused',revision=revision+1,updated_at=? WHERE target_endpoint_id=? AND state IN ('queued','claimed') AND send_started=0")
+            .bind(now).bind(target).execute(&self.pool).await?.rows_affected())
+    }
+
+    pub async fn resume_queue(&self, target: &str, now: &str) -> Result<u64, ReliabilityError> {
+        Ok(sqlx::query("UPDATE agent_work_queue SET state='queued',revision=revision+1,claimed_at=NULL,send_started=0,runtime_owner=NULL,owner_fence=NULL,updated_at=? WHERE target_endpoint_id=? AND state='paused'")
+            .bind(now).bind(target).execute(&self.pool).await?.rows_affected())
+    }
+
+    pub async fn recover_queue(&self, target: &str, now: &str) -> Result<u64, ReliabilityError> {
+        Ok(sqlx::query("UPDATE agent_work_queue SET state=CASE WHEN send_started=0 THEN 'queued' ELSE 'recovery_needed' END,revision=revision+1,updated_at=? WHERE target_endpoint_id=? AND state IN ('claimed','running')")
+            .bind(now).bind(target).execute(&self.pool).await?.rows_affected())
     }
 
     pub async fn workflow_revision(&self, task_id: &str) -> Result<Option<i64>, ReliabilityError> {
@@ -284,17 +313,34 @@ impl ReliabilityStore {
             .map_err(Into::into)
     }
 
-    /// Atomically reserves one workflow envelope. Identical keys replay; a
-    /// conflicting key is rejected by SQLite uniqueness without mutation.
+    /// T025-compatible wrapper for callers that do not reserve a queue row.
     pub async fn admit_workflow(
         &self,
         input: WorkflowAdmission<'_>,
     ) -> Result<ReceiptOutcome, ReliabilityError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let result = self.admit_workflow_tx(&mut tx, input).await;
+        match result {
+            Ok(value) => {
+                tx.commit().await?;
+                Ok(value)
+            }
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
+        }
+    }
+
+    async fn admit_workflow_tx(
+        &self,
+        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        input: WorkflowAdmission<'_>,
+    ) -> Result<ReceiptOutcome, ReliabilityError> {
         if let Some(auth) = &input.authorization {
             let task_row = sqlx::query("SELECT from_agent,to_agent FROM tasks WHERE task_id=?")
                 .bind(input.task_id)
-                .fetch_optional(&mut *tx)
+                .fetch_optional(&mut **tx)
                 .await?;
             let Some(task_row) = task_row else {
                 return Err(ReliabilityError::WorkflowUnauthorized);
@@ -315,7 +361,7 @@ impl ReliabilityStore {
             let admission =
                 sqlx::query("SELECT state,revision FROM task_admissions WHERE task_id=?")
                     .bind(input.task_id)
-                    .fetch_optional(&mut *tx)
+                    .fetch_optional(&mut **tx)
                     .await?;
             let Some(admission) = admission else {
                 return Err(ReliabilityError::WorkflowUnauthorized);
@@ -333,12 +379,12 @@ impl ReliabilityStore {
             .bind(input.transport).bind(input.external_event_id).bind(input.sender_endpoint_id)
             .bind(input.target_endpoint_id).bind(input.task_id).bind(input.correlation_id)
             .bind(input.idempotency_key).bind(input.kind).bind(input.body_hash)
-            .bind(input.now).bind(input.now).execute(&mut *tx).await;
+            .bind(input.now).bind(input.now).execute(&mut **tx).await;
         let inserted = match inserted {
             Ok(result) => result,
             Err(error) => {
                 let row = sqlx::query("SELECT task_id,outcome,body_hash,sender_endpoint_id,target_endpoint_id,correlation_id,idempotency_key,schema,kind FROM workflow_envelopes WHERE sender_endpoint_id=? AND idempotency_key=?")
-                    .bind(input.sender_endpoint_id).bind(input.idempotency_key).fetch_optional(&mut *tx).await?;
+                    .bind(input.sender_endpoint_id).bind(input.idempotency_key).fetch_optional(&mut **tx).await?;
                 let Some(row) = row else {
                     return Err(ReliabilityError::Sql(error));
                 };
@@ -361,7 +407,7 @@ impl ReliabilityStore {
         };
         if inserted.rows_affected() == 0 {
             let row = sqlx::query("SELECT task_id,outcome,body_hash,sender_endpoint_id,target_endpoint_id,correlation_id,idempotency_key,schema,kind FROM workflow_envelopes WHERE transport=? AND external_event_id=?")
-                .bind(input.transport).bind(input.external_event_id).fetch_one(&mut *tx).await?;
+                .bind(input.transport).bind(input.external_event_id).fetch_one(&mut **tx).await?;
             let same = row.try_get::<String, _>("schema")? == "workflow.v1"
                 && row.try_get::<String, _>("kind")? == input.kind
                 && row.try_get::<String, _>("task_id")? == input.task_id
@@ -390,17 +436,17 @@ impl ReliabilityStore {
             .bind(i64::from(input.task.depth)).bind(i64::from(input.task.hops))
             .bind(input.task.deadline.map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)))
             .bind(i64::try_from(input.task.version).map_err(|_| ReliabilityError::Malformed)?)
-            .execute(&mut *tx).await?;
+            .execute(&mut **tx).await?;
             sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,1,'queued',?,?)")
             .bind(Uuid::now_v7().to_string()).bind(input.task.task_id.to_string()).bind(input.now).bind("\"queued\"")
-            .execute(&mut *tx).await?;
+            .execute(&mut **tx).await?;
             sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,reply_room,reply_thread_root,reply_event_id,monitor_room,monitor_generation,render_version,created_at,updated_at) VALUES(?,'enqueued',0,NULL,NULL,?,?,NULL,0,'v1',?,?)")
             .bind(input.task.task_id.to_string()).bind(input.external_event_id).bind(input.external_event_id)
-            .bind(input.now).bind(input.now).execute(&mut *tx).await?;
+            .bind(input.now).bind(input.now).execute(&mut **tx).await?;
         } else if let Some(auth) = &input.authorization {
             let result = sqlx::query("UPDATE task_admissions SET revision=revision+1,updated_at=? WHERE task_id=? AND revision=?")
                 .bind(input.now).bind(input.task_id).bind(auth.expected_revision)
-                .execute(&mut *tx).await?;
+                .execute(&mut **tx).await?;
             if result.rows_affected() != 1 {
                 return Err(ReliabilityError::WorkflowConflict);
             }
@@ -410,11 +456,61 @@ impl ReliabilityStore {
             .map_or(1, |auth| auth.expected_revision + 2);
         sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at) VALUES(?,?,?,?,?,NULL)")
             .bind(input.delivery_id).bind(input.task.task_id.to_string()).bind(attempt).bind(input.target_endpoint_id).bind(input.now)
-            .execute(&mut *tx).await?;
+            .execute(&mut **tx).await?;
         sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state) VALUES(?,?,?,'prepared')")
-            .bind(input.delivery_id).bind(input.task.task_id.to_string()).bind(attempt).execute(&mut *tx).await?;
-        tx.commit().await?;
+            .bind(input.delivery_id).bind(input.task.task_id.to_string()).bind(attempt).execute(&mut **tx).await?;
         Ok(ReceiptOutcome::Inserted)
+    }
+
+    /// Atomically admits T025 facts and reserves the bounded T022 queue row.
+    /// The transaction is intentionally single-owner: no queue reservation may
+    /// be appended after an admission commit.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn admit_queued_workflow(
+        &self,
+        input: WorkflowAdmission<'_>,
+        room_id: &str,
+        thread_root: Option<&str>,
+        capacity: i64,
+    ) -> Result<QueueReservation, ReliabilityError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let admission = self.admit_workflow_tx(&mut tx, input).await;
+        let result = match admission {
+            Ok(ReceiptOutcome::Replay { .. }) => {
+                sqlx::query("SELECT queue_id,sequence,state FROM agent_work_queue WHERE target_endpoint_id=? AND idempotency_key=?")
+                    .bind(input.target_endpoint_id).bind(input.idempotency_key)
+                    .fetch_optional(&mut *tx).await?
+                    .map(|row| Ok(QueueReservation { queue_id: row.try_get("queue_id")?, sequence: row.try_get("sequence")?, state: row.try_get("state")? }))
+                    .unwrap_or(Err(ReliabilityError::WorkflowConflict))
+            }
+            Ok(ReceiptOutcome::Inserted) => {
+                let active: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_work_queue WHERE target_endpoint_id=? AND lane='ordinary' AND state IN ('queued','claimed','running','paused')")
+                    .bind(input.target_endpoint_id).fetch_one(&mut *tx).await?;
+                if active >= capacity { Err(ReliabilityError::QueueFull) } else {
+                    sqlx::query("INSERT INTO agent_queue_counters(target_endpoint_id,next_sequence,capacity,updated_at) VALUES(?,1,?,?) ON CONFLICT(target_endpoint_id) DO UPDATE SET capacity=excluded.capacity,updated_at=excluded.updated_at")
+                        .bind(input.target_endpoint_id).bind(capacity).bind(input.now).execute(&mut *tx).await?;
+                    let sequence: i64 = sqlx::query_scalar("SELECT next_sequence FROM agent_queue_counters WHERE target_endpoint_id=?")
+                        .bind(input.target_endpoint_id).fetch_one(&mut *tx).await?;
+                    let queue_id = Uuid::now_v7().to_string();
+                    sqlx::query("UPDATE agent_queue_counters SET next_sequence=next_sequence+1,updated_at=? WHERE target_endpoint_id=?")
+                        .bind(input.now).bind(input.target_endpoint_id).execute(&mut *tx).await?;
+                    sqlx::query("INSERT INTO agent_work_queue(queue_id,task_id,delivery_id,target_endpoint_id,room_id,thread_root,sender_endpoint_id,idempotency_key,body_hash,lane,state,sequence,revision,send_started,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'ordinary','queued',?,0,0,?,?)")
+                        .bind(&queue_id).bind(input.task_id).bind(input.delivery_id).bind(input.target_endpoint_id).bind(room_id).bind(thread_root).bind(input.sender_endpoint_id).bind(input.idempotency_key).bind(input.body_hash).bind(sequence).bind(input.now).bind(input.now).execute(&mut *tx).await?;
+                    Ok(QueueReservation { queue_id, sequence, state: "queued".into() })
+                }
+            }
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(value) => {
+                tx.commit().await?;
+                Ok(value)
+            }
+            Err(error) => {
+                tx.rollback().await?;
+                Err(error)
+            }
+        }
     }
 
     /// Persist queue admission before making the reserved in-memory slot visible.
@@ -425,7 +521,7 @@ impl ReliabilityStore {
         runtime_instance: &str,
         context: Option<&AdmissionContext>,
     ) -> Result<ReceiptOutcome, ReliabilityError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(context) = context {
             let inserted = sqlx::query("INSERT INTO transport_receipts(transport,external_event_id,room_id,thread_ref,reply_event_id,conversation_id,selected_endpoint_id,task_id,receipt_kind,route_kind,state,result_code,created_at,updated_at) VALUES(?,?,?,?,?,?,?,NULL,'ordinary','message','reserved','reserved',?,?) ON CONFLICT(transport,external_event_id) DO NOTHING")
                 .bind(&context.transport).bind(&context.external_event_id).bind(&context.room_id)
@@ -513,7 +609,7 @@ impl ReliabilityStore {
         target_endpoint: &str,
         now: &str,
     ) -> Result<(), ReliabilityError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at) VALUES(?,?,?,?,?,NULL)")
             .bind(delivery_id).bind(task_id).bind(i64::from(attempt)).bind(target_endpoint).bind(now)
             .execute(&mut *tx).await?;
@@ -529,7 +625,7 @@ impl ReliabilityStore {
         session_id: &str,
         now: &str,
     ) -> Result<bool, ReliabilityError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let delivery = sqlx::query("UPDATE deliveries SET acknowledged_at=? WHERE delivery_id=? AND acknowledged_at IS NULL")
             .bind(now).bind(delivery_id).execute(&mut *tx).await?;
         let disposition = sqlx::query("UPDATE delivery_dispositions SET state='acknowledged',session_id=? WHERE delivery_id=? AND state='prepared'")
@@ -620,7 +716,7 @@ impl ReliabilityStore {
         &self,
         input: RetryTaskInput<'_>,
     ) -> Result<ReceiptOutcome, ReliabilityError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let existing = sqlx::query("SELECT task_id,result_code FROM transport_receipts WHERE transport=? AND external_event_id=?")
             .bind(input.transport).bind(input.external_event_id).fetch_optional(&mut *tx).await?;
         if let Some(row) = existing {
