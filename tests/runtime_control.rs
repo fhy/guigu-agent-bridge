@@ -248,6 +248,58 @@ async fn continuation_generation_mismatch_is_fenced_before_claim() {
 }
 
 #[tokio::test]
+async fn captured_generation_is_used_by_atomic_continue_receipt() {
+    let db = Db::new().await;
+    let store = SqliteRuntimeStore::new(db.pool.clone());
+    let lease = match store
+        .acquire(key(), db.task, at(), Duration::from_secs(30))
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Acquired(value) => value,
+        _ => panic!("acquire"),
+    };
+    store
+        .begin_continuation(&lease, db.delivery, "first", at())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE task_continuations SET runtime_generation='generation.v2:valid' WHERE task_id=?",
+    )
+    .bind(db.task.to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let ready = store.continuation(db.task).await.unwrap().unwrap();
+    let running = store
+        .claim_turn_with_generation(&lease, ready.revision, "generation.v2:valid", at())
+        .await
+        .unwrap();
+    let next = store
+        .record_continue_with_receipt(
+            &lease,
+            running.revision,
+            "generation.v2:valid",
+            "next",
+            1,
+            "structured",
+            "response",
+            at(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(next.runtime_generation, "generation.v2:valid");
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM continuation_response_receipts WHERE task_id=?")
+            .bind(db.task.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(receipts, 1);
+    db.close().await;
+}
+
+#[tokio::test]
 async fn concurrent_acquire_is_atomic_and_stale_owners_are_fenced() {
     let db = Db::new().await;
     let store = SqliteRuntimeStore::new(db.pool.clone());

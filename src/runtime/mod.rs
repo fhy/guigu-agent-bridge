@@ -468,6 +468,36 @@ impl SqliteRuntimeStore {
         Ok(continuation)
     }
 
+    pub async fn claim_turn_with_generation(
+        &self,
+        lease: &Lease,
+        revision: u64,
+        generation: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Continuation, RuntimeError> {
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT runtime_generation FROM task_continuations WHERE task_id=?")
+                .bind(lease.task_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        if current.as_deref() != Some(generation) {
+            return Err(RuntimeError::Fenced);
+        }
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query("UPDATE task_continuations SET state='in_flight',revision=revision+1,heartbeat_at=? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='ready' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
+            .bind(ts(now)).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(generation).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
+        if result.rows_affected() != 1 {
+            return Err(RuntimeError::Fenced);
+        }
+        let row = sqlx::query("SELECT * FROM task_continuations WHERE task_id=?")
+            .bind(lease.task_id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+        let continuation = decode_continuation(&row)?;
+        tx.commit().await?;
+        Ok(continuation)
+    }
+
     pub async fn record_continue(
         &self,
         lease: &Lease,
@@ -492,6 +522,55 @@ impl SqliteRuntimeStore {
         let continuation = decode_continuation(&row)?;
         tx.commit().await?;
         Ok(continuation)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn record_continue_with_receipt(
+        &self,
+        lease: &Lease,
+        revision: u64,
+        generation: &str,
+        next_prompt: &str,
+        observed_bytes: u64,
+        outcome: &str,
+        response: &str,
+        now: DateTime<Utc>,
+    ) -> Result<Continuation, RuntimeError> {
+        let prompt = bounded_prompt(next_prompt)?;
+        let key = format!(
+            "{}:{}:{}:{}",
+            lease.task_id,
+            self.delivery_for(lease.task_id).await?,
+            lease.fence,
+            revision
+        );
+        let hash = Uuid::new_v5(&OUTBOX_BODY_NAMESPACE, response.as_bytes()).to_string();
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query("UPDATE task_continuations SET state='ready',revision=revision+1,next_turn=next_turn+1,completed_turns=completed_turns+1,consecutive_no_progress=consecutive_no_progress+1,next_prompt=?,heartbeat_at=?,observed_output_bytes=observed_output_bytes+? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='in_flight' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
+            .bind(prompt).bind(ts(now)).bind(to_i64(observed_bytes)?).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(generation).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
+        if result.rows_affected() != 1 {
+            return Err(RuntimeError::Fenced);
+        }
+        let inserted = sqlx::query("INSERT INTO continuation_response_receipts(idempotency_key,task_id,delivery_id,resource_key,lease_fence,continuation_revision,response_hash,outcome,output_bytes,runtime_generation,created_at) SELECT ?,task_id,delivery_id,resource_key,lease_fence,revision-1,?,?,?,?,? FROM task_continuations WHERE task_id=? ON CONFLICT(idempotency_key) DO NOTHING")
+            .bind(&key).bind(&hash).bind(outcome).bind(i64::try_from(response.len()).unwrap_or(i64::MAX)).bind(generation).bind(ts(now)).bind(lease.task_id.to_string()).execute(&mut *tx).await?;
+        if inserted.rows_affected() != 1 {
+            return Err(RuntimeError::Continuation);
+        }
+        let row = sqlx::query("SELECT * FROM task_continuations WHERE task_id=?")
+            .bind(lease.task_id.to_string())
+            .fetch_one(&mut *tx)
+            .await?;
+        let continuation = decode_continuation(&row)?;
+        tx.commit().await?;
+        Ok(continuation)
+    }
+
+    async fn delivery_for(&self, task_id: TaskId) -> Result<String, RuntimeError> {
+        sqlx::query_scalar("SELECT delivery_id FROM task_continuations WHERE task_id=?")
+            .bind(task_id.to_string())
+            .fetch_one(&self.pool)
+            .await
+            .map_err(Into::into)
     }
 
     pub async fn record_response_receipt(
@@ -616,6 +695,16 @@ impl SqliteRuntimeStore {
         if continuation.rows_affected() != 1 {
             return Ok(FinalizeResult::Fenced);
         }
+        let terminal_response =
+            serde_json::to_string(&event.payload).map_err(|_| RuntimeError::Malformed)?;
+        let terminal_hash =
+            Uuid::new_v5(&OUTBOX_BODY_NAMESPACE, terminal_response.as_bytes()).to_string();
+        let receipt_key = format!(
+            "{}:{}:{}:{}",
+            lease.task_id, event.id, lease.fence, revision
+        );
+        let _ = sqlx::query("INSERT INTO continuation_response_receipts(idempotency_key,task_id,delivery_id,resource_key,lease_fence,continuation_revision,response_hash,outcome,output_bytes,runtime_generation,created_at) SELECT ?,task_id,delivery_id,resource_key,lease_fence,revision-1,?,'structured',?,?,runtime_generation,? FROM task_continuations WHERE task_id=? ON CONFLICT(idempotency_key) DO NOTHING")
+            .bind(&receipt_key).bind(&terminal_hash).bind(i64::try_from(terminal_response.len()).unwrap_or(i64::MAX)).bind(ts(now)).bind(event.task_id.to_string()).execute(&mut *tx).await;
         let latest: Option<i64> =
             sqlx::query_scalar("SELECT MAX(seq) FROM task_events WHERE task_id=?")
                 .bind(event.task_id.to_string())
@@ -1466,10 +1555,6 @@ impl LeasedAcpDispatcher {
                 Ok(_) => "structured",
                 Err(_) => "protocol_failure",
             };
-            self.store
-                .record_response_receipt(&state, receipt_outcome, &receipt_text, self.clock.now())
-                .await
-                .map_err(Self::execution_error)?;
             match result {
                 Ok(TurnResult::Continue {
                     reason,
@@ -1493,11 +1578,14 @@ impl LeasedAcpDispatcher {
                     let bytes = reason.len().saturating_add(prompt.len()) as u64;
                     state = self
                         .store
-                        .record_continue(
+                        .record_continue_with_receipt(
                             guard.lease(),
                             state.revision,
+                            &state.runtime_generation,
                             &prompt,
                             bytes,
+                            receipt_outcome,
+                            &receipt_text,
                             self.clock.now(),
                         )
                         .await
