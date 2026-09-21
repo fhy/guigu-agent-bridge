@@ -158,6 +158,7 @@ pub struct Continuation {
     pub heartbeat_at: DateTime<Utc>,
     pub last_progress_at: DateTime<Utc>,
     pub observed_output_bytes: u64,
+    pub runtime_generation: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -2005,5 +2006,8 @@ fn decode_continuation(row: &sqlx::sqlite::SqliteRow) -> Result<Continuation, Ru
         heartbeat_at: parse_time(row, "heartbeat_at")?,
         last_progress_at: parse_time(row, "last_progress_at")?,
         observed_output_bytes: count(row, "observed_output_bytes")?,
+        runtime_generation: row
+            .try_get("runtime_generation")
+            .map_err(|_| RuntimeError::Malformed)?,
     })
 }

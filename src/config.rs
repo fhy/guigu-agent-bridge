@@ -65,6 +65,7 @@ pub struct BridgeConfig {
 /// Bounded continuation and execution-lease policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
+    pub allow_nonterminal_end_turn: bool,
     pub max_turns: u32,
     pub max_wall_seconds: u64,
     pub max_inactivity_seconds: u64,
@@ -331,6 +332,8 @@ struct RawBridge {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRuntime {
+    #[serde(default)]
+    allow_nonterminal_end_turn: bool,
     #[serde(default = "default_max_turns")]
     max_turns: u32,
     #[serde(default = "default_max_wall")]
@@ -564,6 +567,7 @@ impl Default for RawBridge {
 impl Default for RawRuntime {
     fn default() -> Self {
         Self {
+            allow_nonterminal_end_turn: false,
             max_turns: default_max_turns(),
             max_wall_seconds: default_max_wall(),
             max_inactivity_seconds: default_max_inactivity(),
@@ -1145,6 +1149,7 @@ fn build_runtime(raw: RawRuntime) -> Result<RuntimeConfig, ConfigError> {
         ));
     }
     Ok(RuntimeConfig {
+        allow_nonterminal_end_turn: raw.allow_nonterminal_end_turn,
         max_turns: raw.max_turns,
         max_wall_seconds: raw.max_wall_seconds,
         max_inactivity_seconds: raw.max_inactivity_seconds,

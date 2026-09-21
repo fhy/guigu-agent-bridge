@@ -93,6 +93,7 @@ mod tests {
                 health_bind: None,
             },
             runtime: RuntimeConfig {
+                allow_nonterminal_end_turn: false,
                 max_turns: 8,
                 max_wall_seconds: 900,
                 max_inactivity_seconds: 120,

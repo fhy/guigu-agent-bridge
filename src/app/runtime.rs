@@ -244,6 +244,7 @@ impl AppRuntime {
                 .sessions(sessions.clone())
                 .repository(repository_trait.clone())
                 .reliability(reliability.clone())
+                .allow_nonterminal_end_turn(config.runtime.allow_nonterminal_end_turn)
                 .build()
                 .map_err(AppError::Assembly)?;
             let workspace =

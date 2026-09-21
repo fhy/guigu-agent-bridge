@@ -64,6 +64,7 @@ pub struct AcpDispatcherBuilder {
     repository: Option<Arc<dyn Repository>>,
     reliability: Option<crate::storage::ReliabilityStore>,
     legacy_results: bool,
+    allow_nonterminal_end_turn: bool,
 }
 
 impl Default for AcpDispatcherBuilder {
@@ -84,6 +85,7 @@ impl AcpDispatcherBuilder {
             repository: None,
             reliability: None,
             legacy_results: false,
+            allow_nonterminal_end_turn: false,
         }
     }
 
@@ -132,6 +134,11 @@ impl AcpDispatcherBuilder {
         self
     }
 
+    pub fn allow_nonterminal_end_turn(mut self, enabled: bool) -> Self {
+        self.allow_nonterminal_end_turn = enabled;
+        self
+    }
+
     /// The configured dispatcher.
     ///
     /// # Errors
@@ -147,6 +154,7 @@ impl AcpDispatcherBuilder {
             repository,
             reliability,
             legacy_results,
+            allow_nonterminal_end_turn,
         } = self;
         let cwd = cwd.ok_or("a working directory is required")?;
         let cwd = cwd
@@ -166,6 +174,7 @@ impl AcpDispatcherBuilder {
                 reliability,
                 client: Mutex::new(None),
                 legacy_results,
+                allow_nonterminal_end_turn,
             }),
         })
     }
@@ -204,6 +213,7 @@ struct DispatcherInner {
     /// channel, tears its loop down and reaps the child.
     client: Mutex<Option<Arc<AcpClient>>>,
     legacy_results: bool,
+    allow_nonterminal_end_turn: bool,
 }
 
 pub struct AcpStructuredTurn {
@@ -236,12 +246,22 @@ impl AcpStructuredTurn {
             tracing::warn!(%error,"could not mark the acp session ready after a streamed turn");
         }
         match completed {
-            Ok(completed) => AcpClient::decode_prompt_completion(completed)?
-                .task_result
-                .ok_or_else(|| AcpError::Schema {
+            Ok(completed) => {
+                let response = AcpClient::decode_prompt_completion(completed)?;
+                if self.dispatcher.inner.allow_nonterminal_end_turn
+                    && response.stop_reason.is_end_turn()
+                    && response.task_result.is_none()
+                {
+                    return Ok(crate::acp::TurnResult::Continue {
+                        reason: "compatibility end_turn".into(),
+                        next_prompt: Some("bridge.continue.v1\nContinue the current task from durable progress. Emit taskResult or bounded progress.".into()),
+                    });
+                }
+                response.task_result.ok_or_else(|| AcpError::Schema {
                     method: crate::acp::schema::METHOD_SESSION_PROMPT.to_owned(),
                     detail: "missing taskResult in strict mode".to_owned(),
-                }),
+                })
+            }
             Err(AcpError::Exited { .. } | AcpError::TransportClosed) => {
                 let recovered = self.dispatcher.ensure_client(&self.target).await?;
                 recovered
@@ -512,11 +532,20 @@ impl AcpDispatcher {
         request: &DispatchRequest<'_>,
     ) -> Result<DispatchOutcome, AcpError> {
         let turn = self.prompt_inner(request, &request.task.text).await?;
-        if turn.task_result.is_none() && !self.inner.legacy_results {
+        if turn.task_result.is_none()
+            && !self.inner.legacy_results
+            && !self.inner.allow_nonterminal_end_turn
+        {
             return Err(AcpError::Schema {
                 method: crate::acp::schema::METHOD_SESSION_PROMPT.to_owned(),
                 detail: "missing taskResult in strict mode".to_owned(),
             });
+        }
+        if turn.task_result.is_none()
+            && self.inner.allow_nonterminal_end_turn
+            && turn.stop_reason.is_end_turn()
+        {
+            return Ok(DispatchOutcome::Completed { output: turn.text });
         }
         Ok(map_turn(turn, self.inner.legacy_results))
     }
