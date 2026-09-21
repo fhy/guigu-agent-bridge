@@ -317,6 +317,13 @@ impl Cancellation {
         active || pending
     }
 
+    /// True once the worker has completed cancellation/shutdown handling for a
+    /// task. Control ingress uses this as the positive handoff before durable
+    /// pause; it is not inferred from the cancellation request itself.
+    pub fn is_retired(&self, task_id: TaskId) -> bool {
+        self.state().retired.contains_key(&task_id)
+    }
+
     /// How many task ids currently hold a cancellation reason.
     ///
     /// Excludes the global reason. Bounded by the worker's in-flight tasks plus

@@ -263,6 +263,12 @@ impl AdminHandler {
                 };
                 self.cancellation
                     .cancel(task_id, "operator requested pause");
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !self.cancellation.is_retired(task_id)
+                    && tokio::time::Instant::now() < deadline
+                {
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
                 let result = queue
                     .pause_task_after_reap(&task_id.to_string(), &chrono::Utc::now().to_rfc3339())
                     .await

@@ -350,7 +350,7 @@ impl ReliabilityStore {
             tx.commit().await?;
             return Ok("recovery_needed");
         }
-        let changed = sqlx::query("UPDATE agent_work_queue SET state='paused',revision=revision+1,updated_at=? WHERE queue_id=? AND revision=? AND runtime_owner=? AND owner_fence=? AND send_started=0").bind(now).bind(id).bind(rev).bind(owner.as_deref()).bind(fence).execute(&mut *tx).await?;
+        let changed = sqlx::query("UPDATE agent_work_queue SET state='paused',revision=revision+1,updated_at=? WHERE queue_id=? AND revision=? AND runtime_owner=? AND owner_fence=? AND state IN ('claimed','running')").bind(now).bind(id).bind(rev).bind(owner.as_deref()).bind(fence).execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {
             tx.rollback().await?;
             return Err(ReliabilityError::WorkflowConflict);
