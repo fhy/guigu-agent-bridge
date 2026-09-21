@@ -3,6 +3,35 @@ name = "guigu-agent-bridge"
 version = "0.1.0"
 edition = "2024"
 rust-version = "1.88"
+description = "Durable Matrix, ACP, and A2A task routing bridge for external agents"
+license = "MIT"
+repository = "https://github.com/guigu-ai/guigu-agent-bridge"
+homepage = "https://github.com/guigu-ai/guigu-agent-bridge"
+documentation = "https://docs.rs/guigu-agent-bridge"
+readme = "README.md"
+keywords = ["agent", "matrix", "acp", "a2a", "sqlite"]
+categories = ["asynchronous", "command-line-utilities"]
+include = [
+    "!/.agent-governance/**",
+    "!/AGENTS.md",
+    "!/tests/**",
+    "!/target/**",
+    "/Cargo.toml",
+    "/Cargo.lock",
+    "/LICENSE",
+    "/README.md",
+    "/config.example.toml",
+    "/docs/ARCHITECTURE.md",
+    "/docs/CONFIGURATION.md",
+    "/docs/PRODUCT.md",
+    "/docs/RELEASE.md",
+    "/docs/USER_GUIDE.md",
+    "/docs/decisions/**",
+    "/docs/integrations/**",
+    "/examples/**",
+    "/migrations/**",
+    "/src/**",
+]
 
 [dependencies]
 # `time` backs the production `Timer` (`TokioTimer`, T006 D1/Q2 = T-B): the

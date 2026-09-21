@@ -6,6 +6,29 @@
 
 当前仓库已实现 Agent Bus、SQLite 持久化、Matrix 接入与观察、ACP Adapter、运行时恢复和可靠性验收。正式架构见 [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)。
 
+## 快速开始
+
+```bash
+cargo install guigu-agent-bridge --version 0.1.0
+install -m 600 config.example.toml "$HOME/.config/guigu-agent-bridge.toml"
+export MATRIX_USER_ID='@bridge:example.org'
+export MATRIX_ACCESS_TOKEN='replace-with-secret-manager-value'
+guigu-agent-bridge "$HOME/.config/guigu-agent-bridge.toml"
+```
+
+示例配置默认关闭 Matrix、Gateway、A2A 和 Agent。首次运行前按
+[配置参考](docs/CONFIGURATION.md) 启用所需端点并填写严格 allowlist。进程启动会在
+配置的 SQLite 文件上运行 embedded migrations；生产环境必须先按
+[发布清单](docs/RELEASE.md) 备份。
+
+## 文档
+
+- [产品与边界](docs/PRODUCT.md)
+- [用户指南](docs/USER_GUIDE.md)
+- [配置参考](docs/CONFIGURATION.md)
+- [架构](docs/ARCHITECTURE.md)
+- [发布、监控与回滚](docs/RELEASE.md)
+
 Agent 开发入口协议见 [AGENTS.md](AGENTS.md)。动态任务状态、内部审查、交接和事件记录不属于公开代码仓库。
 
 ## 设计边界
