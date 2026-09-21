@@ -23,12 +23,17 @@ use tokio::sync::mpsc;
 use guigu_agent_bridge::acp::{
     AcpDispatcher, AcpLimits, SessionState, SqliteSessionStore, TransportLimits,
 };
+use guigu_agent_bridge::app::AcpDispatcherRouter;
 use guigu_agent_bridge::bus::{
     Bus, BusFuture, Clock, ConsumerError, DispatcherRegistry, EndpointRegistry, EventBroadcaster,
     EventConsumer, EventSink, MemoryBus, MpscEventSink, TaskDispatcher, Worker, WorkerConfig,
     derive_endpoint_id,
 };
 use guigu_agent_bridge::config::{Config, load_from_str_with_env};
+use guigu_agent_bridge::matrix::{
+    AdminHandler, AdminPermissionPolicy, CommandLedger, InboundMatrixEvent, MatrixSender,
+    ReplyContext, ReplyFuture,
+};
 use guigu_agent_bridge::models::{
     AgentTask, Conversation, ConversationId, DeliveryId, EndpointId, EventId, Priority, TaskEvent,
     TaskEventPayload, TaskId, TaskStatus, TransportType,
@@ -136,6 +141,148 @@ fn remove_db_files(path: &Path) {
         candidate.push(suffix);
         let _ = std::fs::remove_file(PathBuf::from(candidate));
     }
+}
+
+#[derive(Default)]
+struct PauseReplies(Mutex<Vec<String>>);
+impl MatrixSender for PauseReplies {
+    fn send_reply<'a>(&'a self, _: &'a ReplyContext, body: &'a str) -> ReplyFuture<'a> {
+        self.0.lock().unwrap().push(body.to_owned());
+        Box::pin(async { Ok(()) })
+    }
+}
+
+struct FixedClock;
+impl RuntimeClock for FixedClock {
+    fn now(&self) -> DateTime<Utc> {
+        ts()
+    }
+}
+fn default_policy() -> ContinuationPolicy {
+    ContinuationPolicy {
+        max_turns: 2,
+        max_wall_time: Duration::from_secs(60),
+        max_inactivity: Duration::from_secs(60),
+        max_consecutive_no_progress: 2,
+        max_observed_output_bytes: 1024,
+        lease_ttl: Duration::from_secs(30),
+    }
+}
+
+#[tokio::test]
+async fn authenticated_pause_uses_real_router_and_marks_running_queue_paused() {
+    let harness = Harness::new_reliable("t022-pause", "hang-prompt", default_limits(), true).await;
+    let task = harness.task("pause me");
+    harness
+        .repository_impl
+        .insert_task_and_event(
+            &task,
+            &TaskEvent {
+                id: EventId::generate(),
+                task_id: task.task_id,
+                seq: 1,
+                status: TaskStatus::Running,
+                timestamp: ts(),
+                payload: TaskEventPayload::Running { started_at: ts() },
+            },
+        )
+        .await
+        .unwrap();
+    let delivery = DeliveryId::generate();
+    sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES(?,?,1,?,?)")
+        .bind(delivery.to_string()).bind(task.task_id.to_string()).bind(task.to_agent.to_string()).bind(TS).execute(&harness.pool).await.unwrap();
+    let reliability = guigu_agent_bridge::storage::ReliabilityStore::new(harness.pool.clone());
+    let queue = reliability
+        .reserve_queue(
+            &task.task_id.to_string(),
+            &delivery.to_string(),
+            &task.to_agent.to_string(),
+            "!room",
+            None,
+            "@admin:example",
+            "pause-idem",
+            "hash",
+            4,
+            TS,
+        )
+        .await
+        .unwrap();
+    sqlx::query("UPDATE agent_work_queue SET state='running',runtime_owner='owner',owner_fence=7,send_started=1 WHERE queue_id=?").bind(&queue.queue_id).execute(&harness.pool).await.unwrap();
+    let runtime = SqliteRuntimeStore::new(harness.pool.clone());
+    let leased = Arc::new(LeasedAcpDispatcher::new(
+        (*harness.dispatcher).clone(),
+        runtime,
+        WorkspaceId::from_canonical_path(std::env::temp_dir()).unwrap(),
+        default_policy(),
+        Arc::new(FixedClock),
+        Arc::new(TokioRuntimeTimer),
+        Arc::new(RuntimeMetrics::default()),
+    ));
+    let target = harness.registry.get(task.to_agent).unwrap().clone();
+    let task_for_run = task.clone();
+    let delivery_for_run = delivery.clone();
+    let leased_for_run = Arc::clone(&leased);
+    let run = tokio::spawn(async move {
+        let request = guigu_agent_bridge::bus::DispatchRequest {
+            task: &task_for_run,
+            target: &target,
+            delivery_id: delivery_for_run,
+            attempt: 1,
+        };
+        let _ = leased_for_run.deliver(request.clone()).await;
+        let _ = leased_for_run.execute(request).await;
+    });
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    if let Some((owner, fence)) = sqlx::query_as::<_, (String, i64)>(
+        "SELECT owner_token,fence FROM execution_leases WHERE task_id=? AND state='active'",
+    )
+    .bind(task.task_id.to_string())
+    .fetch_optional(&harness.pool)
+    .await
+    .unwrap()
+    {
+        sqlx::query("UPDATE agent_work_queue SET runtime_owner=?,owner_fence=? WHERE queue_id=?")
+            .bind(owner)
+            .bind(fence)
+            .bind(&queue.queue_id)
+            .execute(&harness.pool)
+            .await
+            .unwrap();
+    }
+    let mut endpoints = std::collections::HashMap::new();
+    endpoints.insert(task.to_agent, leased);
+    let router = Arc::new(AcpDispatcherRouter::new(endpoints));
+    let sender = Arc::new(PauseReplies::default());
+    let admin = AdminHandler::new(
+        harness.repository.clone(),
+        guigu_agent_bridge::bus::Cancellation::new(),
+        sender.clone(),
+        AdminPermissionPolicy::new()
+            .allow_user("@admin:example")
+            .restrict_rooms(["!room"]),
+        Arc::new(CommandLedger::new(8)),
+    )
+    .with_queue_control(Arc::new(reliability))
+    .with_reap_control(router);
+    admin
+        .handle(&InboundMatrixEvent {
+            event_id: "$pause".into(),
+            room_id: "!room".into(),
+            thread_root: None,
+            sender: "@admin:example".into(),
+            body: format!("/pause {}", task.task_id),
+        })
+        .await
+        .unwrap();
+    let state: String = sqlx::query_scalar("SELECT state FROM agent_work_queue WHERE queue_id=?")
+        .bind(&queue.queue_id)
+        .fetch_one(&harness.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "paused");
+    run.abort();
+    harness.pool.close().await;
+    remove_db_files(&harness.path);
 }
 
 // ---------------------------------------------------------------------------

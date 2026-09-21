@@ -234,6 +234,15 @@ impl MatrixIngress {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn with_test_admin_controls(
+        self,
+        queue: Arc<crate::storage::ReliabilityStore>,
+        reap: Arc<dyn crate::matrix::ReapControl>,
+    ) -> Self {
+        self.with_queue_control_store(queue).with_reap_control(reap)
+    }
+
     pub fn with_retry_admission(mut self, retry: Arc<dyn RetryAdmission>) -> Self {
         self.retry = Some(retry);
         self
