@@ -167,20 +167,39 @@ pub async fn route_workflow(
     if matches!(admission, crate::storage::ReceiptOutcome::Replay { .. }) {
         return Ok(task);
     }
-    bus.submit_with_context(
-        task.clone(),
-        AdmissionContext {
-            transport: "matrix-workflow".into(),
-            external_event_id: envelope.message_id.clone(),
-            room_id: "workflow".into(),
-            thread_root: Some(envelope.correlation_id.clone()),
-            reply_event_id: envelope.message_id.clone(),
-            monitor_room: None,
-            monitor_generation: 0,
-        },
-    )
-    .await
-    .map_err(|_| RouteError::Bus)?;
+    let submission = bus
+        .submit_with_context(
+            task.clone(),
+            AdmissionContext {
+                transport: "matrix-workflow".into(),
+                external_event_id: envelope.message_id.clone(),
+                room_id: "workflow".into(),
+                thread_root: Some(envelope.correlation_id.clone()),
+                reply_event_id: envelope.message_id.clone(),
+                monitor_room: None,
+                monitor_generation: 0,
+            },
+        )
+        .await;
+    if let Err(crate::bus::BusError::QueueFull) = submission {
+        reliability
+            .reserve_queue(
+                &task_id,
+                &delivery_id,
+                &target_id,
+                "workflow",
+                Some(&envelope.correlation_id),
+                &sender_id,
+                &envelope.idempotency_key,
+                &body_hash,
+                32,
+                &now,
+            )
+            .await
+            .map_err(|_| RouteError::Bus)?;
+    } else if submission.is_err() {
+        return Err(RouteError::Bus);
+    }
     Ok(task)
 }
 

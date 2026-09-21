@@ -152,7 +152,7 @@ pub use event_consumer::RepositoryEventConsumer;
 pub use pool::{DEFAULT_BUSY_TIMEOUT, MAX_CONNECTIONS, connect, migrate};
 pub use recovery::{RecoveryPlan, plan_recovery, sync_agents};
 pub use reliability::{
-    AdmissionRecovery, PendingProjection, ReceiptOutcome, ReliabilityError, ReliabilityStore,
-    RetryTaskInput, WorkflowAdmission, WorkflowAuthorization,
+    AdmissionRecovery, PendingProjection, QueueReservation, ReceiptOutcome, ReliabilityError,
+    ReliabilityStore, RetryTaskInput, WorkflowAdmission, WorkflowAuthorization,
 };
 pub use repository::{AckOutcome, Delivery, Repository, SqliteRepository, StorageFuture};

@@ -139,6 +139,62 @@ async fn workflow_replay_compares_identity_and_classifies_idempotency_conflict()
 }
 
 #[tokio::test]
+async fn queue_reservation_is_idempotent_and_capacity_bounded() {
+    let pool = database().await;
+    let (endpoint, _conversation, task, _event) = seed(&pool, "queued").await;
+    let delivery = Uuid::now_v7().to_string();
+    sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at) VALUES(?,?,1,?,?,NULL)")
+        .bind(&delivery).bind(&task).bind(&endpoint).bind("2026-09-20T00:00:00Z").execute(&pool).await.unwrap();
+    let store = ReliabilityStore::new(pool.clone());
+    let first = store
+        .reserve_queue(
+            &task,
+            &delivery,
+            &endpoint,
+            "room",
+            Some("thread"),
+            &endpoint,
+            "idem",
+            "hash",
+            1,
+            "2026-09-20T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    let replay = store
+        .reserve_queue(
+            &task,
+            &delivery,
+            &endpoint,
+            "room",
+            Some("thread"),
+            &endpoint,
+            "idem",
+            "hash",
+            1,
+            "2026-09-20T00:00:01Z",
+        )
+        .await
+        .unwrap();
+    assert_eq!(first.queue_id, replay.queue_id);
+    let second = store
+        .reserve_queue(
+            &task,
+            &delivery,
+            &endpoint,
+            "room",
+            Some("thread"),
+            &endpoint,
+            "idem-2",
+            "hash-2",
+            1,
+            "2026-09-20T00:00:02Z",
+        )
+        .await;
+    assert!(matches!(second, Err(ReliabilityError::QueueFull)));
+}
+
+#[tokio::test]
 async fn workflow_authorization_reads_durable_owner_and_review_namespace() {
     let pool = database().await;
     let (endpoint, conversation, seeded_task_id, _) = seed(&pool, "completed").await;

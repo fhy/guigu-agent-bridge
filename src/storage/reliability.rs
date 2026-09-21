@@ -34,6 +34,21 @@ pub struct WorkflowAuthorization<'a> {
     pub expected_revision: i64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueReservation {
+    pub queue_id: String,
+    pub sequence: i64,
+    pub state: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueClaim {
+    pub queue_id: String,
+    pub task_id: String,
+    pub revision: i64,
+    pub owner_fence: i64,
+}
+
 const OUTBOX_BODY_NAMESPACE: Uuid = Uuid::from_u128(0x7297ec04_1338_57b4_9bc4_f0ff9f84fa5a);
 
 #[derive(Debug, Error)]
@@ -50,6 +65,8 @@ pub enum ReliabilityError {
     WorkflowConflict,
     #[error("workflow authorization does not match durable task state")]
     WorkflowUnauthorized,
+    #[error("agent queue is full")]
+    QueueFull,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -112,6 +129,149 @@ pub struct ReliabilityStore {
 impl ReliabilityStore {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
+    }
+
+    /// Atomically reserves a bounded queue row after T025 admission has committed.
+    /// This is the concrete queue-side transaction boundary; callers must not await
+    /// external I/O while it is open.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reserve_queue(
+        &self,
+        task_id: &str,
+        delivery_id: &str,
+        target_endpoint_id: &str,
+        room_id: &str,
+        thread_root: Option<&str>,
+        sender_endpoint_id: &str,
+        idempotency_key: &str,
+        body_hash: &str,
+        capacity: i64,
+        now: &str,
+    ) -> Result<QueueReservation, ReliabilityError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let result = self
+            .reserve_queue_inner(
+                &mut conn,
+                task_id,
+                delivery_id,
+                target_endpoint_id,
+                room_id,
+                thread_root,
+                sender_endpoint_id,
+                idempotency_key,
+                body_hash,
+                capacity,
+                now,
+            )
+            .await;
+        match result {
+            Ok(value) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(value)
+            }
+            Err(error) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(error)
+            }
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn reserve_queue_inner(
+        &self,
+        conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+        task_id: &str,
+        delivery_id: &str,
+        target_endpoint_id: &str,
+        room_id: &str,
+        thread_root: Option<&str>,
+        sender_endpoint_id: &str,
+        idempotency_key: &str,
+        body_hash: &str,
+        capacity: i64,
+        now: &str,
+    ) -> Result<QueueReservation, ReliabilityError> {
+        sqlx::query("INSERT INTO agent_queue_counters(target_endpoint_id,next_sequence,capacity,updated_at) VALUES(?,1,?,?) ON CONFLICT(target_endpoint_id) DO UPDATE SET capacity=excluded.capacity,updated_at=excluded.updated_at")
+            .bind(target_endpoint_id).bind(capacity).bind(now).execute(&mut **conn).await?;
+        let existing = sqlx::query("SELECT queue_id,sequence,state FROM agent_work_queue WHERE target_endpoint_id=? AND idempotency_key=?")
+            .bind(target_endpoint_id).bind(idempotency_key).fetch_optional(&mut **conn).await?;
+        if let Some(row) = existing {
+            return Ok(QueueReservation {
+                queue_id: row.try_get("queue_id")?,
+                sequence: row.try_get("sequence")?,
+                state: row.try_get("state")?,
+            });
+        }
+        let active: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_work_queue WHERE target_endpoint_id=? AND lane='ordinary' AND state IN ('queued','claimed','running','paused')")
+            .bind(target_endpoint_id).fetch_one(&mut **conn).await?;
+        if active >= capacity {
+            return Err(ReliabilityError::QueueFull);
+        }
+        let sequence: i64 = sqlx::query_scalar(
+            "SELECT next_sequence FROM agent_queue_counters WHERE target_endpoint_id=?",
+        )
+        .bind(target_endpoint_id)
+        .fetch_one(&mut **conn)
+        .await?;
+        let queue_id = Uuid::now_v7().to_string();
+        sqlx::query("UPDATE agent_queue_counters SET next_sequence=next_sequence+1,updated_at=? WHERE target_endpoint_id=?")
+            .bind(now).bind(target_endpoint_id).execute(&mut **conn).await?;
+        sqlx::query("INSERT INTO agent_work_queue(queue_id,task_id,delivery_id,target_endpoint_id,room_id,thread_root,sender_endpoint_id,idempotency_key,body_hash,lane,state,sequence,revision,send_started,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'ordinary','queued',?,0,0,?,?)")
+            .bind(&queue_id).bind(task_id).bind(delivery_id).bind(target_endpoint_id).bind(room_id).bind(thread_root).bind(sender_endpoint_id).bind(idempotency_key).bind(body_hash).bind(sequence).bind(now).bind(now).execute(&mut **conn).await?;
+        Ok(QueueReservation {
+            queue_id,
+            sequence,
+            state: "queued".into(),
+        })
+    }
+
+    /// Claims the oldest queued item while holding the SQLite immediate writer lock.
+    pub async fn claim_next(
+        &self,
+        target_endpoint_id: &str,
+        runtime_owner: &str,
+        owner_fence: i64,
+        now: &str,
+    ) -> Result<Option<QueueClaim>, ReliabilityError> {
+        let mut conn = self.pool.acquire().await?;
+        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        let result = async {
+            let row = sqlx::query("SELECT queue_id,task_id,revision FROM agent_work_queue WHERE target_endpoint_id=? AND lane='ordinary' AND state='queued' ORDER BY sequence LIMIT 1")
+                .bind(target_endpoint_id).fetch_optional(&mut *conn).await?;
+            let Some(row) = row else { return Ok(None); };
+            let queue_id: String = row.try_get("queue_id")?;
+            let revision: i64 = row.try_get("revision")?;
+            let next = sqlx::query("UPDATE agent_work_queue SET state='claimed',revision=revision+1,claimed_at=?,runtime_owner=?,owner_fence=?,updated_at=? WHERE queue_id=? AND state='queued' AND revision=?")
+                .bind(now).bind(runtime_owner).bind(owner_fence).bind(now).bind(&queue_id).bind(revision).execute(&mut *conn).await?;
+            if next.rows_affected() != 1 { return Err(ReliabilityError::WorkflowConflict); }
+            Ok(Some(QueueClaim { queue_id, task_id: row.try_get("task_id")?, revision: revision + 1, owner_fence }))
+        }.await;
+        match result {
+            Ok(v) => {
+                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                Ok(v)
+            }
+            Err(e) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                Err(e)
+            }
+        }
+    }
+
+    pub async fn mark_send_started(
+        &self,
+        claim: &QueueClaim,
+        runtime_owner: &str,
+        now: &str,
+    ) -> Result<(), ReliabilityError> {
+        let changed = sqlx::query("UPDATE agent_work_queue SET state='running',send_started=1,updated_at=? WHERE queue_id=? AND state='claimed' AND revision=? AND runtime_owner=? AND owner_fence=?")
+            .bind(now).bind(&claim.queue_id).bind(claim.revision).bind(runtime_owner).bind(claim.owner_fence).execute(&self.pool).await?;
+        if changed.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(ReliabilityError::WorkflowConflict)
+        }
     }
 
     pub async fn workflow_revision(&self, task_id: &str) -> Result<Option<i64>, ReliabilityError> {
