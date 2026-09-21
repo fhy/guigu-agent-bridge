@@ -11,7 +11,6 @@ pub mod bus;
 pub mod config;
 pub mod error;
 pub mod gateway;
-pub mod git_workflow;
 pub mod matrix;
 pub mod models;
 pub mod observer;
