@@ -230,17 +230,8 @@ async fn authenticated_pause_uses_real_router_and_marks_running_queue_paused() {
             delivery_id: delivery_for_run,
             attempt: 1,
         };
-        eprintln!(
-            "deliver={:?}",
-            leased_for_run.deliver(request.clone()).await
-        );
-        eprintln!(
-            "execute_prepared={:?}",
-            leased_for_run
-                .execute_prepared(request)
-                .await
-                .map(|_| "prepared")
-        );
+        let _ = leased_for_run.deliver(request.clone()).await;
+        let _ = leased_for_run.execute_prepared(request).await;
     });
     let (owner, fence) = tokio::time::timeout(Duration::from_secs(30), async {
         loop {
