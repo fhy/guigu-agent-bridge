@@ -57,13 +57,6 @@ fn mock_backend() -> PathBuf {
     static BUILT: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     BUILT
         .get_or_init(|| {
-            let cargo = option_env!("CARGO").unwrap_or("cargo");
-            let status = std::process::Command::new(cargo)
-                .args(["build", "--example", "acp-mock-backend"])
-                .status()
-                .expect("run cargo build --example");
-            assert!(status.success(), "building the mock backend failed");
-
             let current = std::env::current_exe().expect("current test binary");
             let mut path = current
                 .parent()
@@ -72,6 +65,14 @@ fn mock_backend() -> PathBuf {
             path.pop();
             path.push("examples");
             path.push(format!("acp-mock-backend{}", std::env::consts::EXE_SUFFIX));
+            if !path.exists() {
+                let cargo = option_env!("CARGO").unwrap_or("cargo");
+                let status = std::process::Command::new(cargo)
+                    .args(["build", "--example", "acp-mock-backend"])
+                    .status()
+                    .expect("run cargo build --example");
+                assert!(status.success(), "building the mock backend failed");
+            }
             assert!(
                 path.exists(),
                 "the mock backend is missing at {}",
@@ -171,7 +172,7 @@ fn default_policy() -> ContinuationPolicy {
 
 #[tokio::test]
 async fn authenticated_pause_uses_real_router_and_marks_running_queue_paused() {
-    let harness = Harness::new_reliable("t022-pause", "hang-prompt", default_limits(), true).await;
+    let harness = Harness::new("t022-pause", "hang-prompt", default_limits(), true).await;
     let task = harness.task("pause me");
     harness
         .repository_impl
