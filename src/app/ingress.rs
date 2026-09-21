@@ -153,6 +153,8 @@ pub struct MatrixIngress {
     retry: Option<Arc<dyn RetryAdmission>>,
     queue: Option<Arc<crate::storage::ReliabilityStore>>,
     reap: Option<Arc<dyn crate::matrix::ReapControl>>,
+    #[cfg(test)]
+    test_inject: Option<mpsc::Sender<InboundMatrixEvent>>,
 }
 
 impl MatrixIngress {
@@ -184,7 +186,39 @@ impl MatrixIngress {
             retry: None,
             queue: None,
             reap: None,
+            #[cfg(test)]
+            test_inject: None,
         }
+    }
+
+    #[cfg(test)]
+    pub fn new_with_test_channel(
+        receiver: mpsc::Receiver<InboundMatrixEvent>,
+        repository: Arc<dyn Repository>,
+        registry: Arc<EndpointRegistry>,
+        admission: Arc<dyn DurableMatrixAdmission>,
+        sender: Arc<dyn MatrixSender>,
+        reload: Arc<ReloadController>,
+        cancellation: Cancellation,
+        ledger: Arc<CommandLedger>,
+        replies: Arc<ReplyRegistry>,
+        dedup_capacity: usize,
+        inject: mpsc::Sender<InboundMatrixEvent>,
+    ) -> Self {
+        let mut ingress = Self::new(
+            receiver,
+            repository,
+            registry,
+            admission,
+            sender,
+            reload,
+            cancellation,
+            ledger,
+            replies,
+            dedup_capacity,
+        );
+        ingress.test_inject = Some(inject);
+        ingress
     }
 
     pub fn with_queue_control_store(
@@ -206,6 +240,8 @@ impl MatrixIngress {
     }
 
     pub fn start(self) -> MatrixIngressHandle {
+        #[cfg(test)]
+        let test_inject = self.test_inject.clone();
         let (shutdown, receiver) = watch::channel(false);
         let alive = Arc::new(AtomicBool::new(true));
         let task_alive = Arc::clone(&alive);
@@ -217,6 +253,8 @@ impl MatrixIngress {
             shutdown,
             join,
             alive,
+            #[cfg(test)]
+            test_inject,
         }
     }
 
@@ -294,6 +332,8 @@ pub struct MatrixIngressHandle {
     shutdown: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
     alive: Arc<AtomicBool>,
+    #[cfg(test)]
+    test_inject: Option<mpsc::Sender<InboundMatrixEvent>>,
 }
 
 impl MatrixIngressHandle {
@@ -303,5 +343,13 @@ impl MatrixIngressHandle {
     pub async fn shutdown(self) {
         let _ = self.shutdown.send(true);
         let _ = self.join.await;
+    }
+
+    #[cfg(test)]
+    pub async fn inject(&self, event: InboundMatrixEvent) -> Result<(), InboundMatrixEvent> {
+        match &self.test_inject {
+            Some(sender) => sender.send(event).await.map_err(|error| error.0),
+            None => Err(event),
+        }
     }
 }
