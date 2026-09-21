@@ -4,6 +4,7 @@
 //! [`InboundMatrixEvent`] and bridge-owned conversation models.
 
 mod admin;
+pub(crate) use admin::sealed;
 mod client;
 mod conversation;
 mod dedup;

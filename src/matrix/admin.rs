@@ -86,7 +86,11 @@ pub trait RetryAdmission: Send + Sync {
     ) -> BusFuture<'a, Result<RetryReply, ()>>;
 }
 
-pub trait ReapControl: Send + Sync {
+pub(crate) mod sealed {
+    pub trait ReapIssuer {}
+}
+
+pub trait ReapControl: sealed::ReapIssuer + Send + Sync {
     fn reap<'a>(
         &'a self,
         target: crate::models::EndpointId,
@@ -96,10 +100,10 @@ pub trait ReapControl: Send + Sync {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReapAck {
-    pub task_id: TaskId,
-    pub resource_key: String,
-    pub owner: String,
-    pub fence: i64,
+    pub(crate) task_id: TaskId,
+    pub(crate) resource_key: String,
+    pub(crate) owner: String,
+    pub(crate) fence: i64,
 }
 
 pub struct AdminHandler {

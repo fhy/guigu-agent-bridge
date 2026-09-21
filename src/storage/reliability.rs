@@ -350,6 +350,13 @@ impl ReliabilityStore {
             tx.rollback().await?;
             return Err(ReliabilityError::WorkflowConflict);
         }
+        let bound: i64 = sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=?")
+            .bind(resource_key).bind(task_id).bind(owner_token).bind(owner_fence)
+            .fetch_one(&mut *tx).await?;
+        if bound != 1 {
+            tx.rollback().await?;
+            return Err(ReliabilityError::WorkflowConflict);
+        }
         let live: i64 = sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
             .bind(resource_key).bind(task_id).bind(owner_token).bind(owner_fence).bind(now).fetch_one(&mut *tx).await?;
         if live != 0 {

@@ -15,6 +15,8 @@ pub struct AcpDispatcherRouter {
     endpoints: HashMap<EndpointId, Arc<LeasedAcpDispatcher>>,
 }
 
+impl crate::matrix::sealed::ReapIssuer for AcpDispatcherRouter {}
+
 impl AcpDispatcherRouter {
     pub fn new(endpoints: HashMap<EndpointId, Arc<LeasedAcpDispatcher>>) -> Self {
         Self { endpoints }
