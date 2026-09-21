@@ -666,16 +666,23 @@ impl SqliteRuntimeStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn finalize_terminal(
         &self,
         lease: &Lease,
         revision: u64,
+        generation: &str,
         state: ContinuationState,
         observed_bytes: u64,
         event: &crate::models::TaskEvent,
         now: DateTime<Utc>,
     ) -> Result<FinalizeResult, RuntimeError> {
-        if self.ensure_runtime_generation(lease.task_id).await.is_err() {
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT runtime_generation FROM task_continuations WHERE task_id=?")
+                .bind(lease.task_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        if current.as_deref() != Some(generation) {
             return Ok(FinalizeResult::Fenced);
         }
         let mut tx = self.pool.begin().await?;
@@ -690,8 +697,8 @@ impl SqliteRuntimeStore {
         .fetch_optional(&mut *tx)
         .await?
         .ok_or(RuntimeError::Malformed)?;
-        let continuation=sqlx::query("UPDATE task_continuations SET state=?,revision=revision+1,completed_turns=completed_turns+1,heartbeat_at=?,observed_output_bytes=observed_output_bytes+? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND state='in_flight' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
-            .bind(state.as_str()).bind(ts(now)).bind(to_i64(observed_bytes)?).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
+        let continuation=sqlx::query("UPDATE task_continuations SET state=?,revision=revision+1,completed_turns=completed_turns+1,heartbeat_at=?,observed_output_bytes=observed_output_bytes+? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='in_flight' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
+            .bind(state.as_str()).bind(ts(now)).bind(to_i64(observed_bytes)?).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(generation).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
         if continuation.rows_affected() != 1 {
             return Ok(FinalizeResult::Fenced);
         }
@@ -703,8 +710,19 @@ impl SqliteRuntimeStore {
             "{}:{}:{}:{}",
             lease.task_id, event.id, lease.fence, revision
         );
-        let _ = sqlx::query("INSERT INTO continuation_response_receipts(idempotency_key,task_id,delivery_id,resource_key,lease_fence,continuation_revision,response_hash,outcome,output_bytes,runtime_generation,created_at) SELECT ?,task_id,delivery_id,resource_key,lease_fence,revision-1,?,'structured',?,?,runtime_generation,? FROM task_continuations WHERE task_id=? ON CONFLICT(idempotency_key) DO NOTHING")
-            .bind(&receipt_key).bind(&terminal_hash).bind(i64::try_from(terminal_response.len()).unwrap_or(i64::MAX)).bind(ts(now)).bind(event.task_id.to_string()).execute(&mut *tx).await;
+        let receipt = sqlx::query("INSERT INTO continuation_response_receipts(idempotency_key,task_id,delivery_id,resource_key,lease_fence,continuation_revision,response_hash,outcome,output_bytes,runtime_generation,created_at) SELECT ?,task_id,delivery_id,resource_key,lease_fence,revision-1,?,'structured',?,runtime_generation,? FROM task_continuations WHERE task_id=? ON CONFLICT(idempotency_key) DO NOTHING")
+            .bind(&receipt_key).bind(&terminal_hash).bind(i64::try_from(terminal_response.len()).unwrap_or(i64::MAX)).bind(ts(now)).bind(event.task_id.to_string()).execute(&mut *tx).await?;
+        if receipt.rows_affected() != 1 {
+            let existing: Option<String> = sqlx::query_scalar(
+                "SELECT response_hash FROM continuation_response_receipts WHERE idempotency_key=?",
+            )
+            .bind(&receipt_key)
+            .fetch_optional(&mut *tx)
+            .await?;
+            if existing.as_deref() != Some(&terminal_hash) {
+                return Ok(FinalizeResult::RecoveryNeeded);
+            }
+        }
         let latest: Option<i64> =
             sqlx::query_scalar("SELECT MAX(seq) FROM task_events WHERE task_id=?")
                 .bind(event.task_id.to_string())
@@ -1346,7 +1364,12 @@ impl LeasedAcpDispatcher {
         let now = self.clock.now();
         let claimed = self
             .store
-            .claim_turn(guard.lease(), state.revision, now)
+            .claim_turn_with_generation(
+                guard.lease(),
+                state.revision,
+                &state.runtime_generation,
+                now,
+            )
             .await
             .map_err(Self::execution_error)?;
         self.terminal(
@@ -1480,7 +1503,12 @@ impl LeasedAcpDispatcher {
             guard.replace(renewed);
             state = self
                 .store
-                .claim_turn(guard.lease(), state.revision, now)
+                .claim_turn_with_generation(
+                    guard.lease(),
+                    state.revision,
+                    &state.runtime_generation,
+                    now,
+                )
                 .await
                 .map_err(Self::execution_error)?;
             self.metrics.increment(Metric::TurnStarted);
@@ -1770,7 +1798,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                             let _ = command.response.send(Err(DispatchError::RecoveryNeeded));
                             return;
                         };
-                        let state = match store.claim_turn(&lease,state.revision,clock.now()).await {
+                        let state = match store.claim_turn_with_generation(&lease,state.revision,&state.runtime_generation,clock.now()).await {
                             Ok(state) => state,
                             Err(_) => {
                                 let _ = store.release(&lease,ReleaseDisposition::RecoveryNeeded,clock.now()).await;
@@ -1786,7 +1814,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                         }
                         match finalize_rx.await {
                             Ok(finalize) if finalize.task_id == task_id => {
-                                let result=store.finalize_terminal(&lease,state.revision,ContinuationState::Terminal,0,&finalize.event,clock.now()).await.unwrap_or(FinalizeResult::RecoveryNeeded);
+                                let result=store.finalize_terminal(&lease,state.revision,CONTINUATION_RUNTIME_GENERATION,ContinuationState::Terminal,0,&finalize.event,clock.now()).await.unwrap_or(FinalizeResult::RecoveryNeeded);
                                 let _=finalize.response.send(result);
                             }
                             _ => { let _=store.finish(&lease,state.revision,ContinuationState::RecoveryNeeded,0,clock.now()).await; }
@@ -1912,6 +1940,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                                     .finalize_terminal(
                                         &deferred.lease,
                                         deferred.revision,
+                                        CONTINUATION_RUNTIME_GENERATION,
                                         deferred.continuation_state,
                                         deferred.observed_bytes,
                                         &command.event,
@@ -1966,6 +1995,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                                     .finalize_terminal(
                                         &deferred.lease,
                                         deferred.revision,
+                                        CONTINUATION_RUNTIME_GENERATION,
                                         deferred.continuation_state,
                                         0,
                                         &command.event,
