@@ -318,18 +318,74 @@ impl ReliabilityStore {
         Ok(changed.rows_affected())
     }
 
+    /// Control boundary after ACP shutdown/reap. An active lease means reap is
+    /// not proven and is classified as recovery_needed rather than requeued.
+    pub async fn pause_task_after_reap(
+        &self,
+        task_id: &str,
+        now: &str,
+    ) -> Result<&'static str, ReliabilityError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let row = sqlx::query("SELECT queue_id,revision,state,runtime_owner,owner_fence,send_started FROM agent_work_queue WHERE task_id=? AND state IN ('queued','claimed','running') ORDER BY sequence LIMIT 1")
+            .bind(task_id).fetch_optional(&mut *tx).await?;
+        let Some(row) = row else {
+            tx.rollback().await?;
+            return Ok("absent");
+        };
+        let id: String = row.try_get("queue_id")?;
+        let rev: i64 = row.try_get("revision")?;
+        let state: String = row.try_get("state")?;
+        let owner: Option<String> = row.try_get("runtime_owner")?;
+        let fence: Option<i64> = row.try_get("owner_fence")?;
+        if state == "queued" {
+            sqlx::query("UPDATE agent_work_queue SET state='paused',revision=revision+1,updated_at=? WHERE queue_id=? AND revision=? AND state='queued' AND send_started=0")
+                .bind(now).bind(id).bind(rev).execute(&mut *tx).await?;
+            tx.commit().await?;
+            return Ok("paused");
+        }
+        let live: i64 = sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE task_id=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
+            .bind(task_id).bind(owner.as_deref()).bind(fence).bind(now).fetch_one(&mut *tx).await?;
+        if live != 0 {
+            sqlx::query("UPDATE agent_work_queue SET state='recovery_needed',revision=revision+1,reason='pause reap not confirmed',updated_at=? WHERE queue_id=? AND revision=?").bind(now).bind(id).bind(rev).execute(&mut *tx).await?;
+            tx.commit().await?;
+            return Ok("recovery_needed");
+        }
+        let changed = sqlx::query("UPDATE agent_work_queue SET state='paused',revision=revision+1,updated_at=? WHERE queue_id=? AND revision=? AND runtime_owner=? AND owner_fence=? AND send_started=0").bind(now).bind(id).bind(rev).bind(owner.as_deref()).bind(fence).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(ReliabilityError::WorkflowConflict);
+        }
+        tx.commit().await?;
+        Ok("paused")
+    }
+
     pub async fn resume_task(&self, task_id: &str, now: &str) -> Result<u64, ReliabilityError> {
-        let rows = sqlx::query("SELECT queue_id,revision,target_endpoint_id FROM agent_work_queue WHERE task_id=? AND state='paused' ORDER BY sequence")
-            .bind(task_id).fetch_all(&self.pool).await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let rows = sqlx::query("SELECT queue_id,revision,target_endpoint_id,runtime_owner,owner_fence FROM agent_work_queue WHERE task_id=? AND state='paused' ORDER BY sequence")
+            .bind(task_id).fetch_all(&mut *tx).await?;
         let mut count = 0;
         for row in rows {
             let id: String = row.try_get("queue_id")?;
             let rev: i64 = row.try_get("revision")?;
-            let _ = self
-                .resume_queue(&id, rev, "", 0, now)
-                .await
-                .map(|_| count += 1);
+            let target: String = row.try_get("target_endpoint_id")?;
+            let owner: Option<String> = row.try_get("runtime_owner")?;
+            let fence: Option<i64> = row.try_get("owner_fence")?;
+            let sequence: i64 = sqlx::query_scalar(
+                "SELECT next_sequence FROM agent_queue_counters WHERE target_endpoint_id=?",
+            )
+            .bind(&target)
+            .fetch_one(&mut *tx)
+            .await?;
+            sqlx::query("UPDATE agent_queue_counters SET next_sequence=next_sequence+1,updated_at=? WHERE target_endpoint_id=?").bind(now).bind(&target).execute(&mut *tx).await?;
+            let changed = sqlx::query("UPDATE agent_work_queue SET state='queued',sequence=?,revision=revision+1,claimed_at=NULL,send_started=0,runtime_owner=NULL,owner_fence=NULL,updated_at=? WHERE queue_id=? AND revision=? AND state='paused' AND ((runtime_owner=? AND owner_fence=?) OR (runtime_owner IS NULL AND owner_fence IS NULL))")
+                .bind(sequence).bind(now).bind(&id).bind(rev).bind(owner.as_deref()).bind(fence).execute(&mut *tx).await?;
+            if changed.rows_affected() != 1 {
+                tx.rollback().await?;
+                return Err(ReliabilityError::WorkflowConflict);
+            }
+            count += 1;
         }
+        tx.commit().await?;
         Ok(count)
     }
 

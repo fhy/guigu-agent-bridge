@@ -261,14 +261,13 @@ impl AdminHandler {
                 let Some(queue) = &self.queue else {
                     return Ok("pause=unsupported".into());
                 };
-                let changed = queue
-                    .pause_task_queued(&task_id.to_string(), &chrono::Utc::now().to_rfc3339())
+                self.cancellation
+                    .cancel(task_id, "operator requested pause");
+                let result = queue
+                    .pause_task_after_reap(&task_id.to_string(), &chrono::Utc::now().to_rfc3339())
                     .await
                     .map_err(|_| ())?;
-                Ok(format!(
-                    "pause={}",
-                    if changed > 0 { "paused" } else { "conflict" }
-                ))
+                Ok(format!("pause={result}"))
             }
             Command::Resume => {
                 let Some(queue) = &self.queue else {
