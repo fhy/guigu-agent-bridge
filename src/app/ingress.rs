@@ -151,6 +151,7 @@ pub struct MatrixIngress {
     replies: Arc<ReplyRegistry>,
     dedup: EventDedup,
     retry: Option<Arc<dyn RetryAdmission>>,
+    queue: Option<Arc<crate::storage::ReliabilityStore>>,
 }
 
 impl MatrixIngress {
@@ -180,7 +181,16 @@ impl MatrixIngress {
             replies,
             dedup: EventDedup::new(dedup_capacity).expect("positive dedup capacity"),
             retry: None,
+            queue: None,
         }
+    }
+
+    pub fn with_queue_control_store(
+        mut self,
+        queue: Arc<crate::storage::ReliabilityStore>,
+    ) -> Self {
+        self.queue = Some(queue);
+        self
     }
 
     pub fn with_retry_admission(mut self, retry: Arc<dyn RetryAdmission>) -> Self {
@@ -224,6 +234,9 @@ impl MatrixIngress {
             );
             if let Some(retry) = &self.retry {
                 admin = admin.with_retry_admission(Arc::clone(retry));
+            }
+            if let Some(queue) = &self.queue {
+                admin = admin.with_queue_control(Arc::clone(queue));
             }
             match admin.handle(&event).await {
                 Ok(AdminResult::Replied) => continue,

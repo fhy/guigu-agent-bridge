@@ -307,6 +307,32 @@ impl ReliabilityStore {
         Ok(())
     }
 
+    /// Coordinator control for a queued row, which has no owner/fence yet.
+    pub async fn pause_task_queued(
+        &self,
+        task_id: &str,
+        now: &str,
+    ) -> Result<u64, ReliabilityError> {
+        let changed = sqlx::query("UPDATE agent_work_queue SET state='paused',revision=revision+1,updated_at=? WHERE task_id=? AND state='queued' AND send_started=0 AND runtime_owner IS NULL AND owner_fence IS NULL")
+            .bind(now).bind(task_id).execute(&self.pool).await?;
+        Ok(changed.rows_affected())
+    }
+
+    pub async fn resume_task(&self, task_id: &str, now: &str) -> Result<u64, ReliabilityError> {
+        let rows = sqlx::query("SELECT queue_id,revision,target_endpoint_id FROM agent_work_queue WHERE task_id=? AND state='paused' ORDER BY sequence")
+            .bind(task_id).fetch_all(&self.pool).await?;
+        let mut count = 0;
+        for row in rows {
+            let id: String = row.try_get("queue_id")?;
+            let rev: i64 = row.try_get("revision")?;
+            let _ = self
+                .resume_queue(&id, rev, "", 0, now)
+                .await
+                .map(|_| count += 1);
+        }
+        Ok(count)
+    }
+
     pub async fn resume_queue(
         &self,
         queue_id: &str,
@@ -316,7 +342,7 @@ impl ReliabilityStore {
         now: &str,
     ) -> Result<(), ReliabilityError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let target: String = sqlx::query_scalar("SELECT target_endpoint_id FROM agent_work_queue WHERE queue_id=? AND revision=? AND state='paused' AND runtime_owner=? AND owner_fence=?")
+        let target: String = sqlx::query_scalar("SELECT target_endpoint_id FROM agent_work_queue WHERE queue_id=? AND revision=? AND state='paused' AND ((runtime_owner=? AND owner_fence=?) OR (runtime_owner IS NULL AND owner_fence IS NULL))")
             .bind(queue_id).bind(revision).bind(owner).bind(fence).fetch_one(&mut *tx).await?;
         let sequence: i64 = sqlx::query_scalar(
             "SELECT next_sequence FROM agent_queue_counters WHERE target_endpoint_id=?",
@@ -325,7 +351,7 @@ impl ReliabilityStore {
         .fetch_one(&mut *tx)
         .await?;
         sqlx::query("UPDATE agent_queue_counters SET next_sequence=next_sequence+1,updated_at=? WHERE target_endpoint_id=?").bind(now).bind(&target).execute(&mut *tx).await?;
-        let changed = sqlx::query("UPDATE agent_work_queue SET state='queued',sequence=?,revision=revision+1,claimed_at=NULL,send_started=0,runtime_owner=NULL,owner_fence=NULL,updated_at=? WHERE queue_id=? AND revision=? AND state='paused' AND runtime_owner=? AND owner_fence=?")
+        let changed = sqlx::query("UPDATE agent_work_queue SET state='queued',sequence=?,revision=revision+1,claimed_at=NULL,send_started=0,runtime_owner=NULL,owner_fence=NULL,updated_at=? WHERE queue_id=? AND revision=? AND state='paused' AND ((runtime_owner=? AND owner_fence=?) OR (runtime_owner IS NULL AND owner_fence IS NULL))")
             .bind(sequence).bind(now).bind(queue_id).bind(revision).bind(owner).bind(fence).execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {
             tx.rollback().await?;
@@ -350,6 +376,22 @@ impl ReliabilityStore {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Startup recovery entrypoint. Each row is classified independently so a
+    /// malformed/stale row cannot cause a bulk requeue of another owner's work.
+    pub async fn recover_orphaned_queues(&self, now: &str) -> Result<u64, ReliabilityError> {
+        let rows = sqlx::query("SELECT queue_id,revision FROM agent_work_queue WHERE state IN ('claimed','running') ORDER BY sequence")
+            .fetch_all(&self.pool).await?;
+        let mut recovered = 0;
+        for row in rows {
+            let id: String = row.try_get("queue_id")?;
+            let revision: i64 = row.try_get("revision")?;
+            if self.recover_queue(&id, revision, now).await.is_ok() {
+                recovered += 1;
+            }
+        }
+        Ok(recovered)
     }
 
     pub async fn workflow_revision(&self, task_id: &str) -> Result<Option<i64>, ReliabilityError> {

@@ -137,6 +137,15 @@ impl AppRuntime {
         let registry = Arc::new(EndpointRegistry::from_config(&config));
         sync_agents(repository_trait.as_ref(), &registry).await?;
 
+        // T022 durable queue recovery is part of startup, before any worker is
+        // assembled. Ambiguous send-start rows become recovery_needed; only
+        // pre-send rows are returned to queued by the storage CAS.
+        let recovery_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        reliability
+            .recover_orphaned_queues(&recovery_at)
+            .await
+            .map_err(|_| AppError::Runtime)?;
+
         let mut recovery = plan_recovery(repository_trait.as_ref()).await?;
         let mut admission_recovery = reliability
             .classify_admissions(4096)
@@ -457,6 +466,7 @@ impl AppRuntime {
                 replies,
                 4096,
             )
+            .with_queue_control_store(Arc::new(reliability.clone()))
             .with_retry_admission(retry)
             .start();
             runtime.health_state.register_required(sync_handle.alive());
