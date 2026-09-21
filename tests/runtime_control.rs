@@ -170,6 +170,84 @@ async fn every_continuation_write_is_fenced_after_cross_connection_expiry() {
 }
 
 #[tokio::test]
+async fn continuation_response_receipts_are_idempotent_and_hash_bound() {
+    let db = Db::new().await;
+    let store = SqliteRuntimeStore::new(db.pool.clone());
+    let lease = match store
+        .acquire(key(), db.task, at(), Duration::from_secs(30))
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Acquired(value) => value,
+        _ => panic!("acquire"),
+    };
+    store
+        .begin_continuation(&lease, db.delivery, "first", at())
+        .await
+        .unwrap();
+    let continuation = store.continuation(db.task).await.unwrap().unwrap();
+    store
+        .record_response_receipt(&continuation, "structured", "receipt", at())
+        .await
+        .unwrap();
+    store
+        .record_response_receipt(&continuation, "structured", "receipt", at())
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .record_response_receipt(&continuation, "structured", "altered", at())
+            .await,
+        Err(RuntimeError::Continuation)
+    ));
+    let count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM continuation_response_receipts WHERE task_id=?")
+            .bind(db.task.to_string())
+            .fetch_one(&db.pool)
+            .await
+            .unwrap();
+    assert_eq!(count, 1);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn continuation_generation_mismatch_is_fenced_before_claim() {
+    let db = Db::new().await;
+    let store = SqliteRuntimeStore::new(db.pool.clone());
+    let lease = match store
+        .acquire(key(), db.task, at(), Duration::from_secs(30))
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Acquired(value) => value,
+        _ => panic!("acquire"),
+    };
+    store
+        .begin_continuation(&lease, db.delivery, "first", at())
+        .await
+        .unwrap();
+    let ready = store.continuation(db.task).await.unwrap().unwrap();
+    sqlx::query(
+        "UPDATE task_continuations SET runtime_generation='generation.v2:changed' WHERE task_id=?",
+    )
+    .bind(db.task.to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        store.claim_turn(&lease, ready.revision, at()).await,
+        Err(RuntimeError::Fenced)
+    ));
+    let state: String = sqlx::query_scalar("SELECT state FROM task_continuations WHERE task_id=?")
+        .bind(db.task.to_string())
+        .fetch_one(&db.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "ready");
+    db.close().await;
+}
+
+#[tokio::test]
 async fn concurrent_acquire_is_atomic_and_stale_owners_are_fenced() {
     let db = Db::new().await;
     let store = SqliteRuntimeStore::new(db.pool.clone());
