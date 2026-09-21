@@ -8,7 +8,7 @@ use crate::{
     bus::{BusFuture, Cancellation},
     models::{AgentTask, TaskId, TaskStatus},
     observer::{DEFAULT_MAX_CHAIN, MAX_BODY_BYTES, task_trace},
-    storage::Repository,
+    storage::{ReliabilityStore, Repository},
 };
 
 use super::{InboundMatrixEvent, MatrixSender, ReplyContext, ReplyError, derive_matrix_user_id};
@@ -94,6 +94,7 @@ pub struct AdminHandler {
     ledger: Arc<CommandLedger>,
     max_chain: usize,
     retry: Option<Arc<dyn RetryAdmission>>,
+    queue: Option<Arc<ReliabilityStore>>,
 }
 
 impl AdminHandler {
@@ -112,11 +113,17 @@ impl AdminHandler {
             ledger,
             max_chain: DEFAULT_MAX_CHAIN,
             retry: None,
+            queue: None,
         }
     }
 
     pub fn with_retry_admission(mut self, retry: Arc<dyn RetryAdmission>) -> Self {
         self.retry = Some(retry);
+        self
+    }
+
+    pub fn with_queue_control(mut self, queue: Arc<ReliabilityStore>) -> Self {
+        self.queue = Some(queue);
         self
     }
 
@@ -250,6 +257,32 @@ impl AdminHandler {
                     .cancel(task_id, "operator requested cancellation");
                 Ok("cancel_request=registered".into())
             }
+            Command::Pause => {
+                let Some(queue) = &self.queue else {
+                    return Ok("pause=unsupported".into());
+                };
+                let changed = queue
+                    .pause_task_queued(&task_id.to_string(), &chrono::Utc::now().to_rfc3339())
+                    .await
+                    .map_err(|_| ())?;
+                Ok(format!(
+                    "pause={}",
+                    if changed > 0 { "paused" } else { "conflict" }
+                ))
+            }
+            Command::Resume => {
+                let Some(queue) = &self.queue else {
+                    return Ok("resume=unsupported".into());
+                };
+                let changed = queue
+                    .resume_task(&task_id.to_string(), &chrono::Utc::now().to_rfc3339())
+                    .await
+                    .map_err(|_| ())?;
+                Ok(format!(
+                    "resume={}",
+                    if changed > 0 { "queued" } else { "conflict" }
+                ))
+            }
             Command::Retry => {
                 let latest = self
                     .repository
@@ -277,6 +310,8 @@ enum Command {
     Trace,
     Cancel,
     Retry,
+    Pause,
+    Resume,
 }
 fn parse(body: &str) -> Result<(Command, TaskId), &'static str> {
     if body.len() > 256 || !body.is_ascii() {
@@ -288,6 +323,8 @@ fn parse(body: &str) -> Result<(Command, TaskId), &'static str> {
         Some("/trace") => Command::Trace,
         Some("/cancel") => Command::Cancel,
         Some("/retry") => Command::Retry,
+        Some("/pause") => Command::Pause,
+        Some("/resume") => Command::Resume,
         _ => return Err("command=unknown"),
     };
     let Some(id) = fields.next() else {
