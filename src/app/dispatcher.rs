@@ -101,3 +101,19 @@ impl TaskDispatcher for AcpDispatcherRouter {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::matrix::ReapControl;
+
+    #[tokio::test]
+    async fn missing_dispatcher_fails_closed_before_any_sqlite_pause_cas() {
+        let router = AcpDispatcherRouter::new(HashMap::new());
+        let result = router
+            .reap(EndpointId::generate(), TaskId::generate())
+            .await
+            .unwrap();
+        assert!(result.is_none());
+    }
+}
