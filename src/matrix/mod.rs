@@ -17,8 +17,8 @@ mod router;
 mod sync;
 
 pub use admin::{
-    AdminHandler, AdminPermissionPolicy, AdminResult, CommandLedger, ReapControl, RetryAdmission,
-    RetryReply,
+    AdminHandler, AdminPermissionPolicy, AdminResult, CommandLedger, ReapAck, ReapControl,
+    RetryAdmission, RetryReply,
 };
 pub use client::MatrixClient;
 pub use conversation::resolve_conversation;

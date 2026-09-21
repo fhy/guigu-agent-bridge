@@ -91,7 +91,15 @@ pub trait ReapControl: Send + Sync {
         &'a self,
         target: crate::models::EndpointId,
         task: TaskId,
-    ) -> BusFuture<'a, Result<bool, ()>>;
+    ) -> BusFuture<'a, Result<Option<ReapAck>, ()>>;
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReapAck {
+    pub task_id: TaskId,
+    pub resource_key: String,
+    pub owner: String,
+    pub fence: i64,
 }
 
 pub struct AdminHandler {
@@ -279,14 +287,20 @@ impl AdminHandler {
                 self.cancellation
                     .cancel(task_id, "operator requested pause");
                 let reaped = match &self.reap {
-                    Some(control) => control.reap(task.to_agent, task_id).await.unwrap_or(false),
-                    None => false,
+                    Some(control) => control.reap(task.to_agent, task_id).await.unwrap_or(None),
+                    None => None,
                 };
-                if !reaped {
+                let Some(reaped) = reaped else {
                     return Ok("pause=recovery_needed".into());
-                }
+                };
                 let result = queue
-                    .pause_task_after_reap(&task_id.to_string(), &chrono::Utc::now().to_rfc3339())
+                    .pause_task_after_reap(
+                        &reaped.task_id.to_string(),
+                        &reaped.resource_key,
+                        &reaped.owner,
+                        reaped.fence,
+                        &chrono::Utc::now().to_rfc3339(),
+                    )
                     .await
                     .map_err(|_| ())?;
                 Ok(format!("pause={result}"))

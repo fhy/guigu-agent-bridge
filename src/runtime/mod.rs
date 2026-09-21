@@ -210,6 +210,22 @@ impl SqliteRuntimeStore {
         Self { pool }
     }
 
+    pub async fn lease_for_task(
+        &self,
+        task_id: TaskId,
+    ) -> Result<Option<(String, String, i64)>, RuntimeError> {
+        let row = sqlx::query("SELECT resource_key,owner_token,fence FROM execution_leases WHERE task_id=? AND state='active'")
+            .bind(task_id.to_string()).fetch_optional(&self.pool).await?;
+        row.map(|row| {
+            Ok((
+                row.try_get("resource_key")?,
+                row.try_get("owner_token")?,
+                row.try_get("fence")?,
+            ))
+        })
+        .transpose()
+    }
+
     pub async fn acquire(
         &self,
         resource: ExecutionResourceKey,
@@ -1348,6 +1364,14 @@ pub struct LeasedAcpDispatcher {
         Arc<Mutex<std::collections::HashMap<TaskId, tokio::sync::mpsc::Sender<SupervisorCommand>>>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReapReceipt {
+    pub task_id: TaskId,
+    pub resource_key: String,
+    pub owner: String,
+    pub fence: i64,
+}
+
 struct SupervisorCommand {
     reason: String,
     response: tokio::sync::oneshot::Sender<Result<FinalizationCapability, DispatchError>>,
@@ -1454,15 +1478,14 @@ impl LeasedAcpDispatcher {
         let _ = self.dispatcher.shutdown().await;
     }
 
-    pub async fn cancel_and_reap_task(&self, task_id: TaskId, reason: &str) -> bool {
+    pub async fn cancel_and_reap_task(&self, task_id: TaskId, reason: &str) -> Option<ReapReceipt> {
         let sender = self
             .active
             .lock()
             .ok()
             .and_then(|map| map.get(&task_id).cloned());
-        let Some(sender) = sender else {
-            return false;
-        };
+        let sender = sender?;
+        let lease = self.store.lease_for_task(task_id).await.ok().flatten()?;
         let (response, receiver) = tokio::sync::oneshot::channel();
         if sender
             .send(SupervisorCommand {
@@ -1472,9 +1495,41 @@ impl LeasedAcpDispatcher {
             .await
             .is_err()
         {
-            return false;
+            return None;
         }
-        matches!(receiver.await, Ok(Ok(_)))
+        if !matches!(receiver.await, Ok(Ok(_))) {
+            return None;
+        }
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if self
+                .store
+                .lease_for_task(task_id)
+                .await
+                .ok()
+                .flatten()
+                .is_none()
+            {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if self
+            .store
+            .lease_for_task(task_id)
+            .await
+            .ok()
+            .flatten()
+            .is_some()
+        {
+            return None;
+        }
+        Some(ReapReceipt {
+            task_id,
+            resource_key: lease.0,
+            owner: lease.1,
+            fence: lease.2,
+        })
     }
 
     fn execution_error(error: impl std::fmt::Display) -> DispatchError {

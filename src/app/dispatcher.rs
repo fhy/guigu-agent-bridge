@@ -1,6 +1,6 @@
 use std::{collections::HashMap, sync::Arc};
 
-use crate::matrix::ReapControl;
+use crate::matrix::{ReapAck, ReapControl};
 use crate::{
     bus::{
         BusFuture, DispatchError, DispatchOutcome, DispatchRequest, FinalizationCapability,
@@ -39,14 +39,24 @@ impl AcpDispatcherRouter {
 }
 
 impl ReapControl for AcpDispatcherRouter {
-    fn reap<'a>(&'a self, target: EndpointId, task: TaskId) -> BusFuture<'a, Result<bool, ()>> {
+    fn reap<'a>(
+        &'a self,
+        target: EndpointId,
+        task: TaskId,
+    ) -> BusFuture<'a, Result<Option<ReapAck>, ()>> {
         Box::pin(async move {
             let Some(dispatcher) = self.endpoints.get(&target) else {
-                return Ok(false);
+                return Ok(None);
             };
             Ok(dispatcher
                 .cancel_and_reap_task(task, "operator pause")
-                .await)
+                .await
+                .map(|ack| ReapAck {
+                    task_id: ack.task_id,
+                    resource_key: ack.resource_key,
+                    owner: ack.owner,
+                    fence: ack.fence,
+                }))
         })
     }
 }
