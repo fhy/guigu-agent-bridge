@@ -1075,3 +1075,86 @@ impl ReliabilityStore {
         Ok(result)
     }
 }
+
+#[cfg(test)]
+mod reap_pause_tests {
+    use super::*;
+    use crate::storage::{connect, migrate};
+
+    async fn fixture() -> (ReliabilityStore, SqlitePool, String, String, String) {
+        let path = std::env::temp_dir().join(format!("t022-reap-{}.db", Uuid::now_v7()));
+        let pool = connect(path).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let endpoint = Uuid::now_v7().to_string();
+        let conversation = Uuid::now_v7().to_string();
+        let task = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,address_json,capabilities_json) VALUES(?,?,'acp',1,NULL,'[]')").bind(&endpoint).bind(&endpoint).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO conversations(conversation_id,transport,external_id,thread_ref,participants_json) VALUES (?,NULL,NULL,NULL,'[]')").bind(&conversation).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES (?,?,?, ?,?,'x',5,0,0,0)").bind(&task).bind(&task).bind(&endpoint).bind(&endpoint).bind(&conversation).execute(&pool).await.unwrap();
+        let delivery = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES(?,?,1,?,?)").bind(&delivery).bind(&task).bind(&endpoint).bind("2026-09-20T00:00:00Z").execute(&pool).await.unwrap();
+        (
+            ReliabilityStore::new(pool.clone()),
+            pool,
+            task,
+            delivery,
+            endpoint,
+        )
+    }
+
+    #[tokio::test]
+    async fn forged_resource_binding_is_rejected() {
+        let (store, pool, task, delivery, endpoint) = fixture().await;
+        let q = store
+            .reserve_queue(
+                &task,
+                &delivery,
+                &endpoint,
+                "room",
+                None,
+                &endpoint,
+                "i",
+                "h",
+                2,
+                "2026-09-20T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_work_queue SET state='running',runtime_owner='owner',owner_fence=7,send_started=1 WHERE queue_id=?").bind(&q.queue_id).execute(&pool).await.unwrap();
+        assert!(matches!(
+            store
+                .pause_task_after_reap(&task, "forged", "owner", 7, "2026-09-20T00:00:01Z")
+                .await,
+            Err(ReliabilityError::WorkflowConflict)
+        ));
+    }
+
+    #[tokio::test]
+    async fn released_lease_allows_running_pause() {
+        let (store, pool, task, delivery, endpoint) = fixture().await;
+        let q = store
+            .reserve_queue(
+                &task,
+                &delivery,
+                &endpoint,
+                "room",
+                None,
+                &endpoint,
+                "i2",
+                "h",
+                2,
+                "2026-09-20T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE agent_work_queue SET state='running',runtime_owner='owner',owner_fence=7,send_started=1 WHERE queue_id=?").bind(&q.queue_id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('resource',?,?,7,'released',?,?,?)").bind(&task).bind("owner").bind("x").bind("x").bind("x").execute(&pool).await.unwrap();
+        assert_eq!(
+            store
+                .pause_task_after_reap(&task, "resource", "owner", 7, "2026-09-20T00:00:01Z")
+                .await
+                .unwrap(),
+            "paused"
+        );
+    }
+}
