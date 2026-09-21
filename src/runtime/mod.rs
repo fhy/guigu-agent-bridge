@@ -609,6 +609,24 @@ impl SqliteRuntimeStore {
         Ok(())
     }
 
+    pub async fn record_activity_with_generation(
+        &self,
+        lease: &Lease,
+        revision: u64,
+        generation: &str,
+        observed_bytes: u64,
+        now: DateTime<Utc>,
+    ) -> Result<(), RuntimeError> {
+        let result=sqlx::query("UPDATE task_continuations SET heartbeat_at=?,observed_output_bytes=observed_output_bytes+? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='in_flight' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
+            .bind(ts(now)).bind(to_i64(observed_bytes)?).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(generation).bind(lease.owner.to_string()).bind(ts(now)).execute(&self.pool).await?;
+        if result.rows_affected() == 1 {
+            Ok(())
+        } else {
+            Err(RuntimeError::Fenced)
+        }
+    }
+
+    #[deprecated(note = "use record_activity_with_generation")]
     pub async fn record_activity(
         &self,
         lease: &Lease,
@@ -616,14 +634,14 @@ impl SqliteRuntimeStore {
         observed_bytes: u64,
         now: DateTime<Utc>,
     ) -> Result<(), RuntimeError> {
-        self.ensure_runtime_generation(lease.task_id).await?;
-        let result=sqlx::query("UPDATE task_continuations SET heartbeat_at=?,observed_output_bytes=observed_output_bytes+? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND state='in_flight' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
-            .bind(ts(now)).bind(to_i64(observed_bytes)?).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(lease.owner.to_string()).bind(ts(now)).execute(&self.pool).await?;
-        if result.rows_affected() == 1 {
-            Ok(())
-        } else {
-            Err(RuntimeError::Fenced)
-        }
+        self.record_activity_with_generation(
+            lease,
+            revision,
+            CONTINUATION_RUNTIME_GENERATION,
+            observed_bytes,
+            now,
+        )
+        .await
     }
 
     pub async fn finish_with_generation(
@@ -1495,7 +1513,7 @@ impl LeasedAcpDispatcher {
                     Some(crate::acp::TurnUpdate::AgentMessageChunk(chunk))=>{
                         let observed=u64::try_from(chunk.len()).unwrap_or(u64::MAX);
                         let at=self.clock.now();
-                        self.store.record_activity(guard.lease(),state.revision,observed,at).await.map_err(Self::execution_error)?;
+                        self.store.record_activity_with_generation(guard.lease(),state.revision,&state.runtime_generation,observed,at).await.map_err(Self::execution_error)?;
                         let renewed=self.store.renew(guard.lease(),at,self.policy.lease_ttl).await.map_err(Self::execution_error)?;
                         guard.replace(renewed);last_activity=at;
                     }
@@ -1504,7 +1522,7 @@ impl LeasedAcpDispatcher {
                 _=self.timer.sleep(heartbeat)=>{
                     let at=self.clock.now();
                     let renewed=self.store.renew(guard.lease(),at,self.policy.lease_ttl).await.map_err(Self::execution_error)?;
-                    self.store.record_activity(guard.lease(),state.revision,0,at).await.map_err(Self::execution_error)?;
+                    self.store.record_activity_with_generation(guard.lease(),state.revision,&state.runtime_generation,0,at).await.map_err(Self::execution_error)?;
                     guard.replace(renewed);
                 }
                 _=self.timer.sleep(remaining)=>return Err(Self::execution_error(RuntimeError::Exhausted(PolicyLimit::Inactivity))),

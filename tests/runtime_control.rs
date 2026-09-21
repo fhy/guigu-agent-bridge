@@ -300,6 +300,53 @@ async fn captured_generation_is_used_by_atomic_continue_receipt() {
 }
 
 #[tokio::test]
+async fn activity_requires_the_captured_generation() {
+    let db = Db::new().await;
+    let store = SqliteRuntimeStore::new(db.pool.clone());
+    let lease = match store
+        .acquire(key(), db.task, at(), Duration::from_secs(30))
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Acquired(value) => value,
+        _ => panic!("acquire"),
+    };
+    store
+        .begin_continuation(&lease, db.delivery, "first", at())
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE task_continuations SET runtime_generation='generation.v2:valid' WHERE task_id=?",
+    )
+    .bind(db.task.to_string())
+    .execute(&db.pool)
+    .await
+    .unwrap();
+    let ready = store.continuation(db.task).await.unwrap().unwrap();
+    let running = store
+        .claim_turn_with_generation(&lease, ready.revision, "generation.v2:valid", at())
+        .await
+        .unwrap();
+    store
+        .record_activity_with_generation(&lease, running.revision, "generation.v2:valid", 3, at())
+        .await
+        .unwrap();
+    assert!(matches!(
+        store
+            .record_activity_with_generation(
+                &lease,
+                running.revision,
+                "generation.v1:stale",
+                1,
+                at()
+            )
+            .await,
+        Err(RuntimeError::Fenced)
+    ));
+    db.close().await;
+}
+
+#[tokio::test]
 async fn concurrent_acquire_is_atomic_and_stale_owners_are_fenced() {
     let db = Db::new().await;
     let store = SqliteRuntimeStore::new(db.pool.clone());
