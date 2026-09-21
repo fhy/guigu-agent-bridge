@@ -373,6 +373,20 @@ impl ReliabilityStore {
         Ok("paused")
     }
 
+    pub(crate) async fn mark_pause_recovery_needed(
+        &self,
+        task_id: &str,
+        now: &str,
+    ) -> Result<&'static str, ReliabilityError> {
+        let changed = sqlx::query("UPDATE agent_work_queue SET state='recovery_needed',revision=revision+1,reason='pause reap not confirmed',updated_at=? WHERE task_id=? AND state IN ('claimed','running') AND send_started=1")
+            .bind(now).bind(task_id).execute(&self.pool).await?;
+        Ok(if changed.rows_affected() == 1 {
+            "recovery_needed"
+        } else {
+            "absent"
+        })
+    }
+
     pub async fn resume_task(&self, task_id: &str, now: &str) -> Result<u64, ReliabilityError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let rows = sqlx::query("SELECT queue_id,revision,target_endpoint_id,runtime_owner,owner_fence FROM agent_work_queue WHERE task_id=? AND state='paused' ORDER BY sequence")

@@ -295,7 +295,14 @@ impl AdminHandler {
                     None => None,
                 };
                 let Some(reaped) = reaped else {
-                    return Ok("pause=recovery_needed".into());
+                    let result = queue
+                        .mark_pause_recovery_needed(
+                            &task_id.to_string(),
+                            &chrono::Utc::now().to_rfc3339(),
+                        )
+                        .await
+                        .map_err(|_| ())?;
+                    return Ok(format!("pause={result}"));
                 };
                 let result = queue
                     .pause_task_after_reap(
