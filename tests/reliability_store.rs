@@ -263,8 +263,8 @@ async fn workflow_owner_revision_cas_allows_one_concurrent_transition() {
         .execute(&pool).await.unwrap();
     let task = workflow_task(&endpoint, &endpoint, &conversation, &task_id);
     let a = ReliabilityStore::new(pool.clone());
-    let b = ReliabilityStore::new(pool);
-    let make = |event: &'static str, idem: &'static str, delivery: String| {
+    let b = ReliabilityStore::new(pool.clone());
+    let make = |event: &'static str, idem: &'static str, delivery: String, revision: i64| {
         guigu_agent_bridge::storage::WorkflowAdmission {
             transport: "matrix-workflow",
             external_event_id: event,
@@ -281,20 +281,54 @@ async fn workflow_owner_revision_cas_allows_one_concurrent_transition() {
             authorization: Some(guigu_agent_bridge::storage::WorkflowAuthorization {
                 endpoint: &endpoint,
                 role: WorkflowRole::Reviewer,
-                expected_revision: 0,
+                expected_revision: revision,
             }),
         }
     };
     let (left, right) = tokio::join!(
-        a.admit_workflow(make("cas-a", "cas-a", Uuid::now_v7().to_string())),
-        b.admit_workflow(make("cas-b", "cas-b", Uuid::now_v7().to_string()))
+        a.admit_workflow(make("cas-a", "cas-a", Uuid::now_v7().to_string(), 0)),
+        b.admit_workflow(make("cas-b", "cas-b", Uuid::now_v7().to_string(), 0))
     );
     assert_eq!(usize::from(left.is_ok()) + usize::from(right.is_ok()), 1);
     assert!(left.is_err() || right.is_err());
+    let revision: i64 = sqlx::query_scalar("SELECT revision FROM task_admissions WHERE task_id=?")
+        .bind(&task_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert!(revision > 0);
+    let success = a
+        .admit_workflow(make(
+            "cas-revision-1",
+            "cas-revision-1",
+            Uuid::now_v7().to_string(),
+            revision,
+        ))
+        .await;
+    assert!(success.is_ok(), "revision success failed: {success:?}");
+    let stale_delivery = Uuid::now_v7().to_string();
     let stale = a
-        .admit_workflow(make("cas-stale", "cas-stale", Uuid::now_v7().to_string()))
+        .admit_workflow(make("cas-stale", "cas-stale", stale_delivery.clone(), 0))
         .await;
     assert!(matches!(stale, Err(ReliabilityError::WorkflowUnauthorized)));
+    let envelopes: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM workflow_envelopes WHERE external_event_id='cas-stale'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let deliveries: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM deliveries WHERE delivery_id=?")
+        .bind(&stale_delivery)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let dispositions: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM delivery_dispositions WHERE delivery_id=?")
+            .bind(&stale_delivery)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!((envelopes, deliveries, dispositions), (0, 0, 0));
 }
 
 fn retry<'a>(

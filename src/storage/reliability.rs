@@ -245,11 +245,14 @@ impl ReliabilityStore {
                 return Err(ReliabilityError::WorkflowConflict);
             }
         }
-        sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at) VALUES(?,?,1,?,?,NULL)")
-            .bind(input.delivery_id).bind(input.task.task_id.to_string()).bind(input.target_endpoint_id).bind(input.now)
+        let attempt = input
+            .authorization
+            .map_or(1, |auth| auth.expected_revision + 2);
+        sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at) VALUES(?,?,?,?,?,NULL)")
+            .bind(input.delivery_id).bind(input.task.task_id.to_string()).bind(attempt).bind(input.target_endpoint_id).bind(input.now)
             .execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state) VALUES(?,?,1,'prepared')")
-            .bind(input.delivery_id).bind(input.task.task_id.to_string()).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state) VALUES(?,?,?,'prepared')")
+            .bind(input.delivery_id).bind(input.task.task_id.to_string()).bind(attempt).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(ReceiptOutcome::Inserted)
     }
