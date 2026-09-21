@@ -29,7 +29,7 @@ guigu-agent-bridge "$HOME/.config/guigu-agent-bridge.toml"
 - [架构](docs/ARCHITECTURE.md)
 - [发布、监控与回滚](docs/RELEASE.md)
 
-Agent 开发入口协议见 [AGENTS.md](AGENTS.md)。动态任务状态、内部审查、交接和事件记录不属于公开代码仓库。
+动态任务状态、内部审查、交接和事件记录不属于公开代码仓库。
 
 ## 设计边界
 
