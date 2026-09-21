@@ -323,6 +323,9 @@ impl ReliabilityStore {
     pub async fn pause_task_after_reap(
         &self,
         task_id: &str,
+        resource_key: &str,
+        owner_token: &str,
+        owner_fence: i64,
         now: &str,
     ) -> Result<&'static str, ReliabilityError> {
         let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
@@ -343,14 +346,18 @@ impl ReliabilityStore {
             tx.commit().await?;
             return Ok("paused");
         }
-        let live: i64 = sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE task_id=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
-            .bind(task_id).bind(owner.as_deref()).bind(fence).bind(now).fetch_one(&mut *tx).await?;
+        if owner.as_deref() != Some(owner_token) || fence != Some(owner_fence) {
+            tx.rollback().await?;
+            return Err(ReliabilityError::WorkflowConflict);
+        }
+        let live: i64 = sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
+            .bind(resource_key).bind(task_id).bind(owner_token).bind(owner_fence).bind(now).fetch_one(&mut *tx).await?;
         if live != 0 {
             sqlx::query("UPDATE agent_work_queue SET state='recovery_needed',revision=revision+1,reason='pause reap not confirmed',updated_at=? WHERE queue_id=? AND revision=?").bind(now).bind(id).bind(rev).execute(&mut *tx).await?;
             tx.commit().await?;
             return Ok("recovery_needed");
         }
-        let changed = sqlx::query("UPDATE agent_work_queue SET state='paused',revision=revision+1,updated_at=? WHERE queue_id=? AND revision=? AND runtime_owner=? AND owner_fence=? AND state IN ('claimed','running')").bind(now).bind(id).bind(rev).bind(owner.as_deref()).bind(fence).execute(&mut *tx).await?;
+        let changed = sqlx::query("UPDATE agent_work_queue SET state='paused',revision=revision+1,updated_at=? WHERE queue_id=? AND revision=? AND runtime_owner=? AND owner_fence=? AND state IN ('claimed','running')").bind(now).bind(id).bind(rev).bind(owner_token).bind(owner_fence).execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {
             tx.rollback().await?;
             return Err(ReliabilityError::WorkflowConflict);
