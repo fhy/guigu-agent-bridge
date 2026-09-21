@@ -310,7 +310,7 @@ async fn workflow_owner_revision_cas_allows_one_concurrent_transition() {
     let stale = a
         .admit_workflow(make("cas-stale", "cas-stale", stale_delivery.clone(), 0))
         .await;
-    assert!(matches!(stale, Err(ReliabilityError::WorkflowUnauthorized)));
+    assert!(matches!(stale, Err(ReliabilityError::WorkflowConflict)));
     let envelopes: i64 = sqlx::query_scalar(
         "SELECT COUNT(*) FROM workflow_envelopes WHERE external_event_id='cas-stale'",
     )

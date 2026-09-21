@@ -162,10 +162,10 @@ impl ReliabilityStore {
             };
             let revision: i64 = admission.try_get("revision")?;
             let state: String = admission.try_get("state")?;
-            if revision != auth.expected_revision
-                || state == "terminal"
-                || state == "recovery_needed"
-            {
+            if revision != auth.expected_revision {
+                return Err(ReliabilityError::WorkflowConflict);
+            }
+            if state == "terminal" || state == "recovery_needed" {
                 return Err(ReliabilityError::WorkflowUnauthorized);
             }
         }
