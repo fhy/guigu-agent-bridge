@@ -114,6 +114,16 @@ impl ReliabilityStore {
         Self { pool }
     }
 
+    pub async fn workflow_revision(&self, task_id: &str) -> Result<Option<i64>, ReliabilityError> {
+        let row = sqlx::query("SELECT revision FROM task_admissions WHERE task_id=?")
+            .bind(task_id)
+            .fetch_optional(&self.pool)
+            .await?;
+        row.map(|row| row.try_get("revision"))
+            .transpose()
+            .map_err(Into::into)
+    }
+
     /// Atomically reserves one workflow envelope. Identical keys replay; a
     /// conflicting key is rejected by SQLite uniqueness without mutation.
     pub async fn admit_workflow(
@@ -228,9 +238,12 @@ impl ReliabilityStore {
             .bind(input.task.task_id.to_string()).bind(input.external_event_id).bind(input.external_event_id)
             .bind(input.now).bind(input.now).execute(&mut *tx).await?;
         } else if let Some(auth) = &input.authorization {
-            sqlx::query("UPDATE task_admissions SET revision=revision+1,updated_at=? WHERE task_id=? AND revision=?")
+            let result = sqlx::query("UPDATE task_admissions SET revision=revision+1,updated_at=? WHERE task_id=? AND revision=?")
                 .bind(input.now).bind(input.task_id).bind(auth.expected_revision)
                 .execute(&mut *tx).await?;
+            if result.rows_affected() != 1 {
+                return Err(ReliabilityError::WorkflowConflict);
+            }
         }
         sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at) VALUES(?,?,1,?,?,NULL)")
             .bind(input.delivery_id).bind(input.task.task_id.to_string()).bind(input.target_endpoint_id).bind(input.now)

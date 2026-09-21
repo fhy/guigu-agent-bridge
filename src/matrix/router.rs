@@ -127,6 +127,15 @@ pub async fn route_workflow(
     let target_id = envelope.to.to_string();
     let task_id = envelope.task_id.to_string();
     let delivery_id = uuid::Uuid::now_v7().to_string();
+    let expected_revision = if matches!(envelope.kind, crate::models::WorkflowKind::Dispatch) {
+        0
+    } else {
+        reliability
+            .workflow_revision(&task_id)
+            .await
+            .map_err(|_| RouteError::Bus)?
+            .ok_or(RouteError::Forbidden)?
+    };
     let admission = reliability
         .admit_workflow(WorkflowAdmission {
             transport: "matrix-workflow",
@@ -145,7 +154,7 @@ pub async fn route_workflow(
                 || WorkflowAuthorization {
                     endpoint: &sender_id,
                     role: ingress.role,
-                    expected_revision: 0,
+                    expected_revision,
                 },
             ),
         })
