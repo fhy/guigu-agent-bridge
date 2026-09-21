@@ -1,11 +1,12 @@
 use std::{collections::HashMap, sync::Arc};
 
+use crate::matrix::ReapControl;
 use crate::{
     bus::{
         BusFuture, DispatchError, DispatchOutcome, DispatchRequest, FinalizationCapability,
         PreparedExecution, TaskDispatcher,
     },
-    models::EndpointId,
+    models::{EndpointId, TaskId},
     runtime::LeasedAcpDispatcher,
 };
 
@@ -34,6 +35,19 @@ impl AcpDispatcherRouter {
         for dispatcher in self.endpoints.values() {
             dispatcher.shutdown().await;
         }
+    }
+}
+
+impl ReapControl for AcpDispatcherRouter {
+    fn reap<'a>(&'a self, target: EndpointId, task: TaskId) -> BusFuture<'a, Result<bool, ()>> {
+        Box::pin(async move {
+            let Some(dispatcher) = self.endpoints.get(&target) else {
+                return Ok(false);
+            };
+            Ok(dispatcher
+                .cancel_and_reap_task(task, "operator pause")
+                .await)
+        })
     }
 }
 

@@ -1454,6 +1454,29 @@ impl LeasedAcpDispatcher {
         let _ = self.dispatcher.shutdown().await;
     }
 
+    pub async fn cancel_and_reap_task(&self, task_id: TaskId, reason: &str) -> bool {
+        let sender = self
+            .active
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&task_id).cloned());
+        let Some(sender) = sender else {
+            return false;
+        };
+        let (response, receiver) = tokio::sync::oneshot::channel();
+        if sender
+            .send(SupervisorCommand {
+                reason: crate::acp::bounded(reason),
+                response,
+            })
+            .await
+            .is_err()
+        {
+            return false;
+        }
+        matches!(receiver.await, Ok(Ok(_)))
+    }
+
     fn execution_error(error: impl std::fmt::Display) -> DispatchError {
         DispatchError::ExecutionFailed {
             reason: crate::acp::bounded(&error.to_string()),

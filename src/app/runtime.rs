@@ -467,6 +467,7 @@ impl AppRuntime {
                 4096,
             )
             .with_queue_control_store(Arc::new(reliability.clone()))
+            .with_reap_control(acp.clone())
             .with_retry_admission(retry)
             .start();
             runtime.health_state.register_required(sync_handle.alive());

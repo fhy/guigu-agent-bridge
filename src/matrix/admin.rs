@@ -86,6 +86,14 @@ pub trait RetryAdmission: Send + Sync {
     ) -> BusFuture<'a, Result<RetryReply, ()>>;
 }
 
+pub trait ReapControl: Send + Sync {
+    fn reap<'a>(
+        &'a self,
+        target: crate::models::EndpointId,
+        task: TaskId,
+    ) -> BusFuture<'a, Result<bool, ()>>;
+}
+
 pub struct AdminHandler {
     repository: Arc<dyn Repository>,
     cancellation: Cancellation,
@@ -95,6 +103,7 @@ pub struct AdminHandler {
     max_chain: usize,
     retry: Option<Arc<dyn RetryAdmission>>,
     queue: Option<Arc<ReliabilityStore>>,
+    reap: Option<Arc<dyn ReapControl>>,
 }
 
 impl AdminHandler {
@@ -114,6 +123,7 @@ impl AdminHandler {
             max_chain: DEFAULT_MAX_CHAIN,
             retry: None,
             queue: None,
+            reap: None,
         }
     }
 
@@ -124,6 +134,11 @@ impl AdminHandler {
 
     pub fn with_queue_control(mut self, queue: Arc<ReliabilityStore>) -> Self {
         self.queue = Some(queue);
+        self
+    }
+
+    pub fn with_reap_control(mut self, reap: Arc<dyn ReapControl>) -> Self {
+        self.reap = Some(reap);
         self
     }
 
@@ -263,11 +278,12 @@ impl AdminHandler {
                 };
                 self.cancellation
                     .cancel(task_id, "operator requested pause");
-                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
-                while !self.cancellation.is_retired(task_id)
-                    && tokio::time::Instant::now() < deadline
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                let reaped = match &self.reap {
+                    Some(control) => control.reap(task.to_agent, task_id).await.unwrap_or(false),
+                    None => false,
+                };
+                if !reaped {
+                    return Ok("pause=recovery_needed".into());
                 }
                 let result = queue
                     .pause_task_after_reap(&task_id.to_string(), &chrono::Utc::now().to_rfc3339())
