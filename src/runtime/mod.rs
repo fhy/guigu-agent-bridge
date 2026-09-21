@@ -1374,6 +1374,7 @@ pub struct ReapReceipt {
 
 struct SupervisorCommand {
     reason: String,
+    reap_only: bool,
     response: tokio::sync::oneshot::Sender<Result<FinalizationCapability, DispatchError>>,
 }
 
@@ -1391,6 +1392,7 @@ enum LoopOutcome {
     Deferred(DeferredTerminal),
     Cancelled(
         DeferredTerminal,
+        bool,
         tokio::sync::oneshot::Sender<Result<FinalizationCapability, DispatchError>>,
     ),
 }
@@ -1490,6 +1492,7 @@ impl LeasedAcpDispatcher {
         if sender
             .send(SupervisorCommand {
                 reason: crate::acp::bounded(reason),
+                reap_only: true,
                 response,
             })
             .await
@@ -1763,6 +1766,7 @@ impl LeasedAcpDispatcher {
                         observed_bytes: 0,
                         generation: state.runtime_generation.clone(),
                     },
+                    command.reap_only,
                     command.response,
                 ));
             }
@@ -2031,6 +2035,12 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                             let _ = command.response.send(Err(DispatchError::RecoveryNeeded));
                             return;
                         }
+                        if command.reap_only {
+                            let result = store.release(&lease, ReleaseDisposition::Released, clock.now()).await;
+                            let response = result.map(|_| FinalizationCapability { task_id, command: None }).map_err(|_| DispatchError::RecoveryNeeded);
+                            let _ = command.response.send(response);
+                            return;
+                        }
                         let Some(state) = store.continuation(task_id).await.ok().flatten() else {
                             let _ = store.release(&lease,ReleaseDisposition::RecoveryNeeded,clock.now()).await;
                             let _ = command.response.send(Err(DispatchError::RecoveryNeeded));
@@ -2091,7 +2101,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                 .await?
             {
                 LoopOutcome::Finished(outcome) => Ok(outcome),
-                LoopOutcome::Deferred(_) | LoopOutcome::Cancelled(_, _) => {
+                LoopOutcome::Deferred(_) | LoopOutcome::Cancelled(..) => {
                     Err(Self::execution_error("unexpected deferred outcome"))
                 }
             }
@@ -2208,7 +2218,26 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                     Ok(LoopOutcome::Finished(_)) => {
                         let _ = result_tx.send(Err(DispatchError::RecoveryNeeded));
                     }
-                    Ok(LoopOutcome::Cancelled(deferred, cancel_response)) => {
+                    Ok(LoopOutcome::Cancelled(deferred, reap_only, cancel_response)) => {
+                        if reap_only {
+                            let result = dispatcher
+                                .store
+                                .release(
+                                    &deferred.lease,
+                                    ReleaseDisposition::Released,
+                                    dispatcher.clock.now(),
+                                )
+                                .await;
+                            let response = result
+                                .map(|_| FinalizationCapability {
+                                    task_id: task.task_id,
+                                    command: None,
+                                })
+                                .map_err(|_| DispatchError::RecoveryNeeded);
+                            let _ = cancel_response.send(response);
+                            let _ = result_tx.send(Err(DispatchError::RecoveryNeeded));
+                            return;
+                        }
                         let (command_tx, command_rx) = tokio::sync::oneshot::channel();
                         let capability = FinalizationCapability {
                             task_id: task.task_id,
@@ -2293,6 +2322,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
             sender
                 .send(SupervisorCommand {
                     reason: crate::acp::bounded(reason),
+                    reap_only: false,
                     response,
                 })
                 .await

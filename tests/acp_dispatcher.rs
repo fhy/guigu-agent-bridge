@@ -302,6 +302,21 @@ async fn authenticated_pause_uses_real_router_and_marks_running_queue_paused() {
 async fn missing_router_reap_marks_recovery_without_paused_state() {
     let harness = Harness::new_reliable("t022-recovery", "happy", default_limits(), true).await;
     let task = harness.task("recover me");
+    harness
+        .repository_impl
+        .insert_task_and_event(
+            &task,
+            &TaskEvent {
+                id: EventId::generate(),
+                task_id: task.task_id,
+                seq: 1,
+                status: TaskStatus::Running,
+                timestamp: ts(),
+                payload: TaskEventPayload::Running { started_at: ts() },
+            },
+        )
+        .await
+        .unwrap();
     let delivery = DeliveryId::generate();
     sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES(?,?,1,?,?)")
         .bind(delivery.to_string()).bind(task.task_id.to_string()).bind(task.to_agent.to_string()).bind(TS).execute(&harness.pool).await.unwrap();
