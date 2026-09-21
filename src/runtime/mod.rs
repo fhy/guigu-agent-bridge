@@ -626,18 +626,26 @@ impl SqliteRuntimeStore {
         }
     }
 
-    pub async fn finish(
+    pub async fn finish_with_generation(
         &self,
         lease: &Lease,
         revision: u64,
+        generation: &str,
         state: ContinuationState,
         observed_bytes: u64,
         now: DateTime<Utc>,
     ) -> Result<(), RuntimeError> {
-        self.ensure_runtime_generation(lease.task_id).await?;
+        let current: Option<String> =
+            sqlx::query_scalar("SELECT runtime_generation FROM task_continuations WHERE task_id=?")
+                .bind(lease.task_id.to_string())
+                .fetch_optional(&self.pool)
+                .await?;
+        if current.as_deref() != Some(generation) {
+            return Err(RuntimeError::Fenced);
+        }
         let mut tx = self.pool.begin().await?;
-        let result=sqlx::query("UPDATE task_continuations SET state=?,revision=revision+1,completed_turns=completed_turns+1,heartbeat_at=?,observed_output_bytes=observed_output_bytes+? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND state='in_flight' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
-            .bind(state.as_str()).bind(ts(now)).bind(to_i64(observed_bytes)?).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
+        let result=sqlx::query("UPDATE task_continuations SET state=?,revision=revision+1,completed_turns=completed_turns+1,heartbeat_at=?,observed_output_bytes=observed_output_bytes+? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='in_flight' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
+            .bind(state.as_str()).bind(ts(now)).bind(to_i64(observed_bytes)?).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(generation).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Err(RuntimeError::Fenced);
         }
@@ -664,6 +672,26 @@ impl SqliteRuntimeStore {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    #[deprecated(note = "use finish_with_generation")]
+    pub async fn finish(
+        &self,
+        lease: &Lease,
+        revision: u64,
+        state: ContinuationState,
+        observed_bytes: u64,
+        now: DateTime<Utc>,
+    ) -> Result<(), RuntimeError> {
+        self.finish_with_generation(
+            lease,
+            revision,
+            CONTINUATION_RUNTIME_GENERATION,
+            state,
+            observed_bytes,
+            now,
+        )
+        .await
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -1223,6 +1251,7 @@ struct DeferredTerminal {
     revision: u64,
     continuation_state: ContinuationState,
     observed_bytes: u64,
+    generation: String,
 }
 
 enum LoopOutcome {
@@ -1334,6 +1363,13 @@ impl LeasedAcpDispatcher {
     ) -> Result<LoopOutcome, DispatchError> {
         if defer {
             let lease = guard.lease().clone();
+            let generation = self
+                .store
+                .continuation(lease.task_id)
+                .await
+                .map_err(Self::execution_error)?
+                .ok_or_else(|| Self::execution_error(RuntimeError::Malformed))?
+                .runtime_generation;
             guard.disarm();
             return Ok(LoopOutcome::Deferred(DeferredTerminal {
                 outcome,
@@ -1341,10 +1377,24 @@ impl LeasedAcpDispatcher {
                 revision,
                 continuation_state: state,
                 observed_bytes: bytes,
+                generation,
             }));
         }
         self.store
-            .finish(guard.lease(), revision, state, bytes, self.clock.now())
+            .finish_with_generation(
+                guard.lease(),
+                revision,
+                &self
+                    .store
+                    .continuation(guard.lease().task_id)
+                    .await
+                    .map_err(Self::execution_error)?
+                    .ok_or_else(|| Self::execution_error(RuntimeError::Malformed))?
+                    .runtime_generation,
+                state,
+                bytes,
+                self.clock.now(),
+            )
             .await
             .map_err(Self::execution_error)?;
         guard.disarm();
@@ -1525,6 +1575,7 @@ impl LeasedAcpDispatcher {
                         revision: state.revision,
                         continuation_state: ContinuationState::Terminal,
                         observed_bytes: 0,
+                        generation: state.runtime_generation.clone(),
                     },
                     command.response,
                 ));
@@ -1664,9 +1715,10 @@ impl LeasedAcpDispatcher {
                 }
                 Err(error) => {
                     self.store
-                        .finish(
+                        .finish_with_generation(
                             guard.lease(),
                             state.revision,
+                            &state.runtime_generation,
                             ContinuationState::RecoveryNeeded,
                             0,
                             self.clock.now(),
@@ -1809,15 +1861,15 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                         let (finalize_tx, finalize_rx) = tokio::sync::oneshot::channel();
                         let capability=FinalizationCapability{task_id,command:Some(finalize_tx)};
                         if command.response.send(Ok(capability)).is_err() {
-                            let _=store.finish(&lease,state.revision,ContinuationState::RecoveryNeeded,0,clock.now()).await;
+                            let _=store.finish_with_generation(&lease,state.revision,&state.runtime_generation,ContinuationState::RecoveryNeeded,0,clock.now()).await;
                             return;
                         }
                         match finalize_rx.await {
                             Ok(finalize) if finalize.task_id == task_id => {
-                                let result=store.finalize_terminal(&lease,state.revision,CONTINUATION_RUNTIME_GENERATION,ContinuationState::Terminal,0,&finalize.event,clock.now()).await.unwrap_or(FinalizeResult::RecoveryNeeded);
+                                let result=store.finalize_terminal(&lease,state.revision,&state.runtime_generation,ContinuationState::Terminal,0,&finalize.event,clock.now()).await.unwrap_or(FinalizeResult::RecoveryNeeded);
                                 let _=finalize.response.send(result);
                             }
-                            _ => { let _=store.finish(&lease,state.revision,ContinuationState::RecoveryNeeded,0,clock.now()).await; }
+                            _ => { let _=store.finish_with_generation(&lease,state.revision,&state.runtime_generation,ContinuationState::RecoveryNeeded,0,clock.now()).await; }
                         }
                     }
                     _ = timer.sleep(ttl) => {
@@ -1923,9 +1975,10 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                             let _ = dispatcher.dispatcher.shutdown().await;
                             let _ = dispatcher
                                 .store
-                                .finish(
+                                .finish_with_generation(
                                     &deferred.lease,
                                     deferred.revision,
+                                    &deferred.generation,
                                     ContinuationState::RecoveryNeeded,
                                     0,
                                     dispatcher.clock.now(),
@@ -1940,7 +1993,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                                     .finalize_terminal(
                                         &deferred.lease,
                                         deferred.revision,
-                                        CONTINUATION_RUNTIME_GENERATION,
+                                        &deferred.generation,
                                         deferred.continuation_state,
                                         deferred.observed_bytes,
                                         &command.event,
@@ -1954,9 +2007,10 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                                 let _ = dispatcher.dispatcher.shutdown().await;
                                 let _ = dispatcher
                                     .store
-                                    .finish(
+                                    .finish_with_generation(
                                         &deferred.lease,
                                         deferred.revision,
+                                        &deferred.generation,
                                         ContinuationState::RecoveryNeeded,
                                         0,
                                         dispatcher.clock.now(),
@@ -1978,9 +2032,10 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                         if cancel_response.send(Ok(capability)).is_err() {
                             let _ = dispatcher
                                 .store
-                                .finish(
+                                .finish_with_generation(
                                     &deferred.lease,
                                     deferred.revision,
+                                    &deferred.generation,
                                     ContinuationState::RecoveryNeeded,
                                     0,
                                     dispatcher.clock.now(),
@@ -1995,7 +2050,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                                     .finalize_terminal(
                                         &deferred.lease,
                                         deferred.revision,
-                                        CONTINUATION_RUNTIME_GENERATION,
+                                        &deferred.generation,
                                         deferred.continuation_state,
                                         0,
                                         &command.event,
@@ -2008,9 +2063,10 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                             _ => {
                                 let _ = dispatcher
                                     .store
-                                    .finish(
+                                    .finish_with_generation(
                                         &deferred.lease,
                                         deferred.revision,
+                                        &deferred.generation,
                                         ContinuationState::RecoveryNeeded,
                                         0,
                                         dispatcher.clock.now(),
