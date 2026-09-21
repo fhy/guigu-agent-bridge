@@ -288,19 +288,68 @@ impl ReliabilityStore {
         Ok(())
     }
 
-    pub async fn pause_queue(&self, target: &str, now: &str) -> Result<u64, ReliabilityError> {
-        Ok(sqlx::query("UPDATE agent_work_queue SET state='paused',revision=revision+1,updated_at=? WHERE target_endpoint_id=? AND state IN ('queued','claimed') AND send_started=0")
-            .bind(now).bind(target).execute(&self.pool).await?.rows_affected())
+    pub async fn pause_queue(
+        &self,
+        queue_id: &str,
+        revision: i64,
+        owner: &str,
+        fence: i64,
+        now: &str,
+    ) -> Result<(), ReliabilityError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let changed = sqlx::query("UPDATE agent_work_queue SET state='paused',revision=revision+1,updated_at=? WHERE queue_id=? AND revision=? AND state IN ('queued','claimed','running') AND send_started=0 AND runtime_owner=? AND owner_fence=?")
+            .bind(now).bind(queue_id).bind(revision).bind(owner).bind(fence).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(ReliabilityError::WorkflowConflict);
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
-    pub async fn resume_queue(&self, target: &str, now: &str) -> Result<u64, ReliabilityError> {
-        Ok(sqlx::query("UPDATE agent_work_queue SET state='queued',revision=revision+1,claimed_at=NULL,send_started=0,runtime_owner=NULL,owner_fence=NULL,updated_at=? WHERE target_endpoint_id=? AND state='paused'")
-            .bind(now).bind(target).execute(&self.pool).await?.rows_affected())
+    pub async fn resume_queue(
+        &self,
+        queue_id: &str,
+        revision: i64,
+        owner: &str,
+        fence: i64,
+        now: &str,
+    ) -> Result<(), ReliabilityError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let target: String = sqlx::query_scalar("SELECT target_endpoint_id FROM agent_work_queue WHERE queue_id=? AND revision=? AND state='paused' AND runtime_owner=? AND owner_fence=?")
+            .bind(queue_id).bind(revision).bind(owner).bind(fence).fetch_one(&mut *tx).await?;
+        let sequence: i64 = sqlx::query_scalar(
+            "SELECT next_sequence FROM agent_queue_counters WHERE target_endpoint_id=?",
+        )
+        .bind(&target)
+        .fetch_one(&mut *tx)
+        .await?;
+        sqlx::query("UPDATE agent_queue_counters SET next_sequence=next_sequence+1,updated_at=? WHERE target_endpoint_id=?").bind(now).bind(&target).execute(&mut *tx).await?;
+        let changed = sqlx::query("UPDATE agent_work_queue SET state='queued',sequence=?,revision=revision+1,claimed_at=NULL,send_started=0,runtime_owner=NULL,owner_fence=NULL,updated_at=? WHERE queue_id=? AND revision=? AND state='paused' AND runtime_owner=? AND owner_fence=?")
+            .bind(sequence).bind(now).bind(queue_id).bind(revision).bind(owner).bind(fence).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(ReliabilityError::WorkflowConflict);
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
-    pub async fn recover_queue(&self, target: &str, now: &str) -> Result<u64, ReliabilityError> {
-        Ok(sqlx::query("UPDATE agent_work_queue SET state=CASE WHEN send_started=0 THEN 'queued' ELSE 'recovery_needed' END,revision=revision+1,updated_at=? WHERE target_endpoint_id=? AND state IN ('claimed','running')")
-            .bind(now).bind(target).execute(&self.pool).await?.rows_affected())
+    pub async fn recover_queue(
+        &self,
+        queue_id: &str,
+        revision: i64,
+        now: &str,
+    ) -> Result<(), ReliabilityError> {
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let changed = sqlx::query("UPDATE agent_work_queue SET state=CASE WHEN send_started=0 THEN 'queued' ELSE 'recovery_needed' END,revision=revision+1,claimed_at=CASE WHEN send_started=0 THEN NULL ELSE claimed_at END,runtime_owner=CASE WHEN send_started=0 THEN NULL ELSE runtime_owner END,owner_fence=CASE WHEN send_started=0 THEN NULL ELSE owner_fence END,updated_at=? WHERE queue_id=? AND revision=? AND state IN ('claimed','running') AND NOT EXISTS (SELECT 1 FROM execution_leases l WHERE l.task_id=agent_work_queue.task_id AND l.owner_token=agent_work_queue.runtime_owner AND l.fence=agent_work_queue.owner_fence AND l.state='active' AND l.expires_at>?)")
+            .bind(now).bind(queue_id).bind(revision).bind(now).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Err(ReliabilityError::WorkflowConflict);
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn workflow_revision(&self, task_id: &str) -> Result<Option<i64>, ReliabilityError> {
