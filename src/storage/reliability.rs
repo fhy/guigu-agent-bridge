@@ -320,7 +320,7 @@ impl ReliabilityStore {
 
     /// Control boundary after ACP shutdown/reap. An active lease means reap is
     /// not proven and is classified as recovery_needed rather than requeued.
-    pub async fn pause_task_after_reap(
+    pub(crate) async fn pause_task_after_reap(
         &self,
         task_id: &str,
         resource_key: &str,

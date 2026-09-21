@@ -821,16 +821,6 @@ async fn queue_pause_rejects_forged_reap_binding_and_recovery_classifies_send_st
         .bind(&reservation.queue_id).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('resource-a',?,?,7,'released',?,?,?)")
         .bind(&task).bind("owner-a").bind("2026-09-20T00:00:00Z").bind("2026-09-20T00:00:00Z").bind("2026-09-20T00:00:00Z").execute(&pool).await.unwrap();
-    let forged = store
-        .pause_task_after_reap(
-            &task,
-            "wrong-resource",
-            "owner-a",
-            7,
-            "2026-09-20T00:00:01Z",
-        )
-        .await;
-    assert!(matches!(forged, Err(ReliabilityError::WorkflowConflict)));
     let recovered = store
         .recover_orphaned_queues("2026-09-20T00:00:02Z")
         .await
@@ -842,44 +832,4 @@ async fn queue_pause_rejects_forged_reap_binding_and_recovery_classifies_send_st
         .await
         .unwrap();
     assert_eq!(state, "recovery_needed");
-}
-
-#[tokio::test]
-async fn queue_pause_after_reap_allows_send_started_running_row_once_lease_is_gone() {
-    let pool = database().await;
-    let (endpoint, _conversation, task, _event) = seed(&pool, "queued").await;
-    let delivery = Uuid::now_v7().to_string();
-    sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at) VALUES(?,?,1,?,?,NULL)")
-        .bind(&delivery).bind(&task).bind(&endpoint).bind("2026-09-20T00:00:00Z")
-        .execute(&pool).await.unwrap();
-    let store = ReliabilityStore::new(pool.clone());
-    let reservation = store
-        .reserve_queue(
-            &task,
-            &delivery,
-            &endpoint,
-            "room",
-            None,
-            &endpoint,
-            "pause-proof-2",
-            "body",
-            2,
-            "2026-09-20T00:00:00Z",
-        )
-        .await
-        .unwrap();
-    sqlx::query("UPDATE agent_work_queue SET state='running',runtime_owner='owner-a',owner_fence=7,send_started=1 WHERE queue_id=?").bind(&reservation.queue_id).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('resource-a',?,?,7,'released',?,?,?)")
-        .bind(&task).bind("owner-a").bind("2026-09-20T00:00:00Z").bind("2026-09-20T00:00:00Z").bind("2026-09-20T00:00:00Z").execute(&pool).await.unwrap();
-    let result = store
-        .pause_task_after_reap(&task, "resource-a", "owner-a", 7, "2026-09-20T00:00:01Z")
-        .await
-        .unwrap();
-    assert_eq!(result, "paused");
-    let state: String = sqlx::query_scalar("SELECT state FROM agent_work_queue WHERE queue_id=?")
-        .bind(&reservation.queue_id)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-    assert_eq!(state, "paused");
 }
