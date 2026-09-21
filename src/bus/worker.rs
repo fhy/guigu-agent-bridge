@@ -433,11 +433,52 @@ pub enum LifecycleResult {
     Stale,
 }
 
+/// Captured durable execution identity. It is issued by the runtime lease
+/// authority and is never reconstructed from an AgentTask.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueLeaseContext {
+    pub resource_key: String,
+    pub runtime_owner: String,
+    pub owner_fence: i64,
+    pub expires_at: String,
+}
+
 pub trait TaskLifecycle: Send + Sync {
     fn transition<'a>(
         &'a self,
         event: &'a TaskEvent,
     ) -> BusFuture<'a, Result<LifecycleResult, DispatchError>>;
+
+    /// Optional durable queue hooks. The default preserves legacy callers that
+    /// do not provide a SQLite queue; production assembly supplies these hooks
+    /// together with the real lease/workspace authority.
+    fn claim_queue<'a>(
+        &'a self,
+        _task: &'a AgentTask,
+    ) -> BusFuture<'a, Result<Option<QueueLeaseContext>, DispatchError>> {
+        Box::pin(async { Ok(None) })
+    }
+    fn mark_queue_send_started<'a>(
+        &'a self,
+        _task: &'a AgentTask,
+        _lease: &'a QueueLeaseContext,
+    ) -> BusFuture<'a, Result<(), DispatchError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn renew_queue_lease<'a>(
+        &'a self,
+        _task: &'a AgentTask,
+        _lease: &'a QueueLeaseContext,
+    ) -> BusFuture<'a, Result<(), DispatchError>> {
+        Box::pin(async { Ok(()) })
+    }
+    fn release_queue_lease<'a>(
+        &'a self,
+        _task: &'a AgentTask,
+        _lease: &'a QueueLeaseContext,
+    ) -> BusFuture<'a, Result<(), DispatchError>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 /// Sends tasks to a target agent and runs them to a terminal outcome.
@@ -1159,6 +1200,19 @@ impl Worker {
             return self.fail_task(task_id, 2, error).await;
         };
 
+        // Durable queue admission is consumed here, immediately before the
+        // first delivery event. The lifecycle implementation owns the real
+        // workspace-derived lease and returns its captured fence; Worker never
+        // fabricates an execution identity.
+        let queue_lease = if let Some(lifecycle) = &self.lifecycle {
+            match lifecycle.claim_queue(&task).await {
+                Ok(value) => value,
+                Err(error) => return self.fail_task(task_id, 2, error.to_string()).await,
+            }
+        } else {
+            None
+        };
+
         // One subscription for the whole task, created before the first await
         // that a cancellation could race. The receiver is version-triggered, so a
         // signal recorded after this point cannot be missed, and one recorded
@@ -1210,8 +1264,19 @@ impl Worker {
             self.emit(dispatched, task_id, seq).await?;
             seq += 1;
 
+            if let (Some(lifecycle), Some(lease)) = (&self.lifecycle, &queue_lease)
+                && let Err(error) = lifecycle.mark_queue_send_started(&task, lease).await
+            {
+                return self.fail_task(task_id, seq, error.to_string()).await;
+            }
+
             // Stage one, raced: a `deliver` that never resolves is abandoned by
             // the timeout/cancellation boundary instead of blocking the worker.
+            if let (Some(lifecycle), Some(lease)) = (&self.lifecycle, &queue_lease)
+                && let Err(error) = lifecycle.renew_queue_lease(&task, lease).await
+            {
+                return self.fail_task(task_id, seq, error.to_string()).await;
+            }
             match self
                 .race(
                     task_id,

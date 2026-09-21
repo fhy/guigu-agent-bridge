@@ -4,9 +4,10 @@ use crate::{
     acp::{AcpDispatcher, TurnResult},
     bus::{
         BusFuture, DispatchError, DispatchOutcome, DispatchRequest, FinalizationCapability,
-        FinalizeResult, LifecycleResult, PreparedExecution, TaskDispatcher, TaskLifecycle,
+        FinalizeResult, LifecycleResult, PreparedExecution, QueueLeaseContext, TaskDispatcher,
+        TaskLifecycle,
     },
-    models::{DeliveryId, EndpointId, TaskId},
+    models::{AgentTask, DeliveryId, EndpointId, TaskId},
     storage::StorageError,
 };
 use chrono::{DateTime, Utc};
@@ -949,6 +950,82 @@ impl SqliteTaskLifecycle {
 }
 
 impl TaskLifecycle for SqliteTaskLifecycle {
+    fn claim_queue<'a>(
+        &'a self,
+        task: &'a AgentTask,
+    ) -> BusFuture<'a, Result<Option<QueueLeaseContext>, DispatchError>> {
+        Box::pin(async move {
+            let now = Utc::now().to_rfc3339();
+            let mut tx = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(runtime_dispatch_error)?;
+            let row = sqlx::query("SELECT q.queue_id,q.revision,l.resource_key,l.owner_token,l.fence,l.expires_at FROM agent_work_queue q JOIN execution_leases l ON l.task_id=q.task_id AND l.state='active' AND l.expires_at>? WHERE q.task_id=? AND q.state='queued' AND q.send_started=0 ORDER BY q.sequence LIMIT 1")
+                .bind(&now).bind(task.task_id.to_string()).fetch_optional(&mut *tx).await.map_err(runtime_dispatch_error)?;
+            let Some(row) = row else {
+                tx.rollback().await.ok();
+                return Ok(None);
+            };
+            let queue_id: String = row.try_get("queue_id").map_err(runtime_dispatch_error)?;
+            let revision: i64 = row.try_get("revision").map_err(runtime_dispatch_error)?;
+            let owner: String = row.try_get("owner_token").map_err(runtime_dispatch_error)?;
+            let fence: i64 = row.try_get("fence").map_err(runtime_dispatch_error)?;
+            let changed = sqlx::query("UPDATE agent_work_queue SET state='claimed',revision=revision+1,claimed_at=?,runtime_owner=?,owner_fence=?,updated_at=? WHERE queue_id=? AND state='queued' AND revision=? AND send_started=0")
+                .bind(&now).bind(&owner).bind(fence).bind(&now).bind(queue_id).bind(revision).execute(&mut *tx).await.map_err(runtime_dispatch_error)?;
+            if changed.rows_affected() != 1 {
+                tx.rollback().await.ok();
+                return Err(runtime_dispatch_error("queue claim conflict"));
+            }
+            let context = QueueLeaseContext {
+                resource_key: row
+                    .try_get("resource_key")
+                    .map_err(runtime_dispatch_error)?,
+                runtime_owner: owner,
+                owner_fence: fence,
+                expires_at: row.try_get("expires_at").map_err(runtime_dispatch_error)?,
+            };
+            tx.commit().await.map_err(runtime_dispatch_error)?;
+            Ok(Some(context))
+        })
+    }
+
+    fn mark_queue_send_started<'a>(
+        &'a self,
+        task: &'a AgentTask,
+        lease: &'a QueueLeaseContext,
+    ) -> BusFuture<'a, Result<(), DispatchError>> {
+        Box::pin(async move {
+            let now = Utc::now().to_rfc3339();
+            let changed = sqlx::query("UPDATE agent_work_queue SET state='running',send_started=1,revision=revision+1,updated_at=? WHERE task_id=? AND state='claimed' AND send_started=0 AND runtime_owner=? AND owner_fence=? AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=? AND l.task_id=? AND l.owner_token=? AND l.fence=? AND l.state='active' AND l.expires_at>?)")
+                .bind(&now).bind(task.task_id.to_string()).bind(&lease.runtime_owner).bind(lease.owner_fence).bind(&lease.resource_key).bind(task.task_id.to_string()).bind(&lease.runtime_owner).bind(lease.owner_fence).bind(&now).execute(&self.pool).await.map_err(runtime_dispatch_error)?;
+            if changed.rows_affected() == 1 {
+                Ok(())
+            } else {
+                Err(runtime_dispatch_error("queue send-start fenced"))
+            }
+        })
+    }
+
+    fn renew_queue_lease<'a>(
+        &'a self,
+        task: &'a AgentTask,
+        lease: &'a QueueLeaseContext,
+    ) -> BusFuture<'a, Result<(), DispatchError>> {
+        Box::pin(async move {
+            let now = Utc::now();
+            let expires = now + chrono::Duration::seconds(30);
+            let stamp = now.to_rfc3339();
+            let changed = sqlx::query("UPDATE execution_leases SET heartbeat_at=?,expires_at=? WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
+                .bind(&stamp).bind(expires.to_rfc3339()).bind(&lease.resource_key).bind(task.task_id.to_string()).bind(&lease.runtime_owner).bind(lease.owner_fence).bind(&stamp).execute(&self.pool).await.map_err(runtime_dispatch_error)?;
+            if changed.rows_affected() == 1 {
+                Ok(())
+            } else {
+                Err(runtime_dispatch_error("queue lease renewal fenced"))
+            }
+        })
+    }
+
     fn transition<'a>(
         &'a self,
         event: &'a crate::models::TaskEvent,

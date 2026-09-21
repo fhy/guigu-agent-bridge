@@ -132,8 +132,8 @@ pub use registry::{
 pub use worker::{
     Backoff, DispatchError, DispatchOutcome, DispatchRequest, DispatcherRegistry,
     FinalizationCapability, FinalizeCommand, FinalizeResult, LifecycleResult, LoopLimits,
-    PreparedExecution, RetryPolicy, TaskDispatcher, TaskLifecycle, Worker, WorkerBuilder,
-    WorkerConfig, WorkerError,
+    PreparedExecution, QueueLeaseContext, RetryPolicy, TaskDispatcher, TaskLifecycle, Worker,
+    WorkerBuilder, WorkerConfig, WorkerError,
 };
 
 /// A boxed, `Send` future returned by the async bus traits.
