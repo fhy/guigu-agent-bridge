@@ -1255,6 +1255,27 @@ impl Repository for SqliteRepository {
     ) -> StorageFuture<'a, Result<AckOutcome, StorageError>> {
         Box::pin(async move {
             let id = encode_id(delivery_id);
+            if let Some(owner) = &self.owner {
+                let timestamp = encode_timestamp(&at);
+                let owner = Arc::clone(owner);
+                return owner.transaction(move |tx| {
+                    let changed = tx
+                        .execute("UPDATE deliveries SET acknowledged_at=?1 WHERE delivery_id=?2 AND acknowledged_at IS NULL", rusqlite::params![timestamp, id])
+                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    if changed == 1 {
+                        return Ok(AckOutcome::Recorded);
+                    }
+                    let stored: Option<Option<String>> = tx
+                        .query_row("SELECT acknowledged_at FROM deliveries WHERE delivery_id=?1", [&id], |row| row.get(0))
+                        .optional()
+                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    match stored {
+                        Some(Some(_)) => Ok(AckOutcome::AlreadyAcknowledged),
+                        Some(None) => Ok(AckOutcome::Recorded),
+                        None => Err(StorageError::NotFound { entity: "delivery", id }),
+                    }
+                });
+            }
             let result = sqlx::query(ACKNOWLEDGE_DELIVERY)
                 .bind(encode_timestamp(&at))
                 .bind(&id)
