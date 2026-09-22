@@ -771,7 +771,31 @@ impl Repository for SqliteRepository {
         &'a self,
         id: ConversationId,
     ) -> StorageFuture<'a, Result<Option<Conversation>, StorageError>> {
-        Box::pin(async move { self.select_conversation_row(id).await })
+        Box::pin(async move {
+            if let Some(owner) = &self.owner {
+                let key = encode_id(id);
+                let owner = Arc::clone(owner);
+                return owner.execute(move |connection| {
+                    let mut statement = connection
+                        .prepare("SELECT conversation_id,transport,external_id,thread_ref,participants_json FROM conversations WHERE conversation_id=?1")
+                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let mut rows = statement.query([key]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? else { return Ok(None); };
+                    let id: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let transport: Option<String> = row.get(1).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let external_id: Option<String> = row.get(2).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let thread_ref: Option<String> = row.get(3).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let participants: String = row.get(4).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let external_ref = match (transport, external_id) {
+                        (Some(transport), Some(external_id)) => Some(ExternalRef { transport: decode_transport(&transport, "conversations.transport")?, external_id, thread_ref }),
+                        (None, None) => None,
+                        _ => return Err(StorageError::Malformed { field: "conversations.transport", detail: "external reference is partially NULL".into() }),
+                    };
+                    Ok(Some(Conversation { id: decode_id(&id, "conversations.conversation_id")?, participants: decode_json(&participants, "conversations.participants_json")?, external_ref }))
+                });
+            }
+            self.select_conversation_row(id).await
+        })
     }
 
     fn conversation_by_external_ref<'a>(
