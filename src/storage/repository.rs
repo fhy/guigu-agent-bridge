@@ -720,6 +720,25 @@ impl Repository for SqliteRepository {
                 &conversation.participants,
                 "conversations.participants_json",
             )?;
+            if let Some(owner) = &self.owner {
+                let conversation_id = encode_id(conversation.id);
+                let transport = transport.map(str::to_owned);
+                let external_id = external_id.map(str::to_owned);
+                let thread_ref = thread_ref.map(str::to_owned);
+                let owner = Arc::clone(owner);
+                return owner.transaction(move |tx| {
+                    tx.execute(
+                        "INSERT INTO conversations(conversation_id,transport,external_id,thread_ref,participants_json) VALUES (?1,?2,?3,?4,?5)",
+                        rusqlite::params![conversation_id, transport, external_id, thread_ref, participants],
+                    )
+                    .map_err(|error| match error {
+                        rusqlite::Error::SqliteFailure(_, Some(detail))
+                            if detail.contains("UNIQUE") => StorageError::Duplicate { detail },
+                        other => StorageError::OwnerQuery(other.to_string()),
+                    })?;
+                    Ok(())
+                });
+            }
             let error = match sqlx::query(INSERT_CONVERSATION)
                 .bind(encode_id(conversation.id))
                 .bind(transport)
