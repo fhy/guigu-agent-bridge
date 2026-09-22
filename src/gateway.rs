@@ -6,6 +6,15 @@
 use crate::matrix::InboundMatrixEvent;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
+use thiserror::Error;
+
+#[derive(Debug, Error)]
+pub enum GatewayError {
+    #[error("gateway storage error: {0}")]
+    Storage(#[from] crate::storage::StorageError),
+    #[error("gateway sqlite error: {0}")]
+    Query(String),
+}
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
@@ -479,13 +488,21 @@ impl GatewayStore {
         .await
     }
 
-    pub async fn retained_bytes(&self) -> Result<i64, sqlx::Error> {
-        sqlx::query_scalar("SELECT COALESCE(SUM(retained_bytes),0) FROM gateway_envelopes")
-            .fetch_one(&self.pool)
-            .await
+    pub async fn retained_bytes(&self) -> Result<i64, GatewayError> {
+        self.owner
+            .execute(|connection| {
+                connection
+                    .query_row(
+                        "SELECT COALESCE(SUM(retained_bytes),0) FROM gateway_envelopes",
+                        [],
+                        |row| row.get(0),
+                    )
+                    .map_err(|error| GatewayError::Query(error.to_string()))
+            })
+            .map_err(GatewayError::from)
     }
 
-    pub async fn pressure_ok(&self, high: i64) -> Result<bool, sqlx::Error> {
+    pub async fn pressure_ok(&self, high: i64) -> Result<bool, GatewayError> {
         Ok(self.retained_bytes().await? < high)
     }
 
