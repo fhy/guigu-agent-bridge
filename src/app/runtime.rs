@@ -58,6 +58,7 @@ pub enum AppError {
 
 pub struct AppRuntime {
     pool: Option<SqlitePool>,
+    business_store: crate::storage::BusinessStore,
     reload: Arc<ReloadController>,
     health_state: Arc<HealthState>,
     health: Option<HealthServer>,
@@ -83,11 +84,12 @@ impl AppRuntime {
         let config = crate::config::load(&path)?;
         prepare_directories(&config).map_err(AppError::Health)?;
         let pool = connect(&config.bridge.database).await?;
+        let business_store = crate::storage::connect_owner(&config.bridge.database)?.facade();
         if let Err(error) = migrate(&pool).await {
             pool.close().await;
             return Err(error.into());
         }
-        let reliability = crate::storage::ReliabilityStore::new(pool.clone());
+        let reliability = crate::storage::ReliabilityStore::new_owner(business_store.clone());
         let runtime_instance = uuid::Uuid::now_v7().to_string();
         let startup_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         let owns_runtime = reliability
@@ -98,6 +100,7 @@ impl AppRuntime {
             path,
             config,
             pool.clone(),
+            business_store.clone(),
             reliability.clone(),
             runtime_instance.clone(),
             owns_runtime,
@@ -126,14 +129,15 @@ impl AppRuntime {
         path: PathBuf,
         config: Config,
         pool: SqlitePool,
+        business_store: crate::storage::BusinessStore,
         reliability: crate::storage::ReliabilityStore,
         runtime_instance: String,
         owns_runtime: bool,
     ) -> Result<Self, AppError> {
-        let repository = Arc::new(SqliteRepository::new(pool.clone()));
+        let repository = Arc::new(SqliteRepository::new_owner(business_store.clone()));
         let repository_trait: Arc<dyn Repository> = repository.clone();
-        let sessions = SqliteSessionStore::new(pool.clone());
-        let runtime_store = SqliteRuntimeStore::new(pool.clone());
+        let sessions = SqliteSessionStore::new_owner(business_store.clone());
+        let runtime_store = SqliteRuntimeStore::new_owner(business_store.clone());
         let registry = Arc::new(EndpointRegistry::from_config(&config));
         sync_agents(repository_trait.as_ref(), &registry).await?;
 
@@ -204,6 +208,7 @@ impl AppRuntime {
         health_state.set_recovery_blocked(recovery_blocked);
         let mut runtime = Self {
             pool: Some(pool.clone()),
+            business_store,
             reload,
             health_state,
             health: None,
