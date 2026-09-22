@@ -182,4 +182,36 @@ mod tests {
         assert!(repository.agent_exists("agent").expect("original row"));
         assert!(!repository.agent_exists("other").expect("rollback row"));
     }
+
+    #[test]
+    fn event_owner_boundary_preserves_order_and_duplicate_facts() {
+        let path =
+            std::env::temp_dir().join(format!("guigu-owner-events-{}.db", uuid::Uuid::now_v7()));
+        let owner = BusinessStoreOwner::open(&path).expect("owner");
+        owner.execute(|connection| {
+            connection.execute_batch("CREATE TABLE task_events(event_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, seq INTEGER NOT NULL, status TEXT NOT NULL, timestamp TEXT NOT NULL, payload TEXT NOT NULL, UNIQUE(task_id,seq))").map_err(map_sqlite_error)
+        }).expect("schema");
+        let insert = |id: &str, seq: i64, payload: &str| {
+            owner.transaction(move |tx| {
+            tx.execute("INSERT INTO task_events VALUES (?1,'task',?2,'queued','2026-01-01T00:00:00Z',?3)", rusqlite::params![id, seq, payload]).map_err(map_sqlite_error).map(|_| ())
+        })
+        };
+        insert("e2", 2, "{\"ok\":true}").expect("insert 2");
+        insert("e1", 1, "{\"ok\":true}").expect("insert 1");
+        assert!(insert("e1", 1, "{\"ok\":true}").is_err());
+        assert!(insert("e1", 1, "{\"different\":true}").is_err());
+        let order: Vec<i64> = owner
+            .execute(|connection| {
+                let mut statement = connection
+                    .prepare("SELECT seq FROM task_events WHERE task_id='task' ORDER BY seq ASC")
+                    .map_err(map_sqlite_error)?;
+                let rows = statement
+                    .query_map([], |row| row.get(0))
+                    .map_err(map_sqlite_error)?;
+                rows.collect::<Result<Vec<i64>, _>>()
+                    .map_err(map_sqlite_error)
+            })
+            .expect("order");
+        assert_eq!(order, vec![1, 2]);
+    }
 }
