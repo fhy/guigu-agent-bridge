@@ -903,6 +903,30 @@ impl Repository for SqliteRepository {
         task: &'a AgentTask,
     ) -> StorageFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
+            if let Some(owner) = &self.owner {
+                let task_id = encode_id(task.task_id);
+                let root_task_id = encode_id(task.root_task_id);
+                let parent_task_id = task.parent_task_id.map(encode_id);
+                let from_agent = encode_id(task.from_agent);
+                let to_agent = encode_id(task.to_agent);
+                let conversation_id = encode_id(task.conversation_id);
+                let reply_to = task.reply_to.map(encode_id);
+                let text = task.text.to_owned();
+                let priority = task.priority.value() as i64;
+                let deadline = task.deadline.map(|value| value.to_rfc3339());
+                let owner = Arc::clone(owner);
+                return owner.transaction(move |tx| {
+                    tx.execute(
+                        "INSERT INTO tasks(task_id,root_task_id,parent_task_id,from_agent,to_agent,conversation_id,reply_to,text,priority,depth,hops,deadline,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                        rusqlite::params![task_id, root_task_id, parent_task_id, from_agent, to_agent, conversation_id, reply_to, text, priority, task.depth as i64, task.hops as i64, deadline, task.version as i64],
+                    )
+                    .map_err(|error| match error {
+                        rusqlite::Error::SqliteFailure(_, Some(detail)) if detail.contains("UNIQUE") => StorageError::Duplicate { detail },
+                        other => StorageError::OwnerQuery(other.to_string()),
+                    })?;
+                    Ok(())
+                });
+            }
             match insert_task_row(&self.pool, task).await {
                 Ok(()) => Ok(()),
                 Err(error) => match classify_task_duplicate(&self.pool, task, error).await? {
