@@ -66,7 +66,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use super::BusinessStoreOwner;
+use super::{BusinessStore, BusinessStoreOwner};
 use chrono::{DateTime, Utc};
 use rusqlite::OptionalExtension;
 use sqlx::sqlite::SqliteRow;
@@ -390,7 +390,7 @@ pub struct SqliteRepository {
 }
 
 impl SqliteRepository {
-    pub fn new_owner(owner: BusinessStoreOwner) -> Self {
+    pub fn new_owner(owner: BusinessStore) -> Self {
         Self {
             pool: SqlitePool::connect_lazy("sqlite::memory:").expect("owner facade placeholder"),
             owner: Some(Arc::new(owner)),

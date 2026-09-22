@@ -20,15 +20,12 @@ pub struct BusinessStoreOwner {
     state: std::sync::Arc<OwnerState>,
 }
 
+pub type BusinessStore = BusinessStoreOwner;
+
 struct OwnerState {
     path: PathBuf,
     sender: SyncSender<Command>,
     thread: std::sync::Mutex<Option<JoinHandle<()>>>,
-}
-
-#[derive(Clone)]
-pub struct BusinessStore {
-    state: std::sync::Arc<OwnerState>,
 }
 
 impl BusinessStoreOwner {
@@ -86,38 +83,6 @@ impl BusinessStoreOwner {
         let sender = &self.state.sender;
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         sender
-            .send(Box::new(move |connection| {
-                let _ = result_tx.send(command(connection));
-            }))
-            .map_err(|_| StorageError::Owner("owner command queue closed".into()))?;
-        result_rx
-            .recv()
-            .map_err(|_| StorageError::Owner("owner command result dropped".into()))?
-    }
-}
-
-impl BusinessStore {
-    pub fn path(&self) -> &Path {
-        &self.state.path
-    }
-    pub fn transaction<R: Send + 'static>(
-        &self,
-        command: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<R, StorageError> + Send + 'static,
-    ) -> Result<R, StorageError> {
-        self.execute(move |connection| {
-            let transaction = connection.transaction().map_err(map_sqlite_error)?;
-            let result = command(&transaction)?;
-            transaction.commit().map_err(map_sqlite_error)?;
-            Ok(result)
-        })
-    }
-    pub fn execute<R: Send + 'static>(
-        &self,
-        command: impl FnOnce(&mut Connection) -> Result<R, StorageError> + Send + 'static,
-    ) -> Result<R, StorageError> {
-        let (result_tx, result_rx) = mpsc::sync_channel(1);
-        self.state
-            .sender
             .send(Box::new(move |connection| {
                 let _ = result_tx.send(command(connection));
             }))
