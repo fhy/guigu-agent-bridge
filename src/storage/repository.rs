@@ -630,6 +630,33 @@ impl Repository for SqliteRepository {
         id: EndpointId,
     ) -> StorageFuture<'a, Result<Option<AgentEndpoint>, StorageError>> {
         Box::pin(async move {
+            if let Some(owner) = &self.owner {
+                let key = encode_id(id);
+                let owner = Arc::clone(owner);
+                return owner.execute(move |connection| {
+                    let mut statement = connection
+                        .prepare("SELECT endpoint_id,transport,address_json,enabled,capabilities_json FROM agents WHERE endpoint_id=?1 AND address_json IS NOT NULL")
+                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let mut rows = statement
+                        .query([key])
+                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? else {
+                        return Ok(None);
+                    };
+                    let endpoint_id: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let transport: String = row.get(1).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let address: String = row.get(2).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let enabled: i64 = row.get(3).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let capabilities: String = row.get(4).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    Ok(Some(AgentEndpoint {
+                        id: decode_id(&endpoint_id, "agents.endpoint_id")?,
+                        transport: decode_transport(&transport, "agents.transport")?,
+                        address: decode_json(&address, "agents.address_json")?,
+                        enabled: decode_bool(enabled, "agents.enabled")?,
+                        capabilities: decode_json(&capabilities, "agents.capabilities_json")?,
+                    }))
+                });
+            }
             let row = sqlx::query(SELECT_AGENT)
                 .bind(encode_id(id))
                 .fetch_optional(&self.pool)
