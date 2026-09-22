@@ -386,14 +386,14 @@ pub enum AckOutcome {
 #[derive(Debug, Clone)]
 pub struct SqliteRepository {
     pool: SqlitePool,
-    owner: Option<Arc<BusinessStoreOwner>>,
+    owner: Option<BusinessStore>,
 }
 
 impl SqliteRepository {
     pub fn new_owner(owner: BusinessStore) -> Self {
         Self {
             pool: SqlitePool::connect_lazy("sqlite::memory:").expect("owner facade placeholder"),
-            owner: Some(Arc::new(owner)),
+            owner: Some(owner),
         }
     }
 }
