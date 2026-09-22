@@ -230,4 +230,25 @@ mod tests {
             }
         ));
     }
+
+    #[test]
+    fn delivery_owner_facts_are_ordered_and_acknowledgement_is_idempotent() {
+        let path =
+            std::env::temp_dir().join(format!("guigu-owner-delivery-{}.db", uuid::Uuid::now_v7()));
+        let owner = BusinessStoreOwner::open(&path).expect("owner");
+        owner.execute(|connection| {
+            connection.execute_batch("CREATE TABLE deliveries(delivery_id TEXT PRIMARY KEY, task_id TEXT NOT NULL, attempt INTEGER NOT NULL, target_endpoint_id TEXT NOT NULL, dispatched_at TEXT NOT NULL, acknowledged_at TEXT)").map_err(map_sqlite_error)
+        }).expect("schema");
+        owner.transaction(|tx| {
+            tx.execute("INSERT INTO deliveries VALUES ('d2','t',2,'a','2026-01-01T00:00:02Z',NULL),('d1','t',1,'a','2026-01-01T00:00:01Z',NULL)", []).map_err(map_sqlite_error).map(|_| ())
+        }).expect("seed");
+        let ids: Vec<String> = owner.execute(|connection| {
+            let mut statement = connection.prepare("SELECT delivery_id FROM deliveries WHERE acknowledged_at IS NULL ORDER BY dispatched_at ASC, delivery_id ASC").map_err(map_sqlite_error)?;
+            let rows = statement.query_map([], |row| row.get(0)).map_err(map_sqlite_error)?;
+            rows.collect::<Result<Vec<String>, _>>().map_err(map_sqlite_error)
+        }).expect("list");
+        assert_eq!(ids, vec!["d1", "d2"]);
+        owner.transaction(|tx| tx.execute("UPDATE deliveries SET acknowledged_at='2026-01-01T00:00:03Z' WHERE delivery_id='d1'", []).map_err(map_sqlite_error).map(|_| ())).expect("ack");
+        owner.transaction(|tx| tx.execute("UPDATE deliveries SET acknowledged_at='2026-01-01T00:00:04Z' WHERE delivery_id='d1' AND acknowledged_at IS NULL", []).map_err(map_sqlite_error).map(|_| ())).expect("idempotent ack");
+    }
 }
