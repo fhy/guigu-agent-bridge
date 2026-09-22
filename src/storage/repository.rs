@@ -1333,6 +1333,23 @@ impl Repository for SqliteRepository {
         &'a self,
     ) -> StorageFuture<'a, Result<Vec<Delivery>, StorageError>> {
         Box::pin(async move {
+            if let Some(owner) = &self.owner {
+                let owner = Arc::clone(owner);
+                return owner.execute(move |connection| {
+                    let mut statement = connection.prepare("SELECT delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at FROM deliveries WHERE acknowledged_at IS NULL ORDER BY dispatched_at ASC, delivery_id ASC").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let mut rows = statement.query([]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let mut deliveries = Vec::new();
+                    while let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? {
+                        let delivery_id: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let task_id: String = row.get(1).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let attempt: i64 = row.get(2).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let target: String = row.get(3).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let dispatched: String = row.get(4).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        deliveries.push(Delivery::new(decode_id(&delivery_id, "deliveries.delivery_id")?, decode_id(&task_id, "deliveries.task_id")?, decode_u32(attempt, "deliveries.attempt")?, decode_id(&target, "deliveries.target_endpoint_id")?, decode_timestamp(&dispatched, "deliveries.dispatched_at")?));
+                    }
+                    Ok(deliveries)
+                });
+            }
             let rows = sqlx::query(SELECT_UNACKNOWLEDGED_DELIVERIES)
                 .fetch_all(&self.pool)
                 .await
