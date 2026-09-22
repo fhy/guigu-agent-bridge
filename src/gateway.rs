@@ -4,6 +4,7 @@
 //! authority; this module only validates the bounded envelope and its phases.
 
 use crate::matrix::InboundMatrixEvent;
+use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
 use thiserror::Error;
@@ -557,18 +558,16 @@ impl GatewayStore {
         owner: &str,
         revision: i64,
         now: &str,
-    ) -> Result<bool, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        let eligible: Option<i64> = sqlx::query_scalar("SELECT 1 FROM gateway_envelopes e WHERE e.envelope_id=? AND e.cleanup_owner=? AND e.cleanup_revision=? AND e.state IN ('terminal','stale') AND e.terminal_at IS NOT NULL AND e.terminal_at <= datetime(?, '-7 days') AND NOT EXISTS (SELECT 1 FROM gateway_deliveries d WHERE d.envelope_id=e.envelope_id AND d.phase NOT IN ('terminal','stale','recovery_needed')) AND (e.internal_task_id IS NULL OR EXISTS (SELECT 1 FROM task_events te WHERE te.task_id=e.internal_task_id AND te.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=e.internal_task_id) AND te.status IN ('completed','failed','timed_out','cancelled')))")
-            .bind(envelope_id).bind(owner).bind(revision).bind(now).fetch_optional(&mut *tx).await?;
-        if eligible.is_none() {
-            tx.rollback().await?;
-            return Ok(false);
-        }
-        let result = sqlx::query("DELETE FROM gateway_envelopes WHERE envelope_id=? AND cleanup_owner=? AND cleanup_revision=?")
-            .bind(envelope_id).bind(owner).bind(revision).execute(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(result.rows_affected() == 1)
+    ) -> Result<bool, GatewayError> {
+        let envelope_id = envelope_id.to_owned();
+        let owner = owner.to_owned();
+        let now = now.to_owned();
+        self.owner.transaction(move |tx| {
+            let eligible: Option<i64> = tx.query_row("SELECT 1 FROM gateway_envelopes e WHERE e.envelope_id=?1 AND e.cleanup_owner=?2 AND e.cleanup_revision=?3 AND e.state IN ('terminal','stale') AND e.terminal_at IS NOT NULL AND e.terminal_at <= datetime(?4, '-7 days') AND NOT EXISTS (SELECT 1 FROM gateway_deliveries d WHERE d.envelope_id=e.envelope_id AND d.phase NOT IN ('terminal','stale','recovery_needed')) AND (e.internal_task_id IS NULL OR EXISTS (SELECT 1 FROM task_events te WHERE te.task_id=e.internal_task_id AND te.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=e.internal_task_id) AND te.status IN ('completed','failed','timed_out','cancelled')))", rusqlite::params![envelope_id, owner, revision, now], |row| row.get(0)).optional().map_err(|error| GatewayError::Query(error.to_string()))?;
+            if eligible.is_none() { return Ok(false); }
+            let changed = tx.execute("DELETE FROM gateway_envelopes WHERE envelope_id=?1 AND cleanup_owner=?2 AND cleanup_revision=?3", rusqlite::params![envelope_id, owner, revision]).map_err(|error| GatewayError::Query(error.to_string()))?;
+            Ok(changed == 1)
+        }).map_err(GatewayError::from)
     }
 
     pub async fn validate_retained_bytes(&self) -> Result<bool, sqlx::Error> {
