@@ -137,4 +137,24 @@ mod tests {
             .expect("read");
         assert_eq!(value, "ok");
     }
+
+    #[test]
+    fn owner_repository_query_uses_fifo_owner() {
+        let path =
+            std::env::temp_dir().join(format!("guigu-owner-agent-{}.db", uuid::Uuid::now_v7()));
+        let owner = BusinessStoreOwner::open(&path).expect("owner");
+        owner
+            .execute(|connection| {
+                connection
+                    .execute_batch("CREATE TABLE agents (agent_id TEXT PRIMARY KEY)")
+                    .map_err(map_sqlite_error)?;
+                connection
+                    .execute("INSERT INTO agents(agent_id) VALUES (?1)", ["agent-a"])
+                    .map_err(map_sqlite_error)
+            })
+            .expect("seed");
+        let repository = crate::storage::OwnerRepository::new(owner);
+        assert!(repository.agent_exists("agent-a").expect("query"));
+        assert!(!repository.agent_exists("missing").expect("query"));
+    }
 }

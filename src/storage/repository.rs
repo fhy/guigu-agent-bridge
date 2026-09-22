@@ -65,6 +65,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
 
+use super::BusinessStoreOwner;
 use chrono::{DateTime, Utc};
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
@@ -383,6 +384,30 @@ pub enum AckOutcome {
 #[derive(Debug, Clone)]
 pub struct SqliteRepository {
     pool: SqlitePool,
+}
+
+/// Owner-backed repository slice used while the business adapter migrates away
+/// from SQLx. The query and row decoding never expose a rusqlite handle.
+pub struct OwnerRepository {
+    owner: BusinessStoreOwner,
+}
+
+impl OwnerRepository {
+    pub fn new(owner: BusinessStoreOwner) -> Self {
+        Self { owner }
+    }
+
+    pub fn agent_exists(&self, agent_id: &str) -> Result<bool, StorageError> {
+        let agent_id = agent_id.to_owned();
+        self.owner.execute(move |connection| {
+            let mut statement = connection
+                .prepare("SELECT 1 FROM agents WHERE agent_id = ?1 LIMIT 1")
+                .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+            statement
+                .exists([agent_id])
+                .map_err(|error| StorageError::OwnerQuery(error.to_string()))
+        })
+    }
 }
 
 impl SqliteRepository {
