@@ -974,6 +974,31 @@ impl Repository for SqliteRepository {
         parent: TaskId,
     ) -> StorageFuture<'a, Result<Vec<TaskId>, StorageError>> {
         Box::pin(async move {
+            if let Some(owner) = &self.owner {
+                let key = encode_id(parent);
+                let owner = Arc::clone(owner);
+                return owner.execute(move |connection| {
+                    let mut statement = connection
+                        .prepare(
+                            "SELECT task_id FROM tasks WHERE parent_task_id=?1 ORDER BY task_id",
+                        )
+                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let mut rows = statement
+                        .query([key])
+                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let mut ids = Vec::new();
+                    while let Some(row) = rows
+                        .next()
+                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?
+                    {
+                        let value: String = row
+                            .get(0)
+                            .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        ids.push(decode_id(&value, "tasks.task_id")?);
+                    }
+                    Ok(ids)
+                });
+            }
             let rows = sqlx::query(SELECT_CHILD_TASKS)
                 .bind(encode_id(parent))
                 .fetch_all(&self.pool)
@@ -985,6 +1010,19 @@ impl Repository for SqliteRepository {
 
     fn unfinished_tasks<'a>(&'a self) -> StorageFuture<'a, Result<Vec<TaskId>, StorageError>> {
         Box::pin(async move {
+            if let Some(owner) = &self.owner {
+                let owner = Arc::clone(owner);
+                return owner.execute(move |connection| {
+                    let mut statement = connection.prepare("SELECT t.task_id FROM tasks t LEFT JOIN task_events e ON e.task_id=t.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=t.task_id) WHERE e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled') ORDER BY t.task_id ASC").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let mut rows = statement.query([]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let mut ids = Vec::new();
+                    while let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? {
+                        let value: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        ids.push(decode_id(&value, "tasks.task_id")?);
+                    }
+                    Ok(ids)
+                });
+            }
             let rows = sqlx::query(SELECT_UNFINISHED_TASKS)
                 .fetch_all(&self.pool)
                 .await
