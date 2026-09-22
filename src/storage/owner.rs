@@ -157,4 +157,29 @@ mod tests {
         assert!(repository.agent_exists("agent-a").expect("query"));
         assert!(!repository.agent_exists("missing").expect("query"));
     }
+
+    #[test]
+    fn owner_repository_write_rolls_back_on_constraint_error() {
+        let path =
+            std::env::temp_dir().join(format!("guigu-owner-write-{}.db", uuid::Uuid::now_v7()));
+        let owner = BusinessStoreOwner::open(&path).expect("owner");
+        owner
+            .execute(|connection| {
+                connection
+                    .execute_batch("CREATE TABLE agents (endpoint_id TEXT PRIMARY KEY, agent_id TEXT UNIQUE NOT NULL, transport TEXT NOT NULL, enabled INTEGER NOT NULL, address_json TEXT, capabilities_json TEXT NOT NULL)")
+                    .map_err(map_sqlite_error)
+            })
+            .expect("schema");
+        let repository = crate::storage::OwnerRepository::new(owner);
+        repository
+            .insert_agent_raw("endpoint", "agent", "acp", true)
+            .expect("insert");
+        assert!(
+            repository
+                .insert_agent_raw("endpoint", "other", "acp", true)
+                .is_err()
+        );
+        assert!(repository.agent_exists("agent").expect("original row"));
+        assert!(!repository.agent_exists("other").expect("rollback row"));
+    }
 }

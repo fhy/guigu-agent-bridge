@@ -408,6 +408,27 @@ impl OwnerRepository {
                 .map_err(|error| StorageError::OwnerQuery(error.to_string()))
         })
     }
+
+    pub fn insert_agent_raw(
+        &self,
+        endpoint_id: &str,
+        agent_id: &str,
+        transport: &str,
+        enabled: bool,
+    ) -> Result<(), StorageError> {
+        let endpoint_id = endpoint_id.to_owned();
+        let agent_id = agent_id.to_owned();
+        let transport = transport.to_owned();
+        self.owner.transaction(move |transaction| {
+            transaction
+                .execute(
+                    "INSERT INTO agents(endpoint_id,agent_id,transport,enabled,address_json,capabilities_json) VALUES (?1,?2,?3,?4,NULL,'[]')",
+                    rusqlite::params![endpoint_id, agent_id, transport, enabled as i64],
+                )
+                .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+            Ok(())
+        })
+    }
 }
 
 impl SqliteRepository {
