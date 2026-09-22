@@ -1071,6 +1071,25 @@ impl Repository for SqliteRepository {
         task_id: TaskId,
     ) -> StorageFuture<'a, Result<Vec<TaskEvent>, StorageError>> {
         Box::pin(async move {
+            if let Some(owner) = &self.owner {
+                let key = encode_id(task_id);
+                let owner = Arc::clone(owner);
+                return owner.execute(move |connection| {
+                    let mut statement = connection.prepare("SELECT event_id,task_id,seq,status,timestamp,payload FROM task_events WHERE task_id=?1 ORDER BY seq ASC").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let mut rows = statement.query([key]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let mut events = Vec::new();
+                    while let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? {
+                        let event_id: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let task_id: String = row.get(1).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let seq: i64 = row.get(2).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let status: String = row.get(3).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let timestamp: String = row.get(4).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let payload: String = row.get(5).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        events.push(TaskEvent { id: decode_id(&event_id, "task_events.event_id")?, task_id: decode_id(&task_id, "task_events.task_id")?, seq: seq as u64, status: decode_status(&status, "task_events.status")?, timestamp: decode_timestamp(&timestamp, "task_events.timestamp")?, payload: decode_json(&payload, "task_events.payload")? });
+                    }
+                    Ok(events)
+                });
+            }
             let rows = sqlx::query(SELECT_EVENTS_FOR_TASK)
                 .bind(encode_id(task_id))
                 .fetch_all(&self.pool)
