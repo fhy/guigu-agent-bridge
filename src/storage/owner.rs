@@ -214,4 +214,20 @@ mod tests {
             .expect("order");
         assert_eq!(order, vec![1, 2]);
     }
+
+    #[test]
+    fn malformed_event_payload_is_fail_closed() {
+        let error = crate::storage::codec::decode_json::<serde_json::Value>(
+            "{not-json",
+            "task_events.payload",
+        )
+        .expect_err("invalid payload must fail");
+        assert!(matches!(
+            error,
+            StorageError::Malformed {
+                field: "task_events.payload",
+                ..
+            }
+        ));
+    }
 }
