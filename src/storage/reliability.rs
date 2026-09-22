@@ -5,6 +5,7 @@ use sqlx::{Row, SqlitePool};
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::storage::BusinessStore;
 use crate::{
     bus::AdmissionContext,
     models::{AgentTask, TaskEvent, WorkflowRole},
@@ -124,11 +125,19 @@ pub struct AdmissionRecovery {
 #[derive(Clone)]
 pub struct ReliabilityStore {
     pool: SqlitePool,
+    owner: Option<BusinessStore>,
 }
 
 impl ReliabilityStore {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self { pool, owner: None }
+    }
+
+    pub fn new_owner(owner: BusinessStore) -> Self {
+        Self {
+            pool: SqlitePool::connect_lazy("sqlite::memory:").expect("owner facade placeholder"),
+            owner: Some(owner),
+        }
     }
 
     /// Atomically reserves a bounded queue row after T025 admission has committed.

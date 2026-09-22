@@ -182,6 +182,7 @@ pub struct RecoverySnapshot {
 #[derive(Clone)]
 pub struct SqliteRuntimeStore {
     pool: SqlitePool,
+    owner: Option<crate::storage::BusinessStore>,
 }
 
 fn path_components(path: &Path) -> Result<Vec<String>, RuntimeError> {
@@ -207,7 +208,14 @@ fn overlaps(left: &[String], right: &[String]) -> bool {
 
 impl SqliteRuntimeStore {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self { pool, owner: None }
+    }
+
+    pub fn new_owner(owner: crate::storage::BusinessStore) -> Self {
+        Self {
+            pool: SqlitePool::connect_lazy("sqlite::memory:").expect("owner facade placeholder"),
+            owner: Some(owner),
+        }
     }
 
     pub async fn lease_for_task(
