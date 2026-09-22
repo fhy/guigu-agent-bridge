@@ -511,13 +511,13 @@ impl GatewayStore {
         owner: &str,
         now: &str,
         limit: i64,
-    ) -> Result<u64, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        let result = sqlx::query("UPDATE gateway_envelopes SET cleanup_owner=?, cleanup_revision=cleanup_revision+1, cleanup_claimed_at=? WHERE envelope_id IN (SELECT envelope_id FROM gateway_envelopes WHERE state IN ('terminal','stale') AND terminal_at IS NOT NULL AND terminal_at <= datetime(?, '-7 days') AND (cleanup_owner IS NULL OR cleanup_owner=? OR (cleanup_claimed_at <= datetime(?, '-900 seconds') AND EXISTS (SELECT 1 FROM runtime_instances r WHERE r.instance_token=cleanup_owner AND r.state='stopped'))) LIMIT ?) AND (cleanup_owner IS NULL OR cleanup_owner=? OR (cleanup_claimed_at <= datetime(?, '-900 seconds') AND EXISTS (SELECT 1 FROM runtime_instances r WHERE r.instance_token=cleanup_owner AND r.state='stopped')))")
-            .bind(owner).bind(now).bind(now).bind(owner).bind(now).bind(limit).bind(owner).bind(now)
-            .execute(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(result.rows_affected())
+    ) -> Result<u64, GatewayError> {
+        let owner_name = owner.to_owned();
+        let now_value = now.to_owned();
+        self.owner.transaction(move |tx| {
+            let result = tx.execute("UPDATE gateway_envelopes SET cleanup_owner=?1, cleanup_revision=cleanup_revision+1, cleanup_claimed_at=?2 WHERE envelope_id IN (SELECT envelope_id FROM gateway_envelopes WHERE state IN ('terminal','stale') AND terminal_at IS NOT NULL AND terminal_at <= datetime(?2, '-7 days') AND (cleanup_owner IS NULL OR cleanup_owner=?1 OR (cleanup_claimed_at <= datetime(?2, '-900 seconds') AND EXISTS (SELECT 1 FROM runtime_instances r WHERE r.instance_token=cleanup_owner AND r.state='stopped'))) LIMIT ?3) AND (cleanup_owner IS NULL OR cleanup_owner=?1 OR (cleanup_claimed_at <= datetime(?2, '-900 seconds') AND EXISTS (SELECT 1 FROM runtime_instances r WHERE r.instance_token=cleanup_owner AND r.state='stopped')))", rusqlite::params![owner_name, now_value, limit]).map_err(|error| GatewayError::Query(error.to_string()))?;
+            Ok(result as u64)
+        }).map_err(GatewayError::from)
     }
 
     pub async fn delete_cleanup(
