@@ -1193,6 +1193,25 @@ impl Repository for SqliteRepository {
     ) -> StorageFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
             let acknowledged = encode_optional_timestamp(delivery.acknowledged_at().as_ref());
+            if let Some(owner) = &self.owner {
+                let delivery_id = encode_id(delivery.delivery_id());
+                let task_id = encode_id(delivery.task_id());
+                let attempt = encode_u32(delivery.attempt());
+                let target = encode_id(delivery.target());
+                let dispatched_at = encode_timestamp(&delivery.dispatched_at());
+                let owner = Arc::clone(owner);
+                return owner.transaction(move |tx| {
+                    tx.execute(
+                        "INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at) VALUES (?1,?2,?3,?4,?5,?6)",
+                        rusqlite::params![delivery_id, task_id, attempt, target, dispatched_at, acknowledged],
+                    )
+                    .map_err(|error| match error {
+                        rusqlite::Error::SqliteFailure(_, Some(detail)) if detail.contains("UNIQUE") => StorageError::Duplicate { detail },
+                        other => StorageError::OwnerQuery(other.to_string()),
+                    })?;
+                    Ok(())
+                });
+            }
             let error = match sqlx::query(INSERT_DELIVERY)
                 .bind(encode_id(delivery.delivery_id()))
                 .bind(encode_id(delivery.task_id()))
