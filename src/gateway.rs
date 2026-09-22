@@ -570,11 +570,8 @@ impl GatewayStore {
         }).map_err(GatewayError::from)
     }
 
-    pub async fn validate_retained_bytes(&self) -> Result<bool, sqlx::Error> {
-        let mismatch: i64 =
-            sqlx::query_scalar("SELECT COUNT(*) FROM gateway_envelopes e WHERE e.retained_bytes != length(e.canonical_json) + COALESCE((SELECT SUM(a.byte_len) FROM gateway_artifacts a WHERE a.envelope_id=e.envelope_id),0)")
-                .fetch_one(&self.pool)
-                .await?;
+    pub async fn validate_retained_bytes(&self) -> Result<bool, GatewayError> {
+        let mismatch = self.owner.execute(|connection| connection.query_row("SELECT COUNT(*) FROM gateway_envelopes e WHERE e.retained_bytes != length(e.canonical_json) + COALESCE((SELECT SUM(a.byte_len) FROM gateway_artifacts a WHERE a.envelope_id=e.envelope_id),0)", [], |row| row.get::<_, i64>(0)).map_err(|error| GatewayError::Query(error.to_string()))).map_err(GatewayError::from)?;
         Ok(mismatch == 0 && self.retained_bytes().await? < RETAINED_BYTES_HIGH)
     }
 
