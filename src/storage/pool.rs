@@ -138,4 +138,20 @@ mod tests {
         assert!(matches!(error, StorageError::Open { .. }), "{error:?}");
         assert!(!path.parent().expect("parent").exists());
     }
+
+    #[test]
+    fn owner_migration_bootstrap_applies_both_schema_files() {
+        let path =
+            std::env::temp_dir().join(format!("guigu-owner-migrate-{}.db", uuid::Uuid::now_v7()));
+        let owner = connect_owner(&path).expect("owner");
+        migrate_owner(&owner).expect("migrations");
+        let table_count = owner
+            .execute(|connection| {
+                connection
+                    .query_row("SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name IN ('tasks','sessions')", [], |row| row.get::<_, i64>(0))
+                    .map_err(|error| StorageError::OwnerQuery(error.to_string()))
+            })
+            .expect("schema query");
+        assert_eq!(table_count, 2);
+    }
 }
