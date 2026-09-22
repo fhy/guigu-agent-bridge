@@ -66,7 +66,7 @@ use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::Arc;
 
-use super::{BusinessStore, BusinessStoreOwner};
+use super::BusinessStore;
 use chrono::{DateTime, Utc};
 use rusqlite::OptionalExtension;
 use sqlx::sqlite::SqliteRow;
@@ -401,11 +401,11 @@ impl SqliteRepository {
 /// Owner-backed repository slice used while the business adapter migrates away
 /// from SQLx. The query and row decoding never expose a rusqlite handle.
 pub struct OwnerRepository {
-    owner: BusinessStoreOwner,
+    owner: BusinessStore,
 }
 
 impl OwnerRepository {
-    pub fn new(owner: BusinessStoreOwner) -> Self {
+    pub fn new(owner: BusinessStore) -> Self {
         Self { owner }
     }
 
@@ -510,7 +510,7 @@ impl SqliteRepository {
             let status = encode_status(event.status).to_owned();
             let timestamp = encode_timestamp(event.timestamp);
             let payload = encode_json(&event.payload, "task_events.payload")?;
-            let owner = Arc::clone(owner);
+            let owner = owner.clone();
             return owner.transaction(move |tx| {
                 tx.execute("INSERT INTO tasks(task_id,root_task_id,parent_task_id,from_agent,to_agent,conversation_id,reply_to,text,priority,depth,hops,deadline,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)", rusqlite::params![task_id, root_task_id, parent_task_id, from_agent, to_agent, conversation_id, reply_to, text, priority, task.depth as i64, task.hops as i64, deadline, task.version as i64]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
                 tx.execute("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES (?1,?2,?3,?4,?5,?6)", rusqlite::params![event_id, event_task_id, seq, status, timestamp, payload]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
@@ -617,7 +617,7 @@ impl Repository for SqliteRepository {
                 let capabilities = encode_json(&endpoint.capabilities, "agents.capabilities_json")?;
                 let agent_id = agent_id.to_owned();
                 let enabled = encode_bool(endpoint.enabled);
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.transaction(move |tx| {
                     tx.execute(
                         "INSERT INTO agents(endpoint_id,agent_id,transport,enabled,address_json,capabilities_json) VALUES (?1,?2,?3,?4,?5,?6)",
@@ -658,7 +658,7 @@ impl Repository for SqliteRepository {
         Box::pin(async move {
             if let Some(owner) = &self.owner {
                 let key = encode_id(id);
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.execute(move |connection| {
                     let mut statement = connection
                         .prepare("SELECT endpoint_id,transport,address_json,enabled,capabilities_json FROM agents WHERE endpoint_id=?1 AND address_json IS NOT NULL")
@@ -695,7 +695,7 @@ impl Repository for SqliteRepository {
     fn agents<'a>(&'a self) -> StorageFuture<'a, Result<Vec<AgentEndpoint>, StorageError>> {
         Box::pin(async move {
             if let Some(owner) = &self.owner {
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.execute(move |connection| {
                     let mut statement = connection
                         .prepare("SELECT endpoint_id,transport,address_json,enabled,capabilities_json FROM agents WHERE address_json IS NOT NULL ORDER BY agent_id")
@@ -751,7 +751,7 @@ impl Repository for SqliteRepository {
                 let transport = transport.map(str::to_owned);
                 let external_id = external_id.map(str::to_owned);
                 let thread_ref = thread_ref.map(str::to_owned);
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.transaction(move |tx| {
                     tx.execute(
                         "INSERT INTO conversations(conversation_id,transport,external_id,thread_ref,participants_json) VALUES (?1,?2,?3,?4,?5)",
@@ -800,7 +800,7 @@ impl Repository for SqliteRepository {
         Box::pin(async move {
             if let Some(owner) = &self.owner {
                 let key = encode_id(id);
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.execute(move |connection| {
                     let mut statement = connection
                         .prepare("SELECT conversation_id,transport,external_id,thread_ref,participants_json FROM conversations WHERE conversation_id=?1")
@@ -864,7 +864,7 @@ impl Repository for SqliteRepository {
                 let recipient = encode_id(message.recipient);
                 let body = message.body.to_owned();
                 let reply_to = message.reply_to.map(encode_id);
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.transaction(move |tx| {
                     tx.execute(
                         "INSERT INTO messages(message_id,conversation_id,sender,recipient,body,reply_to,metadata_json) VALUES (?1,?2,?3,?4,?5,?6,?7)",
@@ -940,7 +940,7 @@ impl Repository for SqliteRepository {
                 let text = task.text.to_owned();
                 let priority = task.priority.value() as i64;
                 let deadline = task.deadline.map(|value| value.to_rfc3339());
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.transaction(move |tx| {
                     tx.execute(
                         "INSERT INTO tasks(task_id,root_task_id,parent_task_id,from_agent,to_agent,conversation_id,reply_to,text,priority,depth,hops,deadline,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
@@ -970,7 +970,7 @@ impl Repository for SqliteRepository {
         Box::pin(async move {
             if let Some(owner) = &self.owner {
                 let key = encode_id(id);
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.execute(move |connection| {
                     let mut statement = connection.prepare("SELECT task_id,root_task_id,parent_task_id,from_agent,to_agent,conversation_id,reply_to,text,priority,depth,hops,deadline,version FROM tasks WHERE task_id=?1").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
                     let mut rows = statement.query([key]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
@@ -1002,7 +1002,7 @@ impl Repository for SqliteRepository {
         Box::pin(async move {
             if let Some(owner) = &self.owner {
                 let key = encode_id(parent);
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.execute(move |connection| {
                     let mut statement = connection
                         .prepare(
@@ -1037,7 +1037,7 @@ impl Repository for SqliteRepository {
     fn unfinished_tasks<'a>(&'a self) -> StorageFuture<'a, Result<Vec<TaskId>, StorageError>> {
         Box::pin(async move {
             if let Some(owner) = &self.owner {
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.execute(move |connection| {
                     let mut statement = connection.prepare("SELECT t.task_id FROM tasks t LEFT JOIN task_events e ON e.task_id=t.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=t.task_id) WHERE e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled') ORDER BY t.task_id ASC").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
                     let mut rows = statement.query([]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
@@ -1069,7 +1069,7 @@ impl Repository for SqliteRepository {
                 let status = encode_status(event.status).to_owned();
                 let timestamp = encode_timestamp(event.timestamp);
                 let payload = encode_json(&event.payload, "task_events.payload")?;
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.transaction(move |tx| {
                     let result = tx.execute(
                         "INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES (?1,?2,?3,?4,?5,?6)",
@@ -1110,7 +1110,7 @@ impl Repository for SqliteRepository {
         Box::pin(async move {
             if let Some(owner) = &self.owner {
                 let key = encode_id(task_id);
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.execute(move |connection| {
                     let mut statement = connection.prepare("SELECT event_id,task_id,seq,status,timestamp,payload FROM task_events WHERE task_id=?1 ORDER BY seq ASC").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
                     let mut rows = statement.query([key]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
@@ -1143,7 +1143,7 @@ impl Repository for SqliteRepository {
         Box::pin(async move {
             if let Some(owner) = &self.owner {
                 let key = encode_id(task_id);
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.execute(move |connection| {
                     let mut statement = connection.prepare("SELECT event_id,task_id,seq,status,timestamp,payload FROM task_events WHERE task_id=?1 ORDER BY seq DESC LIMIT 1").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
                     let mut rows = statement.query([key]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
@@ -1186,7 +1186,7 @@ impl Repository for SqliteRepository {
 
             if let Some(owner) = &self.owner {
                 let id = encode_id(task_id);
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.transaction(move |tx| {
                     let changed = tx
                         .execute(
@@ -1252,7 +1252,7 @@ impl Repository for SqliteRepository {
                 let attempt = encode_u32(delivery.attempt());
                 let target = encode_id(delivery.target());
                 let dispatched_at = encode_timestamp(&delivery.dispatched_at());
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.transaction(move |tx| {
                     tx.execute(
                         "INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at) VALUES (?1,?2,?3,?4,?5,?6)",
@@ -1310,7 +1310,7 @@ impl Repository for SqliteRepository {
             let id = encode_id(delivery_id);
             if let Some(owner) = &self.owner {
                 let timestamp = encode_timestamp(&at);
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.transaction(move |tx| {
                     let changed = tx
                         .execute("UPDATE deliveries SET acknowledged_at=?1 WHERE delivery_id=?2 AND acknowledged_at IS NULL", rusqlite::params![timestamp, id])
@@ -1363,7 +1363,7 @@ impl Repository for SqliteRepository {
         Box::pin(async move {
             if let Some(owner) = &self.owner {
                 let key = encode_id(id);
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.execute(move |connection| {
                     let mut statement = connection.prepare("SELECT delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at FROM deliveries WHERE delivery_id=?1").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
                     let mut rows = statement.query([key]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
@@ -1387,7 +1387,7 @@ impl Repository for SqliteRepository {
     ) -> StorageFuture<'a, Result<Vec<Delivery>, StorageError>> {
         Box::pin(async move {
             if let Some(owner) = &self.owner {
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.execute(move |connection| {
                     let mut statement = connection.prepare("SELECT delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at FROM deliveries WHERE acknowledged_at IS NULL ORDER BY dispatched_at ASC, delivery_id ASC").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
                     let mut rows = statement.query([]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
@@ -1416,7 +1416,7 @@ impl Repository for SqliteRepository {
     ) -> StorageFuture<'a, Result<Vec<Delivery>, StorageError>> {
         Box::pin(async move {
             if let Some(owner) = &self.owner {
-                let owner = Arc::clone(owner);
+                let owner = owner.clone();
                 return owner.execute(move |connection| {
                     let mut statement = connection.prepare("SELECT d.delivery_id,d.task_id,d.attempt,d.target_endpoint_id,d.dispatched_at,d.acknowledged_at FROM deliveries d LEFT JOIN task_events e ON e.task_id=d.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=d.task_id) WHERE d.acknowledged_at IS NOT NULL AND (e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled')) ORDER BY d.dispatched_at ASC,d.delivery_id ASC").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
                     let mut rows = statement.query([]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
