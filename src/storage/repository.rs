@@ -831,6 +831,26 @@ impl Repository for SqliteRepository {
     ) -> StorageFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
             let metadata = encode_json(&message.metadata, "messages.metadata_json")?;
+            if let Some(owner) = &self.owner {
+                let message_id = encode_id(message.id);
+                let conversation = encode_id(message.conversation);
+                let sender = encode_id(message.sender);
+                let recipient = encode_id(message.recipient);
+                let body = message.body.to_owned();
+                let reply_to = message.reply_to.map(encode_id);
+                let owner = Arc::clone(owner);
+                return owner.transaction(move |tx| {
+                    tx.execute(
+                        "INSERT INTO messages(message_id,conversation_id,sender,recipient,body,reply_to,metadata_json) VALUES (?1,?2,?3,?4,?5,?6,?7)",
+                        rusqlite::params![message_id, conversation, sender, recipient, body, reply_to, metadata],
+                    )
+                    .map_err(|error| match error {
+                        rusqlite::Error::SqliteFailure(_, Some(detail)) if detail.contains("UNIQUE") => StorageError::Duplicate { detail },
+                        other => StorageError::OwnerQuery(other.to_string()),
+                    })?;
+                    Ok(())
+                });
+            }
             let error = match sqlx::query(INSERT_MESSAGE)
                 .bind(encode_id(message.id))
                 .bind(encode_id(message.conversation))
