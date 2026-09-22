@@ -1307,7 +1307,26 @@ impl Repository for SqliteRepository {
         &'a self,
         id: DeliveryId,
     ) -> StorageFuture<'a, Result<Option<Delivery>, StorageError>> {
-        Box::pin(async move { select_delivery_row(&self.pool, id).await })
+        Box::pin(async move {
+            if let Some(owner) = &self.owner {
+                let key = encode_id(id);
+                let owner = Arc::clone(owner);
+                return owner.execute(move |connection| {
+                    let mut statement = connection.prepare("SELECT delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at FROM deliveries WHERE delivery_id=?1").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let mut rows = statement.query([key]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? else { return Ok(None); };
+                    let delivery_id: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let task_id: String = row.get(1).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let attempt: i64 = row.get(2).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let target: String = row.get(3).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let dispatched: String = row.get(4).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let acknowledged: Option<String> = row.get(5).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let delivery = Delivery::new(decode_id(&delivery_id, "deliveries.delivery_id")?, decode_id(&task_id, "deliveries.task_id")?, decode_u32(attempt, "deliveries.attempt")?, decode_id(&target, "deliveries.target_endpoint_id")?, decode_timestamp(&dispatched, "deliveries.dispatched_at")?);
+                    Ok(Some(delivery.with_acknowledged_at(decode_optional_timestamp(acknowledged.as_deref(), "deliveries.acknowledged_at")?)))
+                });
+            }
+            select_delivery_row(&self.pool, id).await
+        })
     }
 
     fn unacknowledged_deliveries<'a>(
