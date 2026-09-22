@@ -60,7 +60,8 @@ uuid = { version = "1", features = ["v7", "serde", "v5"] }
 chrono = { version = "0.4", features = ["serde"] }
 toml = "1.1.6"
 url = "2.5.8"
-matrix-sdk = { version = "=0.13.0", default-features = false, features = ["rustls-tls"] }
+rusqlite = { version = "0.35", features = ["bundled"] }
+matrix-sdk = { version = "=0.13.0", default-features = false, features = ["rustls-tls", "e2e-encryption", "sqlite", "bundled-sqlite"] }
 axum = { version = "=0.8.6", default-features = false, features = ["http1", "json", "tokio"] }
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "json"] }
 # SQLite driver for the durable event store (ADR-002). `default-features = false`

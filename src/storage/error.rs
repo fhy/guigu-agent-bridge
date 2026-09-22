@@ -29,6 +29,8 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum StorageError {
+    #[error("business store owner failed: {0}")]
+    Owner(String),
     /// The database could not be opened or created.
     ///
     /// Includes a missing parent directory: `connect` never creates parent
