@@ -150,7 +150,7 @@ mod repository;
 pub use cycle::{CycleHit, CycleKind, CycleLimits, DEFAULT_MAX_SUBTASKS, detect};
 pub use error::StorageError;
 pub use event_consumer::RepositoryEventConsumer;
-pub use owner::BusinessStoreOwner;
+pub use owner::{BusinessStore, BusinessStoreOwner};
 pub use pool::{
     DEFAULT_BUSY_TIMEOUT, MAX_CONNECTIONS, connect, connect_owner, migrate, migrate_owner,
 };

@@ -17,9 +17,18 @@ const QUEUE_CAPACITY: usize = 64;
 type Command = Box<dyn FnOnce(&mut Connection) + Send + 'static>;
 
 pub struct BusinessStoreOwner {
+    state: std::sync::Arc<OwnerState>,
+}
+
+struct OwnerState {
     path: PathBuf,
-    sender: Option<SyncSender<Command>>,
-    thread: Option<JoinHandle<()>>,
+    sender: SyncSender<Command>,
+    thread: std::sync::Mutex<Option<JoinHandle<()>>>,
+}
+
+#[derive(Clone)]
+pub struct BusinessStore {
+    state: std::sync::Arc<OwnerState>,
 }
 
 impl BusinessStoreOwner {
@@ -40,14 +49,22 @@ impl BusinessStoreOwner {
             })
             .map_err(|error| StorageError::Owner(error.to_string()))?;
         Ok(Self {
-            path,
-            sender: Some(sender),
-            thread: Some(thread),
+            state: std::sync::Arc::new(OwnerState {
+                path,
+                sender,
+                thread: std::sync::Mutex::new(Some(thread)),
+            }),
         })
     }
 
+    pub fn facade(&self) -> BusinessStore {
+        BusinessStore {
+            state: self.state.clone(),
+        }
+    }
+
     pub fn path(&self) -> &Path {
-        &self.path
+        &self.state.path
     }
 
     pub fn transaction<R: Send + 'static>(
@@ -66,10 +83,7 @@ impl BusinessStoreOwner {
         &self,
         command: impl FnOnce(&mut Connection) -> Result<R, StorageError> + Send + 'static,
     ) -> Result<R, StorageError> {
-        let sender = self
-            .sender
-            .as_ref()
-            .ok_or_else(|| StorageError::Owner("owner closed".into()))?;
+        let sender = &self.state.sender;
         let (result_tx, result_rx) = mpsc::sync_channel(1);
         sender
             .send(Box::new(move |connection| {
@@ -82,10 +96,41 @@ impl BusinessStoreOwner {
     }
 }
 
-impl Drop for BusinessStoreOwner {
+impl BusinessStore {
+    pub fn path(&self) -> &Path {
+        &self.state.path
+    }
+    pub fn transaction<R: Send + 'static>(
+        &self,
+        command: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<R, StorageError> + Send + 'static,
+    ) -> Result<R, StorageError> {
+        self.execute(move |connection| {
+            let transaction = connection.transaction().map_err(map_sqlite_error)?;
+            let result = command(&transaction)?;
+            transaction.commit().map_err(map_sqlite_error)?;
+            Ok(result)
+        })
+    }
+    pub fn execute<R: Send + 'static>(
+        &self,
+        command: impl FnOnce(&mut Connection) -> Result<R, StorageError> + Send + 'static,
+    ) -> Result<R, StorageError> {
+        let (result_tx, result_rx) = mpsc::sync_channel(1);
+        self.state
+            .sender
+            .send(Box::new(move |connection| {
+                let _ = result_tx.send(command(connection));
+            }))
+            .map_err(|_| StorageError::Owner("owner command queue closed".into()))?;
+        result_rx
+            .recv()
+            .map_err(|_| StorageError::Owner("owner command result dropped".into()))?
+    }
+}
+
+impl Drop for OwnerState {
     fn drop(&mut self) {
-        self.sender.take();
-        if let Some(thread) = self.thread.take() {
+        if let Some(thread) = self.thread.get_mut().expect("owner thread mutex").take() {
             let _ = thread.join();
         }
     }
