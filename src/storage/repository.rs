@@ -1036,6 +1036,26 @@ impl Repository for SqliteRepository {
         event: &'a TaskEvent,
     ) -> StorageFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
+            if let Some(owner) = &self.owner {
+                let event_id = encode_id(event.id);
+                let task_id = encode_id(event.task_id);
+                let seq = encode_u64(event.seq, "task_events.seq")?;
+                let status = encode_status(event.status).to_owned();
+                let timestamp = encode_timestamp(event.timestamp);
+                let payload = encode_json(&event.payload, "task_events.payload")?;
+                let owner = Arc::clone(owner);
+                return owner.transaction(move |tx| {
+                    tx.execute(
+                        "INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES (?1,?2,?3,?4,?5,?6)",
+                        rusqlite::params![event_id, task_id, seq, status, timestamp, payload],
+                    )
+                    .map_err(|error| match error {
+                        rusqlite::Error::SqliteFailure(_, Some(detail)) if detail.contains("UNIQUE") => StorageError::Duplicate { detail },
+                        other => StorageError::OwnerQuery(other.to_string()),
+                    })?;
+                    Ok(())
+                });
+            }
             match insert_event_row(&self.pool, event).await {
                 Ok(()) => Ok(()),
                 Err(error) => match classify_event_duplicate(&self.pool, event, error).await? {
