@@ -52,6 +52,8 @@ pub enum StorageError {
     /// does not claim.
     #[error("database query failed: {0}")]
     Query(#[source] sqlx::Error),
+    #[error("business sqlite query failed: {0}")]
+    OwnerQuery(String),
     /// A unique/primary-key constraint was violated.
     ///
     /// This is the idempotency signal: a replayed `event_id` or a replayed

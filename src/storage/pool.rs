@@ -32,7 +32,23 @@ use sqlx::SqlitePool;
 use sqlx::migrate::Migrator;
 use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions, SqliteSynchronous};
 
+use crate::storage::BusinessStoreOwner;
 use crate::storage::StorageError;
+
+pub fn connect_owner(path: impl AsRef<Path>) -> Result<BusinessStoreOwner, StorageError> {
+    BusinessStoreOwner::open(path)
+}
+
+pub fn migrate_owner(owner: &BusinessStoreOwner) -> Result<(), StorageError> {
+    owner.execute(|connection| {
+        connection
+            .execute_batch(include_str!("../../migrations/0001_init.sql"))
+            .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+        connection
+            .execute_batch(include_str!("../../migrations/0002_sessions.sql"))
+            .map_err(|error| StorageError::OwnerQuery(error.to_string()))
+    })
+}
 
 /// How long a writer waits for the SQLite write lock before failing.
 ///

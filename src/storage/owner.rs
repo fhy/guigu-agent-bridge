@@ -50,6 +50,18 @@ impl BusinessStoreOwner {
         &self.path
     }
 
+    pub fn transaction<R: Send + 'static>(
+        &self,
+        command: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<R, StorageError> + Send + 'static,
+    ) -> Result<R, StorageError> {
+        self.execute(move |connection| {
+            let transaction = connection.transaction().map_err(map_sqlite_error)?;
+            let result = command(&transaction)?;
+            transaction.commit().map_err(map_sqlite_error)?;
+            Ok(result)
+        })
+    }
+
     pub fn execute<R: Send + 'static>(
         &self,
         command: impl FnOnce(&mut Connection) -> Result<R, StorageError> + Send + 'static,
@@ -83,4 +95,46 @@ fn configure(connection: &Connection) {
     let _ = connection.execute_batch(
         "PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA synchronous = FULL; PRAGMA busy_timeout = 5000;",
     );
+}
+
+fn map_sqlite_error(error: rusqlite::Error) -> StorageError {
+    StorageError::OwnerQuery(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fifo_owner_keeps_transaction_atomic() {
+        let path = std::env::temp_dir().join(format!("guigu-owner-{}.db", uuid::Uuid::now_v7()));
+        let owner = BusinessStoreOwner::open(&path).expect("owner");
+        owner
+            .execute(|connection| {
+                connection
+                    .execute_batch(
+                        "CREATE TABLE facts (id INTEGER PRIMARY KEY, value TEXT NOT NULL)",
+                    )
+                    .map_err(map_sqlite_error)
+            })
+            .expect("schema");
+        owner
+            .transaction(|transaction| {
+                transaction
+                    .execute("INSERT INTO facts (id, value) VALUES (1, ?1)", ["ok"])
+                    .map_err(map_sqlite_error)?;
+                Ok(())
+            })
+            .expect("commit");
+        let value = owner
+            .execute(|connection| {
+                connection
+                    .query_row("SELECT value FROM facts WHERE id=1", [], |row| {
+                        row.get::<_, String>(0)
+                    })
+                    .map_err(map_sqlite_error)
+            })
+            .expect("read");
+        assert_eq!(value, "ok");
+    }
 }

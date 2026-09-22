@@ -151,7 +151,9 @@ pub use cycle::{CycleHit, CycleKind, CycleLimits, DEFAULT_MAX_SUBTASKS, detect};
 pub use error::StorageError;
 pub use event_consumer::RepositoryEventConsumer;
 pub use owner::BusinessStoreOwner;
-pub use pool::{DEFAULT_BUSY_TIMEOUT, MAX_CONNECTIONS, connect, migrate};
+pub use pool::{
+    DEFAULT_BUSY_TIMEOUT, MAX_CONNECTIONS, connect, connect_owner, migrate, migrate_owner,
+};
 pub use recovery::{RecoveryPlan, plan_recovery, sync_agents};
 pub use reliability::{
     AdmissionRecovery, PendingProjection, QueueReservation, ReceiptOutcome, ReliabilityError,
