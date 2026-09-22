@@ -1159,6 +1159,34 @@ impl Repository for SqliteRepository {
                 })?;
             debug_assert!(next > expected_version);
 
+            if let Some(owner) = &self.owner {
+                let id = encode_id(task_id);
+                let owner = Arc::clone(owner);
+                return owner.transaction(move |tx| {
+                    let changed = tx
+                        .execute(
+                            "UPDATE tasks SET version=?1 WHERE task_id=?2 AND version=?3",
+                            rusqlite::params![next as i64, id, expected_version as i64],
+                        )
+                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    if changed == 1 {
+                        return Ok(next);
+                    }
+                    let stored: Option<i64> = tx
+                        .query_row("SELECT version FROM tasks WHERE task_id=?1", [&id], |row| {
+                            row.get(0)
+                        })
+                        .optional()
+                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    match stored {
+                        Some(_) => Err(StorageError::Duplicate {
+                            detail: "tasks.version".to_owned(),
+                        }),
+                        None => Err(StorageError::NotFound { entity: "task", id }),
+                    }
+                });
+            }
+
             let row = sqlx::query(UPDATE_VERSION_IF_CURRENT)
                 .bind(encode_id(task_id))
                 .bind(encode_u64(expected_version, "tasks.version")?)
