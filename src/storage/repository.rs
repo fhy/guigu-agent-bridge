@@ -64,6 +64,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
+use std::sync::Arc;
 
 use super::BusinessStoreOwner;
 use chrono::{DateTime, Utc};
@@ -384,6 +385,16 @@ pub enum AckOutcome {
 #[derive(Debug, Clone)]
 pub struct SqliteRepository {
     pool: SqlitePool,
+    owner: Option<Arc<BusinessStoreOwner>>,
+}
+
+impl SqliteRepository {
+    pub fn new_owner(owner: BusinessStoreOwner) -> Self {
+        Self {
+            pool: SqlitePool::connect_lazy("sqlite::memory:").expect("owner facade placeholder"),
+            owner: Some(Arc::new(owner)),
+        }
+    }
 }
 
 /// Owner-backed repository slice used while the business adapter migrates away
@@ -434,7 +445,7 @@ impl OwnerRepository {
 impl SqliteRepository {
     /// Wrap an opened, migrated pool.
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self { pool, owner: None }
     }
 
     /// Insert a task row and its first event **atomically**.
@@ -573,6 +584,23 @@ impl Repository for SqliteRepository {
         endpoint: &'a AgentEndpoint,
     ) -> StorageFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
+            if let Some(owner) = &self.owner {
+                let endpoint_id = encode_id(endpoint.id);
+                let transport = encode_transport(endpoint.transport).to_owned();
+                let address = encode_json(&endpoint.address, "agents.address_json")?;
+                let capabilities = encode_json(&endpoint.capabilities, "agents.capabilities_json")?;
+                let agent_id = agent_id.to_owned();
+                let enabled = encode_bool(endpoint.enabled);
+                let owner = Arc::clone(owner);
+                return owner.transaction(move |tx| {
+                    tx.execute(
+                        "INSERT INTO agents(endpoint_id,agent_id,transport,enabled,address_json,capabilities_json) VALUES (?1,?2,?3,?4,?5,?6)",
+                        rusqlite::params![endpoint_id, agent_id, transport, enabled, address, capabilities],
+                    )
+                    .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    Ok(())
+                });
+            }
             let address = encode_json(&endpoint.address, "agents.address_json")?;
             let capabilities = encode_json(&endpoint.capabilities, "agents.capabilities_json")?;
             let result = sqlx::query(UPSERT_AGENT)
