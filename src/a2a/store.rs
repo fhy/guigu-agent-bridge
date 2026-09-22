@@ -32,11 +32,19 @@ pub struct CleanupClaim {
 #[derive(Debug, Clone)]
 pub struct A2aStore {
     pool: SqlitePool,
+    owner: Option<crate::storage::BusinessStore>,
 }
 
 impl A2aStore {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self { pool, owner: None }
+    }
+
+    pub fn new_owner(owner: crate::storage::BusinessStore) -> Self {
+        Self {
+            pool: SqlitePool::connect_lazy("sqlite::memory:").expect("owner facade placeholder"),
+            owner: Some(owner),
+        }
     }
 
     pub async fn reserve_inbound(

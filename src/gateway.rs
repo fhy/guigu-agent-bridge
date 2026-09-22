@@ -208,6 +208,7 @@ pub trait GatewayMatrixSender: Send + Sync {
 #[derive(Clone)]
 pub struct GatewayStore {
     pool: SqlitePool,
+    owner: Option<crate::storage::BusinessStore>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,7 +225,14 @@ pub enum TaskWinner {
 
 impl GatewayStore {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self { pool, owner: None }
+    }
+
+    pub fn new_owner(owner: crate::storage::BusinessStore) -> Self {
+        Self {
+            pool: SqlitePool::connect_lazy("sqlite::memory:").expect("owner facade placeholder"),
+            owner: Some(owner),
+        }
     }
 
     pub async fn insert_envelope(

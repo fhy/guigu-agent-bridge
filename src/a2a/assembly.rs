@@ -17,10 +17,10 @@ use std::{
 
 pub(crate) async fn dispatchers(
     config: &Config,
-    pool: SqlitePool,
+    owner: crate::storage::BusinessStore,
 ) -> Result<A2aDispatcherRouter, A2aError> {
     let mut dispatchers = HashMap::new();
-    let store = A2aStore::new(pool);
+    let store = A2aStore::new_owner(owner);
     for (peer_key, peer) in &config.transports.a2a.peers {
         if peer.danger_accept_invalid_certs {
             warn_insecure_peer(peer_key);

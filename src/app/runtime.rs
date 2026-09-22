@@ -282,7 +282,7 @@ impl AppRuntime {
         let acp = Arc::new(AcpDispatcherRouter::new(endpoint_dispatchers));
         let mut dispatchers = DispatcherRegistry::new().with(TransportType::Acp, acp.clone());
         if config.transports.a2a.enabled {
-            let a2a = crate::a2a::assembly::dispatchers(&config, pool.clone())
+            let a2a = crate::a2a::assembly::dispatchers(&config, business_store.clone())
                 .await
                 .map_err(|_| AppError::Assembly("A2A peer startup failed"))?;
             dispatchers = dispatchers.with(TransportType::A2a, Arc::new(a2a));
@@ -305,12 +305,12 @@ impl AppRuntime {
             .with_reliability(reliability.clone(), runtime_instance.clone());
         let durable_bus = Arc::new(bus);
         let gateway_handoff = crate::app::gateway_handoff::GatewayHandoff::new(
-            crate::gateway::GatewayStore::new(pool.clone()),
+            crate::gateway::GatewayStore::new_owner(business_store.clone()),
             Arc::clone(&durable_bus),
             runtime_instance.clone(),
         );
         if config.transports.gateway.enabled
-            && !crate::gateway::GatewayStore::new(pool.clone())
+            && !crate::gateway::GatewayStore::new_owner(business_store.clone())
                 .validate_retained_bytes()
                 .await
                 .map_err(|_| AppError::Assembly("gateway retained-byte validation failed"))?
@@ -420,7 +420,7 @@ impl AppRuntime {
                 ));
                 sync = sync.with_raw_consumer(Arc::new(GatewayRawConsumer::new(
                     Arc::clone(&gateway),
-                    GatewayStore::new(pool.clone()),
+                    GatewayStore::new_owner(business_store.clone()),
                     repository.as_ref().clone(),
                     gateway_handoff.clone(),
                 )));
@@ -440,7 +440,7 @@ impl AppRuntime {
             runtime.gateway = gateway;
             if runtime.gateway.is_some() {
                 runtime.gateway_cleanup = Some(crate::gateway::GatewayCleanupHandle::start(
-                    GatewayStore::new(pool.clone()),
+                    GatewayStore::new_owner(business_store.clone()),
                     runtime_instance.clone(),
                 ));
             }
