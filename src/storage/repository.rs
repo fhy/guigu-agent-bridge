@@ -941,7 +941,32 @@ impl Repository for SqliteRepository {
         &'a self,
         id: TaskId,
     ) -> StorageFuture<'a, Result<Option<AgentTask>, StorageError>> {
-        Box::pin(async move { select_task_row(&self.pool, id).await })
+        Box::pin(async move {
+            if let Some(owner) = &self.owner {
+                let key = encode_id(id);
+                let owner = Arc::clone(owner);
+                return owner.execute(move |connection| {
+                    let mut statement = connection.prepare("SELECT task_id,root_task_id,parent_task_id,from_agent,to_agent,conversation_id,reply_to,text,priority,depth,hops,deadline,version FROM tasks WHERE task_id=?1").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let mut rows = statement.query([key]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? else { return Ok(None); };
+                    let task_id: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let root: String = row.get(1).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let parent: Option<String> = row.get(2).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let from: String = row.get(3).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let to: String = row.get(4).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let conversation: String = row.get(5).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let reply: Option<String> = row.get(6).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let text: String = row.get(7).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let priority: i64 = row.get(8).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let depth: i64 = row.get(9).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let hops: i64 = row.get(10).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let deadline: Option<String> = row.get(11).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let version: i64 = row.get(12).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    Ok(Some(AgentTask { task_id: decode_id(&task_id, "tasks.task_id")?, root_task_id: decode_id(&root, "tasks.root_task_id")?, parent_task_id: parent.as_deref().map(|value| decode_id(value, "tasks.parent_task_id")).transpose()?, from_agent: decode_id(&from, "tasks.from_agent")?, to_agent: decode_id(&to, "tasks.to_agent")?, conversation_id: decode_id(&conversation, "tasks.conversation_id")?, reply_to: reply.as_deref().map(|value| decode_id(value, "tasks.reply_to")).transpose()?, text, priority: crate::models::Priority::new(priority as u8).map_err(|error| StorageError::Malformed { field: "tasks.priority", detail: error.to_string() })?, depth: depth as u32, hops: hops as u32, deadline: deadline.map(|value| DateTime::parse_from_rfc3339(&value).map(|parsed| parsed.with_timezone(&Utc))).transpose().map_err(|error| StorageError::Malformed { field: "tasks.deadline", detail: error.to_string() })?, version: version as u64 }))
+                });
+            }
+            select_task_row(&self.pool, id).await
+        })
     }
 
     fn child_tasks<'a>(
