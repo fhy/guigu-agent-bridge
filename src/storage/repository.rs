@@ -1362,6 +1362,25 @@ impl Repository for SqliteRepository {
         &'a self,
     ) -> StorageFuture<'a, Result<Vec<Delivery>, StorageError>> {
         Box::pin(async move {
+            if let Some(owner) = &self.owner {
+                let owner = Arc::clone(owner);
+                return owner.execute(move |connection| {
+                    let mut statement = connection.prepare("SELECT d.delivery_id,d.task_id,d.attempt,d.target_endpoint_id,d.dispatched_at,d.acknowledged_at FROM deliveries d LEFT JOIN task_events e ON e.task_id=d.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=d.task_id) WHERE d.acknowledged_at IS NOT NULL AND (e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled')) ORDER BY d.dispatched_at ASC,d.delivery_id ASC").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let mut rows = statement.query([]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let mut deliveries = Vec::new();
+                    while let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? {
+                        let delivery_id: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let task_id: String = row.get(1).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let attempt: i64 = row.get(2).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let target: String = row.get(3).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let dispatched: String = row.get(4).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let acknowledged: Option<String> = row.get(5).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let delivery = Delivery::new(decode_id(&delivery_id, "deliveries.delivery_id")?, decode_id(&task_id, "deliveries.task_id")?, decode_u32(attempt, "deliveries.attempt")?, decode_id(&target, "deliveries.target_endpoint_id")?, decode_timestamp(&dispatched, "deliveries.dispatched_at")?);
+                        deliveries.push(delivery.with_acknowledged_at(decode_optional_timestamp(acknowledged.as_deref(), "deliveries.acknowledged_at")?));
+                    }
+                    Ok(deliveries)
+                });
+            }
             let rows = sqlx::query(SELECT_DELIVERIES_AWAITING_OUTCOME)
                 .fetch_all(&self.pool)
                 .await
