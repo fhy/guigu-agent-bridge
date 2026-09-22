@@ -68,6 +68,7 @@ use std::sync::Arc;
 
 use super::BusinessStoreOwner;
 use chrono::{DateTime, Utc};
+use rusqlite::OptionalExtension;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
 
@@ -1045,14 +1046,25 @@ impl Repository for SqliteRepository {
                 let payload = encode_json(&event.payload, "task_events.payload")?;
                 let owner = Arc::clone(owner);
                 return owner.transaction(move |tx| {
-                    tx.execute(
+                    let result = tx.execute(
                         "INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES (?1,?2,?3,?4,?5,?6)",
                         rusqlite::params![event_id, task_id, seq, status, timestamp, payload],
-                    )
-                    .map_err(|error| match error {
-                        rusqlite::Error::SqliteFailure(_, Some(detail)) if detail.contains("UNIQUE") => StorageError::Duplicate { detail },
-                        other => StorageError::OwnerQuery(other.to_string()),
-                    })?;
+                    );
+                    if let Err(error) = result {
+                        if let rusqlite::Error::SqliteFailure(_, Some(detail)) = &error {
+                            if detail.contains("UNIQUE") {
+                                let existing: Option<(String, String, i64, String, String, String)> = tx
+                                    .query_row("SELECT event_id,task_id,seq,status,timestamp,payload FROM task_events WHERE event_id=?1", [&event_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))
+                                    .optional()
+                                    .map_err(|query_error| StorageError::OwnerQuery(query_error.to_string()))?;
+                                if existing.as_ref() == Some(&(event_id, task_id, seq, status, timestamp, payload)) {
+                                    return Ok(());
+                                }
+                                return Err(StorageError::Duplicate { detail: detail.clone() });
+                            }
+                        }
+                        return Err(StorageError::OwnerQuery(error.to_string()));
+                    }
                     Ok(())
                 });
             }
