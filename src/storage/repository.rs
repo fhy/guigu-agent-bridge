@@ -493,6 +493,31 @@ impl SqliteRepository {
             });
         }
 
+        if let Some(owner) = &self.owner {
+            let task_id = encode_id(task.task_id);
+            let root_task_id = encode_id(task.root_task_id);
+            let parent_task_id = task.parent_task_id.map(encode_id);
+            let from_agent = encode_id(task.from_agent);
+            let to_agent = encode_id(task.to_agent);
+            let conversation_id = encode_id(task.conversation_id);
+            let reply_to = task.reply_to.map(encode_id);
+            let text = task.text.clone();
+            let priority = task.priority.value() as i64;
+            let deadline = task.deadline.map(|value| value.to_rfc3339());
+            let event_id = encode_id(event.id);
+            let event_task_id = encode_id(event.task_id);
+            let seq = encode_u64(event.seq, "task_events.seq")?;
+            let status = encode_status(event.status).to_owned();
+            let timestamp = encode_timestamp(event.timestamp);
+            let payload = encode_json(&event.payload, "task_events.payload")?;
+            let owner = Arc::clone(owner);
+            return owner.transaction(move |tx| {
+                tx.execute("INSERT INTO tasks(task_id,root_task_id,parent_task_id,from_agent,to_agent,conversation_id,reply_to,text,priority,depth,hops,deadline,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)", rusqlite::params![task_id, root_task_id, parent_task_id, from_agent, to_agent, conversation_id, reply_to, text, priority, task.depth as i64, task.hops as i64, deadline, task.version as i64]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                tx.execute("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES (?1,?2,?3,?4,?5,?6)", rusqlite::params![event_id, event_task_id, seq, status, timestamp, payload]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                Ok(())
+            });
+        }
+
         let mut transaction = self.pool.begin().await.map_err(StorageError::from)?;
 
         if let Err(error) = insert_task_row(&mut *transaction, task).await {
