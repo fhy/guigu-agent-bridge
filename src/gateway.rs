@@ -241,6 +241,37 @@ impl GatewayStore {
         envelope: &GatewayEnvelope,
         canonical_json: &[u8],
         retained_bytes: i64,
+    ) -> Result<(), GatewayError> {
+        let envelope_id = envelope.envelope_id.to_string();
+        let version = envelope.version.clone();
+        let direction = match envelope.direction {
+            Direction::Inbound => "inbound",
+            Direction::Outbound => "outbound",
+        }
+        .to_owned();
+        let peer_id = envelope.peer_id.clone();
+        let sender_user_id = envelope.sender.peer_id.clone();
+        let idempotency_key = envelope.idempotency_key.clone();
+        let sender_endpoint = envelope.sender.endpoint_id.to_string();
+        let recipient_endpoint = envelope.recipient.endpoint_id.to_string();
+        let conversation_id = envelope.conversation_id.to_string();
+        let correlation_id = envelope.correlation_id.to_string();
+        let kind = format!("{:?}", envelope.kind).to_lowercase();
+        let canonical = canonical_json.to_vec();
+        let payload_hash = envelope.payload_sha256.clone();
+        let created_at = envelope.created_at.clone();
+        self.owner.transaction(move |tx| {
+            tx.execute("INSERT INTO gateway_envelopes (envelope_id,version,direction,peer_id,sender_user_id,idempotency_key,sender_endpoint,recipient_endpoint,conversation_id,correlation_id,kind,canonical_json,payload_sha256,created_at,route_generation,state,retained_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,0,'received',?15)", rusqlite::params![envelope_id, version, direction, peer_id, sender_user_id, idempotency_key, sender_endpoint, recipient_endpoint, conversation_id, correlation_id, kind, canonical, payload_hash, created_at, retained_bytes]).map_err(|error| GatewayError::Query(error.to_string()))?;
+            Ok(())
+        }).map_err(GatewayError::from)
+    }
+
+    #[allow(dead_code)]
+    async fn insert_envelope_sqlx_legacy(
+        &self,
+        envelope: &GatewayEnvelope,
+        canonical_json: &[u8],
+        retained_bytes: i64,
     ) -> Result<(), sqlx::Error> {
         sqlx::query("INSERT INTO gateway_envelopes (envelope_id,version,direction,peer_id,sender_user_id,idempotency_key,sender_endpoint,recipient_endpoint,conversation_id,correlation_id,kind,canonical_json,payload_sha256,created_at,route_generation,state,retained_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(envelope.envelope_id.to_string()).bind(&envelope.version).bind(match envelope.direction { Direction::Inbound => "inbound", Direction::Outbound => "outbound" })
