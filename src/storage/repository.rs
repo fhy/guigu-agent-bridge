@@ -668,6 +668,33 @@ impl Repository for SqliteRepository {
 
     fn agents<'a>(&'a self) -> StorageFuture<'a, Result<Vec<AgentEndpoint>, StorageError>> {
         Box::pin(async move {
+            if let Some(owner) = &self.owner {
+                let owner = Arc::clone(owner);
+                return owner.execute(move |connection| {
+                    let mut statement = connection
+                        .prepare("SELECT endpoint_id,transport,address_json,enabled,capabilities_json FROM agents WHERE address_json IS NOT NULL ORDER BY agent_id")
+                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let mut rows = statement
+                        .query([])
+                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                    let mut agents = Vec::new();
+                    while let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? {
+                        let endpoint_id: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let transport: String = row.get(1).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let address: String = row.get(2).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let enabled: i64 = row.get(3).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        let capabilities: String = row.get(4).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
+                        agents.push(AgentEndpoint {
+                            id: decode_id(&endpoint_id, "agents.endpoint_id")?,
+                            transport: decode_transport(&transport, "agents.transport")?,
+                            address: decode_json(&address, "agents.address_json")?,
+                            enabled: decode_bool(enabled, "agents.enabled")?,
+                            capabilities: decode_json(&capabilities, "agents.capabilities_json")?,
+                        });
+                    }
+                    Ok(agents)
+                });
+            }
             let rows = sqlx::query(SELECT_AGENTS)
                 .fetch_all(&self.pool)
                 .await
