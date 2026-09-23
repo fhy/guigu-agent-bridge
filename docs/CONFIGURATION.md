@@ -22,15 +22,23 @@ use `{env:VARIABLE}` references; do not store access tokens in the file.
 
 ## Matrix
 
-Set `enabled = true`, `homeserver`, `user_id`, `access_token`, and a dedicated
-`crypto_store_path`. The store directory must be private (`0700` on Unix), must not
-be a symlink, and must be backed up and restored as one SQLite generation. The bridge
-always restores the stable `GUIGU_BRIDGE` device; set `device_trusted = true` only
-after that device is verified out of band. Missing trust, rejected sessions, unsafe
-permissions, corrupt stores, and undecryptable events fail closed. `allowed_users`
+Set `enabled = true`, `homeserver`, `user_id`, the access token's exact non-empty
+`device_id`, `access_token`, and a dedicated `crypto_store_path`. Startup verifies the
+authenticated user and device with Matrix before opening the store. The store directory
+and its ancestors must be private and must not be symlinks; on Unix the directory is
+`0700` and SQLite, WAL, SHM, and identity-manifest files are `0600`. The bridge binds
+the store to the normalized homeserver, user, and device and rejects an absent, corrupt,
+or mismatched binding instead of adopting it.
+
+Set `device_trusted = true` only as local operator permission to use this transport.
+It does not mean Matrix owner or cross-signing verification. Clients may show an
+unverified-device warning; this is accepted while owner verification remains a separate
+operational concern. Authentication, identity, key upload, E2EE initialization, unsafe
+permissions, and corrupt stores fail readiness closed. An encrypted event missing its
+room key is dropped without plaintext fallback, task creation, or reply. `allowed_users`
 controls ordinary ingress. `admin_users` and optional `admin_rooms` control slash
-commands. Routes map aliases and rooms to configured agent IDs. Empty allowlists do
-not grant access.
+commands. Routes map aliases and rooms to configured agent IDs. Empty allowlists do not
+grant access.
 
 ## Agents
 

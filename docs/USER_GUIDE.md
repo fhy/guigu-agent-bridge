@@ -13,9 +13,20 @@ workspace is executable and accessible.
 
 ## Matrix Use
 
+Configure the exact device ID authenticated by the access token. On every startup the
+bridge verifies the token's user and device, validates the identity-bound crypto store,
+initializes E2EE, and confirms that the homeserver publishes the store's current device
+fingerprint before `/ready` can return 200. Do not reuse or rename a crypto store for a
+different homeserver, user, device, or replacement token.
+
 An allowed Matrix user sends ordinary text in a routed room or direct room. The bridge
 deduplicates event IDs, persists accepted work, and replies in the originating context.
 When an agent is busy, bounded work is queued rather than starting another executor.
+
+`device_trusted` is a local permission switch, not Matrix owner verification. Matrix
+clients can continue to display an unverified-device warning. Do not self-verify the
+bridge or delete/rebuild its store as an automatic repair. Missing room keys are
+event-local failures: affected encrypted events are not routed or answered.
 
 Authorized administrators can use:
 
@@ -38,6 +49,12 @@ Use `GET /health` for diagnostics and `GET /ready` for traffic eligibility. The 
 listener must remain loopback-only. A 503 readiness response, recovery backlog, expired
 lease, repeated child exit, or queue-full response requires investigation before
 routing more work.
+
+Back up the crypto-store directory as one consistent generation, including its
+`identity-v1.json` and all SQLite/WAL/SHM files. Restore it only with the matching
+homeserver, user, device, token identity, and configuration. An identity mismatch,
+`matrix-device-key-upload-failed`, `matrix-store-corrupt`, or `recovery-blocked`
+diagnostic requires operator investigation while readiness remains 503.
 
 Stop the process with SIGINT or SIGTERM and allow the configured shutdown timeout for
 queue drain and ACP child reap. Deployment and rollback procedures are in `RELEASE.md`.

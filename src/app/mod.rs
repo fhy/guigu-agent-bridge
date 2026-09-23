@@ -13,7 +13,9 @@ mod runtime;
 
 pub use admission::PersistingBus;
 pub use dispatcher::AcpDispatcherRouter;
-pub use health::{HealthServer, HealthState, OwnerState};
+pub use health::{
+    HealthServer, HealthState, MatrixFailure, MatrixPhase, MatrixReadinessOwner, OwnerState,
+};
 pub use ingress::{
     MatrixIngress, MatrixIngressHandle, ReloadingMonitorSender, ReplyRegistry,
     TerminalReplyConsumer,

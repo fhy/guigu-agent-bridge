@@ -34,6 +34,159 @@ pub enum OwnerState {
     Failed = 4,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatrixFailure {
+    Authentication,
+    UserMismatch,
+    DeviceMissing,
+    DeviceMismatch,
+    UnsafeStorePath,
+    UnsafeStoreAncestor,
+    StoreCorrupt,
+    StoreBindingMismatch,
+    CryptoInitialization,
+    DeviceKeyUpload,
+    RequiredTaskExited,
+    Timeout,
+}
+
+impl MatrixFailure {
+    pub(crate) fn as_log_str(self) -> &'static str {
+        match self {
+            Self::Authentication => "matrix-auth-failed",
+            Self::UserMismatch => "matrix-user-mismatch",
+            Self::DeviceMissing => "matrix-device-missing",
+            Self::DeviceMismatch => "matrix-device-mismatch",
+            Self::UnsafeStorePath => "matrix-unsafe-store-path",
+            Self::UnsafeStoreAncestor => "matrix-unsafe-store-ancestor",
+            Self::StoreCorrupt => "matrix-store-corrupt",
+            Self::StoreBindingMismatch => "matrix-store-binding-mismatch",
+            Self::CryptoInitialization => "matrix-crypto-initialization-failed",
+            Self::DeviceKeyUpload => "matrix-device-key-upload-failed",
+            Self::RequiredTaskExited => "matrix-required-task-exited",
+            Self::Timeout => "matrix-startup-timeout",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatrixPhase {
+    Disabled,
+    Preflight,
+    IdentityMatched,
+    StoreBound,
+    KeyProved,
+    Registering,
+    Ready,
+    Failed(MatrixFailure),
+    RecoveryBlocked,
+    ShuttingDown,
+    Stopped,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MatrixReadiness {
+    generation: u64,
+    phase: MatrixPhase,
+}
+
+#[derive(Debug)]
+pub struct MatrixReadinessOwner {
+    state: Mutex<MatrixReadiness>,
+    missing_room_keys: AtomicU64,
+}
+
+impl MatrixReadinessOwner {
+    fn new() -> Self {
+        Self {
+            state: Mutex::new(MatrixReadiness {
+                generation: 0,
+                phase: MatrixPhase::Disabled,
+            }),
+            missing_room_keys: AtomicU64::new(0),
+        }
+    }
+
+    pub fn begin(&self) -> u64 {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .expect("Matrix readiness generation exhausted");
+        state.phase = MatrixPhase::Preflight;
+        state.generation
+    }
+
+    pub fn transition(&self, generation: u64, allowed: &[MatrixPhase], next: MatrixPhase) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.generation != generation
+            || !allowed.contains(&state.phase)
+            || !legal_matrix_transition(state.phase, next)
+        {
+            return false;
+        }
+        state.phase = next;
+        true
+    }
+
+    pub fn phase(&self) -> MatrixPhase {
+        self.state.lock().unwrap_or_else(|p| p.into_inner()).phase
+    }
+
+    pub fn fail_required_task(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if matches!(state.phase, MatrixPhase::Registering | MatrixPhase::Ready) {
+            state.phase = MatrixPhase::Failed(MatrixFailure::RequiredTaskExited);
+        }
+    }
+
+    pub fn stop(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.generation = state
+            .generation
+            .checked_add(1)
+            .expect("Matrix readiness generation exhausted");
+        state.phase = MatrixPhase::ShuttingDown;
+    }
+
+    pub fn stopped(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        if state.phase == MatrixPhase::ShuttingDown {
+            state.phase = MatrixPhase::Stopped;
+        }
+    }
+
+    pub fn record_missing_room_key(&self) {
+        self.missing_room_keys.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn missing_room_keys(&self) -> u64 {
+        self.missing_room_keys.load(Ordering::Relaxed)
+    }
+}
+
+fn legal_matrix_transition(from: MatrixPhase, to: MatrixPhase) -> bool {
+    use MatrixPhase::{
+        Failed, IdentityMatched, KeyProved, Preflight, Ready, RecoveryBlocked, Registering,
+        StoreBound,
+    };
+    matches!(
+        (from, to),
+        (Preflight, IdentityMatched | Failed(_) | RecoveryBlocked)
+            | (IdentityMatched, StoreBound | Failed(_))
+            | (StoreBound, KeyProved | Failed(_))
+            | (KeyProved, Registering | Failed(_))
+            | (Registering, Ready | Failed(_))
+            | (Ready, Failed(MatrixFailure::RequiredTaskExited))
+    )
+}
+
+impl crate::matrix::MissingRoomKeyObserver for HealthState {
+    fn record_missing_room_key(&self) {
+        self.matrix.record_missing_room_key();
+    }
+}
+
 pub struct HealthState {
     runtime: SqliteRuntimeStore,
     metrics: Arc<RuntimeMetrics>,
@@ -43,6 +196,8 @@ pub struct HealthState {
     recovery_blocked: AtomicBool,
     insecure_a2a_peers: AtomicU64,
     required: Mutex<Vec<Arc<AtomicBool>>>,
+    matrix_required: Mutex<Vec<Arc<AtomicBool>>>,
+    matrix: MatrixReadinessOwner,
 }
 
 impl HealthState {
@@ -60,6 +215,8 @@ impl HealthState {
             recovery_blocked: AtomicBool::new(false),
             insecure_a2a_peers: AtomicU64::new(0),
             required: Mutex::new(Vec::new()),
+            matrix_required: Mutex::new(Vec::new()),
+            matrix: MatrixReadinessOwner::new(),
         }
     }
 
@@ -91,6 +248,17 @@ impl HealthState {
             .push(alive);
     }
 
+    pub fn matrix(&self) -> &MatrixReadinessOwner {
+        &self.matrix
+    }
+
+    pub fn register_matrix_required(&self, alive: Arc<AtomicBool>) {
+        self.matrix_required
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(alive);
+    }
+
     pub fn owner(&self) -> OwnerState {
         match self.owner.load(Ordering::Acquire) {
             0 => OwnerState::Starting,
@@ -109,6 +277,17 @@ impl HealthState {
             .unwrap_or_else(|p| p.into_inner())
             .iter()
             .all(|alive| alive.load(Ordering::Acquire));
+        let matrix_running = self
+            .matrix_required
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .all(|alive| alive.load(Ordering::Acquire));
+        let matrix_phase = self.matrix.phase();
+        if !matrix_running && matches!(matrix_phase, MatrixPhase::Registering | MatrixPhase::Ready)
+        {
+            self.matrix.fail_required_task();
+        }
         let mut snapshot = health_snapshot(
             &self.runtime,
             Utc::now(),
@@ -118,6 +297,23 @@ impl HealthState {
         .await;
         if self.recovery_blocked.load(Ordering::Acquire) {
             snapshot.readiness = Readiness::RecoveryBlocked;
+            snapshot.diagnostic = Some("recovery-blocked");
+        } else {
+            match self.matrix.phase() {
+                MatrixPhase::Disabled | MatrixPhase::Ready => {}
+                MatrixPhase::Failed(reason) => {
+                    snapshot.readiness = Readiness::AdapterUnavailable;
+                    snapshot.diagnostic = Some(reason.as_log_str());
+                }
+                MatrixPhase::RecoveryBlocked => {
+                    snapshot.readiness = Readiness::RecoveryBlocked;
+                    snapshot.diagnostic = Some("recovery-blocked");
+                }
+                _ => {
+                    snapshot.readiness = Readiness::AdapterUnavailable;
+                    snapshot.diagnostic = Some("matrix-not-ready");
+                }
+            }
         }
         snapshot.live = !matches!(owner, OwnerState::Stopped | OwnerState::Failed);
         snapshot
@@ -143,6 +339,7 @@ impl HealthState {
             ("recovery_backlog", gauges.recovery_backlog),
             ("projection_failures", self.projections.failures()),
             ("a2a_insecure_peers", self.insecure_a2a_peers()),
+            ("matrix_missing_room_keys", self.matrix.missing_room_keys()),
         ] {
             body.push_str(&format!("guigu_runtime_{name} {value}\n"));
         }
@@ -287,4 +484,86 @@ async fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std:
     );
     stream.write_all(response.as_bytes()).await?;
     stream.shutdown().await
+}
+
+#[cfg(test)]
+mod matrix_readiness_tests {
+    use super::{MatrixFailure, MatrixPhase, MatrixReadinessOwner};
+
+    #[test]
+    fn old_generation_cannot_publish_ready_after_supersession() {
+        let owner = MatrixReadinessOwner::new();
+        let old = owner.begin();
+        assert!(owner.transition(old, &[MatrixPhase::Preflight], MatrixPhase::IdentityMatched));
+        owner.stop();
+        let current = owner.begin();
+
+        assert!(!owner.transition(old, &[MatrixPhase::IdentityMatched], MatrixPhase::Ready));
+        assert_eq!(owner.phase(), MatrixPhase::Preflight);
+        assert!(owner.transition(
+            current,
+            &[MatrixPhase::Preflight],
+            MatrixPhase::Failed(MatrixFailure::Timeout)
+        ));
+        assert!(!owner.transition(
+            current,
+            &[MatrixPhase::Failed(MatrixFailure::Timeout)],
+            MatrixPhase::Ready
+        ));
+    }
+
+    #[test]
+    fn required_task_exit_and_shutdown_are_terminal_for_the_generation() {
+        let owner = MatrixReadinessOwner::new();
+        let generation = owner.begin();
+        assert!(owner.transition(
+            generation,
+            &[MatrixPhase::Preflight],
+            MatrixPhase::IdentityMatched
+        ));
+        assert!(owner.transition(
+            generation,
+            &[MatrixPhase::IdentityMatched],
+            MatrixPhase::StoreBound
+        ));
+        assert!(owner.transition(
+            generation,
+            &[MatrixPhase::StoreBound],
+            MatrixPhase::KeyProved
+        ));
+        assert!(owner.transition(
+            generation,
+            &[MatrixPhase::KeyProved],
+            MatrixPhase::Registering
+        ));
+        owner.fail_required_task();
+        assert_eq!(
+            owner.phase(),
+            MatrixPhase::Failed(MatrixFailure::RequiredTaskExited)
+        );
+        assert!(!owner.transition(generation, &[MatrixPhase::Registering], MatrixPhase::Ready));
+
+        owner.stop();
+        assert_eq!(owner.phase(), MatrixPhase::ShuttingDown);
+        owner.stopped();
+        assert_eq!(owner.phase(), MatrixPhase::Stopped);
+    }
+
+    #[test]
+    fn missing_room_key_does_not_change_transport_phase() {
+        let owner = MatrixReadinessOwner::new();
+        let generation = owner.begin();
+        for (from, to) in [
+            (MatrixPhase::Preflight, MatrixPhase::IdentityMatched),
+            (MatrixPhase::IdentityMatched, MatrixPhase::StoreBound),
+            (MatrixPhase::StoreBound, MatrixPhase::KeyProved),
+            (MatrixPhase::KeyProved, MatrixPhase::Registering),
+            (MatrixPhase::Registering, MatrixPhase::Ready),
+        ] {
+            assert!(owner.transition(generation, &[from], to));
+        }
+        owner.record_missing_room_key();
+        assert_eq!(owner.missing_room_keys(), 1);
+        assert_eq!(owner.phase(), MatrixPhase::Ready);
+    }
 }

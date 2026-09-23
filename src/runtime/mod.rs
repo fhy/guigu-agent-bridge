@@ -1219,6 +1219,7 @@ pub struct HealthSnapshot {
     pub readiness: Readiness,
     pub degraded: BTreeSet<Degradation>,
     pub observed_at: DateTime<Utc>,
+    pub diagnostic: Option<&'static str>,
 }
 pub async fn health_snapshot(
     store: &SqliteRuntimeStore,
@@ -1232,6 +1233,7 @@ pub async fn health_snapshot(
             readiness: Readiness::StorageUnavailable,
             degraded: BTreeSet::new(),
             observed_at: now,
+            diagnostic: Some("storage-unavailable"),
         },
         Ok(counts) => {
             let mut degraded = BTreeSet::new();
@@ -1252,6 +1254,7 @@ pub async fn health_snapshot(
                 readiness,
                 degraded,
                 observed_at: now,
+                diagnostic: None,
             }
         }
     }

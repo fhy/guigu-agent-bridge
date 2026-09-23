@@ -31,9 +31,9 @@ use crate::{
 };
 
 use super::{
-    AcpDispatcherRouter, FileConfigSource, HealthServer, HealthState, MatrixIngress,
-    MatrixIngressHandle, OwnerState, PersistenceFirstProjection, PersistingBus, ProjectionMetrics,
-    ReloadController, ReloadError, ReplyRegistry,
+    AcpDispatcherRouter, FileConfigSource, HealthServer, HealthState, MatrixFailure, MatrixIngress,
+    MatrixIngressHandle, MatrixPhase, OwnerState, PersistenceFirstProjection, PersistingBus,
+    ProjectionMetrics, ReloadController, ReloadError, ReplyRegistry,
 };
 
 #[derive(Debug, thiserror::Error)]
@@ -189,6 +189,11 @@ impl AppRuntime {
             Arc::clone(&metrics),
             Arc::clone(&projection_metrics),
         ));
+        let matrix_generation = config
+            .transports
+            .matrix
+            .enabled
+            .then(|| health_state.matrix().begin());
         let insecure_a2a_peers = if config.transports.a2a.enabled {
             config
                 .transports
@@ -223,6 +228,17 @@ impl AppRuntime {
             runtime_instance: owns_runtime.then_some(runtime_instance.clone()),
         };
         if recovery_blocked {
+            if let Some(generation) = matrix_generation {
+                runtime.health_state.matrix().transition(
+                    generation,
+                    &[MatrixPhase::Preflight],
+                    MatrixPhase::RecoveryBlocked,
+                );
+            }
+            tracing::warn!(
+                category = "recovery-blocked",
+                "runtime startup is health-only"
+            );
             runtime.health = start_health(config.bridge.health_bind, &runtime.health_state).await?;
             runtime.health_state.set_owner(OwnerState::Running);
             return Ok(runtime);
@@ -386,17 +402,75 @@ impl AppRuntime {
             Vec::new()
         };
 
-        let matrix = if config.transports.matrix.enabled {
-            let client = MatrixClient::restore(&config.transports.matrix)
+        let matrix = if let Some(generation) = matrix_generation {
+            let identity_health = Arc::clone(&runtime.health_state);
+            let client =
+                match MatrixClient::restore_with_identity(&config.transports.matrix, || {
+                    identity_health.matrix().transition(
+                        generation,
+                        &[MatrixPhase::Preflight],
+                        MatrixPhase::IdentityMatched,
+                    );
+                })
                 .await
-                .map_err(|_| AppError::Matrix)?;
+                {
+                    Ok(client) => client,
+                    Err(error) => {
+                        runtime.health_state.matrix().transition(
+                            generation,
+                            &[MatrixPhase::Preflight, MatrixPhase::IdentityMatched],
+                            MatrixPhase::Failed(matrix_failure(&error)),
+                        );
+                        tracing::warn!(
+                            category = matrix_failure(&error).as_log_str(),
+                            "Matrix startup is health-only"
+                        );
+                        runtime.health =
+                            start_health(config.bridge.health_bind, &runtime.health_state).await?;
+                        runtime.health_state.set_owner(OwnerState::Running);
+                        return Ok(runtime);
+                    }
+                };
+            runtime.health_state.matrix().transition(
+                generation,
+                &[MatrixPhase::IdentityMatched],
+                MatrixPhase::StoreBound,
+            );
+            let proof =
+                tokio::time::timeout(Duration::from_secs(30), client.initialize_and_prove()).await;
+            let proof_error = match proof {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(matrix_failure(&error)),
+                Err(_) => Some(MatrixFailure::Timeout),
+            };
+            if let Some(reason) = proof_error {
+                runtime.health_state.matrix().transition(
+                    generation,
+                    &[MatrixPhase::StoreBound],
+                    MatrixPhase::Failed(reason),
+                );
+                tracing::warn!(
+                    category = reason.as_log_str(),
+                    "Matrix startup is health-only"
+                );
+                runtime.health =
+                    start_health(config.bridge.health_bind, &runtime.health_state).await?;
+                runtime.health_state.set_owner(OwnerState::Running);
+                return Ok(runtime);
+            }
+            runtime.health_state.matrix().transition(
+                generation,
+                &[MatrixPhase::StoreBound],
+                MatrixPhase::KeyProved,
+            );
             let sdk = Arc::new(SdkMatrixSender::new(client.clone()));
             let mut sync = MatrixSync::new(
                 client,
                 Arc::new(MemorySyncTokenStore::default()),
                 config.transports.matrix.sync_capacity,
             )
-            .map_err(|_| AppError::Matrix)?;
+            .map_err(|_| AppError::Matrix)?
+            .with_missing_key_observer(runtime.health_state.clone());
             let gateway = if config.transports.gateway.enabled {
                 let gateway = Arc::new(MatrixGateway::new(
                     sdk.clone(),
@@ -431,6 +505,7 @@ impl AppRuntime {
         runtime.health = start_health(config.bridge.health_bind, &runtime.health_state).await?;
 
         if let Some((sdk, sync, gateway)) = matrix {
+            let generation = matrix_generation.expect("enabled Matrix has a generation");
             let matrix_sender: Arc<dyn crate::matrix::MatrixSender> = sdk.clone();
             runtime.gateway = gateway;
             if runtime.gateway.is_some() {
@@ -444,6 +519,11 @@ impl AppRuntime {
             let outbox_owner = outbox.clone().start(Duration::from_secs(1));
             let replies = Arc::new(ReplyRegistry::default());
 
+            runtime.health_state.matrix().transition(
+                generation,
+                &[MatrixPhase::KeyProved],
+                MatrixPhase::Registering,
+            );
             let (sync_handle, receiver) = sync.start();
             let retry: Arc<dyn crate::matrix::RetryAdmission> =
                 Arc::new(crate::app::DurableRetryAdmission::new(
@@ -470,8 +550,17 @@ impl AppRuntime {
             .with_reap_control(acp.clone())
             .with_retry_admission(retry)
             .start();
-            runtime.health_state.register_required(sync_handle.alive());
-            runtime.health_state.register_required(ingress.alive());
+            runtime
+                .health_state
+                .register_matrix_required(sync_handle.alive());
+            runtime
+                .health_state
+                .register_matrix_required(ingress.alive());
+            runtime.health_state.matrix().transition(
+                generation,
+                &[MatrixPhase::Registering],
+                MatrixPhase::Ready,
+            );
             runtime.matrix_sync = Some(sync_handle);
             runtime.ingress = Some(ingress);
             runtime.outbox = Some(outbox_owner);
@@ -551,6 +640,7 @@ impl AppRuntime {
     }
 
     pub async fn shutdown(mut self) -> Result<(), AppError> {
+        self.health_state.matrix().stop();
         let mut shutdown_error = None;
         self.health_state.set_owner(OwnerState::Stopping);
         if let Some(token) = self.runtime_instance.as_deref() {
@@ -643,10 +733,27 @@ impl AppRuntime {
         if let Some(pool) = self.pool.take() {
             pool.close().await;
         }
+        self.health_state.matrix().stopped();
         match shutdown_error {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+}
+
+fn matrix_failure(error: &crate::matrix::MatrixError) -> MatrixFailure {
+    use crate::matrix::MatrixError;
+    match error {
+        MatrixError::Authentication | MatrixError::DeviceKicked => MatrixFailure::Authentication,
+        MatrixError::UserMismatch => MatrixFailure::UserMismatch,
+        MatrixError::DeviceMissing => MatrixFailure::DeviceMissing,
+        MatrixError::DeviceMismatch => MatrixFailure::DeviceMismatch,
+        MatrixError::UnsafeStorePath | MatrixError::Configuration => MatrixFailure::UnsafeStorePath,
+        MatrixError::UnsafeStoreAncestor => MatrixFailure::UnsafeStoreAncestor,
+        MatrixError::StoreCorrupt => MatrixFailure::StoreCorrupt,
+        MatrixError::StoreBindingMismatch => MatrixFailure::StoreBindingMismatch,
+        MatrixError::DeviceKeyUpload => MatrixFailure::DeviceKeyUpload,
+        _ => MatrixFailure::CryptoInitialization,
     }
 }
 

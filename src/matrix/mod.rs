@@ -15,6 +15,7 @@ mod outbound;
 mod permission;
 mod reply;
 mod router;
+mod store_identity;
 mod sync;
 
 pub use admin::{
@@ -38,6 +39,6 @@ pub use router::{
     route_event_durable, route_event_with_monitor, route_workflow,
 };
 pub use sync::{
-    MatrixSync, MatrixSyncHandle, MemorySyncTokenStore, RawMatrixEventConsumer, SyncTokenFuture,
-    SyncTokenStore,
+    MatrixSync, MatrixSyncHandle, MemorySyncTokenStore, MissingRoomKeyObserver,
+    RawMatrixEventConsumer, SyncTokenFuture, SyncTokenStore,
 };

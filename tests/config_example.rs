@@ -28,6 +28,7 @@ fn config_example_parses_with_dummy_env() {
         "MATRIX_ACCESS_TOKEN".to_string(),
         "s3cr3t-token".to_string(),
     );
+    env.insert("MATRIX_DEVICE_ID".to_string(), "BRIDGE".to_string());
 
     let config = load_from_str_with_env(&text, &env).expect("config.example.toml should parse");
 
@@ -51,6 +52,7 @@ fn config_example_parses_with_dummy_env() {
         "https://matrix.example"
     );
     assert_eq!(config.transports.matrix.user_id, "@user:example.org");
+    assert_eq!(config.transports.matrix.device_id, "BRIDGE");
     assert_eq!(
         config.transports.matrix.access_token.expose(),
         "s3cr3t-token"

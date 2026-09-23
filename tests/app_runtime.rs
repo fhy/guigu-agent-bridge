@@ -507,6 +507,7 @@ async fn matrix_ingress_reads_back_unknown_commit_before_changed_routing_and_per
 #[tokio::test]
 async fn reload_publishes_hot_generation_and_rejects_restart_changes_atomically() {
     let initial = config("");
+    let initial_queue_capacity = initial.bridge.queue_capacity;
     let source = Arc::new(MutableSource(Mutex::new(initial.clone())));
     let source_trait: Arc<dyn ConfigSource> = source.clone();
     let controller = ReloadController::new(initial, source_trait).unwrap();
@@ -520,6 +521,17 @@ async fn reload_publishes_hot_generation_and_rejects_restart_changes_atomically(
         Some("!monitor:x")
     );
     source.0.lock().unwrap().bridge.queue_capacity += 1;
+    assert_eq!(
+        controller.reload().await.unwrap(),
+        ReloadOutcome::RestartRequired
+    );
+    assert_eq!(controller.snapshot().generation, 2);
+
+    {
+        let mut candidate = source.0.lock().unwrap();
+        candidate.bridge.queue_capacity = initial_queue_capacity;
+        candidate.transports.matrix.device_id = "OTHER".into();
+    }
     assert_eq!(
         controller.reload().await.unwrap(),
         ReloadOutcome::RestartRequired
@@ -650,6 +662,10 @@ async fn startup_recovery_backlog_blocks_readiness_without_spawning_acp() {
     assert_eq!(
         runtime.health_state().snapshot().await.readiness,
         guigu_agent_bridge::runtime::Readiness::RecoveryBlocked
+    );
+    assert_eq!(
+        runtime.health_state().snapshot().await.diagnostic,
+        Some("recovery-blocked")
     );
     runtime.shutdown().await.unwrap();
 }

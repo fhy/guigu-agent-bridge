@@ -134,6 +134,8 @@ pub struct MatrixTransportConfig {
     pub homeserver: String,
     /// Matrix user ID (opaque; format validation is T010's responsibility).
     pub user_id: String,
+    /// Matrix device ID authenticated by the configured access token.
+    pub device_id: String,
     /// Access token (redacted in `Debug`/`Display`; read via [`SecretString::expose`]).
     pub access_token: SecretString,
     /// Monitoring room ID (empty = no monitoring room; opaque otherwise).
@@ -150,7 +152,7 @@ pub struct MatrixTransportConfig {
     pub admin_rooms: Vec<String>,
     /// Persistent matrix-sdk state/crypto/event-cache store root.
     pub crypto_store_path: Option<PathBuf>,
-    /// Operator assertion that the fixed Matrix device was verified out of band.
+    /// Local operator permission to use this device and store; not owner verification.
     pub device_trusted: bool,
 }
 
@@ -491,6 +493,8 @@ struct RawMatrix {
     #[serde(default)]
     user_id: String,
     #[serde(default)]
+    device_id: String,
+    #[serde(default)]
     access_token: String,
     #[serde(default)]
     monitor_room: String,
@@ -516,6 +520,7 @@ impl Default for RawMatrix {
             enabled: false,
             homeserver: String::new(),
             user_id: String::new(),
+            device_id: String::new(),
             access_token: String::new(),
             monitor_room: String::new(),
             sync_capacity: default_matrix_sync_capacity(),
@@ -1247,6 +1252,12 @@ fn build_matrix(raw: RawMatrix) -> Result<MatrixTransportConfig, ConfigError> {
                 "must not be empty when matrix transport is enabled",
             ));
         }
+        if raw.device_id.is_empty() {
+            return Err(validation(
+                "transports.matrix.device_id",
+                "must not be empty when matrix transport is enabled",
+            ));
+        }
         if raw.access_token.is_empty() {
             return Err(validation(
                 "transports.matrix.access_token",
@@ -1304,6 +1315,7 @@ fn build_matrix(raw: RawMatrix) -> Result<MatrixTransportConfig, ConfigError> {
         enabled: raw.enabled,
         homeserver: raw.homeserver,
         user_id: raw.user_id,
+        device_id: raw.device_id,
         access_token: SecretString::new(raw.access_token),
         monitor_room: raw.monitor_room,
         sync_capacity: raw.sync_capacity,
@@ -1979,7 +1991,7 @@ mod tests {
     #[test]
     fn secret_redacted_in_debug_and_display() {
         let env = env_with_home_and(&[("TOKEN", "s3cr3t-value")]);
-        let text = "[transports.matrix]\nenabled = true\nhomeserver = \"https://matrix.example\"\nuser_id = \"@u:x\"\naccess_token = \"{env:TOKEN}\"\ncrypto_store_path = \"/home/tester/.local/share/guigu-agent-bridge/matrix\"\ndevice_trusted = true\n";
+        let text = "[transports.matrix]\nenabled = true\nhomeserver = \"https://matrix.example\"\nuser_id = \"@u:x\"\ndevice_id = \"BRIDGE\"\naccess_token = \"{env:TOKEN}\"\ncrypto_store_path = \"/home/tester/.local/share/guigu-agent-bridge/matrix\"\ndevice_trusted = true\n";
         let config = load_from_str_with_env(text, &env).unwrap();
 
         let debug = format!("{config:?}");
@@ -2002,7 +2014,7 @@ mod tests {
     #[test]
     fn secret_validation_message_omits_value() {
         let env = env_with_home_and(&[("TOKEN", "")]);
-        let text = "[transports.matrix]\nenabled = true\nhomeserver = \"https://matrix.example\"\nuser_id = \"@u:x\"\naccess_token = \"{env:TOKEN}\"\n";
+        let text = "[transports.matrix]\nenabled = true\nhomeserver = \"https://matrix.example\"\nuser_id = \"@u:x\"\ndevice_id = \"BRIDGE\"\naccess_token = \"{env:TOKEN}\"\n";
         let err = load_from_str_with_env(text, &env).unwrap_err();
         match err {
             ConfigError::Validation { field, message } => {

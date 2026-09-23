@@ -24,6 +24,7 @@ lease_ttl_seconds = 30
 enabled = false
 homeserver = "https://matrix.example"
 user_id = "{env:MATRIX_USER_ID}"
+device_id = "{env:MATRIX_DEVICE_ID}"
 access_token = "{env:MATRIX_ACCESS_TOKEN}"
 monitor_room = ""
 sync_capacity = 256
@@ -31,7 +32,7 @@ allowed_users = []
 admin_users = []
 admin_rooms = []
 crypto_store_path = "~/.local/share/guigu-agent-bridge/matrix"
-# Set true only after GUIGU_BRIDGE is verified from an already trusted device.
+# Local permission only; this does not assert Matrix owner verification.
 device_trusted = false
 
 [transports.matrix.routes]

@@ -30,6 +30,10 @@ pub trait RawMatrixEventConsumer: Send + Sync {
     ) -> SyncTokenFuture<'a, Result<bool, MatrixError>>;
 }
 
+pub trait MissingRoomKeyObserver: Send + Sync {
+    fn record_missing_room_key(&self);
+}
+
 /// Adapter-owned checkpoint storage. T017 supplies durable production storage.
 pub trait SyncTokenStore: Send + Sync {
     /// Load the last token committed after successful event delivery.
@@ -69,6 +73,7 @@ pub struct MatrixSync {
     capacity: usize,
     server_timeout: Duration,
     raw_consumer: Option<Arc<dyn RawMatrixEventConsumer>>,
+    missing_key_observer: Option<Arc<dyn MissingRoomKeyObserver>>,
 }
 
 impl std::fmt::Debug for MatrixSync {
@@ -96,11 +101,17 @@ impl MatrixSync {
             capacity,
             server_timeout: Duration::from_secs(30),
             raw_consumer: None,
+            missing_key_observer: None,
         })
     }
 
     pub fn with_raw_consumer(mut self, consumer: Arc<dyn RawMatrixEventConsumer>) -> Self {
         self.raw_consumer = Some(consumer);
+        self
+    }
+
+    pub fn with_missing_key_observer(mut self, observer: Arc<dyn MissingRoomKeyObserver>) -> Self {
+        self.missing_key_observer = Some(observer);
         self
     }
 
@@ -157,6 +168,19 @@ impl MatrixSync {
                         mpsc::error::TrySendError::Closed(_) => MatrixError::ConsumerClosed,
                     })?;
                     delivered += 1;
+                } else if serde_json::from_str::<serde_json::Value>(raw)
+                    .ok()
+                    .and_then(|event| {
+                        event
+                            .get("type")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some("m.room.encrypted")
+                    && let Some(observer) = &self.missing_key_observer
+                {
+                    observer.record_missing_room_key();
                 }
             }
         }

@@ -106,6 +106,7 @@ mod tests {
                     enabled: false,
                     homeserver: String::new(),
                     user_id: String::new(),
+                    device_id: String::new(),
                     access_token: SecretString::new(String::new()),
                     monitor_room: String::new(),
                     sync_capacity: 4,
