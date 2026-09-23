@@ -43,7 +43,7 @@ Matrix      用户交互、观测和人工控制界面
 
 ## 开发准备
 
-需要 Rust 1.88 或更新的 stable toolchain。初始化项目后可运行：
+需要 Rust 1.94 或更新的 stable toolchain。初始化项目后可运行：
 
 ```bash
 cargo check

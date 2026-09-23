@@ -235,20 +235,12 @@ impl StoredSession {
 #[derive(Debug, Clone)]
 pub struct SqliteSessionStore {
     pool: SqlitePool,
-    owner: Option<crate::storage::BusinessStore>,
 }
 
 impl SqliteSessionStore {
     /// Wrap a pool that has been connected and migrated.
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool, owner: None }
-    }
-
-    pub fn new_owner(owner: crate::storage::BusinessStore) -> Self {
-        Self {
-            pool: SqlitePool::connect_lazy("sqlite::memory:").expect("owner facade placeholder"),
-            owner: Some(owner),
-        }
+        Self { pool }
     }
 
     /// The live session for this endpoint, conversation and working directory.

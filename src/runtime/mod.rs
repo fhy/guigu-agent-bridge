@@ -182,7 +182,6 @@ pub struct RecoverySnapshot {
 #[derive(Clone)]
 pub struct SqliteRuntimeStore {
     pool: SqlitePool,
-    owner: Option<crate::storage::BusinessStore>,
 }
 
 fn path_components(path: &Path) -> Result<Vec<String>, RuntimeError> {
@@ -208,14 +207,7 @@ fn overlaps(left: &[String], right: &[String]) -> bool {
 
 impl SqliteRuntimeStore {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool, owner: None }
-    }
-
-    pub fn new_owner(owner: crate::storage::BusinessStore) -> Self {
-        Self {
-            pool: SqlitePool::connect_lazy("sqlite::memory:").expect("owner facade placeholder"),
-            owner: Some(owner),
-        }
+        Self { pool }
     }
 
     pub async fn lease_for_task(
@@ -1096,10 +1088,10 @@ impl TaskLifecycle for SqliteTaskLifecycle {
             }
             let (status, from_state, to_state) = lifecycle_transition(event.status)
                 .ok_or_else(|| runtime_dispatch_error("invalid lifecycle transition"))?;
-            let admission = sqlx::query(&format!(
+            let admission = sqlx::query(sqlx::AssertSqlSafe(format!(
                 "UPDATE task_admissions SET state=?,revision=revision+1,updated_at=? \
                  WHERE task_id=? AND state IN ({from_state})"
-            ))
+            )))
             .bind(to_state)
             .bind(ts(event.timestamp))
             .bind(event.task_id.to_string())

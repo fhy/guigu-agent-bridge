@@ -64,11 +64,8 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::str::FromStr;
-use std::sync::Arc;
 
-use super::BusinessStore;
 use chrono::{DateTime, Utc};
-use rusqlite::OptionalExtension;
 use sqlx::sqlite::SqliteRow;
 use sqlx::{Row, SqlitePool};
 
@@ -386,67 +383,12 @@ pub enum AckOutcome {
 #[derive(Debug, Clone)]
 pub struct SqliteRepository {
     pool: SqlitePool,
-    owner: Option<BusinessStore>,
-}
-
-impl SqliteRepository {
-    pub fn new_owner(owner: BusinessStore) -> Self {
-        Self {
-            pool: SqlitePool::connect_lazy("sqlite::memory:").expect("owner facade placeholder"),
-            owner: Some(owner),
-        }
-    }
-}
-
-/// Owner-backed repository slice used while the business adapter migrates away
-/// from SQLx. The query and row decoding never expose a rusqlite handle.
-pub struct OwnerRepository {
-    owner: BusinessStore,
-}
-
-impl OwnerRepository {
-    pub fn new(owner: BusinessStore) -> Self {
-        Self { owner }
-    }
-
-    pub fn agent_exists(&self, agent_id: &str) -> Result<bool, StorageError> {
-        let agent_id = agent_id.to_owned();
-        self.owner.execute(move |connection| {
-            let mut statement = connection
-                .prepare("SELECT 1 FROM agents WHERE agent_id = ?1 LIMIT 1")
-                .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-            statement
-                .exists([agent_id])
-                .map_err(|error| StorageError::OwnerQuery(error.to_string()))
-        })
-    }
-
-    pub fn insert_agent_raw(
-        &self,
-        endpoint_id: &str,
-        agent_id: &str,
-        transport: &str,
-        enabled: bool,
-    ) -> Result<(), StorageError> {
-        let endpoint_id = endpoint_id.to_owned();
-        let agent_id = agent_id.to_owned();
-        let transport = transport.to_owned();
-        self.owner.transaction(move |transaction| {
-            transaction
-                .execute(
-                    "INSERT INTO agents(endpoint_id,agent_id,transport,enabled,address_json,capabilities_json) VALUES (?1,?2,?3,?4,NULL,'[]')",
-                    rusqlite::params![endpoint_id, agent_id, transport, enabled as i64],
-                )
-                .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-            Ok(())
-        })
-    }
 }
 
 impl SqliteRepository {
     /// Wrap an opened, migrated pool.
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool, owner: None }
+        Self { pool }
     }
 
     /// Insert a task row and its first event **atomically**.
@@ -490,31 +432,6 @@ impl SqliteRepository {
             return Err(StorageError::Malformed {
                 field: "task_events.task_id",
                 detail: "does not match the task being inserted".to_owned(),
-            });
-        }
-
-        if let Some(owner) = &self.owner {
-            let task_id = encode_id(task.task_id);
-            let root_task_id = encode_id(task.root_task_id);
-            let parent_task_id = task.parent_task_id.map(encode_id);
-            let from_agent = encode_id(task.from_agent);
-            let to_agent = encode_id(task.to_agent);
-            let conversation_id = encode_id(task.conversation_id);
-            let reply_to = task.reply_to.map(encode_id);
-            let text = task.text.clone();
-            let priority = task.priority.value() as i64;
-            let deadline = task.deadline.map(|value| value.to_rfc3339());
-            let event_id = encode_id(event.id);
-            let event_task_id = encode_id(event.task_id);
-            let seq = encode_u64(event.seq, "task_events.seq")?;
-            let status = encode_status(event.status).to_owned();
-            let timestamp = encode_timestamp(event.timestamp);
-            let payload = encode_json(&event.payload, "task_events.payload")?;
-            let owner = owner.clone();
-            return owner.transaction(move |tx| {
-                tx.execute("INSERT INTO tasks(task_id,root_task_id,parent_task_id,from_agent,to_agent,conversation_id,reply_to,text,priority,depth,hops,deadline,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)", rusqlite::params![task_id, root_task_id, parent_task_id, from_agent, to_agent, conversation_id, reply_to, text, priority, task.depth as i64, task.hops as i64, deadline, task.version as i64]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                tx.execute("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES (?1,?2,?3,?4,?5,?6)", rusqlite::params![event_id, event_task_id, seq, status, timestamp, payload]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                Ok(())
             });
         }
 
@@ -610,23 +527,6 @@ impl Repository for SqliteRepository {
         endpoint: &'a AgentEndpoint,
     ) -> StorageFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
-            if let Some(owner) = &self.owner {
-                let endpoint_id = encode_id(endpoint.id);
-                let transport = encode_transport(endpoint.transport).to_owned();
-                let address = encode_json(&endpoint.address, "agents.address_json")?;
-                let capabilities = encode_json(&endpoint.capabilities, "agents.capabilities_json")?;
-                let agent_id = agent_id.to_owned();
-                let enabled = encode_bool(endpoint.enabled);
-                let owner = owner.clone();
-                return owner.transaction(move |tx| {
-                    tx.execute(
-                        "INSERT INTO agents(endpoint_id,agent_id,transport,enabled,address_json,capabilities_json) VALUES (?1,?2,?3,?4,?5,?6)",
-                        rusqlite::params![endpoint_id, agent_id, transport, enabled, address, capabilities],
-                    )
-                    .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    Ok(())
-                });
-            }
             let address = encode_json(&endpoint.address, "agents.address_json")?;
             let capabilities = encode_json(&endpoint.capabilities, "agents.capabilities_json")?;
             let result = sqlx::query(UPSERT_AGENT)
@@ -656,33 +556,6 @@ impl Repository for SqliteRepository {
         id: EndpointId,
     ) -> StorageFuture<'a, Result<Option<AgentEndpoint>, StorageError>> {
         Box::pin(async move {
-            if let Some(owner) = &self.owner {
-                let key = encode_id(id);
-                let owner = owner.clone();
-                return owner.execute(move |connection| {
-                    let mut statement = connection
-                        .prepare("SELECT endpoint_id,transport,address_json,enabled,capabilities_json FROM agents WHERE endpoint_id=?1 AND address_json IS NOT NULL")
-                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let mut rows = statement
-                        .query([key])
-                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? else {
-                        return Ok(None);
-                    };
-                    let endpoint_id: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let transport: String = row.get(1).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let address: String = row.get(2).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let enabled: i64 = row.get(3).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let capabilities: String = row.get(4).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    Ok(Some(AgentEndpoint {
-                        id: decode_id(&endpoint_id, "agents.endpoint_id")?,
-                        transport: decode_transport(&transport, "agents.transport")?,
-                        address: decode_json(&address, "agents.address_json")?,
-                        enabled: decode_bool(enabled, "agents.enabled")?,
-                        capabilities: decode_json(&capabilities, "agents.capabilities_json")?,
-                    }))
-                });
-            }
             let row = sqlx::query(SELECT_AGENT)
                 .bind(encode_id(id))
                 .fetch_optional(&self.pool)
@@ -694,33 +567,6 @@ impl Repository for SqliteRepository {
 
     fn agents<'a>(&'a self) -> StorageFuture<'a, Result<Vec<AgentEndpoint>, StorageError>> {
         Box::pin(async move {
-            if let Some(owner) = &self.owner {
-                let owner = owner.clone();
-                return owner.execute(move |connection| {
-                    let mut statement = connection
-                        .prepare("SELECT endpoint_id,transport,address_json,enabled,capabilities_json FROM agents WHERE address_json IS NOT NULL ORDER BY agent_id")
-                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let mut rows = statement
-                        .query([])
-                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let mut agents = Vec::new();
-                    while let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? {
-                        let endpoint_id: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let transport: String = row.get(1).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let address: String = row.get(2).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let enabled: i64 = row.get(3).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let capabilities: String = row.get(4).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        agents.push(AgentEndpoint {
-                            id: decode_id(&endpoint_id, "agents.endpoint_id")?,
-                            transport: decode_transport(&transport, "agents.transport")?,
-                            address: decode_json(&address, "agents.address_json")?,
-                            enabled: decode_bool(enabled, "agents.enabled")?,
-                            capabilities: decode_json(&capabilities, "agents.capabilities_json")?,
-                        });
-                    }
-                    Ok(agents)
-                });
-            }
             let rows = sqlx::query(SELECT_AGENTS)
                 .fetch_all(&self.pool)
                 .await
@@ -746,25 +592,6 @@ impl Repository for SqliteRepository {
                 &conversation.participants,
                 "conversations.participants_json",
             )?;
-            if let Some(owner) = &self.owner {
-                let conversation_id = encode_id(conversation.id);
-                let transport = transport.map(str::to_owned);
-                let external_id = external_id.map(str::to_owned);
-                let thread_ref = thread_ref.map(str::to_owned);
-                let owner = owner.clone();
-                return owner.transaction(move |tx| {
-                    tx.execute(
-                        "INSERT INTO conversations(conversation_id,transport,external_id,thread_ref,participants_json) VALUES (?1,?2,?3,?4,?5)",
-                        rusqlite::params![conversation_id, transport, external_id, thread_ref, participants],
-                    )
-                    .map_err(|error| match error {
-                        rusqlite::Error::SqliteFailure(_, Some(detail))
-                            if detail.contains("UNIQUE") => StorageError::Duplicate { detail },
-                        other => StorageError::OwnerQuery(other.to_string()),
-                    })?;
-                    Ok(())
-                });
-            }
             let error = match sqlx::query(INSERT_CONVERSATION)
                 .bind(encode_id(conversation.id))
                 .bind(transport)
@@ -797,31 +624,7 @@ impl Repository for SqliteRepository {
         &'a self,
         id: ConversationId,
     ) -> StorageFuture<'a, Result<Option<Conversation>, StorageError>> {
-        Box::pin(async move {
-            if let Some(owner) = &self.owner {
-                let key = encode_id(id);
-                let owner = owner.clone();
-                return owner.execute(move |connection| {
-                    let mut statement = connection
-                        .prepare("SELECT conversation_id,transport,external_id,thread_ref,participants_json FROM conversations WHERE conversation_id=?1")
-                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let mut rows = statement.query([key]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? else { return Ok(None); };
-                    let id: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let transport: Option<String> = row.get(1).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let external_id: Option<String> = row.get(2).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let thread_ref: Option<String> = row.get(3).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let participants: String = row.get(4).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let external_ref = match (transport, external_id) {
-                        (Some(transport), Some(external_id)) => Some(ExternalRef { transport: decode_transport(&transport, "conversations.transport")?, external_id, thread_ref }),
-                        (None, None) => None,
-                        _ => return Err(StorageError::Malformed { field: "conversations.transport", detail: "external reference is partially NULL".into() }),
-                    };
-                    Ok(Some(Conversation { id: decode_id(&id, "conversations.conversation_id")?, participants: decode_json(&participants, "conversations.participants_json")?, external_ref }))
-                });
-            }
-            self.select_conversation_row(id).await
-        })
+        Box::pin(async move { self.select_conversation_row(id).await })
     }
 
     fn conversation_by_external_ref<'a>(
@@ -857,26 +660,6 @@ impl Repository for SqliteRepository {
     ) -> StorageFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
             let metadata = encode_json(&message.metadata, "messages.metadata_json")?;
-            if let Some(owner) = &self.owner {
-                let message_id = encode_id(message.id);
-                let conversation = encode_id(message.conversation);
-                let sender = encode_id(message.sender);
-                let recipient = encode_id(message.recipient);
-                let body = message.body.to_owned();
-                let reply_to = message.reply_to.map(encode_id);
-                let owner = owner.clone();
-                return owner.transaction(move |tx| {
-                    tx.execute(
-                        "INSERT INTO messages(message_id,conversation_id,sender,recipient,body,reply_to,metadata_json) VALUES (?1,?2,?3,?4,?5,?6,?7)",
-                        rusqlite::params![message_id, conversation, sender, recipient, body, reply_to, metadata],
-                    )
-                    .map_err(|error| match error {
-                        rusqlite::Error::SqliteFailure(_, Some(detail)) if detail.contains("UNIQUE") => StorageError::Duplicate { detail },
-                        other => StorageError::OwnerQuery(other.to_string()),
-                    })?;
-                    Ok(())
-                });
-            }
             let error = match sqlx::query(INSERT_MESSAGE)
                 .bind(encode_id(message.id))
                 .bind(encode_id(message.conversation))
@@ -929,30 +712,6 @@ impl Repository for SqliteRepository {
         task: &'a AgentTask,
     ) -> StorageFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
-            if let Some(owner) = &self.owner {
-                let task_id = encode_id(task.task_id);
-                let root_task_id = encode_id(task.root_task_id);
-                let parent_task_id = task.parent_task_id.map(encode_id);
-                let from_agent = encode_id(task.from_agent);
-                let to_agent = encode_id(task.to_agent);
-                let conversation_id = encode_id(task.conversation_id);
-                let reply_to = task.reply_to.map(encode_id);
-                let text = task.text.to_owned();
-                let priority = task.priority.value() as i64;
-                let deadline = task.deadline.map(|value| value.to_rfc3339());
-                let owner = owner.clone();
-                return owner.transaction(move |tx| {
-                    tx.execute(
-                        "INSERT INTO tasks(task_id,root_task_id,parent_task_id,from_agent,to_agent,conversation_id,reply_to,text,priority,depth,hops,deadline,version) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
-                        rusqlite::params![task_id, root_task_id, parent_task_id, from_agent, to_agent, conversation_id, reply_to, text, priority, task.depth as i64, task.hops as i64, deadline, task.version as i64],
-                    )
-                    .map_err(|error| match error {
-                        rusqlite::Error::SqliteFailure(_, Some(detail)) if detail.contains("UNIQUE") => StorageError::Duplicate { detail },
-                        other => StorageError::OwnerQuery(other.to_string()),
-                    })?;
-                    Ok(())
-                });
-            }
             match insert_task_row(&self.pool, task).await {
                 Ok(()) => Ok(()),
                 Err(error) => match classify_task_duplicate(&self.pool, task, error).await? {
@@ -967,32 +726,7 @@ impl Repository for SqliteRepository {
         &'a self,
         id: TaskId,
     ) -> StorageFuture<'a, Result<Option<AgentTask>, StorageError>> {
-        Box::pin(async move {
-            if let Some(owner) = &self.owner {
-                let key = encode_id(id);
-                let owner = owner.clone();
-                return owner.execute(move |connection| {
-                    let mut statement = connection.prepare("SELECT task_id,root_task_id,parent_task_id,from_agent,to_agent,conversation_id,reply_to,text,priority,depth,hops,deadline,version FROM tasks WHERE task_id=?1").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let mut rows = statement.query([key]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? else { return Ok(None); };
-                    let task_id: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let root: String = row.get(1).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let parent: Option<String> = row.get(2).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let from: String = row.get(3).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let to: String = row.get(4).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let conversation: String = row.get(5).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let reply: Option<String> = row.get(6).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let text: String = row.get(7).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let priority: i64 = row.get(8).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let depth: i64 = row.get(9).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let hops: i64 = row.get(10).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let deadline: Option<String> = row.get(11).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let version: i64 = row.get(12).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    Ok(Some(AgentTask { task_id: decode_id(&task_id, "tasks.task_id")?, root_task_id: decode_id(&root, "tasks.root_task_id")?, parent_task_id: parent.as_deref().map(|value| decode_id(value, "tasks.parent_task_id")).transpose()?, from_agent: decode_id(&from, "tasks.from_agent")?, to_agent: decode_id(&to, "tasks.to_agent")?, conversation_id: decode_id(&conversation, "tasks.conversation_id")?, reply_to: reply.as_deref().map(|value| decode_id(value, "tasks.reply_to")).transpose()?, text, priority: crate::models::Priority::new(priority as u8).map_err(|error| StorageError::Malformed { field: "tasks.priority", detail: error.to_string() })?, depth: depth as u32, hops: hops as u32, deadline: deadline.map(|value| DateTime::parse_from_rfc3339(&value).map(|parsed| parsed.with_timezone(&Utc))).transpose().map_err(|error| StorageError::Malformed { field: "tasks.deadline", detail: error.to_string() })?, version: version as u64 }))
-                });
-            }
-            select_task_row(&self.pool, id).await
-        })
+        Box::pin(async move { select_task_row(&self.pool, id).await })
     }
 
     fn child_tasks<'a>(
@@ -1000,31 +734,6 @@ impl Repository for SqliteRepository {
         parent: TaskId,
     ) -> StorageFuture<'a, Result<Vec<TaskId>, StorageError>> {
         Box::pin(async move {
-            if let Some(owner) = &self.owner {
-                let key = encode_id(parent);
-                let owner = owner.clone();
-                return owner.execute(move |connection| {
-                    let mut statement = connection
-                        .prepare(
-                            "SELECT task_id FROM tasks WHERE parent_task_id=?1 ORDER BY task_id",
-                        )
-                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let mut rows = statement
-                        .query([key])
-                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let mut ids = Vec::new();
-                    while let Some(row) = rows
-                        .next()
-                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?
-                    {
-                        let value: String = row
-                            .get(0)
-                            .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        ids.push(decode_id(&value, "tasks.task_id")?);
-                    }
-                    Ok(ids)
-                });
-            }
             let rows = sqlx::query(SELECT_CHILD_TASKS)
                 .bind(encode_id(parent))
                 .fetch_all(&self.pool)
@@ -1036,19 +745,6 @@ impl Repository for SqliteRepository {
 
     fn unfinished_tasks<'a>(&'a self) -> StorageFuture<'a, Result<Vec<TaskId>, StorageError>> {
         Box::pin(async move {
-            if let Some(owner) = &self.owner {
-                let owner = owner.clone();
-                return owner.execute(move |connection| {
-                    let mut statement = connection.prepare("SELECT t.task_id FROM tasks t LEFT JOIN task_events e ON e.task_id=t.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=t.task_id) WHERE e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled') ORDER BY t.task_id ASC").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let mut rows = statement.query([]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let mut ids = Vec::new();
-                    while let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? {
-                        let value: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        ids.push(decode_id(&value, "tasks.task_id")?);
-                    }
-                    Ok(ids)
-                });
-            }
             let rows = sqlx::query(SELECT_UNFINISHED_TASKS)
                 .fetch_all(&self.pool)
                 .await
@@ -1062,37 +758,6 @@ impl Repository for SqliteRepository {
         event: &'a TaskEvent,
     ) -> StorageFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
-            if let Some(owner) = &self.owner {
-                let event_id = encode_id(event.id);
-                let task_id = encode_id(event.task_id);
-                let seq = encode_u64(event.seq, "task_events.seq")?;
-                let status = encode_status(event.status).to_owned();
-                let timestamp = encode_timestamp(event.timestamp);
-                let payload = encode_json(&event.payload, "task_events.payload")?;
-                let owner = owner.clone();
-                return owner.transaction(move |tx| {
-                    let result = tx.execute(
-                        "INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES (?1,?2,?3,?4,?5,?6)",
-                        rusqlite::params![event_id, task_id, seq, status, timestamp, payload],
-                    );
-                    if let Err(error) = result {
-                        if let rusqlite::Error::SqliteFailure(_, Some(detail)) = &error {
-                            if detail.contains("UNIQUE") {
-                                let existing: Option<(String, String, i64, String, String, String)> = tx
-                                    .query_row("SELECT event_id,task_id,seq,status,timestamp,payload FROM task_events WHERE event_id=?1", [&event_id], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)))
-                                    .optional()
-                                    .map_err(|query_error| StorageError::OwnerQuery(query_error.to_string()))?;
-                                if existing.as_ref() == Some(&(event_id, task_id, seq, status, timestamp, payload)) {
-                                    return Ok(());
-                                }
-                                return Err(StorageError::Duplicate { detail: detail.clone() });
-                            }
-                        }
-                        return Err(StorageError::OwnerQuery(error.to_string()));
-                    }
-                    Ok(())
-                });
-            }
             match insert_event_row(&self.pool, event).await {
                 Ok(()) => Ok(()),
                 Err(error) => match classify_event_duplicate(&self.pool, event, error).await? {
@@ -1108,25 +773,6 @@ impl Repository for SqliteRepository {
         task_id: TaskId,
     ) -> StorageFuture<'a, Result<Vec<TaskEvent>, StorageError>> {
         Box::pin(async move {
-            if let Some(owner) = &self.owner {
-                let key = encode_id(task_id);
-                let owner = owner.clone();
-                return owner.execute(move |connection| {
-                    let mut statement = connection.prepare("SELECT event_id,task_id,seq,status,timestamp,payload FROM task_events WHERE task_id=?1 ORDER BY seq ASC").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let mut rows = statement.query([key]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let mut events = Vec::new();
-                    while let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? {
-                        let event_id: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let task_id: String = row.get(1).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let seq: i64 = row.get(2).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let status: String = row.get(3).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let timestamp: String = row.get(4).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let payload: String = row.get(5).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        events.push(TaskEvent { id: decode_id(&event_id, "task_events.event_id")?, task_id: decode_id(&task_id, "task_events.task_id")?, seq: seq as u64, status: decode_status(&status, "task_events.status")?, timestamp: decode_timestamp(&timestamp, "task_events.timestamp")?, payload: decode_json(&payload, "task_events.payload")? });
-                    }
-                    Ok(events)
-                });
-            }
             let rows = sqlx::query(SELECT_EVENTS_FOR_TASK)
                 .bind(encode_id(task_id))
                 .fetch_all(&self.pool)
@@ -1141,22 +787,6 @@ impl Repository for SqliteRepository {
         task_id: TaskId,
     ) -> StorageFuture<'a, Result<Option<TaskEvent>, StorageError>> {
         Box::pin(async move {
-            if let Some(owner) = &self.owner {
-                let key = encode_id(task_id);
-                let owner = owner.clone();
-                return owner.execute(move |connection| {
-                    let mut statement = connection.prepare("SELECT event_id,task_id,seq,status,timestamp,payload FROM task_events WHERE task_id=?1 ORDER BY seq DESC LIMIT 1").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let mut rows = statement.query([key]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? else { return Ok(None); };
-                    let event_id: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let task_id: String = row.get(1).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let seq: i64 = row.get(2).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let status: String = row.get(3).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let timestamp: String = row.get(4).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let payload: String = row.get(5).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    Ok(Some(TaskEvent { id: decode_id(&event_id, "task_events.event_id")?, task_id: decode_id(&task_id, "task_events.task_id")?, seq: seq as u64, status: decode_status(&status, "task_events.status")?, timestamp: decode_timestamp(&timestamp, "task_events.timestamp")?, payload: decode_json(&payload, "task_events.payload")? }))
-                });
-            }
             let row = sqlx::query(SELECT_LATEST_EVENT)
                 .bind(encode_id(task_id))
                 .fetch_optional(&self.pool)
@@ -1183,34 +813,6 @@ impl Repository for SqliteRepository {
                     value: expected_version.to_string(),
                 })?;
             debug_assert!(next > expected_version);
-
-            if let Some(owner) = &self.owner {
-                let id = encode_id(task_id);
-                let owner = owner.clone();
-                return owner.transaction(move |tx| {
-                    let changed = tx
-                        .execute(
-                            "UPDATE tasks SET version=?1 WHERE task_id=?2 AND version=?3",
-                            rusqlite::params![next as i64, id, expected_version as i64],
-                        )
-                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    if changed == 1 {
-                        return Ok(next);
-                    }
-                    let stored: Option<i64> = tx
-                        .query_row("SELECT version FROM tasks WHERE task_id=?1", [&id], |row| {
-                            row.get(0)
-                        })
-                        .optional()
-                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    match stored {
-                        Some(_) => Err(StorageError::Duplicate {
-                            detail: "tasks.version".to_owned(),
-                        }),
-                        None => Err(StorageError::NotFound { entity: "task", id }),
-                    }
-                });
-            }
 
             let row = sqlx::query(UPDATE_VERSION_IF_CURRENT)
                 .bind(encode_id(task_id))
@@ -1246,25 +848,6 @@ impl Repository for SqliteRepository {
     ) -> StorageFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
             let acknowledged = encode_optional_timestamp(delivery.acknowledged_at().as_ref());
-            if let Some(owner) = &self.owner {
-                let delivery_id = encode_id(delivery.delivery_id());
-                let task_id = encode_id(delivery.task_id());
-                let attempt = encode_u32(delivery.attempt());
-                let target = encode_id(delivery.target());
-                let dispatched_at = encode_timestamp(&delivery.dispatched_at());
-                let owner = owner.clone();
-                return owner.transaction(move |tx| {
-                    tx.execute(
-                        "INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at) VALUES (?1,?2,?3,?4,?5,?6)",
-                        rusqlite::params![delivery_id, task_id, attempt, target, dispatched_at, acknowledged],
-                    )
-                    .map_err(|error| match error {
-                        rusqlite::Error::SqliteFailure(_, Some(detail)) if detail.contains("UNIQUE") => StorageError::Duplicate { detail },
-                        other => StorageError::OwnerQuery(other.to_string()),
-                    })?;
-                    Ok(())
-                });
-            }
             let error = match sqlx::query(INSERT_DELIVERY)
                 .bind(encode_id(delivery.delivery_id()))
                 .bind(encode_id(delivery.task_id()))
@@ -1308,27 +891,6 @@ impl Repository for SqliteRepository {
     ) -> StorageFuture<'a, Result<AckOutcome, StorageError>> {
         Box::pin(async move {
             let id = encode_id(delivery_id);
-            if let Some(owner) = &self.owner {
-                let timestamp = encode_timestamp(&at);
-                let owner = owner.clone();
-                return owner.transaction(move |tx| {
-                    let changed = tx
-                        .execute("UPDATE deliveries SET acknowledged_at=?1 WHERE delivery_id=?2 AND acknowledged_at IS NULL", rusqlite::params![timestamp, id])
-                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    if changed == 1 {
-                        return Ok(AckOutcome::Recorded);
-                    }
-                    let stored: Option<Option<String>> = tx
-                        .query_row("SELECT acknowledged_at FROM deliveries WHERE delivery_id=?1", [&id], |row| row.get(0))
-                        .optional()
-                        .map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    match stored {
-                        Some(Some(_)) => Ok(AckOutcome::AlreadyAcknowledged),
-                        Some(None) => Ok(AckOutcome::Recorded),
-                        None => Err(StorageError::NotFound { entity: "delivery", id }),
-                    }
-                });
-            }
             let result = sqlx::query(ACKNOWLEDGE_DELIVERY)
                 .bind(encode_timestamp(&at))
                 .bind(&id)
@@ -1360,49 +922,13 @@ impl Repository for SqliteRepository {
         &'a self,
         id: DeliveryId,
     ) -> StorageFuture<'a, Result<Option<Delivery>, StorageError>> {
-        Box::pin(async move {
-            if let Some(owner) = &self.owner {
-                let key = encode_id(id);
-                let owner = owner.clone();
-                return owner.execute(move |connection| {
-                    let mut statement = connection.prepare("SELECT delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at FROM deliveries WHERE delivery_id=?1").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let mut rows = statement.query([key]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? else { return Ok(None); };
-                    let delivery_id: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let task_id: String = row.get(1).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let attempt: i64 = row.get(2).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let target: String = row.get(3).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let dispatched: String = row.get(4).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let acknowledged: Option<String> = row.get(5).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let delivery = Delivery::new(decode_id(&delivery_id, "deliveries.delivery_id")?, decode_id(&task_id, "deliveries.task_id")?, decode_u32(attempt, "deliveries.attempt")?, decode_id(&target, "deliveries.target_endpoint_id")?, decode_timestamp(&dispatched, "deliveries.dispatched_at")?);
-                    Ok(Some(delivery.with_acknowledged_at(decode_optional_timestamp(acknowledged.as_deref(), "deliveries.acknowledged_at")?)))
-                });
-            }
-            select_delivery_row(&self.pool, id).await
-        })
+        Box::pin(async move { select_delivery_row(&self.pool, id).await })
     }
 
     fn unacknowledged_deliveries<'a>(
         &'a self,
     ) -> StorageFuture<'a, Result<Vec<Delivery>, StorageError>> {
         Box::pin(async move {
-            if let Some(owner) = &self.owner {
-                let owner = owner.clone();
-                return owner.execute(move |connection| {
-                    let mut statement = connection.prepare("SELECT delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at FROM deliveries WHERE acknowledged_at IS NULL ORDER BY dispatched_at ASC, delivery_id ASC").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let mut rows = statement.query([]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let mut deliveries = Vec::new();
-                    while let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? {
-                        let delivery_id: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let task_id: String = row.get(1).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let attempt: i64 = row.get(2).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let target: String = row.get(3).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let dispatched: String = row.get(4).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        deliveries.push(Delivery::new(decode_id(&delivery_id, "deliveries.delivery_id")?, decode_id(&task_id, "deliveries.task_id")?, decode_u32(attempt, "deliveries.attempt")?, decode_id(&target, "deliveries.target_endpoint_id")?, decode_timestamp(&dispatched, "deliveries.dispatched_at")?));
-                    }
-                    Ok(deliveries)
-                });
-            }
             let rows = sqlx::query(SELECT_UNACKNOWLEDGED_DELIVERIES)
                 .fetch_all(&self.pool)
                 .await
@@ -1415,25 +941,6 @@ impl Repository for SqliteRepository {
         &'a self,
     ) -> StorageFuture<'a, Result<Vec<Delivery>, StorageError>> {
         Box::pin(async move {
-            if let Some(owner) = &self.owner {
-                let owner = owner.clone();
-                return owner.execute(move |connection| {
-                    let mut statement = connection.prepare("SELECT d.delivery_id,d.task_id,d.attempt,d.target_endpoint_id,d.dispatched_at,d.acknowledged_at FROM deliveries d LEFT JOIN task_events e ON e.task_id=d.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=d.task_id) WHERE d.acknowledged_at IS NOT NULL AND (e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled')) ORDER BY d.dispatched_at ASC,d.delivery_id ASC").map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let mut rows = statement.query([]).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                    let mut deliveries = Vec::new();
-                    while let Some(row) = rows.next().map_err(|error| StorageError::OwnerQuery(error.to_string()))? {
-                        let delivery_id: String = row.get(0).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let task_id: String = row.get(1).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let attempt: i64 = row.get(2).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let target: String = row.get(3).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let dispatched: String = row.get(4).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let acknowledged: Option<String> = row.get(5).map_err(|error| StorageError::OwnerQuery(error.to_string()))?;
-                        let delivery = Delivery::new(decode_id(&delivery_id, "deliveries.delivery_id")?, decode_id(&task_id, "deliveries.task_id")?, decode_u32(attempt, "deliveries.attempt")?, decode_id(&target, "deliveries.target_endpoint_id")?, decode_timestamp(&dispatched, "deliveries.dispatched_at")?);
-                        deliveries.push(delivery.with_acknowledged_at(decode_optional_timestamp(acknowledged.as_deref(), "deliveries.acknowledged_at")?));
-                    }
-                    Ok(deliveries)
-                });
-            }
             let rows = sqlx::query(SELECT_DELIVERIES_AWAITING_OUTCOME)
                 .fetch_all(&self.pool)
                 .await

@@ -90,6 +90,28 @@ async fn concrete_sender_preserves_thread_reply_and_monitor_envelopes() {
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"event_id": "$sent:x"})))
         .mount(&server)
         .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/_matrix/client/.*/keys/upload"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"one_time_key_counts": {}})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/_matrix/client/.*/keys/query"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"failures": {}, "device_keys": {}})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(
+            r"/_matrix/client/.*/rooms/.*/state/m.room.encryption/",
+        ))
+        .respond_with(
+            ResponseTemplate::new(404)
+                .set_body_json(json!({"errcode": "M_NOT_FOUND", "error": "not encrypted"})),
+        )
+        .mount(&server)
+        .await;
 
     let client = MatrixClient::restore(&config(&server.uri())).await.unwrap();
     let sync =

@@ -4,18 +4,8 @@
 //! authority; this module only validates the bounded envelope and its phases.
 
 use crate::matrix::InboundMatrixEvent;
-use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use sqlx::SqlitePool;
-use thiserror::Error;
-
-#[derive(Debug, Error)]
-pub enum GatewayError {
-    #[error("gateway storage error: {0}")]
-    Storage(#[from] crate::storage::StorageError),
-    #[error("gateway sqlite error: {0}")]
-    Query(String),
-}
 use std::sync::Arc;
 use tokio::sync::mpsc;
 use tokio::sync::watch;
@@ -217,7 +207,7 @@ pub trait GatewayMatrixSender: Send + Sync {
 
 #[derive(Clone)]
 pub struct GatewayStore {
-    owner: crate::storage::BusinessStore,
+    pool: SqlitePool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -233,42 +223,11 @@ pub enum TaskWinner {
 }
 
 impl GatewayStore {
-    pub fn new_owner(owner: crate::storage::BusinessStore) -> Self {
-        Self { owner }
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
     }
 
     pub async fn insert_envelope(
-        &self,
-        envelope: &GatewayEnvelope,
-        canonical_json: &[u8],
-        retained_bytes: i64,
-    ) -> Result<(), GatewayError> {
-        let envelope_id = envelope.envelope_id.to_string();
-        let version = envelope.version.clone();
-        let direction = match envelope.direction {
-            Direction::Inbound => "inbound",
-            Direction::Outbound => "outbound",
-        }
-        .to_owned();
-        let peer_id = envelope.peer_id.clone();
-        let sender_user_id = envelope.sender.peer_id.clone();
-        let idempotency_key = envelope.idempotency_key.clone();
-        let sender_endpoint = envelope.sender.endpoint_id.to_string();
-        let recipient_endpoint = envelope.recipient.endpoint_id.to_string();
-        let conversation_id = envelope.conversation_id.to_string();
-        let correlation_id = envelope.correlation_id.to_string();
-        let kind = format!("{:?}", envelope.kind).to_lowercase();
-        let canonical = canonical_json.to_vec();
-        let payload_hash = envelope.payload_sha256.clone();
-        let created_at = envelope.created_at.clone();
-        self.owner.transaction(move |tx| {
-            tx.execute("INSERT INTO gateway_envelopes (envelope_id,version,direction,peer_id,sender_user_id,idempotency_key,sender_endpoint,recipient_endpoint,conversation_id,correlation_id,kind,canonical_json,payload_sha256,created_at,route_generation,state,retained_bytes) VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,0,'received',?15)", rusqlite::params![envelope_id, version, direction, peer_id, sender_user_id, idempotency_key, sender_endpoint, recipient_endpoint, conversation_id, correlation_id, kind, canonical, payload_hash, created_at, retained_bytes]).map_err(|error| GatewayError::Query(error.to_string()))?;
-            Ok(())
-        }).map_err(GatewayError::from)
-    }
-
-    #[allow(dead_code)]
-    async fn insert_envelope_sqlx_legacy(
         &self,
         envelope: &GatewayEnvelope,
         canonical_json: &[u8],
@@ -520,21 +479,13 @@ impl GatewayStore {
         .await
     }
 
-    pub async fn retained_bytes(&self) -> Result<i64, GatewayError> {
-        self.owner
-            .execute(|connection| {
-                connection
-                    .query_row(
-                        "SELECT COALESCE(SUM(retained_bytes),0) FROM gateway_envelopes",
-                        [],
-                        |row| row.get(0),
-                    )
-                    .map_err(|error| GatewayError::Query(error.to_string()))
-            })
-            .map_err(GatewayError::from)
+    pub async fn retained_bytes(&self) -> Result<i64, sqlx::Error> {
+        sqlx::query_scalar("SELECT COALESCE(SUM(retained_bytes),0) FROM gateway_envelopes")
+            .fetch_one(&self.pool)
+            .await
     }
 
-    pub async fn pressure_ok(&self, high: i64) -> Result<bool, GatewayError> {
+    pub async fn pressure_ok(&self, high: i64) -> Result<bool, sqlx::Error> {
         Ok(self.retained_bytes().await? < high)
     }
 
@@ -543,13 +494,13 @@ impl GatewayStore {
         owner: &str,
         now: &str,
         limit: i64,
-    ) -> Result<u64, GatewayError> {
-        let owner_name = owner.to_owned();
-        let now_value = now.to_owned();
-        self.owner.transaction(move |tx| {
-            let result = tx.execute("UPDATE gateway_envelopes SET cleanup_owner=?1, cleanup_revision=cleanup_revision+1, cleanup_claimed_at=?2 WHERE envelope_id IN (SELECT envelope_id FROM gateway_envelopes WHERE state IN ('terminal','stale') AND terminal_at IS NOT NULL AND terminal_at <= datetime(?2, '-7 days') AND (cleanup_owner IS NULL OR cleanup_owner=?1 OR (cleanup_claimed_at <= datetime(?2, '-900 seconds') AND EXISTS (SELECT 1 FROM runtime_instances r WHERE r.instance_token=cleanup_owner AND r.state='stopped'))) LIMIT ?3) AND (cleanup_owner IS NULL OR cleanup_owner=?1 OR (cleanup_claimed_at <= datetime(?2, '-900 seconds') AND EXISTS (SELECT 1 FROM runtime_instances r WHERE r.instance_token=cleanup_owner AND r.state='stopped')))", rusqlite::params![owner_name, now_value, limit]).map_err(|error| GatewayError::Query(error.to_string()))?;
-            Ok(result as u64)
-        }).map_err(GatewayError::from)
+    ) -> Result<u64, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query("UPDATE gateway_envelopes SET cleanup_owner=?, cleanup_revision=cleanup_revision+1, cleanup_claimed_at=? WHERE envelope_id IN (SELECT envelope_id FROM gateway_envelopes WHERE state IN ('terminal','stale') AND terminal_at IS NOT NULL AND terminal_at <= datetime(?, '-7 days') AND (cleanup_owner IS NULL OR cleanup_owner=? OR (cleanup_claimed_at <= datetime(?, '-900 seconds') AND EXISTS (SELECT 1 FROM runtime_instances r WHERE r.instance_token=cleanup_owner AND r.state='stopped'))) LIMIT ?) AND (cleanup_owner IS NULL OR cleanup_owner=? OR (cleanup_claimed_at <= datetime(?, '-900 seconds') AND EXISTS (SELECT 1 FROM runtime_instances r WHERE r.instance_token=cleanup_owner AND r.state='stopped')))")
+            .bind(owner).bind(now).bind(now).bind(owner).bind(now).bind(limit).bind(owner).bind(now)
+            .execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(result.rows_affected())
     }
 
     pub async fn delete_cleanup(
@@ -558,20 +509,25 @@ impl GatewayStore {
         owner: &str,
         revision: i64,
         now: &str,
-    ) -> Result<bool, GatewayError> {
-        let envelope_id = envelope_id.to_owned();
-        let owner = owner.to_owned();
-        let now = now.to_owned();
-        self.owner.transaction(move |tx| {
-            let eligible: Option<i64> = tx.query_row("SELECT 1 FROM gateway_envelopes e WHERE e.envelope_id=?1 AND e.cleanup_owner=?2 AND e.cleanup_revision=?3 AND e.state IN ('terminal','stale') AND e.terminal_at IS NOT NULL AND e.terminal_at <= datetime(?4, '-7 days') AND NOT EXISTS (SELECT 1 FROM gateway_deliveries d WHERE d.envelope_id=e.envelope_id AND d.phase NOT IN ('terminal','stale','recovery_needed')) AND (e.internal_task_id IS NULL OR EXISTS (SELECT 1 FROM task_events te WHERE te.task_id=e.internal_task_id AND te.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=e.internal_task_id) AND te.status IN ('completed','failed','timed_out','cancelled')))", rusqlite::params![envelope_id, owner, revision, now], |row| row.get(0)).optional().map_err(|error| GatewayError::Query(error.to_string()))?;
-            if eligible.is_none() { return Ok(false); }
-            let changed = tx.execute("DELETE FROM gateway_envelopes WHERE envelope_id=?1 AND cleanup_owner=?2 AND cleanup_revision=?3", rusqlite::params![envelope_id, owner, revision]).map_err(|error| GatewayError::Query(error.to_string()))?;
-            Ok(changed == 1)
-        }).map_err(GatewayError::from)
+    ) -> Result<bool, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let eligible: Option<i64> = sqlx::query_scalar("SELECT 1 FROM gateway_envelopes e WHERE e.envelope_id=? AND e.cleanup_owner=? AND e.cleanup_revision=? AND e.state IN ('terminal','stale') AND e.terminal_at IS NOT NULL AND e.terminal_at <= datetime(?, '-7 days') AND NOT EXISTS (SELECT 1 FROM gateway_deliveries d WHERE d.envelope_id=e.envelope_id AND d.phase NOT IN ('terminal','stale','recovery_needed')) AND (e.internal_task_id IS NULL OR EXISTS (SELECT 1 FROM task_events te WHERE te.task_id=e.internal_task_id AND te.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=e.internal_task_id) AND te.status IN ('completed','failed','timed_out','cancelled')))")
+            .bind(envelope_id).bind(owner).bind(revision).bind(now).fetch_optional(&mut *tx).await?;
+        if eligible.is_none() {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let result = sqlx::query("DELETE FROM gateway_envelopes WHERE envelope_id=? AND cleanup_owner=? AND cleanup_revision=?")
+            .bind(envelope_id).bind(owner).bind(revision).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(result.rows_affected() == 1)
     }
 
-    pub async fn validate_retained_bytes(&self) -> Result<bool, GatewayError> {
-        let mismatch = self.owner.execute(|connection| connection.query_row("SELECT COUNT(*) FROM gateway_envelopes e WHERE e.retained_bytes != length(e.canonical_json) + COALESCE((SELECT SUM(a.byte_len) FROM gateway_artifacts a WHERE a.envelope_id=e.envelope_id),0)", [], |row| row.get::<_, i64>(0)).map_err(|error| GatewayError::Query(error.to_string()))).map_err(GatewayError::from)?;
+    pub async fn validate_retained_bytes(&self) -> Result<bool, sqlx::Error> {
+        let mismatch: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM gateway_envelopes e WHERE e.retained_bytes != length(e.canonical_json) + COALESCE((SELECT SUM(a.byte_len) FROM gateway_artifacts a WHERE a.envelope_id=e.envelope_id),0)")
+                .fetch_one(&self.pool)
+                .await?;
         Ok(mismatch == 0 && self.retained_bytes().await? < RETAINED_BYTES_HIGH)
     }
 
@@ -1239,7 +1195,7 @@ mod tests {
         ] {
             let sql = format!("SELECT COUNT(*) FROM {table}");
             assert_eq!(
-                sqlx::query_scalar::<_, i64>(&sql)
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
                     .fetch_one(&pool)
                     .await
                     .unwrap(),
@@ -1272,7 +1228,7 @@ mod tests {
         ] {
             let sql = format!("SELECT COUNT(*) FROM {table}");
             assert_eq!(
-                sqlx::query_scalar::<_, i64>(&sql)
+                sqlx::query_scalar::<_, i64>(sqlx::AssertSqlSafe(sql))
                     .fetch_one(&pool)
                     .await
                     .unwrap(),

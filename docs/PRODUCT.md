@@ -28,7 +28,7 @@ task outcome. SQLite task events and fenced runtime leases remain authoritative.
 
 ## Compatibility
 
-The package requires Rust 1.88 to build. ACP compatibility is negotiated at runtime
+The package requires Rust 1.94 to build. ACP compatibility is negotiated at runtime
 and backend identity is recorded; deployments should pin tested backend versions.
 SQLite migrations are forward-only and applied at startup. See `RELEASE.md` before
 replacing an existing bridge.

@@ -65,7 +65,7 @@ impl TestDb {
 
     /// A raw read used only to assert what is physically stored.
     async fn count(&self, table: &str) -> i64 {
-        sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+        sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
             .fetch_one(&self.pool)
             .await
             .expect("count rows")

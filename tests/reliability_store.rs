@@ -480,10 +480,11 @@ async fn retry_is_atomic_field_exact_and_same_event_idempotent() {
         .unwrap();
     assert_eq!(retry_events, 1);
     for table in ["task_admissions", "projection_outbox"] {
-        let count: i64 = sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
-            .fetch_one(&pool)
-            .await
-            .unwrap();
+        let count: i64 =
+            sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
+                .fetch_one(&pool)
+                .await
+                .unwrap();
         assert_eq!(count, 1, "{table}");
     }
     let tasks: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM tasks")

@@ -57,7 +57,7 @@ async fn applied_migration_count(pool: &SqlitePool) -> i64 {
 }
 
 async fn row_count(pool: &SqlitePool, table: &str) -> i64 {
-    sqlx::query_scalar(&format!("SELECT COUNT(*) FROM {table}"))
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("SELECT COUNT(*) FROM {table}")))
         .fetch_one(pool)
         .await
         .expect("count rows")

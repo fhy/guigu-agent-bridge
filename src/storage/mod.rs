@@ -141,7 +141,6 @@ pub(crate) mod codec;
 mod cycle;
 mod error;
 mod event_consumer;
-mod owner;
 mod pool;
 mod recovery;
 mod reliability;
@@ -150,15 +149,10 @@ mod repository;
 pub use cycle::{CycleHit, CycleKind, CycleLimits, DEFAULT_MAX_SUBTASKS, detect};
 pub use error::StorageError;
 pub use event_consumer::RepositoryEventConsumer;
-pub use owner::{BusinessStore, BusinessStoreOwner};
-pub use pool::{
-    DEFAULT_BUSY_TIMEOUT, MAX_CONNECTIONS, connect, connect_owner, migrate, migrate_owner,
-};
+pub use pool::{DEFAULT_BUSY_TIMEOUT, MAX_CONNECTIONS, connect, migrate};
 pub use recovery::{RecoveryPlan, plan_recovery, sync_agents};
 pub use reliability::{
     AdmissionRecovery, PendingProjection, QueueReservation, ReceiptOutcome, ReliabilityError,
     ReliabilityStore, RetryTaskInput, WorkflowAdmission, WorkflowAuthorization,
 };
-pub use repository::{
-    AckOutcome, Delivery, OwnerRepository, Repository, SqliteRepository, StorageFuture,
-};
+pub use repository::{AckOutcome, Delivery, Repository, SqliteRepository, StorageFuture};

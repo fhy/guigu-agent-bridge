@@ -58,7 +58,6 @@ pub enum AppError {
 
 pub struct AppRuntime {
     pool: Option<SqlitePool>,
-    business_store: crate::storage::BusinessStore,
     reload: Arc<ReloadController>,
     health_state: Arc<HealthState>,
     health: Option<HealthServer>,
@@ -84,12 +83,11 @@ impl AppRuntime {
         let config = crate::config::load(&path)?;
         prepare_directories(&config).map_err(AppError::Health)?;
         let pool = connect(&config.bridge.database).await?;
-        let business_store = crate::storage::connect_owner(&config.bridge.database)?.facade();
         if let Err(error) = migrate(&pool).await {
             pool.close().await;
             return Err(error.into());
         }
-        let reliability = crate::storage::ReliabilityStore::new_owner(business_store.clone());
+        let reliability = crate::storage::ReliabilityStore::new(pool.clone());
         let runtime_instance = uuid::Uuid::now_v7().to_string();
         let startup_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         let owns_runtime = reliability
@@ -100,7 +98,6 @@ impl AppRuntime {
             path,
             config,
             pool.clone(),
-            business_store.clone(),
             reliability.clone(),
             runtime_instance.clone(),
             owns_runtime,
@@ -129,15 +126,14 @@ impl AppRuntime {
         path: PathBuf,
         config: Config,
         pool: SqlitePool,
-        business_store: crate::storage::BusinessStore,
         reliability: crate::storage::ReliabilityStore,
         runtime_instance: String,
         owns_runtime: bool,
     ) -> Result<Self, AppError> {
-        let repository = Arc::new(SqliteRepository::new_owner(business_store.clone()));
+        let repository = Arc::new(SqliteRepository::new(pool.clone()));
         let repository_trait: Arc<dyn Repository> = repository.clone();
-        let sessions = SqliteSessionStore::new_owner(business_store.clone());
-        let runtime_store = SqliteRuntimeStore::new_owner(business_store.clone());
+        let sessions = SqliteSessionStore::new(pool.clone());
+        let runtime_store = SqliteRuntimeStore::new(pool.clone());
         let registry = Arc::new(EndpointRegistry::from_config(&config));
         sync_agents(repository_trait.as_ref(), &registry).await?;
 
@@ -208,7 +204,6 @@ impl AppRuntime {
         health_state.set_recovery_blocked(recovery_blocked);
         let mut runtime = Self {
             pool: Some(pool.clone()),
-            business_store,
             reload,
             health_state,
             health: None,
@@ -282,7 +277,7 @@ impl AppRuntime {
         let acp = Arc::new(AcpDispatcherRouter::new(endpoint_dispatchers));
         let mut dispatchers = DispatcherRegistry::new().with(TransportType::Acp, acp.clone());
         if config.transports.a2a.enabled {
-            let a2a = crate::a2a::assembly::dispatchers(&config, business_store.clone())
+            let a2a = crate::a2a::assembly::dispatchers(&config, pool.clone())
                 .await
                 .map_err(|_| AppError::Assembly("A2A peer startup failed"))?;
             dispatchers = dispatchers.with(TransportType::A2a, Arc::new(a2a));
@@ -305,12 +300,12 @@ impl AppRuntime {
             .with_reliability(reliability.clone(), runtime_instance.clone());
         let durable_bus = Arc::new(bus);
         let gateway_handoff = crate::app::gateway_handoff::GatewayHandoff::new(
-            crate::gateway::GatewayStore::new_owner(business_store.clone()),
+            crate::gateway::GatewayStore::new(pool.clone()),
             Arc::clone(&durable_bus),
             runtime_instance.clone(),
         );
         if config.transports.gateway.enabled
-            && !crate::gateway::GatewayStore::new_owner(business_store.clone())
+            && !crate::gateway::GatewayStore::new(pool.clone())
                 .validate_retained_bytes()
                 .await
                 .map_err(|_| AppError::Assembly("gateway retained-byte validation failed"))?
@@ -420,7 +415,7 @@ impl AppRuntime {
                 ));
                 sync = sync.with_raw_consumer(Arc::new(GatewayRawConsumer::new(
                     Arc::clone(&gateway),
-                    GatewayStore::new_owner(business_store.clone()),
+                    GatewayStore::new(pool.clone()),
                     repository.as_ref().clone(),
                     gateway_handoff.clone(),
                 )));
@@ -440,7 +435,7 @@ impl AppRuntime {
             runtime.gateway = gateway;
             if runtime.gateway.is_some() {
                 runtime.gateway_cleanup = Some(crate::gateway::GatewayCleanupHandle::start(
-                    GatewayStore::new_owner(business_store.clone()),
+                    GatewayStore::new(pool.clone()),
                     runtime_instance.clone(),
                 ));
             }

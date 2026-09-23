@@ -2,7 +2,7 @@
 name = "guigu-agent-bridge"
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.94"
 description = "Durable Matrix, ACP, and A2A task routing bridge for external agents"
 license = "MIT"
 repository = "https://github.com/guigu-ai/guigu-agent-bridge"
@@ -60,15 +60,13 @@ uuid = { version = "1", features = ["v7", "serde", "v5"] }
 chrono = { version = "0.4", features = ["serde"] }
 toml = "1.1.6"
 url = "2.5.8"
-rusqlite = { version = "0.35", features = ["bundled"] }
 matrix-sdk = { version = "=0.13.0", default-features = false, features = ["rustls-tls", "e2e-encryption", "sqlite", "bundled-sqlite"] }
 axum = { version = "=0.8.6", default-features = false, features = ["http1", "json", "tokio"] }
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "json"] }
 # SQLite driver for the durable event store (ADR-002). `default-features = false`
 # avoids the `any`/`json` backends; `macros` is required for `sqlx::migrate!`, and
-# `sqlite` pulls `sqlx-sqlite/bundled`. Pinned to 0.8 because sqlx 0.9 declares
-# `rust-version = 1.94`, above this crate's 1.88.
-sqlx = { version = "0.8", default-features = false, features = [
+# `sqlite` shares libsqlite3-sys 0.33 with matrix-sdk's official SQLite store.
+sqlx = { version = "0.9.0", default-features = false, features = [
     "sqlite",
     "runtime-tokio",
     "migrate",

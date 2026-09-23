@@ -6,8 +6,8 @@ production service change.
 
 ## Candidate
 
-- Build with Rust 1.88 from an exact reviewed commit.
-- Verify `Cargo.toml` reports version `0.1.0` and `rust-version = "1.88"`.
+- Build with Rust 1.94 from an exact reviewed commit.
+- Verify `Cargo.toml` reports version `0.1.0` and `rust-version = "1.94"`.
 - Run `cargo fmt --check`, `cargo check`, `cargo clippy -- -D warnings`, and
   `cargo test` before publishing the exact candidate.
 - Keep credentials outside the repository. Resolve `{env:...}` values through the
