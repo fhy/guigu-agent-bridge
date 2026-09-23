@@ -12,6 +12,12 @@ pub enum MatrixError {
     /// The configured session is not accepted.
     #[error("Matrix authentication failed")]
     Authentication,
+    /// The configured device has not been approved for encrypted traffic.
+    #[error("Matrix device is not trusted")]
+    DeviceUntrusted,
+    /// The restored device/session was rejected and requires operator recovery.
+    #[error("Matrix device was rejected")]
+    DeviceKicked,
     /// A request could not reach or receive a valid HTTP response.
     #[error("Matrix transport failed")]
     Transport,

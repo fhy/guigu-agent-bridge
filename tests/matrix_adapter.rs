@@ -31,6 +31,10 @@ fn config(homeserver: &str) -> MatrixTransportConfig {
         routes: Default::default(),
         admin_users: Vec::new(),
         admin_rooms: Vec::new(),
+        crypto_store_path: Some(
+            std::env::temp_dir().join(format!("guigu-matrix-test-{}", uuid::Uuid::new_v4())),
+        ),
+        device_trusted: true,
     }
 }
 
@@ -364,7 +368,7 @@ async fn unknown_token_is_authentication_and_the_owner_shuts_down_cleanly() {
     .unwrap();
     let (tx, _rx) = mpsc::channel(1);
     let error = sync.sync_once(&tx).await.unwrap_err();
-    assert!(matches!(error, MatrixError::Authentication));
+    assert!(matches!(error, MatrixError::DeviceKicked));
     assert!(!error.to_string().contains("planted-server-secret"));
 
     let idle_server = MockServer::start().await;
@@ -450,4 +454,193 @@ async fn rendered_errors_and_debug_values_never_contain_credentials() {
         assert!(!rendered.contains("@bridge:example.test"));
         assert!(!rendered.contains("planted-query-secret"));
     }
+}
+
+#[tokio::test]
+async fn persistent_store_reopens_with_the_stable_device() {
+    let server = MockServer::start().await;
+    mount_versions(&server).await;
+    let config = config(&server.uri());
+    let store = config.crypto_store_path.clone().unwrap();
+    let first = MatrixClient::restore(&config).await.unwrap();
+    assert_eq!(first.device_id(), "GUIGU_BRIDGE");
+    drop(first);
+    let second = MatrixClient::restore(&config).await.unwrap();
+    assert_eq!(second.device_id(), "GUIGU_BRIDGE");
+    assert!(store.is_dir());
+}
+
+#[tokio::test]
+async fn corrupt_crypto_store_is_rejected_without_reset() {
+    let server = MockServer::start().await;
+    mount_versions(&server).await;
+    let config = config(&server.uri());
+    let store = config.crypto_store_path.clone().unwrap();
+    drop(MatrixClient::restore(&config).await.unwrap());
+    std::fs::write(store.join("matrix-sdk-crypto.sqlite3"), b"corrupt").unwrap();
+    assert!(MatrixClient::restore(&config).await.is_err());
+    assert_eq!(
+        std::fs::read(store.join("matrix-sdk-crypto.sqlite3")).unwrap(),
+        b"corrupt"
+    );
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn unsafe_store_permissions_fail_closed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let server = MockServer::start().await;
+    mount_versions(&server).await;
+    let config = config(&server.uri());
+    let store = config.crypto_store_path.as_ref().unwrap();
+    std::fs::create_dir_all(store).unwrap();
+    std::fs::set_permissions(store, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(matches!(
+        MatrixClient::restore(&config).await,
+        Err(MatrixError::Configuration)
+    ));
+}
+
+#[tokio::test]
+async fn untrusted_device_and_non_directory_store_fail_closed() {
+    let server = MockServer::start().await;
+    mount_versions(&server).await;
+    let mut config = config(&server.uri());
+    config.device_trusted = false;
+    assert!(matches!(
+        MatrixClient::restore(&config).await,
+        Err(MatrixError::DeviceUntrusted)
+    ));
+
+    config.device_trusted = true;
+    let store = config.crypto_store_path.as_ref().unwrap();
+    std::fs::write(store, b"not a store").unwrap();
+    assert!(matches!(
+        MatrixClient::restore(&config).await,
+        Err(MatrixError::Configuration)
+    ));
+}
+
+#[tokio::test]
+async fn encrypted_event_without_a_room_key_is_never_delivered_as_plaintext() {
+    let server = MockServer::start().await;
+    mount_versions(&server).await;
+    let encrypted = json!({
+        "next_batch": "s1",
+        "rooms": {"join": {"!room:example.test": {
+            "timeline": {"events": [{
+                "type": "m.room.encrypted",
+                "event_id": "$encrypted:example.test",
+                "sender": "@alice:example.test",
+                "origin_server_ts": 1,
+                "content": {
+                    "algorithm": "m.megolm.v1.aes-sha2",
+                    "ciphertext": "not-a-valid-ciphertext",
+                    "device_id": "ALICE",
+                    "sender_key": "not-a-key",
+                    "session_id": "missing"
+                }
+            }], "limited": false, "prev_batch": null},
+            "state": {"events": []}, "ephemeral": {"events": []},
+            "account_data": {"events": []}, "unread_notifications": {}
+        }}},
+        "presence": {"events": []}, "account_data": {"events": []},
+        "to_device": {"events": []},
+        "device_lists": {"changed": [], "left": []},
+        "device_one_time_keys_count": {}
+    });
+    Mock::given(method("GET"))
+        .and(path_regex(r"/_matrix/client/.*/sync"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(encrypted))
+        .mount(&server)
+        .await;
+    let sync = MatrixSync::new(
+        MatrixClient::restore(&config(&server.uri())).await.unwrap(),
+        Arc::new(MemorySyncTokenStore::default()),
+        4,
+    )
+    .unwrap();
+    let (tx, mut rx) = mpsc::channel(4);
+    assert_eq!(sync.sync_once(&tx).await.unwrap(), 0);
+    assert!(rx.try_recv().is_err());
+}
+
+#[tokio::test]
+async fn encrypted_room_outbound_uses_encrypted_event_type() {
+    let server = MockServer::start().await;
+    mount_versions(&server).await;
+    let mut response = sync_response("s1", "$one:x");
+    response["rooms"]["join"]["!room:example.test"]["state"]["events"] = json!([{
+        "type": "m.room.encryption", "state_key": "", "event_id": "$enc:x",
+        "sender": "@bridge:example.test", "origin_server_ts": 1,
+        "content": {"algorithm": "m.megolm.v1.aes-sha2"}
+    }, {
+        "type": "m.room.member", "state_key": "@bridge:example.test",
+        "event_id": "$member:x", "sender": "@bridge:example.test", "origin_server_ts": 1,
+        "content": {"membership": "join"}
+    }]);
+    Mock::given(method("GET"))
+        .and(path_regex(r"/_matrix/client/.*/sync"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(response))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/_matrix/client/.*/keys/upload"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"one_time_key_counts": {}})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/_matrix/client/.*/keys/query"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"failures": {}, "device_keys": {}})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(r"/_matrix/client/.*/sendToDevice/.*"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({})))
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"/_matrix/client/.*/rooms/.*/members"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"chunk": [{
+            "type": "m.room.member", "state_key": "@bridge:example.test",
+            "event_id": "$member:x", "sender": "@bridge:example.test",
+            "origin_server_ts": 1, "content": {"membership": "join"}
+        }]})))
+        .mount(&server)
+        .await;
+    Mock::given(method("PUT"))
+        .and(path_regex(
+            r"/_matrix/client/.*/rooms/.*/send/m.room.encrypted/.*",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"event_id": "$sent:x"})))
+        .mount(&server)
+        .await;
+
+    let client = MatrixClient::restore(&config(&server.uri())).await.unwrap();
+    let sync =
+        MatrixSync::new(client.clone(), Arc::new(MemorySyncTokenStore::default()), 4).unwrap();
+    let (tx, _rx) = mpsc::channel(4);
+    sync.sync_once(&tx).await.unwrap();
+    SdkMatrixSender::new(client)
+        .send(
+            "!room:example.test",
+            &ObserverMessage {
+                category: MessageCategory::Summary,
+                severity: Severity::Info,
+                body: "encrypted".into(),
+            },
+        )
+        .await
+        .unwrap();
+    assert!(
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .any(|request| { request.url.path().contains("/send/m.room.encrypted/") })
+    );
 }

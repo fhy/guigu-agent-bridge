@@ -205,7 +205,7 @@ fn classify_sdk_error(error: matrix_sdk::Error) -> MatrixError {
     match error.client_api_error_kind() {
         Some(
             ErrorKind::UnknownToken { .. } | ErrorKind::MissingToken | ErrorKind::Forbidden { .. },
-        ) => MatrixError::Authentication,
+        ) => MatrixError::DeviceKicked,
         _ => MatrixError::Transport,
     }
 }

@@ -148,6 +148,10 @@ pub struct MatrixTransportConfig {
     pub admin_users: Vec<String>,
     /// Admin room scope. Empty is deny-all.
     pub admin_rooms: Vec<String>,
+    /// Persistent matrix-sdk state/crypto/event-cache store root.
+    pub crypto_store_path: Option<PathBuf>,
+    /// Operator assertion that the fixed Matrix device was verified out of band.
+    pub device_trusted: bool,
 }
 
 /// Matrix routing declarations, kept free of matrix-sdk types.
@@ -500,6 +504,10 @@ struct RawMatrix {
     admin_users: Vec<String>,
     #[serde(default)]
     admin_rooms: Vec<String>,
+    #[serde(default)]
+    crypto_store_path: Option<PathBuf>,
+    #[serde(default)]
+    device_trusted: bool,
 }
 
 impl Default for RawMatrix {
@@ -515,6 +523,8 @@ impl Default for RawMatrix {
             routes: RawMatrixRoutes::default(),
             admin_users: Vec::new(),
             admin_rooms: Vec::new(),
+            crypto_store_path: None,
+            device_trusted: false,
         }
     }
 }
@@ -1243,6 +1253,18 @@ fn build_matrix(raw: RawMatrix) -> Result<MatrixTransportConfig, ConfigError> {
                 "must not be empty when matrix transport is enabled",
             ));
         }
+        if raw.crypto_store_path.is_none() {
+            return Err(validation(
+                "transports.matrix.crypto_store_path",
+                "must be configured when matrix transport is enabled",
+            ));
+        }
+        if !raw.device_trusted {
+            return Err(validation(
+                "transports.matrix.device_trusted",
+                "must be true after operator verification",
+            ));
+        }
     }
     validate_capacity("transports.matrix.sync_capacity", raw.sync_capacity)?;
     for (field, values) in [
@@ -1293,6 +1315,8 @@ fn build_matrix(raw: RawMatrix) -> Result<MatrixTransportConfig, ConfigError> {
         },
         admin_users: raw.admin_users,
         admin_rooms: raw.admin_rooms,
+        crypto_store_path: raw.crypto_store_path,
+        device_trusted: raw.device_trusted,
     })
 }
 
@@ -1955,7 +1979,7 @@ mod tests {
     #[test]
     fn secret_redacted_in_debug_and_display() {
         let env = env_with_home_and(&[("TOKEN", "s3cr3t-value")]);
-        let text = "[transports.matrix]\nenabled = true\nhomeserver = \"https://matrix.example\"\nuser_id = \"@u:x\"\naccess_token = \"{env:TOKEN}\"\n";
+        let text = "[transports.matrix]\nenabled = true\nhomeserver = \"https://matrix.example\"\nuser_id = \"@u:x\"\naccess_token = \"{env:TOKEN}\"\ncrypto_store_path = \"/home/tester/.local/share/guigu-agent-bridge/matrix\"\ndevice_trusted = true\n";
         let config = load_from_str_with_env(text, &env).unwrap();
 
         let debug = format!("{config:?}");

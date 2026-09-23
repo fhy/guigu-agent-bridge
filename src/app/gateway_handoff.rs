@@ -113,6 +113,8 @@ mod tests {
                     routes: MatrixRoutesConfig::default(),
                     admin_users: vec![],
                     admin_rooms: vec![],
+                    crypto_store_path: None,
+                    device_trusted: false,
                 },
                 a2a: A2aTransportConfig {
                     enabled: false,

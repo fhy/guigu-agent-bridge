@@ -22,10 +22,15 @@ use `{env:VARIABLE}` references; do not store access tokens in the file.
 
 ## Matrix
 
-Set `enabled = true`, `homeserver`, `user_id`, and `access_token`. `allowed_users`
+Set `enabled = true`, `homeserver`, `user_id`, `access_token`, and a dedicated
+`crypto_store_path`. The store directory must be private (`0700` on Unix), must not
+be a symlink, and must be backed up and restored as one SQLite generation. The bridge
+always restores the stable `GUIGU_BRIDGE` device; set `device_trusted = true` only
+after that device is verified out of band. Missing trust, rejected sessions, unsafe
+permissions, corrupt stores, and undecryptable events fail closed. `allowed_users`
 controls ordinary ingress. `admin_users` and optional `admin_rooms` control slash
-commands. Routes map aliases and rooms to configured agent IDs. Empty allowlists do not
-grant access.
+commands. Routes map aliases and rooms to configured agent IDs. Empty allowlists do
+not grant access.
 
 ## Agents
 

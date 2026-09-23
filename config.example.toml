@@ -30,6 +30,9 @@ sync_capacity = 256
 allowed_users = []
 admin_users = []
 admin_rooms = []
+crypto_store_path = "~/.local/share/guigu-agent-bridge/matrix"
+# Set true only after GUIGU_BRIDGE is verified from an already trusted device.
+device_trusted = false
 
 [transports.matrix.routes]
 aliases = {}
