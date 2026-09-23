@@ -191,36 +191,6 @@ impl MatrixIngress {
         }
     }
 
-    #[cfg(test)]
-    pub fn new_with_test_channel(
-        receiver: mpsc::Receiver<InboundMatrixEvent>,
-        repository: Arc<dyn Repository>,
-        registry: Arc<EndpointRegistry>,
-        admission: Arc<dyn DurableMatrixAdmission>,
-        sender: Arc<dyn MatrixSender>,
-        reload: Arc<ReloadController>,
-        cancellation: Cancellation,
-        ledger: Arc<CommandLedger>,
-        replies: Arc<ReplyRegistry>,
-        dedup_capacity: usize,
-        inject: mpsc::Sender<InboundMatrixEvent>,
-    ) -> Self {
-        let mut ingress = Self::new(
-            receiver,
-            repository,
-            registry,
-            admission,
-            sender,
-            reload,
-            cancellation,
-            ledger,
-            replies,
-            dedup_capacity,
-        );
-        ingress.test_inject = Some(inject);
-        ingress
-    }
-
     pub fn with_queue_control_store(
         mut self,
         queue: Arc<crate::storage::ReliabilityStore>,
@@ -232,15 +202,6 @@ impl MatrixIngress {
     pub fn with_reap_control(mut self, reap: Arc<dyn crate::matrix::ReapControl>) -> Self {
         self.reap = Some(reap);
         self
-    }
-
-    #[cfg(test)]
-    pub(crate) fn with_test_admin_controls(
-        self,
-        queue: Arc<crate::storage::ReliabilityStore>,
-        reap: Arc<dyn crate::matrix::ReapControl>,
-    ) -> Self {
-        self.with_queue_control_store(queue).with_reap_control(reap)
     }
 
     pub fn with_retry_admission(mut self, retry: Arc<dyn RetryAdmission>) -> Self {

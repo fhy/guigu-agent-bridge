@@ -80,79 +80,6 @@ fn warn_insecure_peer(peer_key: &str) {
     );
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{trust_policy, warn_insecure_peer};
-    use crate::{
-        a2a::A2aError,
-        config::{A2aPeerConfig, SecretString},
-    };
-    use std::io::{self, Write};
-    use std::sync::{Arc, Mutex};
-
-    #[derive(Clone, Default)]
-    struct Captured(Arc<Mutex<Vec<u8>>>);
-
-    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
-
-    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
-        type Writer = CapturedWriter;
-
-        fn make_writer(&'a self) -> Self::Writer {
-            CapturedWriter(Arc::clone(&self.0))
-        }
-    }
-
-    impl Write for CapturedWriter {
-        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
-            self.0.lock().unwrap().extend_from_slice(bytes);
-            Ok(bytes.len())
-        }
-
-        fn flush(&mut self) -> io::Result<()> {
-            Ok(())
-        }
-    }
-
-    #[test]
-    fn insecure_peer_warning_contains_only_the_safe_identifier() {
-        let captured = Captured::default();
-        let subscriber = tracing_subscriber::fmt()
-            .without_time()
-            .with_ansi(false)
-            .with_writer(captured.clone())
-            .finish();
-        tracing::subscriber::with_default(subscriber, || warn_insecure_peer("safe-peer-key"));
-        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
-        assert!(output.contains("ERROR"));
-        assert!(output.contains("safe-peer-key"));
-        for secret in ["https://", "Bearer", "certificate.pem", "task content"] {
-            assert!(
-                !output.contains(secret),
-                "warning leaked {secret}: {output}"
-            );
-        }
-    }
-
-    #[test]
-    fn missing_private_ca_never_falls_back_to_dangerous_bypass() {
-        let peer = A2aPeerConfig {
-            url: "https://localhost/rpc".into(),
-            expected_peer_id: "peer".into(),
-            token: SecretString::new("test-token".into()),
-            allowed_targets: Vec::new(),
-            private_ca: Some(std::path::PathBuf::from(
-                "/definitely/missing/a2a-private-ca.pem",
-            )),
-            danger_accept_invalid_certs: true,
-        };
-        assert!(matches!(
-            trust_policy(&peer),
-            Err(A2aError::Config("private CA unavailable"))
-        ));
-    }
-}
-
 pub(crate) async fn server(
     config: &Config,
     pool: SqlitePool,
@@ -243,4 +170,77 @@ pub(crate) async fn server(
         );
     }
     Ok(A2aServer::bind(server_config, ingress).await?.start())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{trust_policy, warn_insecure_peer};
+    use crate::{
+        a2a::A2aError,
+        config::{A2aPeerConfig, SecretString},
+    };
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone, Default)]
+    struct Captured(Arc<Mutex<Vec<u8>>>);
+
+    struct CapturedWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+        type Writer = CapturedWriter;
+
+        fn make_writer(&'a self) -> Self::Writer {
+            CapturedWriter(Arc::clone(&self.0))
+        }
+    }
+
+    impl Write for CapturedWriter {
+        fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+            Ok(bytes.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn insecure_peer_warning_contains_only_the_safe_identifier() {
+        let captured = Captured::default();
+        let subscriber = tracing_subscriber::fmt()
+            .without_time()
+            .with_ansi(false)
+            .with_writer(captured.clone())
+            .finish();
+        tracing::subscriber::with_default(subscriber, || warn_insecure_peer("safe-peer-key"));
+        let output = String::from_utf8(captured.0.lock().unwrap().clone()).unwrap();
+        assert!(output.contains("ERROR"));
+        assert!(output.contains("safe-peer-key"));
+        for secret in ["https://", "Bearer", "certificate.pem", "task content"] {
+            assert!(
+                !output.contains(secret),
+                "warning leaked {secret}: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn missing_private_ca_never_falls_back_to_dangerous_bypass() {
+        let peer = A2aPeerConfig {
+            url: "https://localhost/rpc".into(),
+            expected_peer_id: "peer".into(),
+            token: SecretString::new("test-token".into()),
+            allowed_targets: Vec::new(),
+            private_ca: Some(std::path::PathBuf::from(
+                "/definitely/missing/a2a-private-ca.pem",
+            )),
+            danger_accept_invalid_certs: true,
+        };
+        assert!(matches!(
+            trust_policy(&peer),
+            Err(A2aError::Config("private CA unavailable"))
+        ));
+    }
 }

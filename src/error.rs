@@ -34,7 +34,7 @@ mod tests {
 
     #[test]
     fn shutdown_error_displays_and_sources() {
-        let inner = io::Error::new(io::ErrorKind::Other, "boom");
+        let inner = io::Error::other("boom");
         let err = Error::Shutdown(inner);
 
         let message = err.to_string();

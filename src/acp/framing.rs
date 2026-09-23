@@ -262,7 +262,7 @@ mod tests {
     fn an_oversized_frame_is_refused_before_it_is_buffered_in_full() {
         let mut reader = FrameReader::new(64);
         // No newline yet: the limit is checked as the buffer grows.
-        reader.push(&vec![b'x'; 65]);
+        reader.push(&[b'x'; 65]);
         assert!(matches!(
             reader.next_frame(),
             Err(FrameError::TooLarge { limit: 64 })

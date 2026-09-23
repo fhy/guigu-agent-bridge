@@ -1108,9 +1108,11 @@ mod tests {
             .send_acceptance(&store, &envelope, Some("$root:test"))
             .await
             .unwrap();
-        let calls = sender.calls.lock().unwrap();
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0], calls[1]);
+        {
+            let calls = sender.calls.lock().unwrap();
+            assert_eq!(calls.len(), 2);
+            assert_eq!(calls[0], calls[1]);
+        }
         let state: (String, i64, String) = sqlx::query_as(
             "SELECT phase,attempt,event_id FROM gateway_deliveries WHERE direction='outbound'",
         )
