@@ -221,7 +221,7 @@ async fn authenticated_pause_uses_real_router_and_marks_running_queue_paused() {
     ));
     let target = harness.registry.get(task.to_agent).unwrap().clone();
     let task_for_run = task.clone();
-    let delivery_for_run = delivery.clone();
+    let delivery_for_run = delivery;
     let leased_for_run = Arc::clone(&leased);
     let run = tokio::spawn(async move {
         let request = guigu_agent_bridge::bus::DispatchRequest {
@@ -1007,7 +1007,8 @@ async fn structured_continue_reuses_the_real_session_and_delivery_until_complete
             .await
             .expect("terminal delivery disposition");
     assert_eq!(disposition, "terminal");
-    let projections: Vec<(String, String, Option<String>, Option<String>, String)> = sqlx::query_as(
+    type ProjectionRow = (String, String, Option<String>, Option<String>, String);
+    let projections: Vec<ProjectionRow> = sqlx::query_as(
         "SELECT projection,room_id,thread_root,reply_event_id,body FROM projection_outbox WHERE source_kind='task_event' AND source_id=? ORDER BY projection",
     )
     .bind(events[3].id.to_string())
