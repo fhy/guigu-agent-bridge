@@ -35,6 +35,8 @@ pub enum Phase {
     Spawn,
     /// The `initialize` handshake.
     Initialize,
+    /// ACP authentication.
+    Authenticate,
     /// `session/new` or `session/resume`.
     Session,
     /// `session/prompt`.
@@ -48,6 +50,7 @@ impl fmt::Display for Phase {
         f.write_str(match self {
             Self::Spawn => "process start",
             Self::Initialize => "initialize",
+            Self::Authenticate => "authenticate",
             Self::Session => "session setup",
             Self::Prompt => "prompt",
             Self::Shutdown => "shutdown",

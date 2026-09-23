@@ -729,13 +729,13 @@ impl AppRuntime {
             shutdown_error.get_or_insert(AppError::Health(error));
         }
         self.health_state.set_owner(OwnerState::Stopped);
-        if shutdown_error.is_none()
-            && let Some(token) = self.runtime_instance.take()
-        {
+        if let Some(token) = self.runtime_instance.take() {
             let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
             match self.reliability.stop_runtime(&token, &now).await {
                 Ok(true) => {}
-                Ok(false) | Err(_) => shutdown_error = Some(AppError::Runtime),
+                Ok(false) if shutdown_error.is_none() => shutdown_error = Some(AppError::Runtime),
+                Err(_) if shutdown_error.is_none() => shutdown_error = Some(AppError::Runtime),
+                Ok(false) | Err(_) => {}
             }
         }
         if let Some(pool) = self.pool.take() {

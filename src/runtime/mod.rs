@@ -839,6 +839,16 @@ impl SqliteRuntimeStore {
             return Ok(FinalizeResult::Stale);
         }
         sqlx::query(
+            "UPDATE deliveries SET acknowledged_at=? \
+             WHERE delivery_id=(SELECT delivery_id FROM task_continuations WHERE task_id=?) \
+             AND task_id=? AND acknowledged_at IS NULL",
+        )
+        .bind(ts(now))
+        .bind(event.task_id.to_string())
+        .bind(event.task_id.to_string())
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query(
             "UPDATE delivery_dispositions SET state='terminal',reason_code=NULL \
              WHERE delivery_id=(SELECT delivery_id FROM task_continuations WHERE task_id=?) \
              AND task_id=? AND state IN ('prepared','acknowledged')",

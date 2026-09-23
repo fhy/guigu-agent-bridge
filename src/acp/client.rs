@@ -32,8 +32,8 @@ use crate::acp::AcpTurnHandle;
 use crate::acp::error::{AcpError, Phase};
 use crate::acp::result::TurnResult;
 use crate::acp::schema::{
-    self, InitializeParams, InitializeResult, NewSessionParams, PromptResult, ResumeSessionParams,
-    SessionResult, StopReason,
+    self, AuthenticateParams, AuthenticateResult, InitializeParams, InitializeResult,
+    NewSessionParams, PromptResult, ResumeSessionParams, SessionResult, StopReason,
 };
 use crate::acp::transport::{AcpTransport, TransportLimits};
 use crate::acp::{MAX_SESSION_ID_BYTES, bounded};
@@ -123,10 +123,39 @@ impl AcpClient {
                 supported: schema::PROTOCOL_VERSION,
             });
         }
-        if !result.auth_methods.is_empty() {
-            let advertised = result.auth_methods.len();
+        let api_methods: Vec<_> = result
+            .auth_methods
+            .iter()
+            .filter(|method| method.id == "api-key" && !method.is_terminal())
+            .collect();
+        if api_methods.len() > 1 {
             let _ = transport.shutdown().await;
-            return Err(AcpError::Authentication { advertised });
+            return Err(AcpError::Authentication {
+                advertised: result.auth_methods.len(),
+            });
+        }
+        if !result.auth_methods.is_empty() {
+            let Some(method) = api_methods.first() else {
+                let _ = transport.shutdown().await;
+                return Err(AcpError::Authentication {
+                    advertised: result.auth_methods.len(),
+                });
+            };
+            let params = encode(
+                schema::METHOD_AUTHENTICATE,
+                &AuthenticateParams {
+                    method_id: method.id.clone(),
+                },
+            )?;
+            let completed = transport
+                .request(
+                    Phase::Authenticate,
+                    schema::METHOD_AUTHENTICATE,
+                    params,
+                    limits.initialize_deadline,
+                )
+                .await?;
+            let _: AuthenticateResult = decode(schema::METHOD_AUTHENTICATE, completed.result)?;
         }
 
         let backend_id = backend_id(agent_id, result.agent_info.as_ref());

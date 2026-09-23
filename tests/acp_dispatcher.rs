@@ -1007,6 +1007,13 @@ async fn structured_continue_reuses_the_real_session_and_delivery_until_complete
             .await
             .expect("terminal delivery disposition");
     assert_eq!(disposition, "terminal");
+    let acknowledged: Option<String> =
+        sqlx::query_scalar("SELECT acknowledged_at FROM deliveries WHERE delivery_id=?")
+            .bind(dispatched_delivery(&events[1]).to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .expect("terminal delivery acknowledgement");
+    assert!(acknowledged.is_some());
     type ProjectionRow = (String, String, Option<String>, Option<String>, String);
     let projections: Vec<ProjectionRow> = sqlx::query_as(
         "SELECT projection,room_id,thread_root,reply_event_id,body FROM projection_outbox WHERE source_kind='task_event' AND source_id=? ORDER BY projection",

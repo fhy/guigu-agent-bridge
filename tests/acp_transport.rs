@@ -194,15 +194,20 @@ async fn a_backend_on_another_protocol_version_is_refused() {
 }
 
 #[tokio::test]
-async fn a_backend_that_requires_authentication_is_reported_separately() {
-    let error = AcpClient::connect(&address("need-auth"), AGENT_ID, None, limits())
+async fn a_backend_that_requires_api_key_authenticates_before_session() {
+    let client = AcpClient::connect(&address("need-auth"), AGENT_ID, None, limits())
         .await
-        .expect_err("authentication is not implemented");
-
-    match error {
-        AcpError::Authentication { advertised } => assert_eq!(advertised, 1),
-        other => panic!("expected an authentication failure, got {other:?}"),
-    }
+        .expect("the API-key method should be selected and authenticated");
+    let session = client
+        .new_session("/tmp")
+        .await
+        .expect("session after auth");
+    let turn = client
+        .prompt(&session, "one prompt")
+        .await
+        .expect("prompt after auth");
+    assert!(turn.stop_reason.is_end_turn());
+    client.shutdown().await;
 }
 
 #[tokio::test]

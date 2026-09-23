@@ -29,6 +29,7 @@ pub const PROTOCOL_VERSION: u16 = 1;
 
 /// `initialize`.
 pub const METHOD_INITIALIZE: &str = "initialize";
+pub const METHOD_AUTHENTICATE: &str = "authenticate";
 /// `session/new`.
 pub const METHOD_SESSION_NEW: &str = "session/new";
 /// `session/resume`.
@@ -116,8 +117,37 @@ pub struct InitializeResult {
     pub agent_info: Option<Implementation>,
     /// Authentication methods the agent advertises.
     #[serde(default)]
-    pub auth_methods: Vec<Value>,
+    pub auth_methods: Vec<AuthMethod>,
 }
+
+/// An ACP authentication method advertised by an agent.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthMethod {
+    #[serde(default)]
+    pub r#type: Option<String>,
+    pub id: String,
+    pub name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub _meta: Option<Value>,
+}
+
+impl AuthMethod {
+    pub fn is_terminal(&self) -> bool {
+        self.r#type.as_deref() == Some("terminal")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthenticateParams {
+    pub method_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct AuthenticateResult {}
 
 /// Parameters of `session/new`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -440,6 +470,30 @@ mod tests {
         assert_eq!(result.protocol_version, 1);
         assert_eq!(result.agent_info, None);
         assert!(result.auth_methods.is_empty());
+    }
+
+    #[test]
+    fn api_key_auth_method_has_the_frozen_wire_shape() {
+        let result: InitializeResult = serde_json::from_value(json!({
+            "protocolVersion": 1,
+            "authMethods": [{
+                "id": "api-key",
+                "name": "API Key",
+                "description": "Use an API key to authenticate",
+                "_meta": {"api-key": {"provider": "openai"}}
+            }]
+        }))
+        .expect("API-key method");
+        assert_eq!(result.auth_methods.len(), 1);
+        assert_eq!(result.auth_methods[0].id, "api-key");
+        assert_eq!(result.auth_methods[0].r#type, None);
+        assert!(!result.auth_methods[0].is_terminal());
+        let params = serde_json::to_value(AuthenticateParams {
+            method_id: "api-key".to_owned(),
+        })
+        .expect("authenticate params");
+        assert_eq!(params, json!({"methodId": "api-key"}));
+        let _: AuthenticateResult = serde_json::from_value(json!({})).expect("empty result");
     }
 
     #[test]

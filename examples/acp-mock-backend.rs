@@ -18,7 +18,7 @@
 //! | `coalesced` | writes a notification and the prompt response in a single write |
 //! | `blank-lines` | writes blank lines between frames |
 //! | `bad-protocol-version` | negotiates a protocol version the adapter does not speak |
-//! | `need-auth` | advertises an authentication method |
+//! | `need-auth` | advertises and accepts the API-key authentication method |
 //! | `oversize-frame` | answers `session/new` with a line far over a lowered frame limit |
 //! | `truncated-eof` | writes half a frame and exits |
 //! | `exit-early` | exits before answering `initialize`, with code 7 |
@@ -80,7 +80,7 @@ fn main() {
                     1
                 };
                 let auth = if scenario == "need-auth" {
-                    json!([{"id": "password", "name": "Password"}])
+                    json!([{"id": "api-key", "name": "API Key", "description": "Use an API key to authenticate"}])
                 } else {
                     json!([])
                 };
@@ -94,6 +94,15 @@ fn main() {
                 );
                 if scenario == "exit-after-init" {
                     std::process::exit(3);
+                }
+            }
+            "authenticate" => {
+                if scenario == "need-auth"
+                    && params.get("methodId").and_then(Value::as_str) == Some("api-key")
+                {
+                    respond(&id, json!({}));
+                } else {
+                    write_raw(&error_response(&id, -32602, "invalid params"));
                 }
             }
             "session/new" => {
