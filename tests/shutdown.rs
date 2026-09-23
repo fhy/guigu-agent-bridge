@@ -1,5 +1,11 @@
 use std::future;
 use std::io;
+#[cfg(unix)]
+use std::net::TcpListener;
+#[cfg(unix)]
+use std::process::{Command, Stdio};
+#[cfg(unix)]
+use std::time::Duration;
 
 use guigu_agent_bridge::Error;
 
@@ -21,6 +27,88 @@ impl ConfigFile {
         .unwrap();
         Self(path)
     }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn sigterm_gracefully_stops_the_owner_and_allows_the_next_generation() {
+    let root = std::env::temp_dir().join(format!("guigu-sigterm-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir(&root).unwrap();
+    let database = root.join("state.db");
+    let sessions = root.join("sessions");
+    let port = TcpListener::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .port();
+    let config = root.join("bridge.toml");
+    std::fs::write(
+        &config,
+        format!(
+            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nhealth_bind = \"127.0.0.1:{port}\"\n",
+            database.to_string_lossy(),
+            sessions.to_string_lossy()
+        ),
+    )
+    .unwrap();
+
+    for generation in 0..2 {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+            .arg(&config)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let ready = format!("http://127.0.0.1:{port}/ready");
+        tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                if reqwest::get(&ready)
+                    .await
+                    .is_ok_and(|response| response.status().is_success())
+                {
+                    break;
+                }
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "bridge exited before readiness"
+                );
+                tokio::time::sleep(Duration::from_millis(25)).await;
+            }
+        })
+        .await
+        .expect("bridge becomes ready");
+
+        assert!(
+            Command::new("kill")
+                .args(["-TERM", &child.id().to_string()])
+                .status()
+                .unwrap()
+                .success()
+        );
+        let status = tokio::task::spawn_blocking(move || child.wait().unwrap())
+            .await
+            .unwrap();
+        assert!(
+            status.success(),
+            "generation {generation} exited with {status}"
+        );
+        assert!(
+            TcpListener::bind(("127.0.0.1", port)).is_ok(),
+            "health port remains bound"
+        );
+    }
+
+    let pool = guigu_agent_bridge::storage::connect(&database)
+        .await
+        .unwrap();
+    let states: Vec<String> =
+        sqlx::query_scalar("SELECT state FROM runtime_instances ORDER BY started_at")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(states, vec!["stopped", "stopped"]);
+    pool.close().await;
+    std::fs::remove_dir_all(root).unwrap();
 }
 
 impl Drop for ConfigFile {

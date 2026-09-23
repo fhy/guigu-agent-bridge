@@ -34,7 +34,8 @@ pub fn init_tracing() {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 }
 
-/// Production entry point: initialize tracing, then run until the Ctrl-C signal.
+/// Production entry point: initialize tracing, then run until an interrupt or
+/// termination signal.
 pub async fn run() -> Result<(), Error> {
     init_tracing();
     info!("starting");
@@ -45,7 +46,24 @@ pub async fn run() -> Result<(), Error> {
         .ok_or(app::AppError::Assembly(
             "configuration path required as argv[1] or GUIGU_CONFIG",
         ))?;
-    run_with_shutdown(path, tokio::signal::ctrl_c()).await
+    run_with_shutdown(path, shutdown_signal()).await
+}
+
+#[cfg(unix)]
+async fn shutdown_signal() -> std::io::Result<()> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    let mut interrupt = signal(SignalKind::interrupt())?;
+    let mut terminate = signal(SignalKind::terminate())?;
+    tokio::select! {
+        _ = interrupt.recv() => Ok(()),
+        _ = terminate.recv() => Ok(()),
+    }
+}
+
+#[cfg(not(unix))]
+async fn shutdown_signal() -> std::io::Result<()> {
+    tokio::signal::ctrl_c().await
 }
 
 /// Start the configured production runtime, then run until shutdown resolves.
