@@ -244,6 +244,74 @@ impl AppRuntime {
             return Ok(runtime);
         }
 
+        // Matrix authentication, store binding and fresh device-key proof are the
+        // assembly gate. No ACP, bus, gateway, outbox or task owner exists before it.
+        let matrix_client = if let Some(generation) = matrix_generation {
+            let identity_health = Arc::clone(&runtime.health_state);
+            let client =
+                match MatrixClient::restore_with_identity(&config.transports.matrix, || {
+                    identity_health.matrix().transition(
+                        generation,
+                        &[MatrixPhase::Preflight],
+                        MatrixPhase::IdentityMatched,
+                    );
+                })
+                .await
+                {
+                    Ok(client) => client,
+                    Err(error) => {
+                        runtime.health_state.matrix().transition(
+                            generation,
+                            &[MatrixPhase::Preflight, MatrixPhase::IdentityMatched],
+                            MatrixPhase::Failed(matrix_failure(&error)),
+                        );
+                        tracing::warn!(
+                            category = matrix_failure(&error).as_log_str(),
+                            "Matrix startup is health-only"
+                        );
+                        runtime.health =
+                            start_health(config.bridge.health_bind, &runtime.health_state).await?;
+                        runtime.health_state.set_owner(OwnerState::Running);
+                        return Ok(runtime);
+                    }
+                };
+            runtime.health_state.matrix().transition(
+                generation,
+                &[MatrixPhase::IdentityMatched],
+                MatrixPhase::StoreBound,
+            );
+            let proof =
+                tokio::time::timeout(Duration::from_secs(30), client.initialize_and_prove()).await;
+            let proof_error = match proof {
+                Ok(Ok(())) => None,
+                Ok(Err(error)) => Some(matrix_failure(&error)),
+                Err(_) => Some(MatrixFailure::Timeout),
+            };
+            if let Some(reason) = proof_error {
+                runtime.health_state.matrix().transition(
+                    generation,
+                    &[MatrixPhase::StoreBound],
+                    MatrixPhase::Failed(reason),
+                );
+                tracing::warn!(
+                    category = reason.as_log_str(),
+                    "Matrix startup is health-only"
+                );
+                runtime.health =
+                    start_health(config.bridge.health_bind, &runtime.health_state).await?;
+                runtime.health_state.set_owner(OwnerState::Running);
+                return Ok(runtime);
+            }
+            runtime.health_state.matrix().transition(
+                generation,
+                &[MatrixPhase::StoreBound],
+                MatrixPhase::KeyProved,
+            );
+            Some(client)
+        } else {
+            None
+        };
+
         let mut endpoint_dispatchers = HashMap::new();
         for (agent_id, declared) in &config.agents {
             if !declared.enabled || declared.transport != TransportType::Acp {
@@ -402,67 +470,7 @@ impl AppRuntime {
             Vec::new()
         };
 
-        let matrix = if let Some(generation) = matrix_generation {
-            let identity_health = Arc::clone(&runtime.health_state);
-            let client =
-                match MatrixClient::restore_with_identity(&config.transports.matrix, || {
-                    identity_health.matrix().transition(
-                        generation,
-                        &[MatrixPhase::Preflight],
-                        MatrixPhase::IdentityMatched,
-                    );
-                })
-                .await
-                {
-                    Ok(client) => client,
-                    Err(error) => {
-                        runtime.health_state.matrix().transition(
-                            generation,
-                            &[MatrixPhase::Preflight, MatrixPhase::IdentityMatched],
-                            MatrixPhase::Failed(matrix_failure(&error)),
-                        );
-                        tracing::warn!(
-                            category = matrix_failure(&error).as_log_str(),
-                            "Matrix startup is health-only"
-                        );
-                        runtime.health =
-                            start_health(config.bridge.health_bind, &runtime.health_state).await?;
-                        runtime.health_state.set_owner(OwnerState::Running);
-                        return Ok(runtime);
-                    }
-                };
-            runtime.health_state.matrix().transition(
-                generation,
-                &[MatrixPhase::IdentityMatched],
-                MatrixPhase::StoreBound,
-            );
-            let proof =
-                tokio::time::timeout(Duration::from_secs(30), client.initialize_and_prove()).await;
-            let proof_error = match proof {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(matrix_failure(&error)),
-                Err(_) => Some(MatrixFailure::Timeout),
-            };
-            if let Some(reason) = proof_error {
-                runtime.health_state.matrix().transition(
-                    generation,
-                    &[MatrixPhase::StoreBound],
-                    MatrixPhase::Failed(reason),
-                );
-                tracing::warn!(
-                    category = reason.as_log_str(),
-                    "Matrix startup is health-only"
-                );
-                runtime.health =
-                    start_health(config.bridge.health_bind, &runtime.health_state).await?;
-                runtime.health_state.set_owner(OwnerState::Running);
-                return Ok(runtime);
-            }
-            runtime.health_state.matrix().transition(
-                generation,
-                &[MatrixPhase::StoreBound],
-                MatrixPhase::KeyProved,
-            );
+        let matrix = if let Some(client) = matrix_client {
             let sdk = Arc::new(SdkMatrixSender::new(client.clone()));
             let mut sync = MatrixSync::new(
                 client,
@@ -834,4 +842,206 @@ where
     let cleanup_result = runtime.shutdown().await;
     shutdown_result?;
     cleanup_result
+}
+
+#[cfg(test)]
+mod assembly_tests {
+    use std::collections::BTreeMap;
+
+    use serde_json::json;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use wiremock::{
+        Mock, MockServer, ResponseTemplate,
+        matchers::{method, path_regex},
+    };
+
+    use super::AppRuntime;
+    use crate::{
+        config::load_from_str_with_env,
+        storage::{ReliabilityStore, connect, migrate},
+    };
+
+    #[derive(Clone, Copy)]
+    enum FailureCase {
+        Authentication,
+        StoreBinding,
+        KeyProof,
+    }
+
+    async fn assert_matrix_failure_is_health_only(case: FailureCase) {
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/_matrix/client/versions"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "versions": ["v1.1"], "unstable_features": {}
+            })))
+            .mount(&server)
+            .await;
+        Mock::given(method("GET"))
+            .and(path_regex(r"/_matrix/client/.*/account/whoami"))
+            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                "user_id": if matches!(case, FailureCase::Authentication) {
+                    "@other:example.test"
+                } else {
+                    "@bridge:example.test"
+                },
+                "device_id": "BRIDGE",
+                "is_guest": false
+            })))
+            .mount(&server)
+            .await;
+        if matches!(case, FailureCase::KeyProof) {
+            Mock::given(method("GET"))
+                .and(path_regex(r"/_matrix/client/.*/sync"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+                    "next_batch": "proof",
+                    "rooms": {"join": {}, "invite": {}, "leave": {}, "knock": {}},
+                    "presence": {"events": []}, "account_data": {"events": []},
+                    "to_device": {"events": []},
+                    "device_lists": {"changed": [], "left": []},
+                    "device_one_time_keys_count": {}
+                })))
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/_matrix/client/.*/keys/upload"))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_json(json!({"one_time_key_counts": {}})),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path_regex(r"/_matrix/client/.*/keys/query"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .set_body_json(json!({"failures": {}, "device_keys": {}})),
+                )
+                .mount(&server)
+                .await;
+        }
+
+        let private_root = std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+            .join(".guigu-agent-bridge-tests");
+        std::fs::create_dir_all(&private_root).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&private_root, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+        let root = private_root.join(format!("t029-{}", uuid::Uuid::now_v7()));
+        let sessions = root.join("sessions");
+        let store = root.join("matrix");
+        std::fs::create_dir_all(&sessions).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+            std::fs::set_permissions(&sessions, std::fs::Permissions::from_mode(0o700)).unwrap();
+        }
+        if matches!(case, FailureCase::StoreBinding) {
+            std::fs::create_dir(&store).unwrap();
+            std::fs::write(store.join("unbound-store"), b"preserve").unwrap();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o700)).unwrap();
+            }
+        }
+        let database = root.join("state.db");
+        let config_path = root.join("bridge.toml");
+        let text = format!(
+            r#"
+[bridge]
+database = {database:?}
+session_root = {sessions:?}
+health_bind = "127.0.0.1:0"
+
+[transports.matrix]
+enabled = true
+homeserver = {homeserver:?}
+user_id = "@bridge:example.test"
+device_id = "BRIDGE"
+access_token = "{{env:MATRIX_TOKEN}}"
+crypto_store_path = {store:?}
+device_trusted = true
+
+[agents.worker]
+transport = "acp"
+command = "must-not-start"
+workspace = {root:?}
+enabled = true
+"#,
+            database = database.to_string_lossy(),
+            sessions = sessions.to_string_lossy(),
+            homeserver = server.uri(),
+            store = store.to_string_lossy(),
+            root = root.to_string_lossy(),
+        );
+        std::fs::write(&config_path, &text).unwrap();
+        let config = load_from_str_with_env(
+            &text,
+            &BTreeMap::from([
+                ("HOME".to_owned(), root.to_string_lossy().into_owned()),
+                ("MATRIX_TOKEN".to_owned(), "planted-token".to_owned()),
+            ]),
+        )
+        .unwrap();
+        let pool = connect(&database).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let reliability = ReliabilityStore::new(pool.clone());
+        let instance = uuid::Uuid::now_v7().to_string();
+        assert!(
+            reliability
+                .begin_runtime(&instance, &instance, "2026-09-23T00:00:00Z")
+                .await
+                .unwrap()
+        );
+
+        let runtime = AppRuntime::build(config_path, config, pool, reliability, instance, true)
+            .await
+            .unwrap();
+        assert!(runtime.bus.is_none());
+        assert!(runtime.worker.is_none());
+        assert!(runtime.broadcaster.is_none());
+        assert!(runtime.outbox.is_none());
+        assert!(runtime.acp.is_none());
+        assert!(runtime.a2a.is_none());
+        assert!(runtime.a2a_cleanup.is_none());
+        assert!(runtime.gateway.is_none());
+        assert!(runtime.gateway_cleanup.is_none());
+        assert!(runtime.matrix_sync.is_none());
+        assert!(runtime.ingress.is_none());
+        let snapshot = runtime.health_state.snapshot().await;
+        let expected = match case {
+            FailureCase::Authentication => "matrix-user-mismatch",
+            FailureCase::StoreBinding => "matrix-store-binding-mismatch",
+            FailureCase::KeyProof => "matrix-device-key-upload-failed",
+        };
+        assert_eq!(snapshot.diagnostic, Some(expected));
+
+        let address = runtime.health.as_ref().unwrap().local_addr();
+        let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
+        stream
+            .write_all(b"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n")
+            .await
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).await.unwrap();
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+
+        runtime.shutdown().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn matrix_failures_are_health_only_before_work_owner_assembly() {
+        for case in [
+            FailureCase::Authentication,
+            FailureCase::StoreBinding,
+            FailureCase::KeyProof,
+        ] {
+            assert_matrix_failure_is_health_only(case).await;
+        }
+    }
 }
