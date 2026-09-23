@@ -126,9 +126,13 @@ impl AcpClient {
         let api_methods: Vec<_> = result
             .auth_methods
             .iter()
-            .filter(|method| method.id == "api-key" && !method.is_terminal())
+            .filter(|method| method.is_supported_api_key())
             .collect();
-        if api_methods.len() > 1 {
+        let all_supported = result
+            .auth_methods
+            .iter()
+            .all(|method| method.is_supported_api_key());
+        if api_methods.len() > 1 || !all_supported {
             let _ = transport.shutdown().await;
             return Err(AcpError::Authentication {
                 advertised: result.auth_methods.len(),

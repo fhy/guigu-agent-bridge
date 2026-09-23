@@ -79,10 +79,26 @@ fn main() {
                 } else {
                     1
                 };
-                let auth = if scenario == "need-auth" {
-                    json!([{"id": "api-key", "name": "API Key", "description": "Use an API key to authenticate"}])
-                } else {
-                    json!([])
+                let auth = match scenario.as_str() {
+                    "need-auth" => {
+                        json!([{"id": "api-key", "name": "API Key", "description": "Use an API key to authenticate"}])
+                    }
+                    "need-auth-agent" => {
+                        json!([{"type": "agent", "id": "api-key", "name": "API Key"}])
+                    }
+                    "auth-terminal" => {
+                        json!([{"type": "terminal", "id": "api-key", "name": "API Key"}])
+                    }
+                    "auth-unknown" => {
+                        json!([{"type": "other", "id": "api-key", "name": "API Key"}])
+                    }
+                    "auth-mixed" => {
+                        json!([{"id": "api-key", "name": "API Key"}, {"type": "other", "id": "other", "name": "Other"}])
+                    }
+                    "auth-malformed-mixed" => {
+                        json!([{"id": "api-key", "name": "API Key"}, {"type": 7, "id": "other", "name": "Other"}])
+                    }
+                    _ => json!([]),
                 };
                 respond(
                     &id,
@@ -97,7 +113,7 @@ fn main() {
                 }
             }
             "authenticate" => {
-                if scenario == "need-auth"
+                if matches!(scenario.as_str(), "need-auth" | "need-auth-agent")
                     && params.get("methodId").and_then(Value::as_str) == Some("api-key")
                 {
                     respond(&id, json!({}));

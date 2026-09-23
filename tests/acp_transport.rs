@@ -211,6 +211,31 @@ async fn a_backend_that_requires_api_key_authenticates_before_session() {
 }
 
 #[tokio::test]
+async fn explicit_agent_api_key_authenticates() {
+    let client = connect("need-auth-agent").await;
+    assert!(client.is_alive());
+    assert_eq!(client.shutdown().await, Some(0));
+}
+
+#[tokio::test]
+async fn unsupported_auth_discriminators_fail_closed() {
+    for scenario in ["auth-terminal", "auth-unknown", "auth-mixed"] {
+        let error = AcpClient::connect(&address(scenario), AGENT_ID, None, limits())
+            .await
+            .expect_err("unsupported auth advertisement must fail closed");
+        assert!(
+            matches!(error, AcpError::Authentication { .. }),
+            "{scenario}: {error}"
+        );
+    }
+
+    let error = AcpClient::connect(&address("auth-malformed-mixed"), AGENT_ID, None, limits())
+        .await
+        .expect_err("a malformed method beside api-key must fail closed");
+    assert!(matches!(error, AcpError::Schema { .. }), "{error}");
+}
+
+#[tokio::test]
 async fn a_spawn_failure_never_renders_the_command_line() {
     let secret = "--token=SECRET-DO-NOT-LEAK";
     let address = EndpointAddress::Acp {
