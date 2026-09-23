@@ -9,7 +9,7 @@
 ## 快速开始
 
 ```bash
-cargo install guigu-agent-bridge --version 0.1.0
+cargo install guigu-agent-bridge --version 0.2.0
 install -m 600 config.example.toml "$HOME/.config/guigu-agent-bridge.toml"
 export MATRIX_USER_ID='@bridge:example.org'
 export MATRIX_ACCESS_TOKEN='replace-with-secret-manager-value'
@@ -27,7 +27,8 @@ guigu-agent-bridge "$HOME/.config/guigu-agent-bridge.toml"
 - [用户指南](docs/USER_GUIDE.md)
 - [配置参考](docs/CONFIGURATION.md)
 - [架构](docs/ARCHITECTURE.md)
-- [发布、监控与回滚](docs/RELEASE.md)
+- [0.2.0 发布说明](docs/RELEASE-0.2.0.md)
+- [发布、监控与回滚清单](docs/RELEASE.md)
 
 动态任务状态、内部审查、交接和事件记录不属于公开代码仓库。
 
@@ -55,8 +56,10 @@ cargo fmt --check
 
 ## 发布与替换
 
-v0.1.0 的配置核验、SQLite 迁移、`opencode-chat-bridge` 替换、健康检查、
-监控和回滚步骤见 [docs/RELEASE.md](docs/RELEASE.md)。迁移由进程启动时自动执行；
+v0.2.0 的 E2EE、crypto store、兼容性和升级注意事项见
+[版本发布说明](docs/RELEASE-0.2.0.md)。配置核验、SQLite 迁移、
+`opencode-chat-bridge` 替换、健康检查、监控和回滚步骤见
+[发布清单](docs/RELEASE.md)。迁移由进程启动时自动执行；
 发布前必须备份数据库，并且不得让新旧 Bridge 同时消费同一 Matrix 账户或房间。
 
 ## 目录
