@@ -1,4 +1,4 @@
-# v0.2.0 Release Checklist
+# v0.2.1 Release Checklist
 
 This document prepares replacement of `opencode-chat-bridge` by
 `guigu-agent-bridge`. It does not authorize a push, tag, database migration, or
@@ -7,7 +7,7 @@ production service change.
 ## Candidate
 
 - Build with Rust 1.94 from an exact reviewed commit.
-- Verify `Cargo.toml` reports version `0.2.0` and `rust-version = "1.94"`.
+- Verify `Cargo.toml` reports version `0.2.1` and `rust-version = "1.94"`.
 - Run `cargo fmt --check`, `cargo check`, `cargo clippy -- -D warnings`, and
   `cargo test` before publishing the exact candidate.
 - Keep credentials outside the repository. Resolve `{env:...}` values through the
@@ -58,7 +58,7 @@ production service change.
 - `device_trusted=true` is local permission only. An unverified-device client warning
   is accepted and must not be represented as owner/cross-signing verification.
 - Confirm A2A listeners remain private/loopback unless an explicitly reviewed private
-  bind and peer policy is deployed. Public exposure is outside v0.1.0.
+  bind and peer policy is deployed. Public exposure is outside v0.2.1.
 - Retain structured logs and the pre-cutover database backup through the observation
   window; do not log access tokens, task bodies, or ACP command arguments.
 
