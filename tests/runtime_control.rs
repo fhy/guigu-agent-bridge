@@ -74,7 +74,14 @@ enum ContinuationWrite {
 
 async fn prepared_write(
     write: ContinuationWrite,
-) -> (Db, SqliteRuntimeStore, SqliteRuntimeStore, Lease, u64) {
+) -> (
+    Db,
+    SqliteRuntimeStore,
+    SqliteRuntimeStore,
+    Lease,
+    u64,
+    String,
+) {
     let db = Db::new().await;
     let store = SqliteRuntimeStore::new(db.pool.clone());
     let other_pool = connect(&db.path).await.unwrap();
@@ -93,35 +100,48 @@ async fn prepared_write(
         .await
         .unwrap();
     let ready = store.continuation(db.task).await.unwrap().unwrap();
-    let revision = if matches!(write, ContinuationWrite::Claim) {
-        ready.revision
+    let continuation = if matches!(write, ContinuationWrite::Claim) {
+        ready
     } else {
         store
             .claim_turn(&lease, ready.revision, at())
             .await
             .unwrap()
-            .revision
     };
-    (db, store, other, lease, revision)
+    let revision = continuation.revision;
+    let generation = continuation.runtime_generation;
+    (db, store, other, lease, revision, generation)
 }
 
 async fn attempt_write(
     store: &SqliteRuntimeStore,
     lease: &Lease,
     revision: u64,
+    generation: &str,
     write: ContinuationWrite,
     now: DateTime<Utc>,
 ) -> Result<(), RuntimeError> {
     match write {
         ContinuationWrite::Claim => store.claim_turn(lease, revision, now).await.map(drop),
-        ContinuationWrite::Activity => store.record_activity(lease, revision, 1, now).await,
+        ContinuationWrite::Activity => {
+            store
+                .record_activity_with_generation(lease, revision, generation, 1, now)
+                .await
+        }
         ContinuationWrite::Continue => store
             .record_continue(lease, revision, "next", 1, now)
             .await
             .map(drop),
         ContinuationWrite::Finish => {
             store
-                .finish(lease, revision, ContinuationState::Terminal, 1, now)
+                .finish_with_generation(
+                    lease,
+                    revision,
+                    generation,
+                    ContinuationState::Terminal,
+                    1,
+                    now,
+                )
                 .await
         }
     }
@@ -135,13 +155,13 @@ async fn every_continuation_write_is_fenced_after_cross_connection_recovery() {
         ContinuationWrite::Continue,
         ContinuationWrite::Finish,
     ] {
-        let (db, store, other, lease, revision) = prepared_write(write).await;
+        let (db, store, other, lease, revision, generation) = prepared_write(write).await;
         other
             .release(&lease, ReleaseDisposition::RecoveryNeeded, at())
             .await
             .unwrap();
         assert!(matches!(
-            attempt_write(&store, &lease, revision, write, at()).await,
+            attempt_write(&store, &lease, revision, &generation, write, at()).await,
             Err(RuntimeError::Fenced)
         ));
         drop(other);
@@ -158,10 +178,10 @@ async fn every_continuation_write_is_fenced_after_cross_connection_expiry() {
         ContinuationWrite::Continue,
         ContinuationWrite::Finish,
     ] {
-        let (db, store, other, lease, revision) = prepared_write(write).await;
+        let (db, store, other, lease, revision, generation) = prepared_write(write).await;
         assert_eq!(other.counts_at(expired_at).await.unwrap().expired_leases, 1);
         assert!(matches!(
-            attempt_write(&store, &lease, revision, write, expired_at).await,
+            attempt_write(&store, &lease, revision, &generation, write, expired_at).await,
             Err(RuntimeError::Fenced)
         ));
         drop(other);
@@ -646,9 +666,10 @@ async fn continuation_transitions_are_revision_fenced_and_persist_bounds() {
     );
     let running = store.claim_turn(&lease, next.revision, at()).await.unwrap();
     store
-        .finish(
+        .finish_with_generation(
             &lease,
             running.revision,
+            &running.runtime_generation,
             ContinuationState::Terminal,
             4,
             at(),
