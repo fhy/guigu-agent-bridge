@@ -31,11 +31,21 @@ fn config(homeserver: &str) -> MatrixTransportConfig {
         routes: Default::default(),
         admin_users: Vec::new(),
         admin_rooms: Vec::new(),
-        crypto_store_path: Some(
-            std::env::temp_dir().join(format!("guigu-matrix-test-{}", uuid::Uuid::new_v4())),
-        ),
+        crypto_store_path: Some(private_test_root().join(uuid::Uuid::new_v4().to_string())),
         device_trusted: true,
     }
+}
+
+fn private_test_root() -> PathBuf {
+    let root = PathBuf::from(std::env::var_os("HOME").expect("HOME must be set"))
+        .join(".guigu-agent-bridge-tests");
+    std::fs::create_dir_all(&root).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+    root
 }
 
 fn sync_response(token: &str, event_id: &str) -> serde_json::Value {
@@ -500,6 +510,72 @@ async fn unsafe_store_permissions_fail_closed() {
         MatrixClient::restore(&config).await,
         Err(MatrixError::Configuration)
     ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn writable_store_ancestor_fails_closed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut config = config("http://127.0.0.1:9");
+    let writable_parent = private_test_root().join(uuid::Uuid::new_v4().to_string());
+    std::fs::create_dir(&writable_parent).unwrap();
+    std::fs::set_permissions(&writable_parent, std::fs::Permissions::from_mode(0o770)).unwrap();
+    config.crypto_store_path = Some(writable_parent.join("store"));
+
+    assert!(matches!(
+        MatrixClient::restore(&config).await,
+        Err(MatrixError::Configuration)
+    ));
+    assert!(!config.crypto_store_path.as_ref().unwrap().exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn symlink_store_ancestor_fails_closed() {
+    use std::os::unix::fs::symlink;
+
+    let mut config = config("http://127.0.0.1:9");
+    let root = private_test_root().join(uuid::Uuid::new_v4().to_string());
+    let target = root.join("target");
+    let linked_parent = root.join("linked-parent");
+    std::fs::create_dir_all(&target).unwrap();
+    symlink(&target, &linked_parent).unwrap();
+    config.crypto_store_path = Some(linked_parent.join("store"));
+
+    assert!(matches!(
+        MatrixClient::restore(&config).await,
+        Err(MatrixError::Configuration)
+    ));
+    assert!(!target.join("store").exists());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn non_private_sdk_store_files_fail_closed() {
+    use std::os::unix::fs::PermissionsExt;
+
+    for database in [
+        "matrix-sdk-state.sqlite3",
+        "matrix-sdk-crypto.sqlite3",
+        "matrix-sdk-event-cache.sqlite3",
+    ] {
+        for suffix in ["", "-wal", "-shm"] {
+            let config = config("http://127.0.0.1:9");
+            let store = config.crypto_store_path.as_ref().unwrap();
+            std::fs::create_dir(store).unwrap();
+            std::fs::set_permissions(store, std::fs::Permissions::from_mode(0o700)).unwrap();
+            let file = store.join(format!("{database}{suffix}"));
+            std::fs::write(&file, b"existing store data").unwrap();
+            std::fs::set_permissions(&file, std::fs::Permissions::from_mode(0o640)).unwrap();
+
+            assert!(matches!(
+                MatrixClient::restore(&config).await,
+                Err(MatrixError::Configuration)
+            ));
+            assert_eq!(std::fs::read(file).unwrap(), b"existing store data");
+        }
+    }
 }
 
 #[tokio::test]

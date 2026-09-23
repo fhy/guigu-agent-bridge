@@ -43,8 +43,10 @@ impl MatrixClient {
         if !config.device_trusted {
             return Err(MatrixError::DeviceUntrusted);
         }
+        validate_store_ancestors(store)?;
         validate_store_path(store)?;
         create_store_path(store)?;
+        validate_store_files(store)?;
         validate_store_databases(store)?;
         let inner = Client::builder()
             .homeserver_url(&config.homeserver)
@@ -52,6 +54,7 @@ impl MatrixClient {
             .build()
             .await
             .map_err(|_| MatrixError::Configuration)?;
+        tighten_store_files(store)?;
         let session = MatrixSession {
             meta: matrix_sdk::SessionMeta {
                 user_id,
@@ -77,16 +80,21 @@ fn validate_store_path(path: &std::path::Path) -> Result<(), MatrixError> {
     if path.as_os_str().is_empty() || path == std::path::Path::new("/") {
         return Err(MatrixError::Configuration);
     }
-    if let Ok(metadata) = std::fs::symlink_metadata(path)
-        && (metadata.file_type().is_symlink() || !metadata.is_dir())
-    {
-        return Err(MatrixError::Configuration);
-    }
-    #[cfg(unix)]
-    if let Ok(metadata) = std::fs::metadata(path) {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o077 != 0 {
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => Some(metadata),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(_) => return Err(MatrixError::Configuration),
+    };
+    if let Some(metadata) = metadata {
+        if metadata.file_type().is_symlink() || !metadata.is_dir() {
             return Err(MatrixError::Configuration);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o077 != 0 {
+                return Err(MatrixError::Configuration);
+            }
         }
     }
     Ok(())
@@ -103,6 +111,97 @@ fn create_store_path(path: &std::path::Path) -> Result<(), MatrixError> {
         }
     }
     validate_store_path(path)
+}
+
+fn validate_store_ancestors(path: &std::path::Path) -> Result<(), MatrixError> {
+    let absolute;
+    let path = if path.is_absolute() {
+        path
+    } else {
+        absolute = std::env::current_dir()
+            .map_err(|_| MatrixError::Configuration)?
+            .join(path);
+        &absolute
+    };
+    let mut current = path.parent();
+    while let Some(ancestor) = current {
+        if ancestor.as_os_str().is_empty() {
+            break;
+        }
+        match std::fs::symlink_metadata(ancestor) {
+            Ok(metadata) => {
+                if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                    return Err(MatrixError::Configuration);
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if metadata.permissions().mode() & 0o022 != 0 {
+                        return Err(MatrixError::Configuration);
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(MatrixError::Configuration),
+        }
+        current = ancestor.parent();
+    }
+    Ok(())
+}
+
+fn validate_store_files(path: &std::path::Path) -> Result<(), MatrixError> {
+    for database in [
+        "matrix-sdk-state.sqlite3",
+        "matrix-sdk-crypto.sqlite3",
+        "matrix-sdk-event-cache.sqlite3",
+    ] {
+        for suffix in ["", "-wal", "-shm"] {
+            let file = path.join(format!("{database}{suffix}"));
+            let metadata = match std::fs::symlink_metadata(file) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(_) => return Err(MatrixError::Configuration),
+            };
+            if metadata.file_type().is_symlink() || !metadata.is_file() {
+                return Err(MatrixError::Configuration);
+            }
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if metadata.permissions().mode() & 0o077 != 0 {
+                    return Err(MatrixError::Configuration);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+fn tighten_store_files(path: &std::path::Path) -> Result<(), MatrixError> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for database in [
+            "matrix-sdk-state.sqlite3",
+            "matrix-sdk-crypto.sqlite3",
+            "matrix-sdk-event-cache.sqlite3",
+        ] {
+            for suffix in ["", "-wal", "-shm"] {
+                let file = path.join(format!("{database}{suffix}"));
+                let metadata = match std::fs::symlink_metadata(&file) {
+                    Ok(metadata) => metadata,
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                    Err(_) => return Err(MatrixError::Configuration),
+                };
+                if metadata.file_type().is_symlink() || !metadata.is_file() {
+                    return Err(MatrixError::Configuration);
+                }
+                std::fs::set_permissions(file, std::fs::Permissions::from_mode(0o600))
+                    .map_err(|_| MatrixError::Configuration)?;
+            }
+        }
+    }
+    Ok(())
 }
 
 fn validate_store_databases(path: &std::path::Path) -> Result<(), MatrixError> {
