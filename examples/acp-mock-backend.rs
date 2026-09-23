@@ -118,14 +118,14 @@ fn main() {
                 }
             }
             "session/resume" => {
-                if scenario == "crash-prompt-once" {
-                    if let Some(path) = &marker {
-                        let _ = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(path)
-                            .and_then(|mut file| file.write_all(b"resume\n"));
-                    }
+                if scenario == "crash-prompt-once"
+                    && let Some(path) = &marker
+                {
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .and_then(|mut file| file.write_all(b"resume\n"));
                 }
                 // Echo the requested id: the adapter requires that.
                 let session_id = params
@@ -136,19 +136,19 @@ fn main() {
             }
             "session/prompt" => {
                 prompt_counter += 1;
-                if scenario == "crash-prompt-once" {
-                    if let Some(path) = &marker {
-                        let seen = std::fs::read_to_string(path)
-                            .unwrap_or_default()
-                            .contains("prompt\n");
-                        let _ = std::fs::OpenOptions::new()
-                            .create(true)
-                            .append(true)
-                            .open(path)
-                            .and_then(|mut file| file.write_all(b"prompt\n"));
-                        if !seen {
-                            std::process::exit(9);
-                        }
+                if scenario == "crash-prompt-once"
+                    && let Some(path) = &marker
+                {
+                    let seen = std::fs::read_to_string(path)
+                        .unwrap_or_default()
+                        .contains("prompt\n");
+                    let _ = std::fs::OpenOptions::new()
+                        .create(true)
+                        .append(true)
+                        .open(path)
+                        .and_then(|mut file| file.write_all(b"prompt\n"));
+                    if !seen {
+                        std::process::exit(9);
                     }
                 }
                 if scenario == "hang-prompt" {
