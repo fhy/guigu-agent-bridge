@@ -203,7 +203,7 @@ fn is_busy(error: &sqlx::Error) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{connect, migrate};
+    use crate::storage::{SqliteRepository, connect, migrate, plan_recovery};
     use sqlx::SqlitePool;
     use uuid::Uuid;
 
@@ -248,16 +248,20 @@ mod tests {
             recover_stale_runtime(&path, "legacy", "wrong", "now").await,
             Err(RecoveryError::OwnerIdentity)
         );
-        sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES('ep','agent','acp',1,'[]')").execute(&pool).await.unwrap();
-        sqlx::query(
-            "INSERT INTO conversations(conversation_id,participants_json) VALUES('conv','[]')",
-        )
-        .execute(&pool)
-        .await
-        .unwrap();
-        sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES('task','task','ep','ep','conv','x',1,0,0,0)").execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES('del','task',1,'ep','t')").execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO agent_work_queue(queue_id,task_id,delivery_id,target_endpoint_id,room_id,sender_endpoint_id,idempotency_key,body_hash,lane,state,sequence,revision,created_at,updated_at) VALUES('q','task','del','ep','room','ep','key','hash','ordinary','queued',1,0,'t','t')").execute(&pool).await.unwrap();
+        let endpoint = Uuid::now_v7().to_string();
+        let agent_id = Uuid::now_v7().to_string();
+        let conversation = Uuid::now_v7().to_string();
+        let task = Uuid::now_v7().to_string();
+        let delivery = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES(?,?, 'acp',1,'[]')").bind(&endpoint).bind(&agent_id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO conversations(conversation_id,participants_json) VALUES(?,'[]')")
+            .bind(&conversation)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES(?,?,?,?,?,'x',1,0,0,0)").bind(&task).bind(&task).bind(&endpoint).bind(&endpoint).bind(&conversation).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES(?,?,1,?,'2025-01-01T00:00:00Z')").bind(&delivery).bind(&task).bind(&endpoint).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO agent_work_queue(queue_id,task_id,delivery_id,target_endpoint_id,room_id,sender_endpoint_id,idempotency_key,body_hash,lane,state,sequence,revision,created_at,updated_at) VALUES(?,?,?,?,?,?,?,'hash','ordinary','queued',1,0,'2025-01-01T00:00:00Z','2025-01-01T00:00:00Z')").bind(Uuid::now_v7().to_string()).bind(&task).bind(&delivery).bind(&endpoint).bind(Uuid::now_v7().to_string()).bind(&endpoint).bind("key").execute(&pool).await.unwrap();
         assert_eq!(
             recover_stale_runtime(&path, "legacy", "fp", "now").await,
             Err(RecoveryError::WorkPresent)
@@ -404,6 +408,101 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(config);
         let _ = std::fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn planner_parity_covers_no_event_terminal_nonterminal_and_delivery_cases() {
+        let (path, pool) = fixture().await;
+        let endpoint = Uuid::now_v7().to_string();
+        let agent_id = Uuid::now_v7().to_string();
+        let conversation = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES(?,?, 'acp',1,'[]')")
+            .bind(&endpoint).bind(&agent_id).execute(&pool)
+            .await.unwrap();
+        sqlx::query("INSERT INTO conversations(conversation_id,participants_json) VALUES(?,'[]')")
+            .bind(&conversation)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut task_ids = Vec::new();
+        for status in [
+            None,
+            Some("completed"),
+            Some("failed"),
+            Some("timed_out"),
+            Some("cancelled"),
+            Some("running"),
+        ]
+        .into_iter()
+        {
+            let task = Uuid::now_v7().to_string();
+            task_ids.push(task.clone());
+            sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES(?,?,?,?,?,'x',1,0,0,0)").bind(&task).bind(&task).bind(&endpoint).bind(&endpoint).bind(&conversation).execute(&pool).await.unwrap();
+            if let Some(status) = status {
+                sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,?,?,?,'{}')").bind(Uuid::now_v7().to_string()).bind(&task).bind(1).bind(status).bind("t").execute(&pool).await.unwrap();
+            }
+        }
+        let unack = Uuid::now_v7().to_string();
+        let await_id = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES(?,?,1,?,'2025-01-01T00:00:00Z'),(?,?,1,?,'2025-01-01T00:00:00Z')").bind(&unack).bind(&task_ids[1]).bind(&endpoint).bind(&await_id).bind(&task_ids[5]).bind(&endpoint).execute(&pool).await.unwrap();
+        sqlx::query(
+            "UPDATE deliveries SET acknowledged_at='2025-01-01T00:00:00Z' WHERE delivery_id=?",
+        )
+        .bind(&await_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let repository = SqliteRepository::new(pool.clone());
+        let plan = plan_recovery(&repository).await.unwrap();
+        assert_eq!(plan.unfinished.len(), 2);
+        assert_eq!(plan.unacknowledged.len(), 1);
+        assert_eq!(plan.awaiting_outcome.len(), 1);
+        let counts: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM tasks t LEFT JOIN task_events e ON e.task_id=t.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=t.task_id) WHERE e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled')), (SELECT count(*) FROM deliveries WHERE acknowledged_at IS NULL), (SELECT count(*) FROM deliveries d LEFT JOIN task_events e ON e.task_id=d.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=d.task_id) WHERE d.acknowledged_at IS NOT NULL AND (e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled')))").fetch_one(&pool).await.unwrap();
+        assert_eq!(counts, (2, 1, 1));
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn immediate_lock_contention_and_fingerprint_fencing_leave_snapshot_unchanged() {
+        let (path, pool) = fixture().await;
+        let before: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM runtime_instances),(SELECT count(*) FROM tasks)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        let mut lock = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&path)
+                .busy_timeout(std::time::Duration::from_millis(1)),
+        )
+        .await
+        .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut lock)
+            .await
+            .unwrap();
+        let blocked = tokio::time::timeout(
+            std::time::Duration::from_millis(250),
+            recover_stale_runtime(&path, "legacy", "fp", "now"),
+        )
+        .await;
+        assert!(blocked.is_err());
+        sqlx::query("ROLLBACK").execute(&mut lock).await.unwrap();
+        assert_eq!(
+            recover_stale_runtime(&path, "legacy", "wrong", "now").await,
+            Err(RecoveryError::OwnerIdentity)
+        );
+        let after: (i64, i64) = sqlx::query_as(
+            "SELECT (SELECT count(*) FROM runtime_instances),(SELECT count(*) FROM tasks)",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, after);
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]
