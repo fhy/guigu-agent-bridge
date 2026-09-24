@@ -128,11 +128,7 @@ impl AcpClient {
             .iter()
             .filter(|method| method.is_supported_api_key())
             .collect();
-        let all_supported = result
-            .auth_methods
-            .iter()
-            .all(|method| method.is_supported_api_key());
-        if api_methods.len() > 1 || !all_supported {
+        if api_methods.len() > 1 {
             let _ = transport.shutdown().await;
             return Err(AcpError::Authentication {
                 advertised: result.auth_methods.len(),

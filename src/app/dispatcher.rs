@@ -6,7 +6,7 @@ use crate::{
         BusFuture, DispatchError, DispatchOutcome, DispatchRequest, FinalizationCapability,
         PreparedExecution, TaskDispatcher,
     },
-    models::{EndpointId, TaskId},
+    models::{EndpointId, TaskEvent, TaskId},
     runtime::LeasedAcpDispatcher,
 };
 
@@ -97,6 +97,18 @@ impl TaskDispatcher for AcpDispatcherRouter {
         Box::pin(async move {
             self.endpoint(&request)?
                 .cancel_prepared(request, reason)
+                .await
+        })
+    }
+
+    fn finalize_delivery_failure<'a>(
+        &'a self,
+        request: DispatchRequest<'a>,
+        event: TaskEvent,
+    ) -> BusFuture<'a, Result<(), DispatchError>> {
+        Box::pin(async move {
+            self.endpoint(&request)?
+                .finalize_delivery_failure(request, event)
                 .await
         })
     }

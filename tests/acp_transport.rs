@@ -219,7 +219,7 @@ async fn explicit_agent_api_key_authenticates() {
 
 #[tokio::test]
 async fn unsupported_auth_discriminators_fail_closed() {
-    for scenario in ["auth-terminal", "auth-unknown", "auth-mixed"] {
+    for scenario in ["auth-terminal", "auth-unknown"] {
         let error = AcpClient::connect(&address(scenario), AGENT_ID, None, limits())
             .await
             .expect_err("unsupported auth advertisement must fail closed");
@@ -233,6 +233,23 @@ async fn unsupported_auth_discriminators_fail_closed() {
         .await
         .expect_err("a malformed method beside api-key must fail closed");
     assert!(matches!(error, AcpError::Schema { .. }), "{error}");
+}
+
+#[tokio::test]
+async fn mixed_supported_and_unsupported_alternatives_select_api_key() {
+    let client = AcpClient::connect(&address("auth-mixed"), AGENT_ID, None, limits())
+        .await
+        .expect("supported API-key alternative must be selected");
+    let session = client
+        .new_session("/tmp")
+        .await
+        .expect("session after auth");
+    let turn = client
+        .prompt(&session, "one prompt")
+        .await
+        .expect("prompt after auth");
+    assert!(turn.stop_reason.is_end_turn());
+    client.shutdown().await;
 }
 
 #[tokio::test]
