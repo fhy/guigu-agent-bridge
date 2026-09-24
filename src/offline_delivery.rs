@@ -598,6 +598,21 @@ mod tests {
                 && !multi_text.contains("missing")
                 && !multi_text.contains("SELECT")
         );
+        let verify = connect(&path).await.unwrap();
+        let ack_after: Option<String> =
+            sqlx::query_scalar("SELECT acknowledged_at FROM deliveries WHERE delivery_id=?")
+                .bind(&tuple.delivery_id)
+                .fetch_one(&verify)
+                .await
+                .unwrap();
+        let reason_after: Option<String> =
+            sqlx::query_scalar("SELECT reason_code FROM delivery_dispositions WHERE delivery_id=?")
+                .bind(&tuple.delivery_id)
+                .fetch_one(&verify)
+                .await
+                .unwrap();
+        assert!(ack_after.is_some() && reason_after.as_deref() == Some("offline_reconciled"));
+        verify.close().await;
         let _ = std::fs::remove_file(path);
     }
 
@@ -862,6 +877,62 @@ mod tests {
                 Ok(1),
                 "{disposition}"
             );
+            let db = connect(&path).await.unwrap();
+            let before: (Option<String>, Option<String>, String) = (
+                sqlx::query_scalar("SELECT acknowledged_at FROM deliveries WHERE delivery_id=?")
+                    .bind(&tuple.delivery_id)
+                    .fetch_one(&db)
+                    .await
+                    .unwrap(),
+                sqlx::query_scalar(
+                    "SELECT reason_code FROM delivery_dispositions WHERE delivery_id=?",
+                )
+                .bind(&tuple.delivery_id)
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+                sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=?")
+                    .bind(&tuple.delivery_id)
+                    .fetch_one(&db)
+                    .await
+                    .unwrap(),
+            );
+            if disposition != "terminal" {
+                assert!(
+                    before.0.is_some()
+                        && before.1.as_deref() == Some("offline_reconciled")
+                        && before.2 == "terminal"
+                );
+            } else {
+                assert_eq!(before.2, "terminal");
+            }
+            db.close().await;
+            assert_eq!(
+                reconcile(&path, std::slice::from_ref(&tuple), "later").await,
+                Ok(1)
+            );
+            let db = connect(&path).await.unwrap();
+            let after: (Option<String>, Option<String>, String) = (
+                sqlx::query_scalar("SELECT acknowledged_at FROM deliveries WHERE delivery_id=?")
+                    .bind(&tuple.delivery_id)
+                    .fetch_one(&db)
+                    .await
+                    .unwrap(),
+                sqlx::query_scalar(
+                    "SELECT reason_code FROM delivery_dispositions WHERE delivery_id=?",
+                )
+                .bind(&tuple.delivery_id)
+                .fetch_one(&db)
+                .await
+                .unwrap(),
+                sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=?")
+                    .bind(&tuple.delivery_id)
+                    .fetch_one(&db)
+                    .await
+                    .unwrap(),
+            );
+            assert_eq!(after, before);
+            db.close().await;
             let _ = std::fs::remove_file(path);
         }
         let (path, tuple) = fixture(Some("prepared")).await;
