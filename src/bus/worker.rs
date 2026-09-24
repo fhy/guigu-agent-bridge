@@ -542,6 +542,13 @@ pub trait TaskDispatcher: Send + Sync {
     ) -> BusFuture<'a, Result<FinalizationCapability, DispatchError>> {
         Box::pin(async { Err(DispatchError::UnsupportedPrepared) })
     }
+    fn finalize_delivery_failure<'a>(
+        &'a self,
+        _request: DispatchRequest<'a>,
+        _event: TaskEvent,
+    ) -> BusFuture<'a, Result<(), DispatchError>> {
+        Box::pin(async { Err(DispatchError::UnsupportedPrepared) })
+    }
 }
 
 /// Maps a [`TransportType`] to the dispatcher that can reach it.
@@ -1288,6 +1295,27 @@ impl Worker {
             {
                 Raced::Done(Ok(())) => {}
                 Raced::Done(Err(err)) => {
+                    if dispatcher.supports_prepared() {
+                        let event = TaskEvent {
+                            id: EventId::generate(),
+                            task_id,
+                            seq,
+                            status: TaskStatus::Failed,
+                            timestamp: self.clock.now(),
+                            payload: TaskEventPayload::Failed {
+                                error: err.to_string(),
+                            },
+                        };
+                        dispatcher
+                            .finalize_delivery_failure(request.clone(), event)
+                            .await
+                            .map_err(|_| WorkerError::EventWrite {
+                                task_id,
+                                seq,
+                                error: BusError::TaskChannelClosed,
+                            })?;
+                        return Ok(());
+                    }
                     match self
                         .refused(task_id, attempt, &err, deadline, &mut cancel_rx)
                         .await

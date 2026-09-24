@@ -80,7 +80,7 @@ fn main() {
                     1
                 };
                 let auth = match scenario.as_str() {
-                    "need-auth" => {
+                    "need-auth" | "exit-after-auth" => {
                         json!([{"id": "api-key", "name": "API Key", "description": "Use an API key to authenticate"}])
                     }
                     "need-auth-agent" => {
@@ -113,10 +113,15 @@ fn main() {
                 }
             }
             "authenticate" => {
-                if matches!(scenario.as_str(), "need-auth" | "need-auth-agent")
-                    && params.get("methodId").and_then(Value::as_str) == Some("api-key")
+                if matches!(
+                    scenario.as_str(),
+                    "need-auth" | "need-auth-agent" | "exit-after-auth"
+                ) && params.get("methodId").and_then(Value::as_str) == Some("api-key")
                 {
                     respond(&id, json!({}));
+                    if scenario == "exit-after-auth" {
+                        std::process::exit(3);
+                    }
                 } else {
                     write_raw(&error_response(&id, -32602, "invalid params"));
                 }
@@ -137,6 +142,9 @@ fn main() {
                     &id,
                     json!({"sessionId": format!("session-{session_counter}")}),
                 );
+                if scenario == "exit-after-session" {
+                    std::process::exit(3);
+                }
                 if scenario == "hang-after-session-new" {
                     std::thread::sleep(Duration::from_secs(3600));
                     std::process::exit(0);

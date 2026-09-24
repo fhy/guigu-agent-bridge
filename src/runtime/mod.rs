@@ -851,7 +851,7 @@ impl SqliteRuntimeStore {
         sqlx::query(
             "UPDATE delivery_dispositions SET state='terminal',reason_code=NULL \
              WHERE delivery_id=(SELECT delivery_id FROM task_continuations WHERE task_id=?) \
-             AND task_id=? AND state IN ('prepared','acknowledged')",
+             AND task_id=? AND state IN ('prepared','acknowledged','outcome_unknown')",
         )
         .bind(event.task_id.to_string())
         .bind(event.task_id.to_string())
@@ -1917,6 +1917,26 @@ impl LeasedAcpDispatcher {
                         .await;
                 }
                 Err(error) => {
+                    let terminal_child_exit = matches!(
+                        &error,
+                        DispatchError::ExecutionFailed { reason }
+                            if reason.contains("child process exited")
+                                || reason.contains("no live session for this delivery")
+                    );
+                    if defer && terminal_child_exit {
+                        let lease = guard.lease().clone();
+                        guard.disarm();
+                        return Ok(LoopOutcome::Deferred(DeferredTerminal {
+                            outcome: DispatchOutcome::Failed {
+                                error: crate::acp::bounded(&error.to_string()),
+                            },
+                            lease,
+                            revision: state.revision,
+                            continuation_state: ContinuationState::Terminal,
+                            observed_bytes: 0,
+                            generation: state.runtime_generation.clone(),
+                        }));
+                    }
                     self.store
                         .finish_with_generation(
                             guard.lease(),
@@ -1984,10 +2004,16 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                 return Err(Self::execution_error(error));
             }
             if let Err(error) = self.dispatcher.deliver(request.clone()).await {
-                let _ = self
-                    .store
-                    .release(&lease, ReleaseDisposition::Released, self.clock.now())
-                    .await;
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(
+                        request.task.task_id,
+                        PendingLease {
+                            lease,
+                            claimed: tokio::sync::oneshot::channel().0,
+                        },
+                    );
                 return Err(error);
             }
             if let Err(error) = self
@@ -2123,6 +2149,54 @@ impl TaskDispatcher for LeasedAcpDispatcher {
 
     fn supports_prepared(&self) -> bool {
         true
+    }
+
+    fn finalize_delivery_failure<'a>(
+        &'a self,
+        request: DispatchRequest<'a>,
+        event: crate::models::TaskEvent,
+    ) -> BusFuture<'a, Result<(), DispatchError>> {
+        Box::pin(async move {
+            let pending = self
+                .pending
+                .lock()
+                .unwrap_or_else(|p| p.into_inner())
+                .remove(&request.task.task_id)
+                .ok_or(DispatchError::RecoveryNeeded)?;
+            self.store
+                .begin_continuation(
+                    &pending.lease,
+                    request.delivery_id,
+                    &request.task.text,
+                    self.clock.now(),
+                )
+                .await
+                .map_err(Self::execution_error)?;
+            let state = self
+                .store
+                .continuation(request.task.task_id)
+                .await
+                .map_err(Self::execution_error)?
+                .ok_or(DispatchError::RecoveryNeeded)?;
+            let result = self
+                .store
+                .finalize_terminal(
+                    &pending.lease,
+                    state.revision,
+                    &state.runtime_generation,
+                    ContinuationState::Terminal,
+                    0,
+                    &event,
+                    self.clock.now(),
+                )
+                .await
+                .map_err(Self::execution_error)?;
+            if matches!(result, FinalizeResult::Committed) {
+                Ok(())
+            } else {
+                Err(DispatchError::RecoveryNeeded)
+            }
+        })
     }
 
     fn execute_prepared<'a>(

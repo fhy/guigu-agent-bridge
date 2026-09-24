@@ -43,6 +43,7 @@ use guigu_agent_bridge::runtime::{
     RuntimeClock, RuntimeMetrics, SqliteRuntimeStore, SqliteTaskLifecycle, TokioRuntimeTimer,
     WorkspaceId,
 };
+use guigu_agent_bridge::storage::plan_recovery;
 use guigu_agent_bridge::storage::{Repository, SqliteRepository, connect, migrate, sync_agents};
 
 const TS: &str = "2026-09-16T10:00:00.000000000Z";
@@ -763,6 +764,13 @@ impl Harness {
             > {
                 self.inner.cancel_prepared(request, reason)
             }
+            fn finalize_delivery_failure<'a>(
+                &'a self,
+                request: guigu_agent_bridge::bus::DispatchRequest<'a>,
+                event: TaskEvent,
+            ) -> BusFuture<'a, Result<(), guigu_agent_bridge::bus::DispatchError>> {
+                self.inner.finalize_delivery_failure(request, event)
+            }
         }
         let deadline_elapsed = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let selected: Arc<dyn TaskDispatcher> = if cp2_action != Cp2Action::None {
@@ -801,8 +809,8 @@ impl Harness {
             vec![Arc::clone(&recording) as Arc<dyn EventConsumer>],
         );
         drop(bus);
-        drop(sink);
         worker.run().await.expect("worker");
+        drop(sink);
         broadcaster.run().await;
         let backend_reaped_before_shutdown = dispatcher.backend_id().is_none();
         leased.shutdown().await;
@@ -1334,6 +1342,55 @@ async fn a_bad_protocol_version_fails_before_the_task_runs() {
             .is_none()
     );
 
+    outcome.cleanup().await;
+}
+
+#[tokio::test]
+async fn pre_acceptance_child_exit_atomically_closes_delivery_and_restart_recovery() {
+    let harness = Harness::new_reliable(
+        "pre-acceptance-exit",
+        "exit-after-session",
+        default_limits(),
+        true,
+    )
+    .await;
+    let task = harness.task("bounded smoke");
+    let (outcome, _, _) = harness
+        .run_leased(vec![task.clone()], default_policy(), Cp2Action::None)
+        .await;
+
+    let events = outcome.task_events(task.task_id);
+    assert_eq!(statuses(&events).last(), Some(&TaskStatus::Failed));
+    let delivery_id = dispatched_delivery(&events[1]);
+    let acknowledged: Option<String> =
+        sqlx::query_scalar("SELECT acknowledged_at FROM deliveries WHERE delivery_id=?")
+            .bind(delivery_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .unwrap();
+    assert!(acknowledged.is_some());
+    let disposition: String =
+        sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=?")
+            .bind(delivery_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .unwrap();
+    assert_eq!(disposition, "terminal");
+
+    let plan = plan_recovery(outcome.repository.as_ref()).await.unwrap();
+    assert!(!plan.unfinished.contains(&task.task_id));
+    assert!(
+        !plan
+            .unacknowledged
+            .iter()
+            .any(|d| d.delivery_id() == delivery_id)
+    );
+    assert!(
+        !plan
+            .awaiting_outcome
+            .iter()
+            .any(|d| d.delivery_id() == delivery_id)
+    );
     outcome.cleanup().await;
 }
 
