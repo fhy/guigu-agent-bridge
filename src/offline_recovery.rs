@@ -308,6 +308,104 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[tokio::test]
+    async fn admission_lease_continuation_and_delivery_states_fail_closed() {
+        for (label, sql) in [
+            (
+                "admission",
+                "INSERT INTO task_admissions(task_id,state,revision,created_at,updated_at) VALUES('task','ready',0,'t','t')",
+            ),
+            (
+                "lease",
+                "INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('rk','task','legacy',1,'active','t','t','later')",
+            ),
+            (
+                "continuation",
+                "INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes) VALUES('task','rk','del',1,1,'in_flight',1,0,0,'p','t','t','t',0)",
+            ),
+        ] {
+            let (path, pool) = fixture().await;
+            sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES('ep','agent','acp',1,'[]')").execute(&pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO conversations(conversation_id,participants_json) VALUES('conv','[]')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES('task','task','ep','ep','conv','x',1,0,0,0)").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES('del','task',1,'ep','t')").execute(&pool).await.unwrap();
+            if label == "continuation" {
+                sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('rk','task','legacy',1,'released','t','t','later')").execute(&pool).await.unwrap();
+            }
+            sqlx::query(sql).execute(&pool).await.unwrap();
+            assert_eq!(
+                recover_stale_runtime(&path, "legacy", "fp", "now").await,
+                Err(RecoveryError::WorkPresent),
+                "{label}"
+            );
+            let state: String = sqlx::query_scalar(
+                "SELECT state FROM runtime_instances WHERE instance_token='legacy'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(state, "active");
+            pool.close().await;
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn transaction_local_planner_queries_match_empty_production_plan() {
+        let (path, pool) = fixture().await;
+        let unfinished: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks t LEFT JOIN task_events e ON e.task_id=t.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=t.task_id) WHERE e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled')").fetch_one(&pool).await.unwrap();
+        assert_eq!(unfinished, 0);
+        let unack: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM deliveries WHERE acknowledged_at IS NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let awaiting: i64 = sqlx::query_scalar("SELECT count(*) FROM deliveries d LEFT JOIN task_events e ON e.task_id=d.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=d.task_id) WHERE d.acknowledged_at IS NOT NULL AND (e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled'))").fetch_one(&pool).await.unwrap();
+        assert_eq!((unfinished, unack, awaiting), (0, 0, 0));
+        assert_eq!(
+            recover_stale_runtime(&path, "legacy", "fp", "now").await,
+            Ok(RecoveryOutcome::Recovered)
+        );
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn stale_owner_recovery_allows_next_runtime_generation() {
+        let (path, pool) = fixture().await;
+        assert_eq!(
+            recover_stale_runtime(&path, "legacy", "fp", "now").await,
+            Ok(RecoveryOutcome::Recovered)
+        );
+        pool.close().await;
+        let root = std::env::temp_dir().join(format!("t032-config-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("bridge.toml");
+        let sessions = root.join("sessions");
+        std::fs::write(
+            &config,
+            format!(
+                "[bridge]\ndatabase = {:?}\nsession_root = {:?}\n",
+                path, sessions
+            ),
+        )
+        .unwrap();
+        let runtime = crate::app::AppRuntime::start(&config).await.unwrap();
+        assert_ne!(
+            runtime.health_state().snapshot().await.diagnostic,
+            Some("recovery-blocked")
+        );
+        runtime.shutdown().await.unwrap();
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(config);
+        let _ = std::fs::remove_dir_all(root);
+    }
+
     #[test]
     fn cli_rejects_unknown_duplicate_missing_and_non_utf8_arguments() {
         let ok = [
