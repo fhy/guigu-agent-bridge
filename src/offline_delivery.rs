@@ -262,6 +262,7 @@ async fn planner_counts(c: &mut SqliteConnection) -> Result<(i64, i64, i64), Rec
 mod tests {
     use super::*;
     use crate::storage::{SqliteRepository, connect, migrate, plan_recovery};
+    use std::os::unix::ffi::OsStringExt;
     use uuid::Uuid;
 
     async fn fixture(disposition: Option<&str>) -> (PathBuf, DeliveryTuple) {
@@ -326,6 +327,18 @@ mod tests {
         ];
         let os = bad.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
         assert_eq!(parse_args(&os), Err(ReconcileError::InvalidArguments));
+        let empty = ["reconcile-delivery", "--database", "x"];
+        let os = empty
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        assert_eq!(parse_args(&os), Err(ReconcileError::InvalidArguments));
+        let non_utf8 = vec![
+            std::ffi::OsString::from("reconcile-delivery"),
+            std::ffi::OsString::from("--database"),
+            std::ffi::OsString::from_vec(vec![0xff]),
+        ];
+        assert_eq!(parse_args(&non_utf8), Err(ReconcileError::InvalidArguments));
         let duplicate = [
             "reconcile-delivery",
             "--database",
@@ -574,6 +587,99 @@ mod tests {
         assert_eq!(before, 0);
         pool.close().await;
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn same_database_two_tuple_success_and_late_missing_disposition_roll_back() {
+        let (path, first) = fixture(Some("prepared")).await;
+        let pool = connect(&path).await.unwrap();
+        let second = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) SELECT ?,task_id,2,target_endpoint_id,dispatched_at FROM deliveries WHERE delivery_id=?")
+            .bind(&second).bind(&first.delivery_id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state) SELECT ?,task_id,2,'prepared' FROM deliveries WHERE delivery_id=?")
+            .bind(&second).bind(&first.delivery_id).execute(&pool).await.unwrap();
+        pool.close().await;
+        let second_tuple = DeliveryTuple {
+            delivery_id: second.clone(),
+            task_id: first.task_id.clone(),
+            attempt: 2,
+        };
+        assert_eq!(
+            reconcile(&path, &[first.clone(), second_tuple.clone()], "now").await,
+            Ok(2)
+        );
+        let pool = connect(&path).await.unwrap();
+        sqlx::query("UPDATE deliveries SET acknowledged_at=NULL WHERE delivery_id=?")
+            .bind(&first.delivery_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE delivery_dispositions SET state='prepared' WHERE delivery_id=?")
+            .bind(&first.delivery_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("DELETE FROM delivery_dispositions WHERE delivery_id=?")
+            .bind(&second)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        assert_eq!(
+            reconcile(&path, &[first.clone(), second_tuple], "now").await,
+            Err(ReconcileError::WorkPresent)
+        );
+        let pool = connect(&path).await.unwrap();
+        let ack: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM deliveries WHERE acknowledged_at IS NOT NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ack, 1);
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn missing_event_lease_stopping_and_continuation_allowlist_preserve_snapshot() {
+        let (path, tuple) = fixture(Some("prepared")).await;
+        let pool = connect(&path).await.unwrap();
+        sqlx::query("DELETE FROM task_events WHERE task_id=?")
+            .bind(&tuple.task_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        assert_eq!(
+            reconcile(&path, std::slice::from_ref(&tuple), "now").await,
+            Err(ReconcileError::WorkPresent)
+        );
+        let _ = std::fs::remove_file(path);
+        for state in ["stopping"] {
+            let (path, tuple) = fixture(Some("prepared")).await;
+            let pool = connect(&path).await.unwrap();
+            let insert = sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('r',?,'o',1,?,'2025-01-01T00:00:00Z','2025-01-01T00:00:00Z','2025-01-02T00:00:00Z')").bind(&tuple.task_id).bind(state).execute(&pool).await;
+            assert!(insert.is_err());
+            pool.close().await;
+            let _ = std::fs::remove_file(path);
+        }
+        for state in ["terminal", "ready"] {
+            let (path, tuple) = fixture(Some("prepared")).await;
+            let pool = connect(&path).await.unwrap();
+            sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('r',?,'o',1,'released','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z','2025-01-02T00:00:00Z')").bind(&tuple.task_id).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes) VALUES(?,?,?,1,1,?,1,0,0,'p','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z',0)").bind(&tuple.task_id).bind("r").bind(&tuple.delivery_id).bind(state).execute(&pool).await.unwrap();
+            pool.close().await;
+            let result = reconcile(&path, std::slice::from_ref(&tuple), "now").await;
+            assert_eq!(
+                result,
+                if state == "terminal" {
+                    Ok(1)
+                } else {
+                    Err(ReconcileError::WorkPresent)
+                }
+            );
+            let _ = std::fs::remove_file(path);
+        }
     }
 
     #[tokio::test]
