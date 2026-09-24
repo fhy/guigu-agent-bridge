@@ -115,7 +115,7 @@ fn main() {
             "authenticate" => {
                 if matches!(
                     scenario.as_str(),
-                    "need-auth" | "need-auth-agent" | "exit-after-auth"
+                    "need-auth" | "need-auth-agent" | "auth-mixed" | "exit-after-auth"
                 ) && params.get("methodId").and_then(Value::as_str) == Some("api-key")
                 {
                     respond(&id, json!({}));
