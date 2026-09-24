@@ -42,28 +42,21 @@ pub async fn run() -> Result<(), Error> {
     info!("starting");
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref().and_then(|v| v.to_str()) == Some("recover-runtime") {
-        let values: Vec<_> = args.collect();
-        let value = |flag: &str| {
-            values
-                .windows(2)
-                .find(|pair| pair[0] == flag)
-                .map(|pair| pair[1].clone())
-        };
-        let database =
-            value("--database").ok_or(app::AppError::Assembly("database path required"))?;
-        let token =
-            value("--owner-token").ok_or(app::AppError::Assembly("owner token required"))?;
-        let fingerprint = value("--process-fingerprint")
-            .ok_or(app::AppError::Assembly("fingerprint required"))?;
+        let mut cli = vec![std::ffi::OsString::from("recover-runtime")];
+        cli.extend(args);
+        let (database, token, fingerprint) = offline_recovery::parse_cli_args(&cli)
+            .map_err(|_| app::AppError::Assembly("invalid recover-runtime arguments"))?;
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-        offline_recovery::recover_stale_runtime(
-            database,
-            token.to_str().unwrap_or_default(),
-            fingerprint.to_str().unwrap_or_default(),
-            &now,
-        )
-        .await
-        .map_err(|_| app::AppError::Runtime)?;
+        let result = offline_recovery::recover_stale_runtime(database, &token, &fingerprint, &now)
+            .await
+            .map_err(|_| app::AppError::Runtime)?;
+        println!(
+            "recover-runtime result={}",
+            match result {
+                offline_recovery::RecoveryOutcome::Recovered => "recovered",
+                offline_recovery::RecoveryOutcome::AlreadyStopped => "already-stopped",
+            }
+        );
         return Ok(());
     }
     let path = std::env::args_os()

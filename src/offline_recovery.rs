@@ -29,6 +29,33 @@ pub enum RecoveryOutcome {
     AlreadyStopped,
 }
 
+pub fn parse_cli_args(
+    args: &[std::ffi::OsString],
+) -> Result<(std::path::PathBuf, String, String), RecoveryError> {
+    if args.len() != 7 || args[0] != "recover-runtime" {
+        return Err(RecoveryError::InvalidArguments);
+    }
+    let mut values = [None, None, None];
+    for pair in args[1..].chunks_exact(2) {
+        let flag = pair[0].to_str().ok_or(RecoveryError::InvalidArguments)?;
+        let value = pair[1].to_str().ok_or(RecoveryError::InvalidArguments)?;
+        let slot = match flag {
+            "--database" => &mut values[0],
+            "--owner-token" => &mut values[1],
+            "--process-fingerprint" => &mut values[2],
+            _ => return Err(RecoveryError::InvalidArguments),
+        };
+        if slot.replace(value.to_owned()).is_some() || value.is_empty() {
+            return Err(RecoveryError::InvalidArguments);
+        }
+    }
+    Ok((
+        std::path::PathBuf::from(values[0].take().ok_or(RecoveryError::InvalidArguments)?),
+        values[1].take().ok_or(RecoveryError::InvalidArguments)?,
+        values[2].take().ok_or(RecoveryError::InvalidArguments)?,
+    ))
+}
+
 pub async fn recover_stale_runtime(
     database: impl AsRef<Path>,
     owner_token: &str,
@@ -243,5 +270,82 @@ mod tests {
         assert_eq!(state, "active");
         pool.close().await;
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn every_nonterminal_queue_state_is_rejected_and_terminal_allowlist_is_safe() {
+        for state in ["queued", "paused", "claimed", "running", "recovery_needed"] {
+            let (path, pool) = fixture().await;
+            sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES('ep','agent','acp',1,'[]')").execute(&pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO conversations(conversation_id,participants_json) VALUES('conv','[]')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES('task','task','ep','ep','conv','x',1,0,0,0)").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES('del','task',1,'ep','t')").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO agent_work_queue(queue_id,task_id,delivery_id,target_endpoint_id,room_id,sender_endpoint_id,idempotency_key,body_hash,lane,state,sequence,revision,created_at,updated_at) VALUES('q','task','del','ep','room','ep','key','hash','ordinary',?,1,0,'t','t')").bind(state).execute(&pool).await.unwrap();
+            assert_eq!(
+                recover_stale_runtime(&path, "legacy", "fp", "now").await,
+                Err(RecoveryError::WorkPresent),
+                "state={state}"
+            );
+            pool.close().await;
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn multiple_active_or_stopping_owners_are_rejected() {
+        let (path, pool) = fixture().await;
+        sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES('other','t','t','stopping','other-fp')").execute(&pool).await.unwrap();
+        assert_eq!(
+            recover_stale_runtime(&path, "legacy", "fp", "now").await,
+            Err(RecoveryError::MultipleOwners)
+        );
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn cli_rejects_unknown_duplicate_missing_and_non_utf8_arguments() {
+        let ok = [
+            "recover-runtime",
+            "--database",
+            "x",
+            "--owner-token",
+            "o",
+            "--process-fingerprint",
+            "f",
+        ];
+        let args = ok.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
+        assert!(parse_cli_args(&args).is_ok());
+        let mut duplicate = args.clone();
+        duplicate[3] = "--database".into();
+        assert_eq!(
+            parse_cli_args(&duplicate),
+            Err(RecoveryError::InvalidArguments)
+        );
+        let mut unknown = args.clone();
+        unknown[1] = "--unknown".into();
+        assert_eq!(
+            parse_cli_args(&unknown),
+            Err(RecoveryError::InvalidArguments)
+        );
+        assert_eq!(
+            parse_cli_args(&args[..5]),
+            Err(RecoveryError::InvalidArguments)
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStringExt;
+            let mut invalid = args.clone();
+            invalid[4] = std::ffi::OsString::from_vec(vec![0xff]);
+            assert_eq!(
+                parse_cli_args(&invalid),
+                Err(RecoveryError::InvalidArguments)
+            );
+        }
     }
 }
