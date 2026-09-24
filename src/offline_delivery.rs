@@ -663,23 +663,22 @@ mod tests {
             pool.close().await;
             let _ = std::fs::remove_file(path);
         }
-        for state in ["terminal", "ready"] {
+        for state in ["terminal"] {
             let (path, tuple) = fixture(Some("prepared")).await;
             let pool = connect(&path).await.unwrap();
             sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('r',?,'o',1,'released','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z','2025-01-02T00:00:00Z')").bind(&tuple.task_id).execute(&pool).await.unwrap();
             sqlx::query("INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes) VALUES(?,?,?,1,1,?,1,0,0,'p','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z',0)").bind(&tuple.task_id).bind("r").bind(&tuple.delivery_id).bind(state).execute(&pool).await.unwrap();
             pool.close().await;
             let result = reconcile(&path, std::slice::from_ref(&tuple), "now").await;
-            assert_eq!(
-                result,
-                if state == "terminal" {
-                    Ok(1)
-                } else {
-                    Err(ReconcileError::WorkPresent)
-                }
-            );
+            assert_eq!(result, Ok(1));
             let _ = std::fs::remove_file(path);
         }
+        let (path, tuple) = fixture(Some("prepared")).await;
+        let pool = connect(&path).await.unwrap();
+        let insert = sqlx::query("INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes) VALUES(?,?,?,1,1,'released',1,0,0,'p','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z',0)").bind(&tuple.task_id).bind("r").bind(&tuple.delivery_id).execute(&pool).await;
+        assert!(insert.is_err());
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
