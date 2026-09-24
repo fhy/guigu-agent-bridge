@@ -512,4 +512,76 @@ mod tests {
         assert!(!text.contains("wrong") && !text.contains("SELECT") && !text.contains(&db));
         let _ = std::fs::remove_file(path);
     }
+
+    #[tokio::test]
+    async fn closed_work_and_disposition_state_matrix_is_fail_closed() {
+        for state in ["queued", "paused", "claimed", "running", "recovery_needed"] {
+            let (path, tuple) = fixture(Some("prepared")).await;
+            let pool = connect(&path).await.unwrap();
+            let endpoint: String =
+                sqlx::query_scalar("SELECT target_endpoint_id FROM deliveries WHERE delivery_id=?")
+                    .bind(&tuple.delivery_id)
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            sqlx::query("INSERT INTO agent_work_queue(queue_id,task_id,delivery_id,target_endpoint_id,room_id,sender_endpoint_id,idempotency_key,body_hash,lane,state,sequence,revision,created_at,updated_at) VALUES('q',?,?,?,?,?,'k','h','ordinary',?,1,0,'2025-01-01T00:00:00Z','2025-01-01T00:00:00Z')").bind(&tuple.task_id).bind(&tuple.delivery_id).bind(&endpoint).bind("room").bind(&endpoint).bind(state).execute(&pool).await.unwrap();
+            pool.close().await;
+            assert_eq!(
+                reconcile(&path, std::slice::from_ref(&tuple), "now").await,
+                Err(ReconcileError::WorkPresent)
+            );
+            let _ = std::fs::remove_file(path);
+        }
+        for state in ["active", "released", "recovery_needed"] {
+            let (path, tuple) = fixture(Some("prepared")).await;
+            let pool = connect(&path).await.unwrap();
+            sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('r',?, 'o',1,?,'2025-01-01T00:00:00Z','2025-01-01T00:00:00Z','2025-01-02T00:00:00Z')").bind(&tuple.task_id).bind(state).execute(&pool).await.unwrap();
+            pool.close().await;
+            let result = reconcile(&path, std::slice::from_ref(&tuple), "now").await;
+            if state == "released" {
+                assert_eq!(result, Ok(1));
+            } else {
+                assert_eq!(result, Err(ReconcileError::WorkPresent));
+            }
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn malformed_schema_and_t032_composition_are_fail_closed() {
+        let path = std::env::temp_dir().join(format!("t033-malformed-{}", Uuid::now_v7()));
+        std::fs::write(&path, b"not sqlite").unwrap();
+        let tuple = DeliveryTuple {
+            delivery_id: "d".into(),
+            task_id: "t".into(),
+            attempt: 1,
+        };
+        assert_eq!(
+            reconcile(&path, &[tuple], "now").await,
+            Err(ReconcileError::Database)
+        );
+        let _ = std::fs::remove_file(path);
+        let (path, tuple) = fixture(Some("prepared")).await;
+        let pool = connect(&path).await.unwrap();
+        let unresolved: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM deliveries WHERE acknowledged_at IS NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(unresolved, 1);
+        pool.close().await;
+        assert_eq!(
+            reconcile(&path, std::slice::from_ref(&tuple), "now").await,
+            Ok(1)
+        );
+        let pool = connect(&path).await.unwrap();
+        let unresolved: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM deliveries WHERE acknowledged_at IS NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(unresolved, 0);
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
 }
