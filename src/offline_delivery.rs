@@ -139,6 +139,26 @@ async fn reconcile_tx(
     tuples: &[DeliveryTuple],
     now: &str,
 ) -> Result<usize, ReconcileError> {
+    reconcile_tx_inner(c, tuples, now, false).await
+}
+
+#[cfg(test)]
+async fn reconcile_tx_with_fence(
+    c: &mut SqliteConnection,
+    tuples: &[DeliveryTuple],
+    now: &str,
+) -> Result<usize, ReconcileError> {
+    reconcile_tx_inner(c, tuples, now, true).await
+}
+
+async fn reconcile_tx_inner(
+    c: &mut SqliteConnection,
+    tuples: &[DeliveryTuple],
+    now: &str,
+    pre_cas_fence: bool,
+) -> Result<usize, ReconcileError> {
+    #[cfg(not(test))]
+    let _ = pre_cas_fence;
     let before = planner_counts(c).await?;
     let mut newly_acknowledged = 0_i64;
     for t in tuples {
@@ -195,13 +215,21 @@ async fn reconcile_tx(
             return Err(ReconcileError::WorkPresent);
         }
     }
+    #[cfg(test)]
+    if pre_cas_fence {
+        sqlx::query("UPDATE deliveries SET acknowledged_at='fenced-by-test' WHERE delivery_id=?")
+            .bind(&tuples[0].delivery_id)
+            .execute(&mut *c)
+            .await
+            .map_err(|_| ReconcileError::Database)?;
+    }
     for t in tuples {
         let was_ack: Option<String> = sqlx::query_scalar("SELECT acknowledged_at FROM deliveries WHERE delivery_id=? AND task_id=? AND attempt=?").bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).fetch_one(&mut *c).await.map_err(|_| ReconcileError::Database)?;
-        let ack = sqlx::query("UPDATE deliveries SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE delivery_id=? AND task_id=? AND attempt=?").bind(now).bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).execute(&mut *c).await.map_err(|_| ReconcileError::Database)?;
-        if ack.rows_affected() != 1 {
-            return Err(ReconcileError::Fenced);
-        }
         if was_ack.is_none() {
+            let ack = sqlx::query("UPDATE deliveries SET acknowledged_at=? WHERE delivery_id=? AND task_id=? AND attempt=? AND acknowledged_at IS NULL").bind(now).bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).execute(&mut *c).await.map_err(|_| ReconcileError::Database)?;
+            if ack.rows_affected() != 1 {
+                return Err(ReconcileError::Fenced);
+            }
             newly_acknowledged += 1;
         }
         let changed = sqlx::query("UPDATE delivery_dispositions SET state='terminal', reason_code='offline_reconciled' WHERE delivery_id=? AND task_id=? AND attempt=? AND state IN ('prepared','acknowledged','outcome_unknown')").bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).execute(&mut *c).await.map_err(|_| ReconcileError::Database)?.rows_affected();
@@ -355,5 +383,133 @@ mod tests {
         let _ = std::fs::remove_file(path);
         let _ = std::fs::remove_file(path2);
         let _ = std::fs::remove_file(path3);
+    }
+
+    #[tokio::test]
+    async fn event_and_admission_matrix_and_fenced_transaction_are_fail_closed() {
+        for status in [
+            "running",
+            "ready",
+            "enqueued",
+            "dispatching",
+            "completed",
+            "failed",
+            "timed_out",
+            "cancelled",
+        ] {
+            let (path, tuple) = fixture(Some("prepared")).await;
+            let pool = connect(&path).await.unwrap();
+            if status == "ready" || status == "enqueued" || status == "dispatching" {
+                sqlx::query("UPDATE task_admissions SET state=? WHERE task_id=?")
+                    .bind(status)
+                    .bind(&tuple.task_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            } else if status == "running" {
+                sqlx::query("UPDATE task_events SET status='running' WHERE task_id=?")
+                    .bind(&tuple.task_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            } else {
+                sqlx::query("UPDATE task_events SET status=? WHERE task_id=?")
+                    .bind(status)
+                    .bind(&tuple.task_id)
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+            }
+            pool.close().await;
+            let result = reconcile(&path, std::slice::from_ref(&tuple), "now").await;
+            if status == "completed"
+                || status == "failed"
+                || status == "timed_out"
+                || status == "cancelled"
+            {
+                assert_eq!(result, Ok(1));
+            } else {
+                assert_eq!(result, Err(ReconcileError::WorkPresent));
+            }
+            let _ = std::fs::remove_file(path);
+        }
+        let (path, tuple) = fixture(Some("prepared")).await;
+        let mut conn = SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            reconcile_tx_with_fence(&mut conn, std::slice::from_ref(&tuple), "now").await,
+            Err(ReconcileError::Fenced)
+        );
+        sqlx::query("ROLLBACK").execute(&mut conn).await.unwrap();
+        let _ = conn.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn busy_and_process_cli_paths_are_fixed_and_redacted() {
+        let (path, tuple) = fixture(Some("prepared")).await;
+        let mut lock = SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut lock)
+            .await
+            .unwrap();
+        assert_eq!(
+            reconcile(&path, std::slice::from_ref(&tuple), "now").await,
+            Err(ReconcileError::Busy)
+        );
+        sqlx::query("ROLLBACK").execute(&mut lock).await.unwrap();
+        let _ = lock.close().await;
+        let exe = std::env::var("CARGO_BIN_EXE_guigu-agent-bridge")
+            .unwrap_or_else(|_| "target/debug/guigu-agent-bridge".into());
+        let db = path.to_str().unwrap().to_owned();
+        let out = tokio::process::Command::new(exe)
+            .args([
+                "reconcile-delivery",
+                "--database",
+                db.as_str(),
+                "--delivery",
+                tuple.delivery_id.as_str(),
+                tuple.task_id.as_str(),
+                "1",
+            ])
+            .output()
+            .await
+            .unwrap();
+        assert!(out.status.success());
+        assert!(
+            String::from_utf8_lossy(&out.stdout).contains("reconcile-delivery result=reconciled")
+        );
+        assert!(out.stderr.is_empty());
+        let bad = tokio::process::Command::new(
+            std::env::var("CARGO_BIN_EXE_guigu-agent-bridge")
+                .unwrap_or_else(|_| "target/debug/guigu-agent-bridge".into()),
+        )
+        .args([
+            "reconcile-delivery",
+            "--database",
+            db.as_str(),
+            "--delivery",
+            "wrong",
+            tuple.task_id.as_str(),
+            "1",
+        ])
+        .output()
+        .await
+        .unwrap();
+        assert!(!bad.status.success());
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&bad.stdout),
+            String::from_utf8_lossy(&bad.stderr)
+        );
+        assert!(!text.contains("wrong") && !text.contains("SELECT") && !text.contains(&db));
+        let _ = std::fs::remove_file(path);
     }
 }
