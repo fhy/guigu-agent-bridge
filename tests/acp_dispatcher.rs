@@ -10,7 +10,7 @@
 //! No test sleeps: a mock that hangs is bounded by the adapter's own deadlines, and
 //! every run ends through the drain-then-terminate path with the child shut down.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -781,7 +781,11 @@ impl Harness {
                 deadline_elapsed: Arc::clone(&deadline_elapsed),
             })
         } else {
-            Arc::clone(&leased) as Arc<dyn TaskDispatcher>
+            // Exercise the production routing path, including the router's
+            // prepared-delivery finalization forwarding.
+            let mut endpoints = HashMap::new();
+            endpoints.insert(derive_endpoint_id("worker"), Arc::clone(&leased));
+            Arc::new(AcpDispatcherRouter::new(endpoints))
         };
         let worker_clock = Clock::new(move || {
             if deadline_elapsed.load(std::sync::atomic::Ordering::Acquire) {
