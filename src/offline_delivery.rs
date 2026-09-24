@@ -613,6 +613,53 @@ mod tests {
                 .unwrap();
         assert!(ack_after.is_some() && reason_after.as_deref() == Some("offline_reconciled"));
         verify.close().await;
+        let (fresh_path, fresh_tuple) = fixture(Some("prepared")).await;
+        let fresh_db = fresh_path.to_str().unwrap().to_owned();
+        let fresh_multi = tokio::process::Command::new(
+            std::env::var("CARGO_BIN_EXE_guigu-agent-bridge")
+                .unwrap_or_else(|_| "target/debug/guigu-agent-bridge".into()),
+        )
+        .args([
+            "reconcile-delivery",
+            "--database",
+            fresh_db.as_str(),
+            "--delivery",
+            fresh_tuple.delivery_id.as_str(),
+            fresh_tuple.task_id.as_str(),
+            "1",
+            "--delivery",
+            "missing",
+            fresh_tuple.task_id.as_str(),
+            "1",
+        ])
+        .output()
+        .await
+        .unwrap();
+        assert!(!fresh_multi.status.success());
+        let fresh_verify = connect(&fresh_path).await.unwrap();
+        let fresh_ack: Option<String> =
+            sqlx::query_scalar("SELECT acknowledged_at FROM deliveries WHERE delivery_id=?")
+                .bind(&fresh_tuple.delivery_id)
+                .fetch_one(&fresh_verify)
+                .await
+                .unwrap();
+        let fresh_state: String =
+            sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=?")
+                .bind(&fresh_tuple.delivery_id)
+                .fetch_one(&fresh_verify)
+                .await
+                .unwrap();
+        let fresh_reason: Option<String> =
+            sqlx::query_scalar("SELECT reason_code FROM delivery_dispositions WHERE delivery_id=?")
+                .bind(&fresh_tuple.delivery_id)
+                .fetch_one(&fresh_verify)
+                .await
+                .unwrap();
+        assert_eq!(fresh_ack, None);
+        assert_eq!(fresh_state, "prepared");
+        assert_eq!(fresh_reason, None);
+        fresh_verify.close().await;
+        let _ = std::fs::remove_file(fresh_path);
         let _ = std::fs::remove_file(path);
     }
 
