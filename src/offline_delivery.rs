@@ -561,6 +561,37 @@ mod tests {
         assert!(
             String::from_utf8_lossy(&again.stdout).contains("reconcile-delivery result=reconciled")
         );
+        let multi = tokio::process::Command::new(
+            std::env::var("CARGO_BIN_EXE_guigu-agent-bridge")
+                .unwrap_or_else(|_| "target/debug/guigu-agent-bridge".into()),
+        )
+        .args([
+            "reconcile-delivery",
+            "--database",
+            db.as_str(),
+            "--delivery",
+            tuple.delivery_id.as_str(),
+            tuple.task_id.as_str(),
+            "1",
+            "--delivery",
+            "missing",
+            tuple.task_id.as_str(),
+            "1",
+        ])
+        .output()
+        .await
+        .unwrap();
+        assert!(!multi.status.success());
+        let multi_text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&multi.stdout),
+            String::from_utf8_lossy(&multi.stderr)
+        );
+        assert!(
+            !multi_text.contains(&db)
+                && !multi_text.contains("missing")
+                && !multi_text.contains("SELECT")
+        );
         let _ = std::fs::remove_file(path);
     }
 
@@ -636,6 +667,13 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(ack, 1);
+        let reason: String =
+            sqlx::query_scalar("SELECT reason_code FROM delivery_dispositions WHERE delivery_id=?")
+                .bind(&first.delivery_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reason, "offline_reconciled");
         pool.close().await;
         let _ = std::fs::remove_file(path);
     }
