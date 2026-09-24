@@ -197,7 +197,8 @@ async fn recover_in_transaction(
 }
 
 fn is_busy(error: &sqlx::Error) -> bool {
-    error.to_string().to_ascii_lowercase().contains("busy")
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("busy") || message.contains("locked")
 }
 
 #[cfg(test)]
@@ -483,12 +484,8 @@ mod tests {
             .execute(&mut lock)
             .await
             .unwrap();
-        let blocked = tokio::time::timeout(
-            std::time::Duration::from_millis(250),
-            recover_stale_runtime(&path, "legacy", "fp", "now"),
-        )
-        .await;
-        assert!(blocked.is_err());
+        let blocked = recover_stale_runtime(&path, "legacy", "fp", "now").await;
+        assert_eq!(blocked, Err(RecoveryError::Busy));
         sqlx::query("ROLLBACK").execute(&mut lock).await.unwrap();
         assert_eq!(
             recover_stale_runtime(&path, "legacy", "wrong", "now").await,
@@ -501,6 +498,120 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(before, after);
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn missing_owner_and_malformed_database_fail_closed_without_output_values() {
+        let (path, pool) = fixture().await;
+        sqlx::query("DELETE FROM runtime_instances WHERE instance_token='legacy'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            recover_stale_runtime(&path, "legacy", "fp", "now").await,
+            Err(RecoveryError::OwnerIdentity)
+        );
+        pool.close().await;
+        let _ = std::fs::remove_file(&path);
+        let malformed = std::env::temp_dir().join(format!("t032-malformed-{}", Uuid::now_v7()));
+        std::fs::write(&malformed, b"not sqlite").unwrap();
+        assert_eq!(
+            recover_stale_runtime(&malformed, "secret-token", "secret-fp", "now").await,
+            Err(RecoveryError::Database)
+        );
+        let _ = std::fs::remove_file(malformed);
+    }
+
+    #[tokio::test]
+    async fn lease_and_continuation_each_nonterminal_state_fail_closed() {
+        for state in ["active", "stopping", "recovery_needed"] {
+            let (path, pool) = fixture().await;
+            sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES('ep','agent','acp',1,'[]')").execute(&pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO conversations(conversation_id,participants_json) VALUES('conv','[]')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES('task','task','ep','ep','conv','x',1,0,0,0)").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES('del','task',1,'ep','2025-01-01T00:00:00Z')").execute(&pool).await.unwrap();
+            if state == "stopping" {
+                sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('rk','task','legacy',1,'active','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z','2025-01-02T00:00:00Z')").execute(&pool).await.unwrap();
+                let mut connection = pool.acquire().await.unwrap();
+                sqlx::query("PRAGMA ignore_check_constraints=ON")
+                    .execute(&mut *connection)
+                    .await
+                    .unwrap();
+                sqlx::query("UPDATE execution_leases SET state='stopping' WHERE resource_key='rk'")
+                    .execute(&mut *connection)
+                    .await
+                    .unwrap();
+            } else {
+                sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('rk','task','legacy',1,?,'2025-01-01T00:00:00Z','2025-01-01T00:00:00Z','2025-01-02T00:00:00Z')").bind(state).execute(&pool).await.unwrap();
+            }
+            assert_eq!(
+                recover_stale_runtime(&path, "legacy", "fp", "now").await,
+                Err(RecoveryError::WorkPresent),
+                "lease {state}"
+            );
+            let owner: String = sqlx::query_scalar(
+                "SELECT state FROM runtime_instances WHERE instance_token='legacy'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(owner, "active");
+            pool.close().await;
+            let _ = std::fs::remove_file(path);
+        }
+        for state in ["in_flight", "ready", "recovery_needed"] {
+            let (path, pool) = fixture().await;
+            sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES('ep','agent','acp',1,'[]')").execute(&pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO conversations(conversation_id,participants_json) VALUES('conv','[]')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES('task','task','ep','ep','conv','x',1,0,0,0)").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES('del','task',1,'ep','2025-01-01T00:00:00Z')").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('rk','task','legacy',1,'released','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z','2025-01-02T00:00:00Z')").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes) VALUES('task','rk','del',1,1,?,1,0,0,'p','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z',0)").bind(state).execute(&pool).await.unwrap();
+            assert_eq!(
+                recover_stale_runtime(&path, "legacy", "fp", "now").await,
+                Err(RecoveryError::WorkPresent),
+                "continuation {state}"
+            );
+            pool.close().await;
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn final_cas_rows_affected_zero_is_fenced() {
+        let (path, pool) = fixture().await;
+        let mut conn = SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE runtime_instances SET state='stopping' WHERE instance_token='legacy'")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        let rows = sqlx::query("UPDATE runtime_instances SET state='stopped' WHERE instance_token='legacy' AND process_fingerprint='fp' AND state='active'").execute(&mut conn).await.unwrap().rows_affected();
+        assert_eq!(rows, 0);
+        sqlx::query("ROLLBACK").execute(&mut conn).await.unwrap();
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM runtime_instances WHERE instance_token='legacy'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "active");
         pool.close().await;
         let _ = std::fs::remove_file(path);
     }
