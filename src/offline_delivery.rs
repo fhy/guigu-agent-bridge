@@ -1,5 +1,6 @@
 //! Explicit offline reconciliation for already-terminal deliveries.
 use sqlx::{Connection, Row, SqliteConnection, sqlite::SqliteConnectOptions};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -77,6 +78,13 @@ pub fn parse_args(
         }
     }
     if db.as_deref().unwrap_or("").is_empty() || tuples.is_empty() {
+        return Err(ReconcileError::InvalidArguments);
+    }
+    let mut seen = HashSet::new();
+    if tuples
+        .iter()
+        .any(|t| !seen.insert((t.delivery_id.clone(), t.task_id.clone(), t.attempt)))
+    {
         return Err(ReconcileError::InvalidArguments);
     }
     Ok((PathBuf::from(db.unwrap()), tuples))
@@ -186,7 +194,10 @@ async fn reconcile_tx(
         }
     }
     for t in tuples {
-        sqlx::query("UPDATE deliveries SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE delivery_id=? AND task_id=? AND attempt=?").bind(now).bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).execute(&mut *c).await.map_err(|_| ReconcileError::Database)?;
+        let ack = sqlx::query("UPDATE deliveries SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE delivery_id=? AND task_id=? AND attempt=?").bind(now).bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).execute(&mut *c).await.map_err(|_| ReconcileError::Database)?;
+        if ack.rows_affected() != 1 {
+            return Err(ReconcileError::Fenced);
+        }
         let changed = sqlx::query("UPDATE delivery_dispositions SET state='terminal', reason_code='offline_reconciled' WHERE delivery_id=? AND task_id=? AND attempt=? AND state IN ('prepared','acknowledged','outcome_unknown')").bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).execute(&mut *c).await.map_err(|_| ReconcileError::Database)?.rows_affected();
         if changed == 0 {
             let state: Option<String> = sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=? AND task_id=? AND attempt=?").bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).fetch_optional(&mut *c).await.map_err(|_| ReconcileError::Database)?;
@@ -201,6 +212,40 @@ async fn reconcile_tx(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{SqliteRepository, connect, migrate, plan_recovery};
+    use uuid::Uuid;
+
+    async fn fixture(disposition: Option<&str>) -> (PathBuf, DeliveryTuple) {
+        let path = std::env::temp_dir().join(format!("t033-{}.db", Uuid::now_v7()));
+        let pool = connect(&path).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let ep = Uuid::now_v7().to_string();
+        let conv = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES(?,?, 'acp',1,'[]')").bind(&ep).bind(Uuid::now_v7().to_string()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO conversations(conversation_id,participants_json) VALUES(?,'[]')")
+            .bind(&conv)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let task = Uuid::now_v7().to_string();
+        let delivery = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES(?,?,?,?,?,'x',1,0,0,0)").bind(&task).bind(&task).bind(&ep).bind(&ep).bind(&conv).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,1,'completed','2025-01-01T00:00:00Z','{}')").bind(Uuid::now_v7().to_string()).bind(&task).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO task_admissions(task_id,state,revision,created_at,updated_at) VALUES(?,'terminal',0,'2025-01-01T00:00:00Z','2025-01-01T00:00:00Z')").bind(&task).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES(?,?,1,?,'2025-01-01T00:00:00Z')").bind(&delivery).bind(&task).bind(&ep).execute(&pool).await.unwrap();
+        if let Some(state) = disposition {
+            sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state) VALUES(?,?,1,?)").bind(&delivery).bind(&task).bind(state).execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+        (
+            path,
+            DeliveryTuple {
+                delivery_id: delivery,
+                task_id: task,
+                attempt: 1,
+            },
+        )
+    }
     #[test]
     fn strict_tuple_parser_rejects_unknown_and_accepts_multiple() {
         let a = [
@@ -232,5 +277,62 @@ mod tests {
         ];
         let os = bad.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
         assert_eq!(parse_args(&os), Err(ReconcileError::InvalidArguments));
+    }
+
+    #[tokio::test]
+    async fn sqlite_reconciliation_updates_exact_rows_and_production_plan_excludes_delivery() {
+        let (path, tuple) = fixture(Some("prepared")).await;
+        let before = connect(&path).await.unwrap();
+        let repo = SqliteRepository::new(before.clone());
+        let plan_before = plan_recovery(&repo).await.unwrap();
+        assert_eq!(plan_before.unacknowledged.len(), 1);
+        before.close().await;
+        assert_eq!(
+            reconcile(&path, std::slice::from_ref(&tuple), "2025-01-02T00:00:00Z").await,
+            Ok(1)
+        );
+        let after = connect(&path).await.unwrap();
+        let repo = SqliteRepository::new(after.clone());
+        let plan_after = plan_recovery(&repo).await.unwrap();
+        assert!(plan_after.unacknowledged.is_empty());
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=?")
+                .bind(&tuple.delivery_id)
+                .fetch_one(&after)
+                .await
+                .unwrap();
+        assert_eq!(state, "terminal");
+        assert_eq!(
+            reconcile(&path, std::slice::from_ref(&tuple), "2025-01-03T00:00:00Z").await,
+            Ok(1)
+        );
+        after.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn missing_disposition_and_partial_multi_tuple_roll_back() {
+        let (path, good) = fixture(Some("prepared")).await;
+        let (path2, missing) = fixture(None).await;
+        assert_eq!(
+            reconcile(&path2, std::slice::from_ref(&missing), "now").await,
+            Err(ReconcileError::WorkPresent)
+        );
+        let (path3, second) = fixture(Some("prepared")).await;
+        assert_eq!(
+            reconcile(&path3, &[good.clone(), second.clone()], "now").await,
+            Err(ReconcileError::WorkPresent)
+        );
+        let db = connect(&path3).await.unwrap();
+        let ack: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM deliveries WHERE acknowledged_at IS NOT NULL")
+                .fetch_one(&db)
+                .await
+                .unwrap();
+        assert_eq!(ack, 0);
+        db.close().await;
+        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_file(path2);
+        let _ = std::fs::remove_file(path3);
     }
 }
