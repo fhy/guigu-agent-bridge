@@ -14,6 +14,7 @@ pub mod gateway;
 pub mod matrix;
 pub mod models;
 pub mod observer;
+pub mod offline_recovery;
 pub mod runtime;
 pub mod storage;
 
@@ -39,6 +40,32 @@ pub fn init_tracing() {
 pub async fn run() -> Result<(), Error> {
     init_tracing();
     info!("starting");
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref().and_then(|v| v.to_str()) == Some("recover-runtime") {
+        let values: Vec<_> = args.collect();
+        let value = |flag: &str| {
+            values
+                .windows(2)
+                .find(|pair| pair[0] == flag)
+                .map(|pair| pair[1].clone())
+        };
+        let database =
+            value("--database").ok_or(app::AppError::Assembly("database path required"))?;
+        let token =
+            value("--owner-token").ok_or(app::AppError::Assembly("owner token required"))?;
+        let fingerprint = value("--process-fingerprint")
+            .ok_or(app::AppError::Assembly("fingerprint required"))?;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        offline_recovery::recover_stale_runtime(
+            database,
+            token.to_str().unwrap_or_default(),
+            fingerprint.to_str().unwrap_or_default(),
+            &now,
+        )
+        .await
+        .map_err(|_| app::AppError::Runtime)?;
+        return Ok(());
+    }
     let path = std::env::args_os()
         .nth(1)
         .map(std::path::PathBuf::from)
