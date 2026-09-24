@@ -139,6 +139,8 @@ async fn reconcile_tx(
     tuples: &[DeliveryTuple],
     now: &str,
 ) -> Result<usize, ReconcileError> {
+    let before = planner_counts(c).await?;
+    let mut newly_acknowledged = 0_i64;
     for t in tuples {
         let row = sqlx::query(
             "SELECT task_id,attempt,acknowledged_at FROM deliveries WHERE delivery_id=?",
@@ -194,9 +196,13 @@ async fn reconcile_tx(
         }
     }
     for t in tuples {
+        let was_ack: Option<String> = sqlx::query_scalar("SELECT acknowledged_at FROM deliveries WHERE delivery_id=? AND task_id=? AND attempt=?").bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).fetch_one(&mut *c).await.map_err(|_| ReconcileError::Database)?;
         let ack = sqlx::query("UPDATE deliveries SET acknowledged_at=COALESCE(acknowledged_at,?) WHERE delivery_id=? AND task_id=? AND attempt=?").bind(now).bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).execute(&mut *c).await.map_err(|_| ReconcileError::Database)?;
         if ack.rows_affected() != 1 {
             return Err(ReconcileError::Fenced);
+        }
+        if was_ack.is_none() {
+            newly_acknowledged += 1;
         }
         let changed = sqlx::query("UPDATE delivery_dispositions SET state='terminal', reason_code='offline_reconciled' WHERE delivery_id=? AND task_id=? AND attempt=? AND state IN ('prepared','acknowledged','outcome_unknown')").bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).execute(&mut *c).await.map_err(|_| ReconcileError::Database)?.rows_affected();
         if changed == 0 {
@@ -206,7 +212,22 @@ async fn reconcile_tx(
             }
         }
     }
+    let after = planner_counts(c).await?;
+    if after.0 != before.0 || after.2 != before.2 || after.1 != before.1 - newly_acknowledged {
+        return Err(ReconcileError::Fenced);
+    }
     Ok(tuples.len())
+}
+
+async fn planner_counts(c: &mut SqliteConnection) -> Result<(i64, i64, i64), ReconcileError> {
+    let unfinished: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks t LEFT JOIN task_events e ON e.task_id=t.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=t.task_id) WHERE e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled')").fetch_one(&mut *c).await.map_err(|_| ReconcileError::Database)?;
+    let unack: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM deliveries WHERE acknowledged_at IS NULL")
+            .fetch_one(&mut *c)
+            .await
+            .map_err(|_| ReconcileError::Database)?;
+    let awaiting: i64 = sqlx::query_scalar("SELECT count(*) FROM deliveries d LEFT JOIN task_events e ON e.task_id=d.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=d.task_id) WHERE d.acknowledged_at IS NOT NULL AND (e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled'))").fetch_one(&mut *c).await.map_err(|_| ReconcileError::Database)?;
+    Ok((unfinished, unack, awaiting))
 }
 
 #[cfg(test)]
