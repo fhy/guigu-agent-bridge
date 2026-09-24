@@ -1402,7 +1402,7 @@ async fn pre_acceptance_child_exit_atomically_closes_delivery_and_restart_recove
 async fn router_finalization_missing_endpoint_and_second_consumption_are_recovery_needed() {
     let harness = Harness::new_reliable(
         "router-finalization-errors",
-        "exit-after-session",
+        "exit-after-init",
         default_limits(),
         true,
     )
@@ -1459,6 +1459,206 @@ async fn router_finalization_missing_endpoint_and_second_consumption_are_recover
         router.finalize_delivery_failure(request, event).await,
         Err(guigu_agent_bridge::bus::DispatchError::RecoveryNeeded)
     ));
+
+    // A real failed delivery leaves a pending lease. The first router consume
+    // closes it; a second consume is fenced and cannot emit another event.
+    let task2 = harness.task("router pending lifecycle");
+    let queued = TaskEvent {
+        id: EventId::generate(),
+        task_id: task2.task_id,
+        seq: 1,
+        status: TaskStatus::Queued,
+        timestamp: ts(),
+        payload: TaskEventPayload::Queued,
+    };
+    harness
+        .repository_impl
+        .insert_task_and_event(&task2, &queued)
+        .await
+        .unwrap();
+    let delivery_id = DeliveryId::generate();
+    let dispatched = TaskEvent {
+        id: EventId::generate(),
+        task_id: task2.task_id,
+        seq: 2,
+        status: TaskStatus::Dispatched,
+        timestamp: ts(),
+        payload: TaskEventPayload::Dispatched {
+            delivery_id,
+            attempt: 1,
+        },
+    };
+    harness
+        .repository_impl
+        .append_event(&dispatched)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE tasks SET version=1 WHERE task_id=?")
+        .bind(task2.task_id.to_string())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO task_admissions(task_id,state,revision,reply_room,reply_thread_root,reply_event_id,monitor_room,monitor_generation,render_version,created_at,updated_at) VALUES(?,'enqueued',0,'!r','$t','$e','!m',7,'v1',?,?)")
+        .bind(task2.task_id.to_string()).bind(TS).bind(TS).execute(&harness.pool).await.unwrap();
+    let runtime_store = SqliteRuntimeStore::new(harness.pool.clone());
+    let leased2 = Arc::new(LeasedAcpDispatcher::new(
+        (*harness.dispatcher).clone(),
+        runtime_store,
+        WorkspaceId::from_canonical_path(std::env::temp_dir()).unwrap(),
+        default_policy(),
+        Arc::new(FixedRuntimeClock),
+        Arc::new(TokioRuntimeTimer),
+        Arc::new(RuntimeMetrics::default()),
+    ));
+    let request2 = guigu_agent_bridge::bus::DispatchRequest {
+        task: &task2,
+        target,
+        delivery_id,
+        attempt: 1,
+    };
+    let delivery_error = leased2.deliver(request2.clone()).await;
+    assert!(
+        delivery_error.is_err(),
+        "expected failed delivery: {delivery_error:?}"
+    );
+    let mut routed = HashMap::new();
+    routed.insert(target.id(), Arc::clone(&leased2));
+    let router2 = AcpDispatcherRouter::new(routed);
+    let failure = TaskEvent {
+        id: EventId::generate(),
+        task_id: task2.task_id,
+        seq: 3,
+        status: TaskStatus::Failed,
+        timestamp: ts(),
+        payload: TaskEventPayload::Failed {
+            error: "auth failure".into(),
+        },
+    };
+    let first = router2
+        .finalize_delivery_failure(request2.clone(), failure.clone())
+        .await;
+    assert!(first.is_ok(), "first finalization failed: {first:?}");
+    assert!(matches!(
+        router2.finalize_delivery_failure(request2, failure).await,
+        Err(guigu_agent_bridge::bus::DispatchError::RecoveryNeeded)
+    ));
+    let ack: Option<String> =
+        sqlx::query_scalar("SELECT acknowledged_at FROM deliveries WHERE delivery_id=?")
+            .bind(delivery_id.to_string())
+            .fetch_one(&harness.pool)
+            .await
+            .unwrap();
+    assert!(ack.is_some());
+    let disposition: String =
+        sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=?")
+            .bind(delivery_id.to_string())
+            .fetch_one(&harness.pool)
+            .await
+            .unwrap();
+    assert_eq!(disposition, "terminal");
+    let terminal_events: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM task_events WHERE task_id=? AND status='failed'")
+            .bind(task2.task_id.to_string())
+            .fetch_one(&harness.pool)
+            .await
+            .unwrap();
+    assert_eq!(terminal_events, 1);
+    leased2.shutdown().await;
+
+    // Fence a separately prepared pending lease before finalization. The router
+    // normalizes the underlying failure and the durable lease remains marked
+    // for recovery without creating a terminal event.
+    let task3 = harness.task("router fenced finalization");
+    let queued3 = TaskEvent {
+        id: EventId::generate(),
+        task_id: task3.task_id,
+        seq: 1,
+        status: TaskStatus::Queued,
+        timestamp: ts(),
+        payload: TaskEventPayload::Queued,
+    };
+    harness
+        .repository_impl
+        .insert_task_and_event(&task3, &queued3)
+        .await
+        .unwrap();
+    let delivery3 = DeliveryId::generate();
+    let dispatched3 = TaskEvent {
+        id: EventId::generate(),
+        task_id: task3.task_id,
+        seq: 2,
+        status: TaskStatus::Dispatched,
+        timestamp: ts(),
+        payload: TaskEventPayload::Dispatched {
+            delivery_id: delivery3,
+            attempt: 1,
+        },
+    };
+    harness
+        .repository_impl
+        .append_event(&dispatched3)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE tasks SET version=1 WHERE task_id=?")
+        .bind(task3.task_id.to_string())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+    sqlx::query("INSERT INTO task_admissions(task_id,state,revision,reply_room,reply_thread_root,reply_event_id,monitor_room,monitor_generation,render_version,created_at,updated_at) VALUES(?,'enqueued',0,'!r','$t','$e','!m',7,'v1',?,?)")
+        .bind(task3.task_id.to_string()).bind(TS).bind(TS).execute(&harness.pool).await.unwrap();
+    let leased3 = Arc::new(LeasedAcpDispatcher::new(
+        (*harness.dispatcher).clone(),
+        SqliteRuntimeStore::new(harness.pool.clone()),
+        WorkspaceId::from_canonical_path(std::env::temp_dir()).unwrap(),
+        default_policy(),
+        Arc::new(FixedRuntimeClock),
+        Arc::new(TokioRuntimeTimer),
+        Arc::new(RuntimeMetrics::default()),
+    ));
+    let request3 = guigu_agent_bridge::bus::DispatchRequest {
+        task: &task3,
+        target,
+        delivery_id: delivery3,
+        attempt: 1,
+    };
+    assert!(leased3.deliver(request3.clone()).await.is_err());
+    sqlx::query("UPDATE execution_leases SET state='recovery_needed' WHERE task_id=?")
+        .bind(task3.task_id.to_string())
+        .execute(&harness.pool)
+        .await
+        .unwrap();
+    let mut routed3 = HashMap::new();
+    routed3.insert(target.id(), Arc::clone(&leased3));
+    let router3 = AcpDispatcherRouter::new(routed3);
+    let failed3 = TaskEvent {
+        id: EventId::generate(),
+        task_id: task3.task_id,
+        seq: 3,
+        status: TaskStatus::Failed,
+        timestamp: ts(),
+        payload: TaskEventPayload::Failed {
+            error: "fenced".into(),
+        },
+    };
+    assert!(matches!(
+        router3.finalize_delivery_failure(request3, failed3).await,
+        Err(guigu_agent_bridge::bus::DispatchError::RecoveryNeeded)
+    ));
+    let lease_state: String =
+        sqlx::query_scalar("SELECT state FROM execution_leases WHERE task_id=?")
+            .bind(task3.task_id.to_string())
+            .fetch_one(&harness.pool)
+            .await
+            .unwrap();
+    assert_eq!(lease_state, "recovery_needed");
+    let terminal_events: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM task_events WHERE task_id=? AND status='failed'")
+            .bind(task3.task_id.to_string())
+            .fetch_one(&harness.pool)
+            .await
+            .unwrap();
+    assert_eq!(terminal_events, 0);
+    leased3.shutdown().await;
     harness.dispatcher.shutdown().await;
     harness.pool.close().await;
     remove_db_files(&harness.path);

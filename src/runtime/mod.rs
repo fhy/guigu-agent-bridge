@@ -2172,12 +2172,22 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                 )
                 .await
                 .map_err(Self::execution_error)?;
-            let state = self
+            let ready = self
                 .store
                 .continuation(request.task.task_id)
                 .await
                 .map_err(Self::execution_error)?
                 .ok_or(DispatchError::RecoveryNeeded)?;
+            let state = self
+                .store
+                .claim_turn_with_generation(
+                    &pending.lease,
+                    ready.revision,
+                    &ready.runtime_generation,
+                    self.clock.now(),
+                )
+                .await
+                .map_err(Self::execution_error)?;
             let result = self
                 .store
                 .finalize_terminal(
