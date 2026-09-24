@@ -196,6 +196,72 @@ async fn recover_in_transaction(
     Ok(RecoveryOutcome::Recovered)
 }
 
+#[cfg(test)]
+async fn recover_in_transaction_with_fence(
+    conn: &mut SqliteConnection,
+    token: &str,
+    fingerprint: &str,
+    now: &str,
+) -> Result<RecoveryOutcome, RecoveryError> {
+    // Exercise the production predicate reads, then fence the owner immediately
+    // before invoking the same final CAS update.
+    recover_predicates(conn, token, fingerprint).await?;
+    sqlx::query(
+        "UPDATE runtime_instances SET process_fingerprint='fenced-by-test' WHERE instance_token=?",
+    )
+    .bind(token)
+    .execute(&mut *conn)
+    .await
+    .map_err(|_| RecoveryError::Database)?;
+    let updated = sqlx::query("UPDATE runtime_instances SET state='stopped', heartbeat_at=? WHERE instance_token=? AND process_fingerprint=? AND state IN ('active','stopping')")
+        .bind(now).bind(token).bind(fingerprint).execute(&mut *conn).await.map_err(|_| RecoveryError::Database)?;
+    if updated.rows_affected() != 1 {
+        return Err(RecoveryError::Fenced);
+    }
+    Ok(RecoveryOutcome::Recovered)
+}
+
+#[cfg(test)]
+async fn recover_predicates(
+    conn: &mut SqliteConnection,
+    token: &str,
+    fingerprint: &str,
+) -> Result<(), RecoveryError> {
+    let owners = sqlx::query(
+        "SELECT state, process_fingerprint FROM runtime_instances WHERE instance_token=?",
+    )
+    .bind(token)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|_| RecoveryError::Database)?;
+    if owners.is_empty() {
+        return Err(RecoveryError::OwnerIdentity);
+    }
+    let stored: String = owners[0]
+        .try_get("process_fingerprint")
+        .map_err(|_| RecoveryError::Database)?;
+    if stored != fingerprint {
+        return Err(RecoveryError::OwnerIdentity);
+    }
+    let checks = [
+        "SELECT count(*) FROM task_admissions WHERE state NOT IN ('terminal','recovery_needed')",
+        "SELECT count(*) FROM agent_work_queue WHERE state NOT IN ('completed','expired','superseded')",
+        "SELECT count(*) FROM execution_leases WHERE state IN ('active','stopping','recovery_needed')",
+        "SELECT count(*) FROM task_continuations WHERE state NOT IN ('terminal','released')",
+        "SELECT count(*) FROM deliveries d LEFT JOIN delivery_dispositions p ON p.delivery_id=d.delivery_id WHERE d.acknowledged_at IS NULL OR p.state IS NULL OR p.state IN ('prepared','acknowledged','outcome_unknown')",
+    ];
+    for sql in checks {
+        let n: i64 = sqlx::query_scalar(sql)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|_| RecoveryError::Database)?;
+        if n != 0 {
+            return Err(RecoveryError::WorkPresent);
+        }
+    }
+    Ok(())
+}
+
 fn is_busy(error: &sqlx::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("busy") || message.contains("locked")
@@ -613,6 +679,123 @@ mod tests {
                 .unwrap();
         assert_eq!(state, "active");
         pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn production_final_cas_reports_fenced_after_pre_cas_owner_change() {
+        let (path, pool) = fixture().await;
+        let mut conn = SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            recover_in_transaction_with_fence(&mut conn, "legacy", "fp", "now").await,
+            Err(RecoveryError::Fenced)
+        );
+        sqlx::query("ROLLBACK").execute(&mut conn).await.unwrap();
+        let snapshot: (String, String) = sqlx::query_as("SELECT state, process_fingerprint FROM runtime_instances WHERE instance_token='legacy'").fetch_one(&pool).await.unwrap();
+        assert_eq!(snapshot, ("active".into(), "fp".into()));
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn acknowledged_disposition_states_and_missing_disposition_fail_closed() {
+        for disposition in [
+            Some("prepared"),
+            Some("acknowledged"),
+            Some("outcome_unknown"),
+            None,
+        ] {
+            let (path, pool) = fixture().await;
+            sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES('ep','agent','acp',1,'[]')").execute(&pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO conversations(conversation_id,participants_json) VALUES('conv','[]')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES('task','task','ep','ep','conv','x',1,0,0,0)").execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at) VALUES('del','task',1,'ep','2025-01-01T00:00:00Z','2025-01-01T00:00:01Z')").execute(&pool).await.unwrap();
+            if let Some(state) = disposition {
+                sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state) VALUES('del','task',1,?)").bind(state).execute(&pool).await.unwrap();
+            }
+            assert_eq!(
+                recover_stale_runtime(&path, "legacy", "fp", "now").await,
+                Err(RecoveryError::WorkPresent)
+            );
+            let owner: String = sqlx::query_scalar(
+                "SELECT state FROM runtime_instances WHERE instance_token='legacy'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(owner, "active");
+            pool.close().await;
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[tokio::test]
+    async fn cli_process_emits_fixed_success_already_stopped_and_rejection() {
+        let (path, pool) = fixture().await;
+        pool.close().await;
+        let exe = std::env::var("CARGO_BIN_EXE_guigu-agent-bridge")
+            .unwrap_or_else(|_| "target/debug/guigu-agent-bridge".to_owned());
+        let database = path.to_str().unwrap().to_owned();
+        let run = |token: &'static str| {
+            let exe = exe.clone();
+            let database = database.clone();
+            async move {
+                tokio::process::Command::new(exe)
+                    .args([
+                        "recover-runtime",
+                        "--database",
+                        database.as_str(),
+                        "--owner-token",
+                        token,
+                        "--process-fingerprint",
+                        "fp",
+                    ])
+                    .output()
+                    .await
+                    .unwrap()
+            }
+        };
+        let first = run("legacy").await;
+        assert!(first.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&first.stdout)
+                .lines()
+                .last()
+                .unwrap(),
+            "recover-runtime result=recovered"
+        );
+        let second = run("legacy").await;
+        assert!(second.status.success());
+        assert_eq!(
+            String::from_utf8_lossy(&second.stdout)
+                .lines()
+                .last()
+                .unwrap(),
+            "recover-runtime result=already-stopped"
+        );
+        let rejected = run("secret-token").await;
+        assert!(!rejected.status.success());
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&rejected.stdout),
+            String::from_utf8_lossy(&rejected.stderr)
+        );
+        assert!(
+            !combined.contains("secret-token")
+                && !combined.contains(path.to_str().unwrap())
+                && !combined.contains("SELECT")
+        );
         let _ = std::fs::remove_file(path);
     }
 
