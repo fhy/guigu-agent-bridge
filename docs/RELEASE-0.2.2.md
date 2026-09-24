@@ -2,8 +2,10 @@
 
 This patch release hardens ACP API-key authentication and runtime shutdown.
 
-- ACP accepts only the default or `agent` `api-key` method and rejects terminal,
-  unknown, malformed, or mixed authentication advertisements.
+- ACP accepts only the default or `agent` `api-key` method. The 0.2.2 client
+  historically rejected mixed advertisements; 0.2.3 selects one supported
+  API-key alternative from a fully decoded mixed list while retaining fail-closed
+  malformed and ambiguous behavior.
 - Authentication remains child-process scoped; API keys are never sent over
   JSON-RPC or persisted by the bridge.
 - Graceful shutdown fences the runtime owner as stopped even after an earlier
