@@ -1399,6 +1399,72 @@ async fn pre_acceptance_child_exit_atomically_closes_delivery_and_restart_recove
 }
 
 #[tokio::test]
+async fn router_finalization_missing_endpoint_and_second_consumption_are_recovery_needed() {
+    let harness = Harness::new_reliable(
+        "router-finalization-errors",
+        "exit-after-session",
+        default_limits(),
+        true,
+    )
+    .await;
+    let task = harness.task("router finalization probe");
+    let target = harness
+        .registry
+        .resolve_agent_id("worker")
+        .and_then(|id| harness.registry.get(id))
+        .unwrap();
+    let event = TaskEvent {
+        id: EventId::generate(),
+        task_id: task.task_id,
+        seq: 3,
+        status: TaskStatus::Failed,
+        timestamp: ts(),
+        payload: TaskEventPayload::Failed {
+            error: "pre-acceptance".into(),
+        },
+    };
+    let request = guigu_agent_bridge::bus::DispatchRequest {
+        task: &task,
+        target,
+        delivery_id: DeliveryId::generate(),
+        attempt: 1,
+    };
+    let empty = AcpDispatcherRouter::new(HashMap::new());
+    assert!(matches!(
+        empty
+            .finalize_delivery_failure(request.clone(), event.clone())
+            .await,
+        Err(guigu_agent_bridge::bus::DispatchError::RecoveryNeeded)
+    ));
+
+    struct FixedRuntimeClock;
+    impl RuntimeClock for FixedRuntimeClock {
+        fn now(&self) -> DateTime<Utc> {
+            ts()
+        }
+    }
+    let leased = Arc::new(LeasedAcpDispatcher::new(
+        (*harness.dispatcher).clone(),
+        SqliteRuntimeStore::new(harness.pool.clone()),
+        WorkspaceId::from_canonical_path(std::env::temp_dir()).unwrap(),
+        default_policy(),
+        Arc::new(FixedRuntimeClock),
+        Arc::new(TokioRuntimeTimer),
+        Arc::new(RuntimeMetrics::default()),
+    ));
+    let mut endpoints = HashMap::new();
+    endpoints.insert(target.id(), leased);
+    let router = AcpDispatcherRouter::new(endpoints);
+    assert!(matches!(
+        router.finalize_delivery_failure(request, event).await,
+        Err(guigu_agent_bridge::bus::DispatchError::RecoveryNeeded)
+    ));
+    harness.dispatcher.shutdown().await;
+    harness.pool.close().await;
+    remove_db_files(&harness.path);
+}
+
+#[tokio::test]
 async fn a_refusal_after_acceptance_is_a_terminal_failure() {
     let harness = Harness::new("refuse", "refuse", default_limits(), true).await;
     let task = harness.task(SECRET_BODY);
