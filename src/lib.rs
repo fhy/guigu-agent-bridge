@@ -14,6 +14,7 @@ pub mod gateway;
 pub mod matrix;
 pub mod models;
 pub mod observer;
+pub mod offline_delivery;
 pub mod offline_recovery;
 pub mod runtime;
 pub mod storage;
@@ -57,6 +58,19 @@ pub async fn run() -> Result<(), Error> {
                 offline_recovery::RecoveryOutcome::AlreadyStopped => "already-stopped",
             }
         );
+        return Ok(());
+    }
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref().and_then(|v| v.to_str()) == Some("reconcile-delivery") {
+        let mut cli = vec![std::ffi::OsString::from("reconcile-delivery")];
+        cli.extend(args);
+        let (database, tuples) = offline_delivery::parse_args(&cli)
+            .map_err(|_| app::AppError::Assembly("invalid reconcile-delivery arguments"))?;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let count = offline_delivery::reconcile(database, &tuples, &now)
+            .await
+            .map_err(|_| app::AppError::Runtime)?;
+        println!("reconcile-delivery result=reconciled count={count}");
         return Ok(());
     }
     let path = std::env::args_os()
