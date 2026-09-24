@@ -216,14 +216,20 @@ async fn reconcile_tx_inner(
         }
     }
     #[cfg(test)]
-    if pre_cas_fence {
+    if pre_cas_fence && tuples.len() == 1 {
         sqlx::query("UPDATE deliveries SET acknowledged_at='fenced-by-test' WHERE delivery_id=?")
             .bind(&tuples[0].delivery_id)
             .execute(&mut *c)
             .await
             .map_err(|_| ReconcileError::Database)?;
     }
-    for t in tuples {
+    for (index, t) in tuples.iter().enumerate() {
+        #[cfg(not(test))]
+        let _ = index;
+        #[cfg(test)]
+        if pre_cas_fence && index == 1 {
+            return Err(ReconcileError::Fenced);
+        }
         let was_ack: Option<String> = sqlx::query_scalar("SELECT acknowledged_at FROM deliveries WHERE delivery_id=? AND task_id=? AND attempt=?").bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).fetch_one(&mut *c).await.map_err(|_| ReconcileError::Database)?;
         if was_ack.is_none() {
             let ack = sqlx::query("UPDATE deliveries SET acknowledged_at=? WHERE delivery_id=? AND task_id=? AND attempt=? AND acknowledged_at IS NULL").bind(now).bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).execute(&mut *c).await.map_err(|_| ReconcileError::Database)?;
@@ -674,6 +680,50 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(reason, "offline_reconciled");
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn second_tuple_fence_rolls_back_first_tuple_write() {
+        let (path, first) = fixture(Some("prepared")).await;
+        let pool = connect(&path).await.unwrap();
+        let second = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) SELECT ?,task_id,2,target_endpoint_id,dispatched_at FROM deliveries WHERE delivery_id=?").bind(&second).bind(&first.delivery_id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state) SELECT ?,task_id,2,'prepared' FROM deliveries WHERE delivery_id=?").bind(&second).bind(&first.delivery_id).execute(&pool).await.unwrap();
+        pool.close().await;
+        let second_tuple = DeliveryTuple {
+            delivery_id: second,
+            task_id: first.task_id.clone(),
+            attempt: 2,
+        };
+        let mut c = SqliteConnection::connect(&format!("sqlite://{}", path.display()))
+            .await
+            .unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(
+            reconcile_tx_with_fence(&mut c, &[first.clone(), second_tuple], "now").await,
+            Err(ReconcileError::Fenced)
+        );
+        sqlx::query("ROLLBACK").execute(&mut c).await.unwrap();
+        c.close().await.unwrap();
+        let pool = connect(&path).await.unwrap();
+        let ack: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM deliveries WHERE acknowledged_at IS NOT NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(ack, 0);
+        let reason: Option<String> =
+            sqlx::query_scalar("SELECT reason_code FROM delivery_dispositions WHERE delivery_id=?")
+                .bind(&first.delivery_id)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(reason, None);
         pool.close().await;
         let _ = std::fs::remove_file(path);
     }
