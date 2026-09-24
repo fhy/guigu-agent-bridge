@@ -105,6 +105,28 @@ async fn recover_in_transaction(
     fingerprint: &str,
     now: &str,
 ) -> Result<RecoveryOutcome, RecoveryError> {
+    recover_in_transaction_inner(conn, token, fingerprint, now, false).await
+}
+
+#[cfg(test)]
+async fn recover_in_transaction_with_fence(
+    conn: &mut SqliteConnection,
+    token: &str,
+    fingerprint: &str,
+    now: &str,
+) -> Result<RecoveryOutcome, RecoveryError> {
+    recover_in_transaction_inner(conn, token, fingerprint, now, true).await
+}
+
+async fn recover_in_transaction_inner(
+    conn: &mut SqliteConnection,
+    token: &str,
+    fingerprint: &str,
+    now: &str,
+    pre_cas_fence: bool,
+) -> Result<RecoveryOutcome, RecoveryError> {
+    #[cfg(not(test))]
+    let _ = pre_cas_fence;
     let owners = sqlx::query(
         "SELECT state, process_fingerprint FROM runtime_instances WHERE instance_token=?",
     )
@@ -181,6 +203,14 @@ async fn recover_in_transaction(
         "SELECT count(*) FROM deliveries d LEFT JOIN task_events e ON e.task_id=d.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=d.task_id) WHERE d.acknowledged_at IS NOT NULL AND (e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled'))",
     ).fetch_one(&mut *conn).await.map_err(|_| RecoveryError::Database)?)?;
 
+    #[cfg(test)]
+    if pre_cas_fence {
+        sqlx::query("UPDATE runtime_instances SET process_fingerprint='fenced-by-test' WHERE instance_token=?")
+            .bind(token)
+            .execute(&mut *conn)
+            .await
+            .map_err(|_| RecoveryError::Database)?;
+    }
     let updated = sqlx::query(
         "UPDATE runtime_instances SET state='stopped', heartbeat_at=? WHERE instance_token=? AND process_fingerprint=? AND state IN ('active','stopping')",
     )
@@ -194,72 +224,6 @@ async fn recover_in_transaction(
         return Err(RecoveryError::Fenced);
     }
     Ok(RecoveryOutcome::Recovered)
-}
-
-#[cfg(test)]
-async fn recover_in_transaction_with_fence(
-    conn: &mut SqliteConnection,
-    token: &str,
-    fingerprint: &str,
-    now: &str,
-) -> Result<RecoveryOutcome, RecoveryError> {
-    // Exercise the production predicate reads, then fence the owner immediately
-    // before invoking the same final CAS update.
-    recover_predicates(conn, token, fingerprint).await?;
-    sqlx::query(
-        "UPDATE runtime_instances SET process_fingerprint='fenced-by-test' WHERE instance_token=?",
-    )
-    .bind(token)
-    .execute(&mut *conn)
-    .await
-    .map_err(|_| RecoveryError::Database)?;
-    let updated = sqlx::query("UPDATE runtime_instances SET state='stopped', heartbeat_at=? WHERE instance_token=? AND process_fingerprint=? AND state IN ('active','stopping')")
-        .bind(now).bind(token).bind(fingerprint).execute(&mut *conn).await.map_err(|_| RecoveryError::Database)?;
-    if updated.rows_affected() != 1 {
-        return Err(RecoveryError::Fenced);
-    }
-    Ok(RecoveryOutcome::Recovered)
-}
-
-#[cfg(test)]
-async fn recover_predicates(
-    conn: &mut SqliteConnection,
-    token: &str,
-    fingerprint: &str,
-) -> Result<(), RecoveryError> {
-    let owners = sqlx::query(
-        "SELECT state, process_fingerprint FROM runtime_instances WHERE instance_token=?",
-    )
-    .bind(token)
-    .fetch_all(&mut *conn)
-    .await
-    .map_err(|_| RecoveryError::Database)?;
-    if owners.is_empty() {
-        return Err(RecoveryError::OwnerIdentity);
-    }
-    let stored: String = owners[0]
-        .try_get("process_fingerprint")
-        .map_err(|_| RecoveryError::Database)?;
-    if stored != fingerprint {
-        return Err(RecoveryError::OwnerIdentity);
-    }
-    let checks = [
-        "SELECT count(*) FROM task_admissions WHERE state NOT IN ('terminal','recovery_needed')",
-        "SELECT count(*) FROM agent_work_queue WHERE state NOT IN ('completed','expired','superseded')",
-        "SELECT count(*) FROM execution_leases WHERE state IN ('active','stopping','recovery_needed')",
-        "SELECT count(*) FROM task_continuations WHERE state NOT IN ('terminal','released')",
-        "SELECT count(*) FROM deliveries d LEFT JOIN delivery_dispositions p ON p.delivery_id=d.delivery_id WHERE d.acknowledged_at IS NULL OR p.state IS NULL OR p.state IN ('prepared','acknowledged','outcome_unknown')",
-    ];
-    for sql in checks {
-        let n: i64 = sqlx::query_scalar(sql)
-            .fetch_one(&mut *conn)
-            .await
-            .map_err(|_| RecoveryError::Database)?;
-        if n != 0 {
-            return Err(RecoveryError::WorkPresent);
-        }
-    }
-    Ok(())
 }
 
 fn is_busy(error: &sqlx::Error) -> bool {
