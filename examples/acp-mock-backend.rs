@@ -95,6 +95,9 @@ fn main() {
                     "auth-mixed" => {
                         json!([{"id": "api-key", "name": "API Key"}, {"type": "other", "id": "other", "name": "Other"}])
                     }
+                    "auth-duplicate" => {
+                        json!([{"id": "api-key", "name": "API Key"}, {"type": "agent", "id": "api-key", "name": "API Key duplicate"}])
+                    }
                     "auth-malformed-mixed" => {
                         json!([{"id": "api-key", "name": "API Key"}, {"type": 7, "id": "other", "name": "Other"}])
                     }

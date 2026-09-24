@@ -107,9 +107,14 @@ impl TaskDispatcher for AcpDispatcherRouter {
         event: TaskEvent,
     ) -> BusFuture<'a, Result<(), DispatchError>> {
         Box::pin(async move {
-            self.endpoint(&request)?
+            let endpoint = self
+                .endpoints
+                .get(&request.target.id())
+                .ok_or(DispatchError::RecoveryNeeded)?;
+            endpoint
                 .finalize_delivery_failure(request, event)
                 .await
+                .map_err(|_| DispatchError::RecoveryNeeded)
         })
     }
 }

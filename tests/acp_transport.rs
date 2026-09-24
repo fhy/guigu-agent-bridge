@@ -233,6 +233,10 @@ async fn unsupported_auth_discriminators_fail_closed() {
         .await
         .expect_err("a malformed method beside api-key must fail closed");
     assert!(matches!(error, AcpError::Schema { .. }), "{error}");
+    let error = AcpClient::connect(&address("auth-duplicate"), AGENT_ID, None, limits())
+        .await
+        .expect_err("duplicate supported API-key methods must fail closed");
+    assert!(matches!(error, AcpError::Authentication { .. }), "{error}");
 }
 
 #[tokio::test]
