@@ -2146,6 +2146,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
             let delivery_id = request.delivery_id;
             let attempt = request.attempt;
             let dispatcher = self.clone();
+            let pending_lease = pending.lease.clone();
             let (result_tx, result_rx) = tokio::sync::oneshot::channel();
             let (cancel_tx, mut cancel_rx) = tokio::sync::mpsc::channel(1);
             self.active
@@ -2160,7 +2161,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                     attempt,
                 };
                 let outcome = dispatcher
-                    .execute_loop(&owned, pending.lease, true, &mut cancel_rx)
+                    .execute_loop(&owned, pending_lease.clone(), true, &mut cancel_rx)
                     .await;
                 dispatcher
                     .active
@@ -2304,7 +2305,78 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                         }
                     }
                     Err(error) => {
-                        let _ = result_tx.send(Err(error));
+                        // Delivery was already durable before ACP execution began. Even
+                        // an initialize/auth/session/child-exit failure must therefore
+                        // return a finalization capability so the worker writes the
+                        // terminal event and the store closes acknowledgement and
+                        // disposition atomically.
+                        let Some(current) = dispatcher
+                            .store
+                            .continuation(task.task_id)
+                            .await
+                            .ok()
+                            .flatten()
+                        else {
+                            let _ = result_tx.send(Err(error));
+                            return;
+                        };
+                        let (command_tx, command_rx) = tokio::sync::oneshot::channel();
+                        let capability = FinalizationCapability {
+                            task_id: task.task_id,
+                            command: Some(command_tx),
+                        };
+                        if result_tx
+                            .send(Ok(PreparedExecution {
+                                outcome: DispatchOutcome::Failed {
+                                    error: crate::acp::bounded(&error.to_string()),
+                                },
+                                capability,
+                            }))
+                            .is_err()
+                        {
+                            let _ = dispatcher
+                                .store
+                                .finish_with_generation(
+                                    &pending_lease,
+                                    current.revision,
+                                    &current.runtime_generation,
+                                    ContinuationState::RecoveryNeeded,
+                                    0,
+                                    dispatcher.clock.now(),
+                                )
+                                .await;
+                            return;
+                        }
+                        match command_rx.await {
+                            Ok(command) if command.task_id == task.task_id => {
+                                let _ = dispatcher
+                                    .store
+                                    .finalize_terminal(
+                                        &pending_lease,
+                                        current.revision,
+                                        &current.runtime_generation,
+                                        ContinuationState::Terminal,
+                                        0,
+                                        &command.event,
+                                        dispatcher.clock.now(),
+                                    )
+                                    .await;
+                                let _ = command.response.send(FinalizeResult::Committed);
+                            }
+                            _ => {
+                                let _ = dispatcher
+                                    .store
+                                    .finish_with_generation(
+                                        &pending.lease,
+                                        current.revision,
+                                        &current.runtime_generation,
+                                        ContinuationState::RecoveryNeeded,
+                                        0,
+                                        dispatcher.clock.now(),
+                                    )
+                                    .await;
+                            }
+                        }
                     }
                 }
             });
