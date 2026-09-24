@@ -326,6 +326,24 @@ mod tests {
         ];
         let os = bad.iter().map(std::ffi::OsString::from).collect::<Vec<_>>();
         assert_eq!(parse_args(&os), Err(ReconcileError::InvalidArguments));
+        let duplicate = [
+            "reconcile-delivery",
+            "--database",
+            "x",
+            "--delivery",
+            "d",
+            "t",
+            "1",
+            "--delivery",
+            "d",
+            "t",
+            "1",
+        ];
+        let os = duplicate
+            .iter()
+            .map(std::ffi::OsString::from)
+            .collect::<Vec<_>>();
+        assert_eq!(parse_args(&os), Err(ReconcileError::InvalidArguments));
     }
 
     #[tokio::test]
@@ -510,6 +528,51 @@ mod tests {
             String::from_utf8_lossy(&bad.stderr)
         );
         assert!(!text.contains("wrong") && !text.contains("SELECT") && !text.contains(&db));
+        let again = tokio::process::Command::new(
+            std::env::var("CARGO_BIN_EXE_guigu-agent-bridge")
+                .unwrap_or_else(|_| "target/debug/guigu-agent-bridge".into()),
+        )
+        .args([
+            "reconcile-delivery",
+            "--database",
+            db.as_str(),
+            "--delivery",
+            tuple.delivery_id.as_str(),
+            tuple.task_id.as_str(),
+            "1",
+        ])
+        .output()
+        .await
+        .unwrap();
+        assert!(again.status.success());
+        assert!(
+            String::from_utf8_lossy(&again.stdout).contains("reconcile-delivery result=reconciled")
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn same_database_multi_tuple_failure_rolls_back_every_tuple() {
+        let (path, first) = fixture(Some("prepared")).await;
+        let pool = connect(&path).await.unwrap();
+        pool.close().await;
+        let second_tuple = DeliveryTuple {
+            delivery_id: Uuid::now_v7().to_string(),
+            task_id: first.task_id.clone(),
+            attempt: 1,
+        };
+        assert_eq!(
+            reconcile(&path, &[first.clone(), second_tuple], "now").await,
+            Err(ReconcileError::WorkPresent)
+        );
+        let pool = connect(&path).await.unwrap();
+        let before: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM deliveries WHERE acknowledged_at IS NOT NULL")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(before, 0);
+        pool.close().await;
         let _ = std::fs::remove_file(path);
     }
 
@@ -582,6 +645,44 @@ mod tests {
                 .unwrap();
         assert_eq!(unresolved, 0);
         pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn final_frozen_matrix_continuation_disposition_cli_idempotency_and_t032_call() {
+        for state in ["in_flight", "ready", "recovery_needed"] {
+            let (path, tuple) = fixture(Some("prepared")).await;
+            let pool = connect(&path).await.unwrap();
+            sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('r',?,'o',1,'released','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z','2025-01-02T00:00:00Z')").bind(&tuple.task_id).execute(&pool).await.unwrap();
+            sqlx::query("INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes) VALUES(?,?,?,1,1,?,1,0,0,'p','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z',0)").bind(&tuple.task_id).bind("r").bind(&tuple.delivery_id).bind(state).execute(&pool).await.unwrap();
+            pool.close().await;
+            assert_eq!(
+                reconcile(&path, std::slice::from_ref(&tuple), "now").await,
+                Err(ReconcileError::WorkPresent)
+            );
+            let _ = std::fs::remove_file(path);
+        }
+        for disposition in ["prepared", "acknowledged", "outcome_unknown", "terminal"] {
+            let (path, tuple) = fixture(Some(disposition)).await;
+            assert_eq!(
+                reconcile(&path, std::slice::from_ref(&tuple), "now").await,
+                Ok(1),
+                "{disposition}"
+            );
+            let _ = std::fs::remove_file(path);
+        }
+        let (path, tuple) = fixture(Some("prepared")).await;
+        let pool = connect(&path).await.unwrap();
+        sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES('legacy','2025-01-01T00:00:00Z','2025-01-01T00:00:00Z','active','fp')").execute(&pool).await.unwrap();
+        pool.close().await;
+        assert_eq!(
+            reconcile(&path, std::slice::from_ref(&tuple), "now").await,
+            Ok(1)
+        );
+        assert_eq!(
+            crate::offline_recovery::recover_stale_runtime(&path, "legacy", "fp", "now").await,
+            Ok(crate::offline_recovery::RecoveryOutcome::Recovered)
+        );
         let _ = std::fs::remove_file(path);
     }
 }
