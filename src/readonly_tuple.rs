@@ -223,6 +223,8 @@ fn is_busy(error: &sqlx::Error) -> bool {
 mod tests {
     use super::*;
     use crate::storage::{connect, migrate};
+    #[cfg(unix)]
+    use std::os::unix::ffi::OsStringExt;
     use uuid::Uuid;
 
     #[tokio::test]
@@ -233,5 +235,42 @@ mod tests {
         pool.close().await;
         assert_eq!(select(&path).await, Err(SelectionError::Empty));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn parser_is_strict_and_never_echoes_values() {
+        let ok = vec![
+            "select-preacceptance".into(),
+            "--database".into(),
+            "/private/production.db".into(),
+        ];
+        assert_eq!(
+            parse_args(&ok).unwrap(),
+            PathBuf::from("/private/production.db")
+        );
+        let duplicate = vec![
+            "select-preacceptance".into(),
+            "--database".into(),
+            "a".into(),
+            "--database".into(),
+            "b".into(),
+        ];
+        assert_eq!(
+            parse_args(&duplicate),
+            Err(SelectionError::InvalidArguments)
+        );
+        let empty = vec![
+            "select-preacceptance".into(),
+            "--database".into(),
+            "".into(),
+        ];
+        assert_eq!(parse_args(&empty), Err(SelectionError::InvalidArguments));
+        let non_utf8 = vec![
+            "select-preacceptance".into(),
+            "--database".into(),
+            std::ffi::OsString::from_vec(vec![0xff]),
+        ];
+        assert_eq!(parse_args(&non_utf8), Err(SelectionError::InvalidArguments));
     }
 }
