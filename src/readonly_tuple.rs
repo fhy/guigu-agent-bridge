@@ -237,7 +237,7 @@ async fn prove_candidate(
     if queue != 0 || continuation != 0 {
         return Ok(false);
     }
-    let unfinished: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks t WHERE t.task_id=? AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=t.task_id AND e.status IN ('completed','failed','timed_out','cancelled'))")
+    let unfinished: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks t LEFT JOIN task_events e ON e.task_id=t.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=t.task_id) WHERE t.task_id=? AND (e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled'))")
         .bind(&t.task_id).fetch_one(&mut *c).await.map_err(|_| SelectionError::Database)?;
     let unacknowledged: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM deliveries WHERE delivery_id=? AND acknowledged_at IS NULL",
@@ -419,6 +419,23 @@ mod tests {
         .unwrap();
         pool.close().await;
         assert_eq!(select(&path).await, Err(SelectionError::Empty));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn latest_nonterminal_event_matches_production_planner() {
+        let path = std::env::temp_dir().join(format!("t038-latest-event-{}.db", Uuid::now_v7()));
+        let tuple = eligible_fixture(&path, "latest", "2099-01-01T00:00:00Z").await;
+        let pool = connect(&path).await.unwrap();
+        let payload = serde_json::to_string(&TaskEventPayload::Dispatched {
+            delivery_id: tuple.delivery_id.parse().unwrap(),
+            attempt: 1,
+        })
+        .unwrap();
+        sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,2,'dispatched','t',?)")
+            .bind(Uuid::now_v7().to_string()).bind(&tuple.task_id).bind(payload).execute(&pool).await.unwrap();
+        pool.close().await;
+        assert_eq!(select(&path).await.unwrap(), tuple);
         let _ = std::fs::remove_file(path);
     }
 
