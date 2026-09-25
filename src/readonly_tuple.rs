@@ -227,11 +227,129 @@ mod tests {
     use std::os::unix::ffi::OsStringExt;
     use uuid::Uuid;
 
+    async fn eligible_fixture(path: &Path, suffix: &str, expiry: &str) -> SelectedTuple {
+        let pool = connect(path).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let endpoint = Uuid::now_v7().to_string();
+        let conversation = Uuid::now_v7().to_string();
+        let task = Uuid::now_v7().to_string();
+        let delivery = Uuid::now_v7().to_string();
+        let runtime = Uuid::now_v7().to_string();
+        let resource = format!("resource-{suffix}");
+        sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES(?,?, 'acp',1,'[]')")
+            .bind(&endpoint).bind(Uuid::now_v7().to_string()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO conversations(conversation_id,participants_json) VALUES(?,'[]')")
+            .bind(&conversation)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES(?,?,?,?,?,'fixture',1,0,0,0)")
+            .bind(&task).bind(&task).bind(&endpoint).bind(&endpoint).bind(&conversation).execute(&pool).await.unwrap();
+        let payload = serde_json::to_string(&TaskEventPayload::Dispatched {
+            delivery_id: delivery.parse().unwrap(),
+            attempt: 1,
+        })
+        .unwrap();
+        sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,1,'dispatched','2026-01-01T00:00:00Z',?)")
+            .bind(Uuid::now_v7().to_string()).bind(&task).bind(payload).execute(&pool).await.unwrap();
+        let runtime_state = if suffix == "two" { "stopped" } else { "active" };
+        sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES(?,'t','t',?,'fixture')")
+            .bind(&runtime).bind(runtime_state).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,created_at,updated_at) VALUES(?,'dispatching',4,?,'t','t')")
+            .bind(&task).bind(&runtime).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES(?,?,1,?,'2026-01-01T00:00:00Z')")
+            .bind(&delivery).bind(&task).bind(&endpoint).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state,reason_code) VALUES(?,?,1,'prepared','fixture')")
+            .bind(&delivery).bind(&task).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES(?,?,?,7,'recovery_needed','t','t',?)")
+            .bind(&resource).bind(&task).bind(format!("owner-{suffix}")).bind(expiry).execute(&pool).await.unwrap();
+        pool.close().await;
+        SelectedTuple {
+            delivery_id: delivery,
+            task_id: task,
+            attempt: 1,
+        }
+    }
+
     #[tokio::test]
     async fn empty_selection_is_redacted_and_read_only() {
         let path = std::env::temp_dir().join(format!("t038-empty-{}.db", Uuid::now_v7()));
         let pool = connect(&path).await.unwrap();
         migrate(&pool).await.unwrap();
+        pool.close().await;
+        assert_eq!(select(&path).await, Err(SelectionError::Empty));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn expired_bound_tuple_is_selected_and_snapshot_is_unchanged() {
+        let path = std::env::temp_dir().join(format!("t038-eligible-{}.db", Uuid::now_v7()));
+        let tuple = eligible_fixture(&path, "expired", "2000-01-01T00:00:00Z").await;
+        let before: String = sqlx::query_scalar(
+            "SELECT group_concat(name, ',') FROM sqlite_master WHERE type='table'",
+        )
+        .fetch_one(&connect(&path).await.unwrap())
+        .await
+        .unwrap();
+        assert_eq!(select(&path).await.unwrap(), tuple);
+        let pool = connect(&path).await.unwrap();
+        let after: String = sqlx::query_scalar(
+            "SELECT group_concat(name, ',') FROM sqlite_master WHERE type='table'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(before, after);
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn multiple_malformed_and_conflicting_candidates_fail_closed() {
+        let path = std::env::temp_dir().join(format!("t038-multiple-{}.db", Uuid::now_v7()));
+        let _ = eligible_fixture(&path, "one", "2099-01-01T00:00:00Z").await;
+        let _ = eligible_fixture(&path, "two", "2099-01-01T00:00:00Z").await;
+        assert_eq!(select(&path).await, Err(SelectionError::Multiple));
+        let pool = connect(&path).await.unwrap();
+        sqlx::query("UPDATE task_events SET payload='{}'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        assert!(matches!(
+            select(&path).await,
+            Err(SelectionError::Malformed | SelectionError::Empty)
+        ));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn queue_and_continuation_evidence_rejects_candidate() {
+        let path = std::env::temp_dir().join(format!("t038-blocked-{}.db", Uuid::now_v7()));
+        let tuple = eligible_fixture(&path, "blocked", "2099-01-01T00:00:00Z").await;
+        let pool = connect(&path).await.unwrap();
+        sqlx::query("INSERT INTO agent_queue_counters(target_endpoint_id,next_sequence,capacity,updated_at) SELECT target_endpoint_id,1,1,'t' FROM deliveries WHERE delivery_id=?")
+            .bind(&tuple.delivery_id).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO agent_work_queue(queue_id,task_id,delivery_id,target_endpoint_id,room_id,sender_endpoint_id,idempotency_key,body_hash,lane,state,sequence,revision,created_at,updated_at) SELECT 'q',task_id,delivery_id,target_endpoint_id,'r',target_endpoint_id,'i','h','ordinary','queued',1,0,'t','t' FROM deliveries WHERE delivery_id=?")
+            .bind(&tuple.delivery_id).execute(&pool).await.unwrap();
+        pool.close().await;
+        assert_eq!(select(&path).await, Err(SelectionError::Empty));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn selection_to_use_drift_is_rejected_on_reselection() {
+        let path = std::env::temp_dir().join(format!("t038-drift-{}.db", Uuid::now_v7()));
+        let tuple = eligible_fixture(&path, "drift", "2099-01-01T00:00:00Z").await;
+        assert_eq!(select(&path).await.unwrap(), tuple);
+        let pool = connect(&path).await.unwrap();
+        sqlx::query(
+            "UPDATE deliveries SET acknowledged_at='2026-01-02T00:00:00Z' WHERE delivery_id=?",
+        )
+        .bind(&tuple.delivery_id)
+        .execute(&pool)
+        .await
+        .unwrap();
         pool.close().await;
         assert_eq!(select(&path).await, Err(SelectionError::Empty));
         let _ = std::fs::remove_file(path);
