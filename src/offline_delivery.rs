@@ -755,33 +755,48 @@ mod tests {
         sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) SELECT ?,task_id,2,target_endpoint_id,dispatched_at FROM deliveries WHERE delivery_id=?").bind(&second).bind(&first.delivery_id).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state) SELECT ?,task_id,2,'prepared' FROM deliveries WHERE delivery_id=?").bind(&second).bind(&first.delivery_id).execute(&pool).await.unwrap();
         let snapshot = async |pool: &SqlitePool| {
-            let tables = [
-                "tasks",
-                "task_events",
-                "task_admissions",
-                "agent_work_queue",
-                "execution_leases",
-                "task_continuations",
-                "deliveries",
-                "delivery_dispositions",
-                "sessions",
+            let queries = [
+                (
+                    "tasks",
+                    "SELECT coalesce(json_group_array(json_object('task_id',task_id,'root_task_id',root_task_id,'parent_task_id',parent_task_id,'conversation_id',conversation_id,'text',text,'version',version)),'[]') FROM tasks ORDER BY task_id",
+                ),
+                (
+                    "task_events",
+                    "SELECT coalesce(json_group_array(json_object('event_id',event_id,'task_id',task_id,'seq',seq,'status',status,'timestamp',timestamp,'payload',payload)),'[]') FROM task_events ORDER BY task_id,seq",
+                ),
+                (
+                    "task_admissions",
+                    "SELECT coalesce(json_group_array(json_object('task_id',task_id,'state',state,'revision',revision,'runtime_instance',runtime_instance,'reply_room',reply_room,'updated_at',updated_at)),'[]') FROM task_admissions ORDER BY task_id",
+                ),
+                (
+                    "agent_work_queue",
+                    "SELECT coalesce(json_group_array(json_object('queue_id',queue_id,'task_id',task_id,'delivery_id',delivery_id,'state',state,'revision',revision,'runtime_owner',runtime_owner,'owner_fence',owner_fence,'updated_at',updated_at)),'[]') FROM agent_work_queue ORDER BY queue_id",
+                ),
+                (
+                    "execution_leases",
+                    "SELECT coalesce(json_group_array(json_object('resource_key',resource_key,'task_id',task_id,'owner_token',owner_token,'fence',fence,'state',state,'heartbeat_at',heartbeat_at,'expires_at',expires_at)),'[]') FROM execution_leases ORDER BY resource_key",
+                ),
+                (
+                    "task_continuations",
+                    "SELECT coalesce(json_group_array(json_object('task_id',task_id,'resource_key',resource_key,'delivery_id',delivery_id,'lease_fence',lease_fence,'revision',revision,'state',state,'next_prompt',next_prompt,'heartbeat_at',heartbeat_at)),'[]') FROM task_continuations ORDER BY task_id",
+                ),
+                (
+                    "deliveries",
+                    "SELECT coalesce(json_group_array(json_object('delivery_id',delivery_id,'task_id',task_id,'attempt',attempt,'target_endpoint_id',target_endpoint_id,'dispatched_at',dispatched_at,'acknowledged_at',acknowledged_at)),'[]') FROM deliveries ORDER BY delivery_id",
+                ),
+                (
+                    "delivery_dispositions",
+                    "SELECT coalesce(json_group_array(json_object('delivery_id',delivery_id,'task_id',task_id,'attempt',attempt,'state',state,'session_id',session_id,'reason_code',reason_code,'reap_at',reap_at)),'[]') FROM delivery_dispositions ORDER BY delivery_id",
+                ),
+                (
+                    "sessions",
+                    "SELECT coalesce(json_group_array(json_object('session_id',session_id,'endpoint_id',endpoint_id,'conversation_id',conversation_id,'cwd',cwd,'backend_id',backend_id,'state',state,'updated_at',updated_at)),'[]') FROM sessions ORDER BY session_id,endpoint_id",
+                ),
             ];
             let mut result = Vec::new();
-            for table in tables {
-                let query = match table {
-                    "tasks" => "SELECT count(*) FROM tasks",
-                    "task_events" => "SELECT count(*) FROM task_events",
-                    "task_admissions" => "SELECT count(*) FROM task_admissions",
-                    "agent_work_queue" => "SELECT count(*) FROM agent_work_queue",
-                    "execution_leases" => "SELECT count(*) FROM execution_leases",
-                    "task_continuations" => "SELECT count(*) FROM task_continuations",
-                    "deliveries" => "SELECT count(*) FROM deliveries",
-                    "delivery_dispositions" => "SELECT count(*) FROM delivery_dispositions",
-                    "sessions" => "SELECT count(*) FROM sessions",
-                    _ => unreachable!(),
-                };
-                let count: i64 = sqlx::query_scalar(query).fetch_one(pool).await.unwrap();
-                result.push((table, count));
+            for (table, query) in queries {
+                let value: String = sqlx::query_scalar(query).fetch_one(pool).await.unwrap();
+                result.push((table, value));
             }
             result
         };
