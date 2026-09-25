@@ -17,6 +17,7 @@ pub mod observer;
 pub mod offline_delivery;
 pub mod offline_preacceptance;
 pub mod offline_recovery;
+pub mod readonly_tuple;
 pub mod runtime;
 pub mod storage;
 pub(crate) mod terminal_closure;
@@ -91,6 +92,19 @@ pub async fn run() -> Result<(), Error> {
                 println!("recover-preacceptance result=already-reconciled");
             }
         }
+        return Ok(());
+    }
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref().and_then(|v| v.to_str()) == Some("select-preacceptance") {
+        let mut cli = vec![std::ffi::OsString::from("select-preacceptance")];
+        cli.extend(args);
+        let database = readonly_tuple::parse_args(&cli)
+            .map_err(|_| app::AppError::Assembly("invalid select-preacceptance arguments"))?;
+        let selected = readonly_tuple::select(database)
+            .await
+            .map_err(|_| app::AppError::Runtime)?;
+        let _ = selected;
+        println!("select-preacceptance result=selected count=1");
         return Ok(());
     }
     init_tracing();
