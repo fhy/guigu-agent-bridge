@@ -129,18 +129,53 @@ async fn prove_candidate(
     {
         return Err(SelectionError::Malformed);
     }
-    let admission: Option<String> =
-        sqlx::query_scalar("SELECT state FROM task_admissions WHERE task_id=?")
+    let admission =
+        sqlx::query("SELECT state,runtime_instance,revision FROM task_admissions WHERE task_id=?")
             .bind(&t.task_id)
             .fetch_optional(&mut *c)
             .await
             .map_err(|_| SelectionError::Database)?;
-    if admission.as_deref() != Some("dispatching") {
+    let Some(admission) = admission else {
+        return Ok(false);
+    };
+    if admission
+        .try_get::<String, _>("state")
+        .map_err(|_| SelectionError::Malformed)?
+        != "dispatching"
+        || admission
+            .try_get::<Option<String>, _>("runtime_instance")
+            .map_err(|_| SelectionError::Malformed)?
+            .is_none()
+        || admission
+            .try_get::<i64, _>("revision")
+            .map_err(|_| SelectionError::Malformed)?
+            < 0
+    {
         return Ok(false);
     }
-    let lease: Option<(String,String,i64,String)> = sqlx::query_as("SELECT resource_key,owner_token,fence,expires_at FROM execution_leases WHERE task_id=? AND state='recovery_needed'").bind(&t.task_id).fetch_optional(&mut *c).await.map_err(|_| SelectionError::Database)?;
-    if lease.is_none() {
+    let lease = sqlx::query("SELECT resource_key,owner_token,fence,expires_at FROM execution_leases WHERE task_id=? AND state='recovery_needed'")
+        .bind(&t.task_id).fetch_optional(&mut *c).await.map_err(|_| SelectionError::Database)?;
+    let Some(lease) = lease else {
         return Ok(false);
+    };
+    if lease
+        .try_get::<String, _>("resource_key")
+        .map_err(|_| SelectionError::Malformed)?
+        .is_empty()
+        || lease
+            .try_get::<String, _>("owner_token")
+            .map_err(|_| SelectionError::Malformed)?
+            .is_empty()
+        || lease
+            .try_get::<i64, _>("fence")
+            .map_err(|_| SelectionError::Malformed)?
+            < 0
+        || lease
+            .try_get::<String, _>("expires_at")
+            .map_err(|_| SelectionError::Malformed)?
+            .is_empty()
+    {
+        return Err(SelectionError::Malformed);
     }
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE task_id=?")
         .bind(&t.task_id)
