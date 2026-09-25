@@ -41,8 +41,6 @@ pub fn init_tracing() {
 /// Production entry point: initialize tracing, then run until an interrupt or
 /// termination signal.
 pub async fn run() -> Result<(), Error> {
-    init_tracing();
-    info!("starting");
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref().and_then(|v| v.to_str()) == Some("recover-runtime") {
         let mut cli = vec![std::ffi::OsString::from("recover-runtime")];
@@ -85,9 +83,18 @@ pub async fn run() -> Result<(), Error> {
         let count = offline_preacceptance::recover(database, &tuples, &now)
             .await
             .map_err(|_| app::AppError::Runtime)?;
-        println!("recover-preacceptance result=recovered count={count}");
+        match count {
+            offline_preacceptance::PreAcceptanceOutcome::Recovered { count } => {
+                println!("recover-preacceptance result=recovered count={count}");
+            }
+            offline_preacceptance::PreAcceptanceOutcome::AlreadyReconciled => {
+                println!("recover-preacceptance result=already-reconciled");
+            }
+        }
         return Ok(());
     }
+    init_tracing();
+    info!("starting");
     let path = std::env::args_os()
         .nth(1)
         .map(std::path::PathBuf::from)
