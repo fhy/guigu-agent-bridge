@@ -246,7 +246,7 @@ async fn prove_candidate(
     .fetch_one(&mut *c)
     .await
     .map_err(|_| SelectionError::Database)?;
-    let awaiting_outcome: i64 = sqlx::query_scalar("SELECT count(*) FROM deliveries d WHERE d.delivery_id=? AND d.acknowledged_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=d.task_id AND e.status IN ('completed','failed','timed_out','cancelled'))")
+    let awaiting_outcome: i64 = sqlx::query_scalar("SELECT count(*) FROM deliveries d LEFT JOIN task_events e ON e.task_id=d.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=d.task_id) WHERE d.delivery_id=? AND d.acknowledged_at IS NOT NULL AND (e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled'))")
         .bind(&t.delivery_id).fetch_one(&mut *c).await.map_err(|_| SelectionError::Database)?;
     if unfinished != 1 || unacknowledged != 1 || awaiting_outcome != 0 || admission_revision < 0 {
         return Err(SelectionError::Conflicting);
@@ -434,8 +434,18 @@ mod tests {
         .unwrap();
         sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,2,'dispatched','t',?)")
             .bind(Uuid::now_v7().to_string()).bind(&tuple.task_id).bind(payload).execute(&pool).await.unwrap();
+        sqlx::query(
+            "UPDATE deliveries SET acknowledged_at='2026-01-02T00:00:00Z' WHERE delivery_id=?",
+        )
+        .bind(&tuple.delivery_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        let awaiting: i64 = sqlx::query_scalar("SELECT count(*) FROM deliveries d LEFT JOIN task_events e ON e.task_id=d.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=d.task_id) WHERE d.delivery_id=? AND d.acknowledged_at IS NOT NULL AND (e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled'))")
+            .bind(&tuple.delivery_id).fetch_one(&pool).await.unwrap();
+        assert_eq!(awaiting, 1);
         pool.close().await;
-        assert_eq!(select(&path).await.unwrap(), tuple);
+        assert_eq!(select(&path).await, Err(SelectionError::Empty));
         let _ = std::fs::remove_file(path);
     }
 
