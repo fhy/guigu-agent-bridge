@@ -268,6 +268,7 @@ async fn planner_counts(c: &mut SqliteConnection) -> Result<(i64, i64, i64), Rec
 mod tests {
     use super::*;
     use crate::storage::{SqliteRepository, connect, migrate, plan_recovery};
+    use sqlx::SqlitePool;
     use std::os::unix::ffi::OsStringExt;
     use uuid::Uuid;
 
@@ -753,6 +754,38 @@ mod tests {
         let second = Uuid::now_v7().to_string();
         sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) SELECT ?,task_id,2,target_endpoint_id,dispatched_at FROM deliveries WHERE delivery_id=?").bind(&second).bind(&first.delivery_id).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state) SELECT ?,task_id,2,'prepared' FROM deliveries WHERE delivery_id=?").bind(&second).bind(&first.delivery_id).execute(&pool).await.unwrap();
+        let snapshot = async |pool: &SqlitePool| {
+            let tables = [
+                "tasks",
+                "task_events",
+                "task_admissions",
+                "agent_work_queue",
+                "execution_leases",
+                "task_continuations",
+                "deliveries",
+                "delivery_dispositions",
+                "sessions",
+            ];
+            let mut result = Vec::new();
+            for table in tables {
+                let query = match table {
+                    "tasks" => "SELECT count(*) FROM tasks",
+                    "task_events" => "SELECT count(*) FROM task_events",
+                    "task_admissions" => "SELECT count(*) FROM task_admissions",
+                    "agent_work_queue" => "SELECT count(*) FROM agent_work_queue",
+                    "execution_leases" => "SELECT count(*) FROM execution_leases",
+                    "task_continuations" => "SELECT count(*) FROM task_continuations",
+                    "deliveries" => "SELECT count(*) FROM deliveries",
+                    "delivery_dispositions" => "SELECT count(*) FROM delivery_dispositions",
+                    "sessions" => "SELECT count(*) FROM sessions",
+                    _ => unreachable!(),
+                };
+                let count: i64 = sqlx::query_scalar(query).fetch_one(pool).await.unwrap();
+                result.push((table, count));
+            }
+            result
+        };
+        let before_snapshot = snapshot(&pool).await;
         pool.close().await;
         let second_tuple = DeliveryTuple {
             delivery_id: second,
@@ -786,6 +819,7 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(reason, None);
+        assert_eq!(snapshot(&pool).await, before_snapshot);
         pool.close().await;
         let _ = std::fs::remove_file(path);
     }
