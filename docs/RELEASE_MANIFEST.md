@@ -4,6 +4,15 @@ Use this manifest for every release that will be used by a production change.
 The release is not deployable until every required capability is present in the
 tested candidate binary and in the published artifact.
 
+## Motivating Incident
+
+Version 0.2.4 was published before the independently reviewed T037
+pre-acceptance recovery capability was included. During the subsequent T036
+validation, the published artifact lacked the recovery path needed for a legacy
+pre-acceptance state, so the process correctly stopped before any production
+mutation. This incident shows why release provenance must be paired with
+capability-by-capability evidence from the exact artifact.
+
 ## Release Identity
 
 ```text
