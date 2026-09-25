@@ -15,6 +15,7 @@ pub mod matrix;
 pub mod models;
 pub mod observer;
 pub mod offline_delivery;
+pub mod offline_preacceptance;
 pub mod offline_recovery;
 pub mod runtime;
 pub mod storage;
@@ -71,6 +72,19 @@ pub async fn run() -> Result<(), Error> {
             .await
             .map_err(|_| app::AppError::Runtime)?;
         println!("reconcile-delivery result=reconciled count={count}");
+        return Ok(());
+    }
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref().and_then(|v| v.to_str()) == Some("recover-preacceptance") {
+        let mut cli = vec![std::ffi::OsString::from("recover-preacceptance")];
+        cli.extend(args);
+        let (database, tuples) = offline_preacceptance::parse_args(&cli)
+            .map_err(|_| app::AppError::Assembly("invalid recover-preacceptance arguments"))?;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let count = offline_preacceptance::recover(database, &tuples, &now)
+            .await
+            .map_err(|_| app::AppError::Runtime)?;
+        println!("recover-preacceptance result=recovered count={count}");
         return Ok(());
     }
     let path = std::env::args_os()
