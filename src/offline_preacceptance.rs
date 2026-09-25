@@ -890,6 +890,23 @@ mod tests {
                     .await
                     .unwrap();
             }
+            "lease:duplicate" => {
+                let resource = format!("second-resource-{}", uuid::Uuid::now_v7());
+                sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES(?,?,?,8,'recovery_needed','t','t','2099-01-01T00:00:00Z')")
+                    .bind(resource).bind(&tuple.task_id).bind("second-owner").execute(&pool).await.unwrap();
+            }
+            "delivery:acknowledged" => {
+                sqlx::query("UPDATE deliveries SET acknowledged_at='2026-01-01T00:00:01Z' WHERE delivery_id=?")
+                    .bind(&tuple.delivery_id).execute(&pool).await.unwrap();
+            }
+            "disposition:session-bound" => {
+                sqlx::query("UPDATE delivery_dispositions SET session_id='session-sentinel' WHERE delivery_id=?")
+                    .bind(&tuple.delivery_id).execute(&pool).await.unwrap();
+            }
+            "disposition:child-bound" => {
+                sqlx::query("UPDATE delivery_dispositions SET child_fingerprint='child-sentinel' WHERE delivery_id=?")
+                    .bind(&tuple.delivery_id).execute(&pool).await.unwrap();
+            }
             "queue:queued"
             | "queue:claimed"
             | "queue:running"
@@ -1026,6 +1043,19 @@ mod tests {
             parse_args(&non_utf8),
             Err(PreAcceptanceError::InvalidArguments)
         );
+        let non_utf8_tuple = vec![
+            std::ffi::OsString::from("recover-preacceptance"),
+            std::ffi::OsString::from("--database"),
+            std::ffi::OsString::from("db"),
+            std::ffi::OsString::from("--delivery"),
+            std::ffi::OsString::from_vec(vec![0xff]),
+            std::ffi::OsString::from("task"),
+            std::ffi::OsString::from("1"),
+        ];
+        assert_eq!(
+            parse_args(&non_utf8_tuple),
+            Err(PreAcceptanceError::InvalidArguments)
+        );
         let empty = [
             "recover-preacceptance",
             "--database",
@@ -1038,6 +1068,20 @@ mod tests {
         .map(std::ffi::OsString::from);
         assert_eq!(
             parse_args(&empty),
+            Err(PreAcceptanceError::InvalidArguments)
+        );
+        let empty_database = [
+            "recover-preacceptance",
+            "--database",
+            "",
+            "--delivery",
+            "d",
+            "task",
+            "1",
+        ]
+        .map(std::ffi::OsString::from);
+        assert_eq!(
+            parse_args(&empty_database),
             Err(PreAcceptanceError::InvalidArguments)
         );
     }
@@ -1538,7 +1582,11 @@ mod tests {
             "lease:missing",
             "lease:active",
             "lease:released",
+            "lease:duplicate",
+            "delivery:acknowledged",
             "disposition:missing",
+            "disposition:session-bound",
+            "disposition:child-bound",
             "disposition:acknowledged",
             "disposition:outcome_unknown",
             "disposition:terminal",
@@ -1590,6 +1638,17 @@ mod tests {
             );
             assert_eq!(full_snapshot(&path).await, before);
         }
+        let before = full_snapshot(&path).await;
+        assert_eq!(
+            recover(
+                &path,
+                &[tuple.clone(), tuple.clone()],
+                "2026-01-02T00:00:00Z"
+            )
+            .await,
+            Err(PreAcceptanceError::InvalidArguments)
+        );
+        assert_eq!(full_snapshot(&path).await, before);
         let _ = std::fs::remove_file(path);
 
         let malformed =
