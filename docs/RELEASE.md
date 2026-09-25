@@ -13,6 +13,10 @@ production service change.
 - Keep credentials outside the repository. Resolve `{env:...}` values through the
   service environment or a secret manager.
 
+Offline `reconcile-delivery` and `recover-runtime` are separately reviewed tools.
+They are never automatic startup actions and require an explicit operations task;
+do not run them against production databases without that authorization.
+
 ## Pre-deployment
 
 1. Record the old service unit, executable, arguments, environment, Matrix account,
