@@ -13,9 +13,13 @@ production service change.
 - Keep credentials outside the repository. Resolve `{env:...}` values through the
   service environment or a secret manager.
 
-Offline `reconcile-delivery` and `recover-runtime` are separately reviewed tools.
-They are never automatic startup actions and require an explicit operations task;
-do not run them against production databases without that authorization.
+Offline `recover-preacceptance`, `reconcile-delivery`, and `recover-runtime` are
+separately reviewed tools. They are never automatic startup actions and require an
+explicit operations task. `recover-preacceptance` accepts only an exact delivery,
+task, and attempt tuple whose persisted dispatched event and pre-acceptance state
+are proven by the tool; malformed, mismatched, or ambiguous state is rejected.
+Do not run any of these commands against production databases without that separate
+authorization, and never infer a successful post-acceptance outcome.
 
 ## Pre-deployment
 

@@ -1,6 +1,6 @@
 [package]
 name = "guigu-agent-bridge"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2024"
 rust-version = "1.94"
 description = "Durable Matrix, ACP, and A2A task routing bridge for external agents"
@@ -30,6 +30,7 @@ include = [
     "/docs/RELEASE-0.2.2.md",
     "/docs/RELEASE-0.2.3.md",
     "/docs/RELEASE-0.2.4.md",
+    "/docs/RELEASE-0.2.5.md",
     "/docs/USER_GUIDE.md",
     "/docs/decisions/**",
     "/docs/integrations/**",
