@@ -1,5 +1,5 @@
 //! Explicit offline closure for a proven pre-acceptance dispatch refusal.
-use crate::models::event::TaskEventPayload;
+use crate::models::{EventId, TaskEvent, TaskEventPayload, TaskId, TaskStatus};
 use sqlx::{Connection, Row, SqliteConnection, sqlite::SqliteConnectOptions};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -16,6 +16,8 @@ pub enum PreAcceptanceError {
     Busy,
     #[error("pre-acceptance recovery rejected: fencing conflict")]
     Fenced,
+    #[error("pre-acceptance recovery already reconciled")]
+    AlreadyReconciled,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -184,7 +186,7 @@ async fn validate(
         return Err(PreAcceptanceError::NotEligible);
     }
     let row = sqlx::query(
-        "SELECT status,payload FROM task_events WHERE task_id=? ORDER BY seq DESC LIMIT 1",
+        "SELECT seq,status,payload FROM task_events WHERE task_id=? ORDER BY seq DESC LIMIT 1",
     )
     .bind(&t.task_id)
     .fetch_optional(&mut *c)
@@ -209,6 +211,17 @@ async fn validate(
             attempt,
         } if delivery_id.to_string() == t.delivery_id && i64::from(attempt) == t.attempt => {}
         _ => return Err(PreAcceptanceError::NotEligible),
+    }
+    let event_seq: i64 = row
+        .try_get("seq")
+        .map_err(|_| PreAcceptanceError::Database)?;
+    let task_version: i64 = sqlx::query_scalar("SELECT version FROM tasks WHERE task_id=?")
+        .bind(&t.task_id)
+        .fetch_one(&mut *c)
+        .await
+        .map_err(|_| PreAcceptanceError::NotEligible)?;
+    if event_seq != task_version + 1 {
+        return Err(PreAcceptanceError::NotEligible);
     }
     let a = sqlx::query("SELECT state FROM task_admissions WHERE task_id=?")
         .bind(&t.task_id)
@@ -262,7 +275,7 @@ async fn close_one(
     let owner: Option<String> = a
         .try_get("runtime_instance")
         .map_err(|_| PreAcceptanceError::Database)?;
-    let l=sqlx::query("SELECT resource_key,owner_token,fence FROM execution_leases WHERE task_id=? AND state='recovery_needed'").bind(&t.task_id).fetch_one(&mut *c).await.map_err(|_|PreAcceptanceError::Fenced)?;
+    let l=sqlx::query("SELECT resource_key,owner_token,fence,expires_at FROM execution_leases WHERE task_id=? AND state='recovery_needed'").bind(&t.task_id).fetch_one(&mut *c).await.map_err(|_|PreAcceptanceError::Fenced)?;
     let resource: String = l
         .try_get("resource_key")
         .map_err(|_| PreAcceptanceError::Database)?;
@@ -272,22 +285,66 @@ async fn close_one(
     let fence: i64 = l
         .try_get("fence")
         .map_err(|_| PreAcceptanceError::Database)?;
+    let expires_at: String = l
+        .try_get("expires_at")
+        .map_err(|_| PreAcceptanceError::Database)?;
+    let task_version: i64 = sqlx::query_scalar("SELECT version FROM tasks WHERE task_id=?")
+        .bind(&t.task_id)
+        .fetch_one(&mut *c)
+        .await
+        .map_err(|_| PreAcceptanceError::Fenced)?;
     let seq: i64 =
         sqlx::query_scalar("SELECT coalesce(max(seq),0)+1 FROM task_events WHERE task_id=?")
             .bind(&t.task_id)
             .fetch_one(&mut *c)
             .await
             .map_err(|_| PreAcceptanceError::Database)?;
-    let payload = serde_json::json!({"failed":{"error":"pre_acceptance_auth_failure"}}).to_string();
-    sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,?,'failed',?,?)").bind(uuid::Uuid::now_v7().to_string()).bind(&t.task_id).bind(seq).bind(now).bind(payload).execute(&mut *c).await.map_err(|_|PreAcceptanceError::Fenced)?;
-    let changed=sqlx::query("UPDATE task_admissions SET state='terminal',revision=revision+1,updated_at=? WHERE task_id=? AND state='dispatching' AND revision=? AND (runtime_instance IS ? OR runtime_instance=?)").bind(now).bind(&t.task_id).bind(rev).bind(&owner).bind(&owner).execute(&mut *c).await.map_err(|_|PreAcceptanceError::Fenced)?.rows_affected();
-    if changed != 1 {
-        return Err(PreAcceptanceError::Fenced);
-    }
-    if sqlx::query("UPDATE deliveries SET acknowledged_at=? WHERE delivery_id=? AND task_id=? AND attempt=? AND acknowledged_at IS NULL").bind(now).bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).execute(&mut *c).await.map_err(|_|PreAcceptanceError::Fenced)?.rows_affected()!=1{return Err(PreAcceptanceError::Fenced)}
-    if sqlx::query("UPDATE delivery_dispositions SET state='terminal',reason_code='pre_acceptance_auth_failure' WHERE delivery_id=? AND task_id=? AND attempt=? AND state='prepared'").bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).execute(&mut *c).await.map_err(|_|PreAcceptanceError::Fenced)?.rows_affected()!=1{return Err(PreAcceptanceError::Fenced)}
-    if sqlx::query("UPDATE execution_leases SET state='released',heartbeat_at=? WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='recovery_needed'").bind(now).bind(resource).bind(&t.task_id).bind(token).bind(fence).execute(&mut *c).await.map_err(|_|PreAcceptanceError::Fenced)?.rows_affected()!=1{return Err(PreAcceptanceError::Fenced)}
-    Ok(())
+    let event = TaskEvent {
+        id: EventId::generate(),
+        task_id: t
+            .task_id
+            .parse::<TaskId>()
+            .map_err(|_| PreAcceptanceError::NotEligible)?,
+        seq: u64::try_from(seq).map_err(|_| PreAcceptanceError::NotEligible)?,
+        status: TaskStatus::Failed,
+        timestamp: chrono::DateTime::parse_from_rfc3339(now)
+            .map_err(|_| PreAcceptanceError::InvalidArguments)?
+            .with_timezone(&chrono::Utc),
+        payload: TaskEventPayload::Failed {
+            error: "pre_acceptance_auth_failure".into(),
+        },
+    };
+    crate::terminal_closure::apply(
+        c,
+        crate::terminal_closure::ClosureContext {
+            task_id: &t.task_id,
+            resource_key: &resource,
+            event: &event,
+            now,
+            delivery: crate::terminal_closure::DeliveryBinding::OfflineExact {
+                delivery_id: &t.delivery_id,
+                attempt: t.attempt,
+            },
+            admission: crate::terminal_closure::AdmissionMode::Offline {
+                runtime_owner: owner.as_deref(),
+                revision: rev,
+            },
+            task_version: crate::terminal_closure::TaskVersionMode::OfflineExpected(task_version),
+            disposition_reason: Some("pre_acceptance_auth_failure"),
+        },
+        crate::terminal_closure::LeaseMode::OfflineRecoveryNeeded {
+            owner: &token,
+            fence,
+            expires_at: &expires_at,
+        },
+    )
+    .await
+    .map_err(|e| match e {
+        crate::terminal_closure::ClosureError::Fenced => PreAcceptanceError::Fenced,
+        crate::terminal_closure::ClosureError::AdmissionStale => PreAcceptanceError::Fenced,
+        crate::terminal_closure::ClosureError::Malformed => PreAcceptanceError::NotEligible,
+        crate::terminal_closure::ClosureError::Database(_) => PreAcceptanceError::Database,
+    })
 }
 fn is_busy(e: &sqlx::Error) -> bool {
     let s = e.to_string().to_ascii_lowercase();
@@ -355,5 +412,54 @@ mod tests {
             parse_args(&non_utf8),
             Err(PreAcceptanceError::InvalidArguments)
         );
+    }
+
+    #[tokio::test]
+    async fn real_sqlite_success_uses_shared_core_and_preserves_unrelated_fields() {
+        let path = std::env::temp_dir().join(format!("t037-{}.db", uuid::Uuid::now_v7()));
+        let pool = crate::storage::connect(&path).await.unwrap();
+        crate::storage::migrate(&pool).await.unwrap();
+        let endpoint = uuid::Uuid::now_v7().to_string();
+        let conversation = uuid::Uuid::now_v7().to_string();
+        let task = uuid::Uuid::now_v7().to_string();
+        let delivery = uuid::Uuid::now_v7().to_string();
+        let resource = "resource-t037";
+        sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES(?,?, 'acp',1,'[]')").bind(&endpoint).bind(uuid::Uuid::now_v7().to_string()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO conversations(conversation_id,participants_json) VALUES(?,'[]')")
+            .bind(&conversation)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES(?,?,?,?,?,'secret sentinel',1,0,0,0)").bind(&task).bind(&task).bind(&endpoint).bind(&endpoint).bind(&conversation).execute(&pool).await.unwrap();
+        let dispatched = serde_json::to_string(&TaskEventPayload::Dispatched {
+            delivery_id: delivery.parse().unwrap(),
+            attempt: 1,
+        })
+        .unwrap();
+        sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,1,'dispatched',? ,?)").bind(uuid::Uuid::now_v7().to_string()).bind(&task).bind("2026-01-01T00:00:00Z").bind(dispatched).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,created_at,updated_at) VALUES(?,'dispatching',4,NULL,'t','t')").bind(&task).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES(?,?,1,?,'2026-01-01T00:00:00Z')").bind(&delivery).bind(&task).bind(&endpoint).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state,reason_code) VALUES(?,?,1,'prepared','before')").bind(&delivery).bind(&task).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES(?,?,?,7,'recovery_needed','t','t','2099-01-01T00:00:00Z')").bind(resource).bind(&task).bind("owner").execute(&pool).await.unwrap();
+        pool.close().await;
+        let tuple = PreAcceptanceTuple {
+            delivery_id: delivery.clone(),
+            task_id: task.clone(),
+            attempt: 1,
+        };
+        assert_eq!(
+            recover(&path, &[tuple], "2026-01-02T00:00:00Z").await,
+            Ok(1)
+        );
+        let after = crate::storage::connect(&path).await.unwrap();
+        let snapshot: (String, i64, String, String, String, String) = sqlx::query_as("SELECT t.text,t.version,a.state,d.acknowledged_at,p.state,l.state FROM tasks t JOIN task_admissions a ON a.task_id=t.task_id JOIN deliveries d ON d.task_id=t.task_id JOIN delivery_dispositions p ON p.task_id=t.task_id JOIN execution_leases l ON l.task_id=t.task_id WHERE t.task_id=?").bind(&task).fetch_one(&after).await.unwrap();
+        assert_eq!(snapshot.0, "secret sentinel");
+        assert_eq!(snapshot.1, 1);
+        assert_eq!(snapshot.2, "terminal");
+        assert!(!snapshot.3.is_empty());
+        assert_eq!(snapshot.4, "terminal");
+        assert_eq!(snapshot.5, "released");
+        after.close().await;
+        let _ = std::fs::remove_file(path);
     }
 }

@@ -815,13 +815,32 @@ impl SqliteRuntimeStore {
             crate::models::TaskStatus::Cancelled => "cancelled",
             _ => return Err(RuntimeError::Malformed),
         };
-        let payload = serde_json::to_string(&event.payload).map_err(|_| RuntimeError::Malformed)?;
-        sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES (?,?,?,?,?,?)").bind(event.id.to_string()).bind(event.task_id.to_string()).bind(to_i64(event.seq)?).bind(status).bind(ts(event.timestamp)).bind(payload).execute(&mut *tx).await?;
-        let lease_update = sqlx::query("UPDATE execution_leases SET state='released',heartbeat_at=?,expires_at=? WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
-            .bind(ts(now)).bind(ts(now)).bind(lease.resource.to_string()).bind(lease.task_id.to_string()).bind(lease.owner.to_string()).bind(to_i64(lease.fence)?).bind(ts(now)).execute(&mut *tx).await?;
-        if lease_update.rows_affected() != 1 {
-            return Ok(FinalizeResult::Fenced);
-        }
+        let now_text = ts(now);
+        crate::terminal_closure::apply(
+            &mut tx,
+            crate::terminal_closure::ClosureContext {
+                task_id: &event.task_id.to_string(),
+                resource_key: &lease.resource.to_string(),
+                event,
+                now: &now_text,
+                delivery: crate::terminal_closure::DeliveryBinding::LiveContinuation,
+                admission: crate::terminal_closure::AdmissionMode::Live,
+                task_version: crate::terminal_closure::TaskVersionMode::LiveAlreadyAdvanced,
+                disposition_reason: None,
+            },
+            crate::terminal_closure::LeaseMode::LiveActive {
+                owner: &lease.owner.to_string(),
+                fence: to_i64(lease.fence)?,
+                now: &now_text,
+            },
+        )
+        .await
+        .map_err(|error| match error {
+            crate::terminal_closure::ClosureError::Fenced => RuntimeError::Fenced,
+            crate::terminal_closure::ClosureError::AdmissionStale => RuntimeError::Fenced,
+            crate::terminal_closure::ClosureError::Malformed => RuntimeError::Malformed,
+            crate::terminal_closure::ClosureError::Database(error) => RuntimeError::from(error),
+        })?;
         let claim_state = if state == ContinuationState::RecoveryNeeded {
             "recovery_needed"
         } else {
@@ -834,29 +853,6 @@ impl SqliteRuntimeStore {
             sqlx::query("UPDATE workspace_claims SET state='recovery_needed',revision=revision+1,updated_at=? WHERE runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'")
                 .bind(ts(now)).bind(lease.owner.to_string()).bind(lease.task_id.to_string()).bind(to_i64(lease.fence)?).execute(&mut *tx).await?;
         }
-        let admission = sqlx::query("UPDATE task_admissions SET state='terminal',revision=revision+1,updated_at=? WHERE task_id=? AND state IN ('enqueued','dispatching','running')").bind(ts(now)).bind(event.task_id.to_string()).execute(&mut *tx).await?;
-        if admission.rows_affected() != 1 {
-            return Ok(FinalizeResult::Stale);
-        }
-        sqlx::query(
-            "UPDATE deliveries SET acknowledged_at=? \
-             WHERE delivery_id=(SELECT delivery_id FROM task_continuations WHERE task_id=?) \
-             AND task_id=? AND acknowledged_at IS NULL",
-        )
-        .bind(ts(now))
-        .bind(event.task_id.to_string())
-        .bind(event.task_id.to_string())
-        .execute(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE delivery_dispositions SET state='terminal',reason_code=NULL \
-             WHERE delivery_id=(SELECT delivery_id FROM task_continuations WHERE task_id=?) \
-             AND task_id=? AND state IN ('prepared','acknowledged','outcome_unknown')",
-        )
-        .bind(event.task_id.to_string())
-        .bind(event.task_id.to_string())
-        .execute(&mut *tx)
-        .await?;
         let render_version: String = envelope.try_get("render_version")?;
         if let Some(room) = envelope.try_get::<Option<String>, _>("reply_room")? {
             let body = terminal_reply_body(&event.payload).ok_or(RuntimeError::Malformed)?;

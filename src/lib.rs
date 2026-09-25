@@ -19,6 +19,7 @@ pub mod offline_preacceptance;
 pub mod offline_recovery;
 pub mod runtime;
 pub mod storage;
+pub(crate) mod terminal_closure;
 
 use std::future::Future;
 
