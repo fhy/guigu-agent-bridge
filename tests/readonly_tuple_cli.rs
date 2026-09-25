@@ -64,7 +64,7 @@ async fn select_preacceptance_cli_success_is_fixed_and_redacted() {
     sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,created_at,updated_at) VALUES(?,'dispatching',4,?,'t','t')").bind(&task).bind(&runtime).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES(?,?,1,?,'t')").bind(&delivery).bind(&task).bind(&endpoint).execute(&pool).await.unwrap();
     sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state,reason_code) VALUES(?,?,1,'prepared','fixture')").bind(&delivery).bind(&task).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES(?,?,?,7,'recovery_needed','t','t','2000')").bind(format!("resource-{task}" )).bind(&task).bind(format!("owner-{task}" )).execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES(?,?,?,7,'recovery_needed','t','t','2000')").bind(format!("resource-{task}" )).bind(&task).bind(&runtime).execute(&pool).await.unwrap();
     pool.close().await;
     let output = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
         .args(["select-preacceptance", "--database"])

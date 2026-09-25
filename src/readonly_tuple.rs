@@ -138,18 +138,18 @@ async fn prove_candidate(
     let Some(admission) = admission else {
         return Ok(false);
     };
+    let runtime_instance: String = admission
+        .try_get::<Option<String>, _>("runtime_instance")
+        .map_err(|_| SelectionError::Malformed)?
+        .ok_or(SelectionError::Conflicting)?;
+    let admission_revision = admission
+        .try_get::<i64, _>("revision")
+        .map_err(|_| SelectionError::Malformed)?;
     if admission
         .try_get::<String, _>("state")
         .map_err(|_| SelectionError::Malformed)?
         != "dispatching"
-        || admission
-            .try_get::<Option<String>, _>("runtime_instance")
-            .map_err(|_| SelectionError::Malformed)?
-            .is_none()
-        || admission
-            .try_get::<i64, _>("revision")
-            .map_err(|_| SelectionError::Malformed)?
-            < 0
+        || admission_revision < 0
     {
         return Ok(false);
     }
@@ -158,6 +158,26 @@ async fn prove_candidate(
     let Some(lease) = lease else {
         return Ok(false);
     };
+    let lease_resource: String = lease
+        .try_get("resource_key")
+        .map_err(|_| SelectionError::Malformed)?;
+    let lease_owner: String = lease
+        .try_get("owner_token")
+        .map_err(|_| SelectionError::Malformed)?;
+    let lease_fence = lease
+        .try_get::<i64, _>("fence")
+        .map_err(|_| SelectionError::Malformed)?;
+    let lease_expiry: String = lease
+        .try_get("expires_at")
+        .map_err(|_| SelectionError::Malformed)?;
+    if lease_resource.is_empty()
+        || lease_owner.is_empty()
+        || lease_fence < 1
+        || lease_expiry.is_empty()
+        || lease_owner != runtime_instance
+    {
+        return Err(SelectionError::Conflicting);
+    }
     if lease
         .try_get::<String, _>("resource_key")
         .map_err(|_| SelectionError::Malformed)?
@@ -197,6 +217,12 @@ async fn prove_candidate(
     if disposition.as_deref() != Some("prepared") {
         return Ok(false);
     }
+    let evidence: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT session_id,child_fingerprint,reap_status FROM delivery_dispositions WHERE delivery_id=? AND task_id=? AND attempt=?",
+    ).bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).fetch_one(&mut *c).await.map_err(|_| SelectionError::Database)?;
+    if evidence.0.is_some() || evidence.1.is_some() || evidence.2.is_some() {
+        return Ok(false);
+    }
     let queue: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_work_queue WHERE task_id=?")
         .bind(&t.task_id)
         .fetch_one(&mut *c)
@@ -210,6 +236,20 @@ async fn prove_candidate(
             .map_err(|_| SelectionError::Database)?;
     if queue != 0 || continuation != 0 {
         return Ok(false);
+    }
+    let unfinished: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks t WHERE t.task_id=? AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=t.task_id AND e.status IN ('completed','failed','timed_out','cancelled'))")
+        .bind(&t.task_id).fetch_one(&mut *c).await.map_err(|_| SelectionError::Database)?;
+    let unacknowledged: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM deliveries WHERE delivery_id=? AND acknowledged_at IS NULL",
+    )
+    .bind(&t.delivery_id)
+    .fetch_one(&mut *c)
+    .await
+    .map_err(|_| SelectionError::Database)?;
+    let awaiting_outcome: i64 = sqlx::query_scalar("SELECT count(*) FROM deliveries d WHERE d.delivery_id=? AND d.acknowledged_at IS NOT NULL AND NOT EXISTS (SELECT 1 FROM task_events e WHERE e.task_id=d.task_id AND e.status IN ('completed','failed','timed_out','cancelled'))")
+        .bind(&t.delivery_id).fetch_one(&mut *c).await.map_err(|_| SelectionError::Database)?;
+    if unfinished != 1 || unacknowledged != 1 || awaiting_outcome != 0 || admission_revision < 0 {
+        return Err(SelectionError::Conflicting);
     }
     Ok(true)
 }
@@ -262,7 +302,7 @@ mod tests {
         sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state,reason_code) VALUES(?,?,1,'prepared','fixture')")
             .bind(&delivery).bind(&task).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES(?,?,?,7,'recovery_needed','t','t',?)")
-            .bind(&resource).bind(&task).bind(format!("owner-{suffix}")).bind(expiry).execute(&pool).await.unwrap();
+            .bind(&resource).bind(&task).bind(&runtime).bind(expiry).execute(&pool).await.unwrap();
         pool.close().await;
         SelectedTuple {
             delivery_id: delivery,
@@ -345,6 +385,33 @@ mod tests {
         let pool = connect(&path).await.unwrap();
         sqlx::query(
             "UPDATE deliveries SET acknowledged_at='2026-01-02T00:00:00Z' WHERE delivery_id=?",
+        )
+        .bind(&tuple.delivery_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+        assert_eq!(select(&path).await, Err(SelectionError::Empty));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn cross_binding_and_prepared_post_acceptance_evidence_fail_closed() {
+        let path = std::env::temp_dir().join(format!("t038-binding-{}.db", Uuid::now_v7()));
+        let tuple = eligible_fixture(&path, "binding", "2099-01-01T00:00:00Z").await;
+        let pool = connect(&path).await.unwrap();
+        sqlx::query("UPDATE execution_leases SET owner_token='other-owner' WHERE task_id=?")
+            .bind(&tuple.task_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        assert_eq!(select(&path).await, Err(SelectionError::Conflicting));
+        let pool = connect(&path).await.unwrap();
+        sqlx::query("UPDATE execution_leases SET owner_token=(SELECT runtime_instance FROM task_admissions WHERE task_id=?) WHERE task_id=?")
+            .bind(&tuple.task_id).bind(&tuple.task_id).execute(&pool).await.unwrap();
+        sqlx::query(
+            "UPDATE delivery_dispositions SET session_id='session-evidence' WHERE delivery_id=?",
         )
         .bind(&tuple.delivery_id)
         .execute(&pool)
