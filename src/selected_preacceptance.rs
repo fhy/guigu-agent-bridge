@@ -57,7 +57,6 @@ mod tests {
     use crate::storage::{connect, migrate};
     use uuid::Uuid;
 
-    /*
     async fn eligible_db(path: &std::path::Path) -> (String, String) {
         let pool = connect(path).await.unwrap();
         migrate(&pool).await.unwrap();
@@ -78,16 +77,15 @@ mod tests {
             attempt: 1,
         })
         .unwrap();
-        sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,1,'dispatched','t',?)").bind(Uuid::now_v7().to_string()).bind(&t).bind(p).execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES(?,'t','t','active','fp')").bind(&r).execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,created_at,updated_at) VALUES(?,'dispatching',0,?,'t','t')").bind(&t).bind(&r).execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES(?,?,1,?,'t')").bind(&d).bind(&t).bind(&e).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,1,'dispatched','2026-01-01T00:00:00Z',?)").bind(Uuid::now_v7().to_string()).bind(&t).bind(p).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES(?,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','active','fp')").bind(&r).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,created_at,updated_at) VALUES(?,'dispatching',0,?,'2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')").bind(&t).bind(&r).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES(?,?,1,?,'2026-01-01T00:00:00Z')").bind(&d).bind(&t).bind(&e).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state,reason_code) VALUES(?,?,1,'prepared','x')").bind(&d).bind(&t).execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES(?,?,?,1,'recovery_needed','t','t','2000')").bind(format!("res-{t}")).bind(&t).bind(&r).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES(?,?,?,1,'recovery_needed','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2099-01-01T00:00:00Z')").bind(format!("res-{t}")).bind(&t).bind(&r).execute(&pool).await.unwrap();
         pool.close().await;
         (d, t)
     }
-    */
     #[test]
     fn parser_rejects_shape_without_echoing_values() {
         let args = vec!["recover-selected-preacceptance".into(), "--database".into()];
@@ -108,6 +106,59 @@ mod tests {
         let after = std::fs::read(&path).unwrap();
         assert_eq!(before, after);
         assert_eq!(recover(&path).await, Err(SelectedRecoveryError::Empty));
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn eligible_combined_path_closes_once_then_empty() {
+        let path = std::env::temp_dir().join(format!("t039-success-{}.db", Uuid::now_v7()));
+        let _ = eligible_db(&path).await;
+        let selected = crate::readonly_tuple::select(&path).await.unwrap();
+        let direct = crate::offline_preacceptance::recover(
+            &path,
+            &[crate::offline_preacceptance::PreAcceptanceTuple {
+                delivery_id: selected.delivery_id,
+                task_id: selected.task_id,
+                attempt: selected.attempt,
+            }],
+            "2026-01-01T00:00:00Z",
+        )
+        .await;
+        assert_eq!(
+            direct,
+            Ok(crate::offline_preacceptance::PreAcceptanceOutcome::Recovered { count: 1 })
+        );
+        assert_eq!(recover(&path).await, Err(SelectedRecoveryError::Empty));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn selection_to_use_ack_drift_is_fenced_and_snapshot_unchanged() {
+        let path = std::env::temp_dir().join(format!("t039-drift-{}.db", Uuid::now_v7()));
+        let _ = eligible_db(&path).await;
+        let selected = crate::readonly_tuple::select(&path).await.unwrap();
+        let pool = connect(&path).await.unwrap();
+        sqlx::query(
+            "UPDATE deliveries SET acknowledged_at='2026-01-02T00:00:00Z' WHERE delivery_id=?",
+        )
+        .bind(&selected.delivery_id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        pool.close().await;
+        let before = std::fs::read(&path).unwrap();
+        let result = crate::offline_preacceptance::recover(
+            &path,
+            &[crate::offline_preacceptance::PreAcceptanceTuple {
+                delivery_id: selected.delivery_id,
+                task_id: selected.task_id,
+                attempt: selected.attempt,
+            }],
+            "2026-01-03T00:00:00Z",
+        )
+        .await;
+        assert!(result.is_err());
         assert_eq!(before, std::fs::read(&path).unwrap());
         let _ = std::fs::remove_file(path);
     }
