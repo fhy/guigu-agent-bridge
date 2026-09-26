@@ -1,5 +1,6 @@
 //! Read-only selection of an exact T037 pre-acceptance tuple.
 use crate::models::TaskEventPayload;
+use crate::readonly_tuple_diagnostics::{ConflictCause, ConflictSet, DiagnosedSelectionError};
 use sqlx::{Connection, Row, SqliteConnection, sqlite::SqliteConnectOptions};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -45,19 +46,40 @@ pub fn parse_args(args: &[std::ffi::OsString]) -> Result<PathBuf, SelectionError
 /// Select exactly one T037-eligible tuple from one consistent read snapshot.
 /// This function never writes, migrates, retries, or invokes the recovery command.
 pub async fn select(database: impl AsRef<Path>) -> Result<SelectedTuple, SelectionError> {
+    select_core(database.as_ref())
+        .await
+        .map_err(|error| match error {
+            DiagnosedSelectionError::InvalidArguments => SelectionError::InvalidArguments,
+            DiagnosedSelectionError::Empty => SelectionError::Empty,
+            DiagnosedSelectionError::Multiple => SelectionError::Multiple,
+            DiagnosedSelectionError::Malformed => SelectionError::Malformed,
+            DiagnosedSelectionError::Conflicting(_) => SelectionError::Conflicting,
+            DiagnosedSelectionError::Nonterminal => SelectionError::Nonterminal,
+            DiagnosedSelectionError::Busy => SelectionError::Busy,
+            DiagnosedSelectionError::Database => SelectionError::Database,
+        })
+}
+
+pub async fn diagnose(
+    database: impl AsRef<Path>,
+) -> Result<SelectedTuple, DiagnosedSelectionError> {
+    select_core(database.as_ref()).await
+}
+
+async fn select_core(database: &Path) -> Result<SelectedTuple, DiagnosedSelectionError> {
     let opts = SqliteConnectOptions::new()
-        .filename(database.as_ref())
+        .filename(database)
         .create_if_missing(false)
         .foreign_keys(true)
         .busy_timeout(std::time::Duration::from_secs(5));
     let mut c = SqliteConnection::connect_with(&opts)
         .await
-        .map_err(|_| SelectionError::Database)?;
+        .map_err(|_| DiagnosedSelectionError::Database)?;
     sqlx::query("BEGIN").execute(&mut c).await.map_err(|e| {
         if is_busy(&e) {
-            SelectionError::Busy
+            DiagnosedSelectionError::Busy
         } else {
-            SelectionError::Database
+            DiagnosedSelectionError::Database
         }
     })?;
     let result = select_tx(&mut c).await;
@@ -66,14 +88,14 @@ pub async fn select(database: impl AsRef<Path>) -> Result<SelectedTuple, Selecti
     result
 }
 
-async fn select_tx(c: &mut SqliteConnection) -> Result<SelectedTuple, SelectionError> {
+async fn select_tx(c: &mut SqliteConnection) -> Result<SelectedTuple, DiagnosedSelectionError> {
     let rows = sqlx::query("SELECT d.delivery_id,d.task_id,d.attempt,d.acknowledged_at FROM deliveries d ORDER BY d.delivery_id")
-        .fetch_all(&mut *c).await.map_err(|_| SelectionError::Database)?;
+        .fetch_all(&mut *c).await.map_err(|_| DiagnosedSelectionError::Database)?;
     let mut eligible = Vec::new();
     for row in rows {
         if row
             .try_get::<Option<String>, _>("acknowledged_at")
-            .map_err(|_| SelectionError::Malformed)?
+            .map_err(|_| DiagnosedSelectionError::Malformed)?
             .is_some()
         {
             continue;
@@ -81,129 +103,116 @@ async fn select_tx(c: &mut SqliteConnection) -> Result<SelectedTuple, SelectionE
         let tuple = SelectedTuple {
             delivery_id: row
                 .try_get("delivery_id")
-                .map_err(|_| SelectionError::Malformed)?,
+                .map_err(|_| DiagnosedSelectionError::Malformed)?,
             task_id: row
                 .try_get("task_id")
-                .map_err(|_| SelectionError::Malformed)?,
+                .map_err(|_| DiagnosedSelectionError::Malformed)?,
             attempt: row
                 .try_get("attempt")
-                .map_err(|_| SelectionError::Malformed)?,
+                .map_err(|_| DiagnosedSelectionError::Malformed)?,
         };
         if tuple.attempt < 1 {
-            return Err(SelectionError::Malformed);
+            return Err(DiagnosedSelectionError::Malformed);
         }
         if prove_candidate(c, &tuple).await? {
             eligible.push(tuple);
         }
     }
     match eligible.len() {
-        0 => Err(SelectionError::Empty),
+        0 => Err(DiagnosedSelectionError::Empty),
         1 => Ok(eligible.remove(0)),
-        _ => Err(SelectionError::Multiple),
+        _ => Err(DiagnosedSelectionError::Multiple),
     }
 }
 
 async fn prove_candidate(
     c: &mut SqliteConnection,
     t: &SelectedTuple,
-) -> Result<bool, SelectionError> {
+) -> Result<bool, DiagnosedSelectionError> {
     let event = sqlx::query(
         "SELECT status,payload FROM task_events WHERE task_id=? ORDER BY seq DESC LIMIT 1",
     )
     .bind(&t.task_id)
     .fetch_optional(&mut *c)
     .await
-    .map_err(|_| SelectionError::Database)?
-    .ok_or(SelectionError::Nonterminal)?;
+    .map_err(|_| DiagnosedSelectionError::Database)?
+    .ok_or(DiagnosedSelectionError::Nonterminal)?;
     if event
         .try_get::<String, _>("status")
-        .map_err(|_| SelectionError::Malformed)?
+        .map_err(|_| DiagnosedSelectionError::Malformed)?
         != "dispatched"
     {
         return Ok(false);
     }
     let payload: String = event
         .try_get("payload")
-        .map_err(|_| SelectionError::Malformed)?;
+        .map_err(|_| DiagnosedSelectionError::Malformed)?;
     if !matches!(serde_json::from_str::<TaskEventPayload>(&payload), Ok(TaskEventPayload::Dispatched { delivery_id, attempt }) if delivery_id.to_string() == t.delivery_id && i64::from(attempt) == t.attempt)
     {
-        return Err(SelectionError::Malformed);
+        return Err(DiagnosedSelectionError::Malformed);
     }
     let admission =
         sqlx::query("SELECT state,runtime_instance,revision FROM task_admissions WHERE task_id=?")
             .bind(&t.task_id)
             .fetch_optional(&mut *c)
             .await
-            .map_err(|_| SelectionError::Database)?;
+            .map_err(|_| DiagnosedSelectionError::Database)?;
     let Some(admission) = admission else {
         return Ok(false);
     };
-    let runtime_instance: String = admission
+    let runtime_instance: Option<String> = admission
         .try_get::<Option<String>, _>("runtime_instance")
-        .map_err(|_| SelectionError::Malformed)?
-        .ok_or(SelectionError::Conflicting)?;
+        .map_err(|_| DiagnosedSelectionError::Malformed)?;
+    let mut conflicts = ConflictSet::default();
+    if runtime_instance.is_none() {
+        conflicts.insert(ConflictCause::AdmissionRuntimeMissing);
+    }
     let admission_revision = admission
         .try_get::<i64, _>("revision")
-        .map_err(|_| SelectionError::Malformed)?;
+        .map_err(|_| DiagnosedSelectionError::Malformed)?;
     if admission
         .try_get::<String, _>("state")
-        .map_err(|_| SelectionError::Malformed)?
+        .map_err(|_| DiagnosedSelectionError::Malformed)?
         != "dispatching"
         || admission_revision < 0
     {
         return Ok(false);
     }
-    let lease = sqlx::query("SELECT resource_key,owner_token,fence,expires_at FROM execution_leases WHERE task_id=? AND state='recovery_needed'")
-        .bind(&t.task_id).fetch_optional(&mut *c).await.map_err(|_| SelectionError::Database)?;
-    let Some(lease) = lease else {
-        return Ok(false);
-    };
-    let lease_resource: String = lease
-        .try_get("resource_key")
-        .map_err(|_| SelectionError::Malformed)?;
-    let lease_owner: String = lease
-        .try_get("owner_token")
-        .map_err(|_| SelectionError::Malformed)?;
-    let lease_fence = lease
-        .try_get::<i64, _>("fence")
-        .map_err(|_| SelectionError::Malformed)?;
-    let lease_expiry: String = lease
-        .try_get("expires_at")
-        .map_err(|_| SelectionError::Malformed)?;
-    if lease_resource.is_empty()
-        || lease_owner.is_empty()
-        || lease_fence < 1
-        || lease_expiry.is_empty()
-        || lease_owner != runtime_instance
-    {
-        return Err(SelectionError::Conflicting);
-    }
-    if lease
-        .try_get::<String, _>("resource_key")
-        .map_err(|_| SelectionError::Malformed)?
-        .is_empty()
-        || lease
-            .try_get::<String, _>("owner_token")
-            .map_err(|_| SelectionError::Malformed)?
-            .is_empty()
-        || lease
-            .try_get::<i64, _>("fence")
-            .map_err(|_| SelectionError::Malformed)?
-            < 0
-        || lease
-            .try_get::<String, _>("expires_at")
-            .map_err(|_| SelectionError::Malformed)?
-            .is_empty()
-    {
-        return Err(SelectionError::Malformed);
+    let leases = sqlx::query("SELECT resource_key,owner_token,fence,expires_at FROM execution_leases WHERE task_id=? AND state='recovery_needed'")
+        .bind(&t.task_id).fetch_all(&mut *c).await.map_err(|_| DiagnosedSelectionError::Database)?;
+    for lease in &leases {
+        let resource: String = lease
+            .try_get("resource_key")
+            .map_err(|_| DiagnosedSelectionError::Malformed)?;
+        let owner: String = lease
+            .try_get("owner_token")
+            .map_err(|_| DiagnosedSelectionError::Malformed)?;
+        let fence: i64 = lease
+            .try_get("fence")
+            .map_err(|_| DiagnosedSelectionError::Malformed)?;
+        let expiry: String = lease
+            .try_get("expires_at")
+            .map_err(|_| DiagnosedSelectionError::Malformed)?;
+        let valid = !resource.is_empty() && !owner.is_empty() && fence >= 1 && !expiry.is_empty();
+        if !valid {
+            conflicts.insert(ConflictCause::LeaseIdentityInvalid);
+        } else if runtime_instance
+            .as_deref()
+            .is_some_and(|runtime| owner != runtime)
+        {
+            conflicts.insert(ConflictCause::LeaseOwnerMismatch);
+        }
     }
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE task_id=?")
         .bind(&t.task_id)
         .fetch_one(&mut *c)
         .await
-        .map_err(|_| SelectionError::Database)?;
+        .map_err(|_| DiagnosedSelectionError::Database)?;
     if count != 1 {
-        return Err(SelectionError::Conflicting);
+        conflicts.insert(ConflictCause::LeaseCardinality);
+    }
+    if leases.is_empty() && conflicts.is_empty() {
+        return Ok(false);
     }
     let disposition: Option<String> = sqlx::query_scalar(
         "SELECT state FROM delivery_dispositions WHERE delivery_id=? AND task_id=? AND attempt=?",
@@ -213,43 +222,58 @@ async fn prove_candidate(
     .bind(t.attempt)
     .fetch_optional(&mut *c)
     .await
-    .map_err(|_| SelectionError::Database)?;
+    .map_err(|_| DiagnosedSelectionError::Database)?;
     if disposition.as_deref() != Some("prepared") {
-        return Ok(false);
+        return if conflicts.is_empty() {
+            Ok(false)
+        } else {
+            Err(DiagnosedSelectionError::Conflicting(conflicts))
+        };
     }
     let evidence: (Option<String>, Option<String>, Option<String>) = sqlx::query_as(
         "SELECT session_id,child_fingerprint,reap_status FROM delivery_dispositions WHERE delivery_id=? AND task_id=? AND attempt=?",
-    ).bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).fetch_one(&mut *c).await.map_err(|_| SelectionError::Database)?;
+    ).bind(&t.delivery_id).bind(&t.task_id).bind(t.attempt).fetch_one(&mut *c).await.map_err(|_| DiagnosedSelectionError::Database)?;
     if evidence.0.is_some() || evidence.1.is_some() || evidence.2.is_some() {
-        return Ok(false);
+        return if conflicts.is_empty() {
+            Ok(false)
+        } else {
+            Err(DiagnosedSelectionError::Conflicting(conflicts))
+        };
     }
     let queue: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_work_queue WHERE task_id=?")
         .bind(&t.task_id)
         .fetch_one(&mut *c)
         .await
-        .map_err(|_| SelectionError::Database)?;
+        .map_err(|_| DiagnosedSelectionError::Database)?;
     let continuation: i64 =
         sqlx::query_scalar("SELECT count(*) FROM task_continuations WHERE task_id=?")
             .bind(&t.task_id)
             .fetch_one(&mut *c)
             .await
-            .map_err(|_| SelectionError::Database)?;
+            .map_err(|_| DiagnosedSelectionError::Database)?;
     if queue != 0 || continuation != 0 {
-        return Ok(false);
+        return if conflicts.is_empty() {
+            Ok(false)
+        } else {
+            Err(DiagnosedSelectionError::Conflicting(conflicts))
+        };
     }
     let unfinished: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks t LEFT JOIN task_events e ON e.task_id=t.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=t.task_id) WHERE t.task_id=? AND (e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled'))")
-        .bind(&t.task_id).fetch_one(&mut *c).await.map_err(|_| SelectionError::Database)?;
+        .bind(&t.task_id).fetch_one(&mut *c).await.map_err(|_| DiagnosedSelectionError::Database)?;
     let unacknowledged: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM deliveries WHERE delivery_id=? AND acknowledged_at IS NULL",
     )
     .bind(&t.delivery_id)
     .fetch_one(&mut *c)
     .await
-    .map_err(|_| SelectionError::Database)?;
+    .map_err(|_| DiagnosedSelectionError::Database)?;
     let awaiting_outcome: i64 = sqlx::query_scalar("SELECT count(*) FROM deliveries d LEFT JOIN task_events e ON e.task_id=d.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=d.task_id) WHERE d.delivery_id=? AND d.acknowledged_at IS NOT NULL AND (e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled'))")
-        .bind(&t.delivery_id).fetch_one(&mut *c).await.map_err(|_| SelectionError::Database)?;
+        .bind(&t.delivery_id).fetch_one(&mut *c).await.map_err(|_| DiagnosedSelectionError::Database)?;
     if unfinished != 1 || unacknowledged != 1 || awaiting_outcome != 0 || admission_revision < 0 {
-        return Err(SelectionError::Conflicting);
+        conflicts.insert(ConflictCause::PlannerParity);
+    }
+    if !conflicts.is_empty() {
+        return Err(DiagnosedSelectionError::Conflicting(conflicts));
     }
     Ok(true)
 }
@@ -318,6 +342,7 @@ mod tests {
         migrate(&pool).await.unwrap();
         pool.close().await;
         assert_eq!(select(&path).await, Err(SelectionError::Empty));
+        assert_eq!(diagnose(&path).await, Err(DiagnosedSelectionError::Empty));
         let _ = std::fs::remove_file(path);
     }
 
@@ -332,6 +357,7 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(select(&path).await.unwrap(), tuple);
+        assert_eq!(diagnose(&path).await.unwrap(), tuple);
         let pool = connect(&path).await.unwrap();
         let after: String = sqlx::query_scalar(
             "SELECT group_concat(name, ',') FROM sqlite_master WHERE type='table'",
@@ -350,6 +376,10 @@ mod tests {
         let _ = eligible_fixture(&path, "one", "2099-01-01T00:00:00Z").await;
         let _ = eligible_fixture(&path, "two", "2099-01-01T00:00:00Z").await;
         assert_eq!(select(&path).await, Err(SelectionError::Multiple));
+        assert_eq!(
+            diagnose(&path).await,
+            Err(DiagnosedSelectionError::Multiple)
+        );
         let pool = connect(&path).await.unwrap();
         sqlx::query("UPDATE task_events SET payload='{}'")
             .execute(&pool)
@@ -359,6 +389,10 @@ mod tests {
         assert!(matches!(
             select(&path).await,
             Err(SelectionError::Malformed | SelectionError::Empty)
+        ));
+        assert!(matches!(
+            diagnose(&path).await,
+            Err(DiagnosedSelectionError::Malformed | DiagnosedSelectionError::Empty)
         ));
         let _ = std::fs::remove_file(path);
     }
@@ -419,6 +453,109 @@ mod tests {
         .unwrap();
         pool.close().await;
         assert_eq!(select(&path).await, Err(SelectionError::Empty));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn diagnosis_reports_invalid_lease_and_owner_causes_without_mutation() {
+        let path = std::env::temp_dir().join(format!("t041-conflict-{}.db", Uuid::now_v7()));
+        let tuple = eligible_fixture(&path, "diagnosis", "2099-01-01T00:00:00Z").await;
+        let pool = connect(&path).await.unwrap();
+        sqlx::query("UPDATE execution_leases SET owner_token='' WHERE task_id=?")
+            .bind(&tuple.task_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let before = std::fs::read(&path).unwrap();
+        let error = diagnose(&path).await.unwrap_err();
+        assert!(
+            matches!(error, DiagnosedSelectionError::Conflicting(cause) if cause.public_causes() == vec!["lease-identity-invalid"])
+        );
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn diagnosis_reports_owner_mismatch_and_cardinality_without_mutation() {
+        let path = std::env::temp_dir().join(format!("t041-mismatch-{}.db", Uuid::now_v7()));
+        let tuple = eligible_fixture(&path, "mismatch", "2099-01-01T00:00:00Z").await;
+        let pool = connect(&path).await.unwrap();
+        sqlx::query("UPDATE execution_leases SET owner_token='other-owner' WHERE task_id=?")
+            .bind(&tuple.task_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let error = diagnose(&path).await.unwrap_err();
+        assert!(
+            matches!(error, DiagnosedSelectionError::Conflicting(cause) if cause.public_causes() == vec!["lease-owner-mismatch"])
+        );
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) SELECT 'second',task_id,owner_token,8,state,acquired_at,heartbeat_at,expires_at FROM execution_leases WHERE task_id=?")
+            .bind(&tuple.task_id).execute(&pool).await.unwrap();
+        pool.close().await;
+        let error = diagnose(&path).await.unwrap_err();
+        assert!(
+            matches!(error, DiagnosedSelectionError::Conflicting(cause) if cause.public_causes() == vec!["lease-owner-mismatch", "lease-cardinality"])
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn diagnosis_reports_standalone_lease_cardinality_without_mutation() {
+        let path = std::env::temp_dir().join(format!("t041-cardinality-{}.db", Uuid::now_v7()));
+        let tuple = eligible_fixture(&path, "cardinality", "2099-01-01T00:00:00Z").await;
+        let pool = connect(&path).await.unwrap();
+        sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) SELECT 'second',task_id,owner_token,8,state,acquired_at,heartbeat_at,expires_at FROM execution_leases WHERE task_id=?")
+            .bind(&tuple.task_id).execute(&pool).await.unwrap();
+        pool.close().await;
+        let before = std::fs::read(&path).unwrap();
+        let error = diagnose(&path).await.unwrap_err();
+        assert!(
+            matches!(error, DiagnosedSelectionError::Conflicting(cause) if cause.public_causes() == vec!["lease-cardinality"])
+        );
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn diagnosis_reports_missing_admission_runtime_without_mutation() {
+        let path = std::env::temp_dir().join(format!("t041-missing-runtime-{}.db", Uuid::now_v7()));
+        let tuple = eligible_fixture(&path, "missing-runtime", "2099-01-01T00:00:00Z").await;
+        let pool = connect(&path).await.unwrap();
+        sqlx::query("UPDATE task_admissions SET runtime_instance=NULL WHERE task_id=?")
+            .bind(&tuple.task_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let before = std::fs::read(&path).unwrap();
+        let error = diagnose(&path).await.unwrap_err();
+        assert!(
+            matches!(error, DiagnosedSelectionError::Conflicting(cause) if cause.public_causes() == vec!["admission-runtime-missing"])
+        );
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn diagnosis_nonterminal_is_typed_and_read_only() {
+        let path = std::env::temp_dir().join(format!("t041-other-{}.db", Uuid::now_v7()));
+        let tuple = eligible_fixture(&path, "other", "2099-01-01T00:00:00Z").await;
+        let pool = connect(&path).await.unwrap();
+        sqlx::query("DELETE FROM task_events WHERE task_id=?")
+            .bind(&tuple.task_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(
+            diagnose(&path).await,
+            Err(DiagnosedSelectionError::Nonterminal)
+        );
+        assert_eq!(before, std::fs::read(&path).unwrap());
         let _ = std::fs::remove_file(path);
     }
 

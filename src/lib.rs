@@ -18,6 +18,7 @@ pub mod offline_delivery;
 pub mod offline_preacceptance;
 pub mod offline_recovery;
 pub mod readonly_tuple;
+pub mod readonly_tuple_diagnostics;
 pub mod runtime;
 pub mod selected_preacceptance;
 pub mod storage;
@@ -52,6 +53,25 @@ fn recovery_failure(command: &'static str) -> Error {
         command,
         category: "recovery",
         status: 10,
+    })
+}
+
+fn diagnosed_failure(error: readonly_tuple_diagnostics::DiagnosedSelectionError) -> Error {
+    use readonly_tuple_diagnostics::DiagnosedSelectionError::*;
+    let (category, status) = match error {
+        InvalidArguments => ("invalid-arguments", 2),
+        Empty => ("empty", 3),
+        Multiple => ("multiple", 4),
+        Malformed => ("malformed", 5),
+        Nonterminal => ("nonterminal", 7),
+        Busy => ("busy", 8),
+        Database => ("database", 9),
+        Conflicting(causes) => return Error::Diagnostic(causes),
+    };
+    Error::Cli(error::CliFailure {
+        command: "diagnose-preacceptance-conflict",
+        category,
+        status,
     })
 }
 
@@ -132,6 +152,26 @@ pub async fn run() -> Result<(), Error> {
             .map_err(|error| selection_failure("select-preacceptance", error))?;
         let _ = selected;
         println!("select-preacceptance result=selected count=1");
+        return Ok(());
+    }
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref().and_then(|v| v.to_str()) == Some("diagnose-preacceptance-conflict") {
+        let mut cli = vec![std::ffi::OsString::from("diagnose-preacceptance-conflict")];
+        cli.extend(args);
+        let database = readonly_tuple_diagnostics::parse_args(&cli).map_err(|_| {
+            Error::Cli(error::CliFailure {
+                command: "diagnose-preacceptance-conflict",
+                category: "invalid-arguments",
+                status: 2,
+            })
+        })?;
+        match readonly_tuple::diagnose(database).await {
+            Ok(_) => println!("diagnose-preacceptance-conflict result=eligible count=1"),
+            Err(readonly_tuple_diagnostics::DiagnosedSelectionError::Conflicting(causes)) => {
+                return Err(Error::Diagnostic(causes));
+            }
+            Err(error) => return Err(diagnosed_failure(error)),
+        }
         return Ok(());
     }
     let mut args = std::env::args_os().skip(1);
@@ -243,6 +283,27 @@ mod tests {
         };
         assert_eq!(failure.category, "recovery");
         assert_eq!(failure.status, 10);
+    }
+
+    #[test]
+    fn diagnostic_failures_have_frozen_redacted_statuses() {
+        use readonly_tuple_diagnostics::DiagnosedSelectionError::*;
+        let cases = [
+            (InvalidArguments, "invalid-arguments", 2),
+            (Empty, "empty", 3),
+            (Multiple, "multiple", 4),
+            (Malformed, "malformed", 5),
+            (Nonterminal, "nonterminal", 7),
+            (Busy, "busy", 8),
+            (Database, "database", 9),
+        ];
+        for (error, category, status) in cases {
+            let Error::Cli(failure) = diagnosed_failure(error) else {
+                panic!("expected bounded diagnostic failure")
+            };
+            assert_eq!(failure.category, category);
+            assert_eq!(failure.status, status);
+        }
     }
 
     #[test]
