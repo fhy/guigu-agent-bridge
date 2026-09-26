@@ -8,7 +8,9 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
 
 #[cfg(test)]
-static T037_CALLS: AtomicUsize = AtomicUsize::new(0);
+type Observer = AtomicUsize;
+#[cfg(not(test))]
+type Observer = ();
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SelectedRecoveryError {
@@ -36,14 +38,24 @@ pub fn parse_args(args: &[std::ffi::OsString]) -> Result<PathBuf, SelectedRecove
 }
 
 pub async fn recover(database: impl AsRef<Path>) -> Result<usize, SelectedRecoveryError> {
-    recover_inner(database, false).await
+    recover_inner(database, false, None).await
 }
 
 #[cfg(test)]
 pub async fn recover_with_ack_drift(
     database: impl AsRef<Path>,
 ) -> Result<usize, SelectedRecoveryError> {
-    recover_inner(database, true).await
+    #[cfg(not(test))]
+    let _ = calls;
+    recover_inner(database, true, None).await
+}
+
+#[cfg(test)]
+async fn recover_observed(
+    database: impl AsRef<Path>,
+    calls: &AtomicUsize,
+) -> Result<usize, SelectedRecoveryError> {
+    recover_inner(database, false, Some(calls)).await
 }
 
 #[cfg(test)]
@@ -70,13 +82,14 @@ pub async fn recover_with_ack_drift_snapshot(
         task_id: selected.task_id,
         attempt: selected.attempt,
     };
-    let result = call_t037(database, tuple).await;
+    let result = call_t037(database, tuple, None).await;
     (result, baseline)
 }
 
 async fn recover_inner(
     database: impl AsRef<Path>,
     inject_ack_drift: bool,
+    calls: Option<&Observer>,
 ) -> Result<usize, SelectedRecoveryError> {
     #[cfg(not(test))]
     let _ = inject_ack_drift;
@@ -112,15 +125,20 @@ async fn recover_inner(
             .await
             .map_err(|_| SelectedRecoveryError::Recovery)?;
     }
-    call_t037(database, tuple).await
+    call_t037(database, tuple, calls).await
 }
 
 async fn call_t037(
     database: impl AsRef<Path>,
     tuple: offline_preacceptance::PreAcceptanceTuple,
+    calls: Option<&Observer>,
 ) -> Result<usize, SelectedRecoveryError> {
+    #[cfg(not(test))]
+    let _ = calls;
     #[cfg(test)]
-    T037_CALLS.fetch_add(1, Ordering::SeqCst);
+    if let Some(calls) = calls {
+        calls.fetch_add(1, Ordering::SeqCst);
+    }
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
     match offline_preacceptance::recover(database, &[tuple], &now).await {
         Ok(offline_preacceptance::PreAcceptanceOutcome::Recovered { count }) => Ok(count),
@@ -194,13 +212,16 @@ mod tests {
     async fn eligible_combined_path_closes_once_then_empty() {
         let path = std::env::temp_dir().join(format!("t039-success-{}.db", Uuid::now_v7()));
         let _ = eligible_db(&path).await;
-        T037_CALLS.store(0, Ordering::SeqCst);
-        assert_eq!(recover(&path).await, Ok(1));
-        let calls_after_success = T037_CALLS.load(Ordering::SeqCst);
+        let calls = AtomicUsize::new(0);
+        assert_eq!(recover_observed(&path, &calls).await, Ok(1));
+        let calls_after_success = calls.load(Ordering::SeqCst);
         let snapshot = std::fs::read(&path).unwrap();
-        assert_eq!(recover(&path).await, Err(SelectedRecoveryError::Empty));
+        assert_eq!(
+            recover_observed(&path, &calls).await,
+            Err(SelectedRecoveryError::Empty)
+        );
         assert_eq!(snapshot, std::fs::read(&path).unwrap());
-        assert_eq!(T037_CALLS.load(Ordering::SeqCst), calls_after_success);
+        assert_eq!(calls.load(Ordering::SeqCst), calls_after_success);
         let _ = std::fs::remove_file(path);
     }
 
