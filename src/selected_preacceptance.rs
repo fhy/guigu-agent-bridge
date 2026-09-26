@@ -56,6 +56,38 @@ mod tests {
     use super::*;
     use crate::storage::{connect, migrate};
     use uuid::Uuid;
+
+    /*
+    async fn eligible_db(path: &std::path::Path) -> (String, String) {
+        let pool = connect(path).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let e = Uuid::now_v7().to_string();
+        let c = Uuid::now_v7().to_string();
+        let t = Uuid::now_v7().to_string();
+        let d = Uuid::now_v7().to_string();
+        let r = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES(?,?, 'acp',1,'[]')").bind(&e).bind(Uuid::now_v7().to_string()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO conversations(conversation_id,participants_json) VALUES(?,'[]')")
+            .bind(&c)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES(?,?,?,?,?,'x',1,0,0,0)").bind(&t).bind(&t).bind(&e).bind(&e).bind(&c).execute(&pool).await.unwrap();
+        let p = serde_json::to_string(&crate::models::TaskEventPayload::Dispatched {
+            delivery_id: d.parse().unwrap(),
+            attempt: 1,
+        })
+        .unwrap();
+        sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,1,'dispatched','t',?)").bind(Uuid::now_v7().to_string()).bind(&t).bind(p).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES(?,'t','t','active','fp')").bind(&r).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,created_at,updated_at) VALUES(?,'dispatching',0,?,'t','t')").bind(&t).bind(&r).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES(?,?,1,?,'t')").bind(&d).bind(&t).bind(&e).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state,reason_code) VALUES(?,?,1,'prepared','x')").bind(&d).bind(&t).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES(?,?,?,1,'recovery_needed','t','t','2000')").bind(format!("res-{t}")).bind(&t).bind(&r).execute(&pool).await.unwrap();
+        pool.close().await;
+        (d, t)
+    }
+    */
     #[test]
     fn parser_rejects_shape_without_echoing_values() {
         let args = vec!["recover-selected-preacceptance".into(), "--database".into()];
