@@ -1,5 +1,7 @@
 //! In-process, redacted composition of T038 selection and T037 recovery.
 use crate::{offline_preacceptance, readonly_tuple};
+#[cfg(test)]
+use sqlx::Connection;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
@@ -29,6 +31,57 @@ pub fn parse_args(args: &[std::ffi::OsString]) -> Result<PathBuf, SelectedRecove
 }
 
 pub async fn recover(database: impl AsRef<Path>) -> Result<usize, SelectedRecoveryError> {
+    recover_inner(database, false).await
+}
+
+#[cfg(test)]
+pub async fn recover_with_ack_drift(
+    database: impl AsRef<Path>,
+) -> Result<usize, SelectedRecoveryError> {
+    recover_inner(database, true).await
+}
+
+#[cfg(test)]
+pub async fn recover_with_ack_drift_snapshot(
+    database: impl AsRef<Path>,
+) -> (Result<usize, SelectedRecoveryError>, Vec<u8>) {
+    let selected = match readonly_tuple::select(database.as_ref()).await {
+        Ok(value) => value,
+        Err(error) => return (Err(SelectedRecoveryError::Selection), Vec::new()),
+    };
+    let opts = sqlx::sqlite::SqliteConnectOptions::new()
+        .filename(database.as_ref())
+        .foreign_keys(true);
+    let mut connection = sqlx::SqliteConnection::connect_with(&opts).await.unwrap();
+    sqlx::query("UPDATE deliveries SET acknowledged_at='2026-01-02T00:00:00Z' WHERE delivery_id=?")
+        .bind(&selected.delivery_id)
+        .execute(&mut connection)
+        .await
+        .unwrap();
+    connection.close().await.unwrap();
+    let baseline = std::fs::read(database.as_ref()).unwrap();
+    let tuple = offline_preacceptance::PreAcceptanceTuple {
+        delivery_id: selected.delivery_id,
+        task_id: selected.task_id,
+        attempt: selected.attempt,
+    };
+    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let result = offline_preacceptance::recover(database, &[tuple], &now)
+        .await
+        .map(|outcome| match outcome {
+            offline_preacceptance::PreAcceptanceOutcome::Recovered { count } => count,
+            offline_preacceptance::PreAcceptanceOutcome::AlreadyReconciled => 0,
+        })
+        .map_err(|_| SelectedRecoveryError::Recovery);
+    (result, baseline)
+}
+
+async fn recover_inner(
+    database: impl AsRef<Path>,
+    inject_ack_drift: bool,
+) -> Result<usize, SelectedRecoveryError> {
+    #[cfg(not(test))]
+    let _ = inject_ack_drift;
     let selected =
         readonly_tuple::select(database.as_ref())
             .await
@@ -41,6 +94,26 @@ pub async fn recover(database: impl AsRef<Path>) -> Result<usize, SelectedRecove
         task_id: selected.task_id,
         attempt: selected.attempt,
     };
+    #[cfg(test)]
+    if inject_ack_drift {
+        let opts = sqlx::sqlite::SqliteConnectOptions::new()
+            .filename(database.as_ref())
+            .foreign_keys(true);
+        let mut connection = sqlx::SqliteConnection::connect_with(&opts)
+            .await
+            .map_err(|_| SelectedRecoveryError::Recovery)?;
+        sqlx::query(
+            "UPDATE deliveries SET acknowledged_at='2026-01-02T00:00:00Z' WHERE delivery_id=?",
+        )
+        .bind(&tuple.delivery_id)
+        .execute(&mut connection)
+        .await
+        .map_err(|_| SelectedRecoveryError::Recovery)?;
+        connection
+            .close()
+            .await
+            .map_err(|_| SelectedRecoveryError::Recovery)?;
+    }
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
     match offline_preacceptance::recover(database, &[tuple], &now).await {
         Ok(offline_preacceptance::PreAcceptanceOutcome::Recovered { count }) => Ok(count),
@@ -114,21 +187,7 @@ mod tests {
     async fn eligible_combined_path_closes_once_then_empty() {
         let path = std::env::temp_dir().join(format!("t039-success-{}.db", Uuid::now_v7()));
         let _ = eligible_db(&path).await;
-        let selected = crate::readonly_tuple::select(&path).await.unwrap();
-        let direct = crate::offline_preacceptance::recover(
-            &path,
-            &[crate::offline_preacceptance::PreAcceptanceTuple {
-                delivery_id: selected.delivery_id,
-                task_id: selected.task_id,
-                attempt: selected.attempt,
-            }],
-            "2026-01-01T00:00:00Z",
-        )
-        .await;
-        assert_eq!(
-            direct,
-            Ok(crate::offline_preacceptance::PreAcceptanceOutcome::Recovered { count: 1 })
-        );
+        assert_eq!(recover(&path).await, Ok(1));
         assert_eq!(recover(&path).await, Err(SelectedRecoveryError::Empty));
         let _ = std::fs::remove_file(path);
     }
@@ -137,28 +196,8 @@ mod tests {
     async fn selection_to_use_ack_drift_is_fenced_and_snapshot_unchanged() {
         let path = std::env::temp_dir().join(format!("t039-drift-{}.db", Uuid::now_v7()));
         let _ = eligible_db(&path).await;
-        let selected = crate::readonly_tuple::select(&path).await.unwrap();
-        let pool = connect(&path).await.unwrap();
-        sqlx::query(
-            "UPDATE deliveries SET acknowledged_at='2026-01-02T00:00:00Z' WHERE delivery_id=?",
-        )
-        .bind(&selected.delivery_id)
-        .execute(&pool)
-        .await
-        .unwrap();
-        pool.close().await;
-        let before = std::fs::read(&path).unwrap();
-        let result = crate::offline_preacceptance::recover(
-            &path,
-            &[crate::offline_preacceptance::PreAcceptanceTuple {
-                delivery_id: selected.delivery_id,
-                task_id: selected.task_id,
-                attempt: selected.attempt,
-            }],
-            "2026-01-03T00:00:00Z",
-        )
-        .await;
-        assert!(result.is_err());
+        let (result, before) = recover_with_ack_drift_snapshot(&path).await;
+        assert_eq!(result, Err(SelectedRecoveryError::Recovery));
         assert_eq!(before, std::fs::read(&path).unwrap());
         let _ = std::fs::remove_file(path);
     }
