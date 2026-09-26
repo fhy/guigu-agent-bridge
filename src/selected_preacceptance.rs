@@ -54,6 +54,8 @@ pub async fn recover(database: impl AsRef<Path>) -> Result<usize, SelectedRecove
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::storage::{connect, migrate};
+    use uuid::Uuid;
     #[test]
     fn parser_rejects_shape_without_echoing_values() {
         let args = vec!["recover-selected-preacceptance".into(), "--database".into()];
@@ -61,5 +63,20 @@ mod tests {
             parse_args(&args),
             Err(SelectedRecoveryError::InvalidArguments)
         );
+    }
+
+    #[tokio::test]
+    async fn empty_database_is_stable_and_never_retries_t037() {
+        let path = std::env::temp_dir().join(format!("t039-empty-{}.db", Uuid::now_v7()));
+        let pool = connect(&path).await.unwrap();
+        migrate(&pool).await.unwrap();
+        pool.close().await;
+        let before = std::fs::read(&path).unwrap();
+        assert_eq!(recover(&path).await, Err(SelectedRecoveryError::Empty));
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before, after);
+        assert_eq!(recover(&path).await, Err(SelectedRecoveryError::Empty));
+        assert_eq!(before, std::fs::read(&path).unwrap());
+        let _ = std::fs::remove_file(path);
     }
 }

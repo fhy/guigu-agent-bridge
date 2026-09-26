@@ -37,6 +37,27 @@ fn select_preacceptance_cli_has_fixed_success_and_rejection_shapes() {
     assert!(!invalid_text.contains("--database"));
 }
 
+#[test]
+fn combined_cli_rejection_is_fixed_and_redacted() {
+    let output = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        .args([
+            "recover-selected-preacceptance",
+            "--database",
+            "/missing/t039.db",
+        ])
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    let text = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!text.contains("/missing/t039.db"));
+    assert!(!text.contains("SELECT"));
+    assert!(!text.contains("delivery"));
+}
+
 #[tokio::test]
 async fn select_preacceptance_cli_success_is_fixed_and_redacted() {
     let path = std::env::temp_dir().join(format!("t038-cli-success-{}.db", Uuid::now_v7()));
