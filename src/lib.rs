@@ -29,6 +29,32 @@ use tracing::info;
 
 pub use error::Error;
 
+fn selection_failure(command: &'static str, error: readonly_tuple::SelectionError) -> Error {
+    let (category, status) = match error {
+        readonly_tuple::SelectionError::InvalidArguments => ("invalid-arguments", 2),
+        readonly_tuple::SelectionError::Empty => ("empty", 3),
+        readonly_tuple::SelectionError::Multiple => ("multiple", 4),
+        readonly_tuple::SelectionError::Malformed => ("malformed", 5),
+        readonly_tuple::SelectionError::Conflicting => ("conflicting", 6),
+        readonly_tuple::SelectionError::Nonterminal => ("nonterminal", 7),
+        readonly_tuple::SelectionError::Busy => ("busy", 8),
+        readonly_tuple::SelectionError::Database => ("database", 9),
+    };
+    Error::Cli(error::CliFailure {
+        command,
+        category,
+        status,
+    })
+}
+
+fn recovery_failure(command: &'static str) -> Error {
+    Error::Cli(error::CliFailure {
+        command,
+        category: "recovery",
+        status: 10,
+    })
+}
+
 /// Initialize the global tracing subscriber for structured logging.
 ///
 /// Uses `try_init` so repeated calls (e.g. when `run` is invoked more than once,
@@ -100,10 +126,10 @@ pub async fn run() -> Result<(), Error> {
         let mut cli = vec![std::ffi::OsString::from("select-preacceptance")];
         cli.extend(args);
         let database = readonly_tuple::parse_args(&cli)
-            .map_err(|_| app::AppError::Assembly("invalid select-preacceptance arguments"))?;
+            .map_err(|error| selection_failure("select-preacceptance", error))?;
         let selected = readonly_tuple::select(database)
             .await
-            .map_err(|_| app::AppError::Runtime)?;
+            .map_err(|error| selection_failure("select-preacceptance", error))?;
         let _ = selected;
         println!("select-preacceptance result=selected count=1");
         return Ok(());
@@ -113,11 +139,32 @@ pub async fn run() -> Result<(), Error> {
         let mut cli = vec![std::ffi::OsString::from("recover-selected-preacceptance")];
         cli.extend(args);
         let database = selected_preacceptance::parse_args(&cli).map_err(|_| {
-            app::AppError::Assembly("invalid recover-selected-preacceptance arguments")
+            selection_failure(
+                "recover-selected-preacceptance",
+                readonly_tuple::SelectionError::InvalidArguments,
+            )
         })?;
-        let count = selected_preacceptance::recover(database)
-            .await
-            .map_err(|_| app::AppError::Runtime)?;
+        let count =
+            selected_preacceptance::recover(database)
+                .await
+                .map_err(|error| match error {
+                    selected_preacceptance::SelectedRecoveryError::Selection(selection) => {
+                        selection_failure("recover-selected-preacceptance", selection)
+                    }
+                    selected_preacceptance::SelectedRecoveryError::InvalidArguments => {
+                        selection_failure(
+                            "recover-selected-preacceptance",
+                            readonly_tuple::SelectionError::InvalidArguments,
+                        )
+                    }
+                    selected_preacceptance::SelectedRecoveryError::Empty => selection_failure(
+                        "recover-selected-preacceptance",
+                        readonly_tuple::SelectionError::Empty,
+                    ),
+                    selected_preacceptance::SelectedRecoveryError::Recovery => {
+                        recovery_failure("recover-selected-preacceptance")
+                    }
+                })?;
         println!("recover-selected-preacceptance result=recovered count={count}");
         return Ok(());
     }
@@ -169,6 +216,34 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn selector_failures_have_frozen_redacted_statuses() {
+        use readonly_tuple::SelectionError::*;
+        let cases = [
+            (InvalidArguments, "invalid-arguments", 2),
+            (Empty, "empty", 3),
+            (Multiple, "multiple", 4),
+            (Malformed, "malformed", 5),
+            (Conflicting, "conflicting", 6),
+            (Nonterminal, "nonterminal", 7),
+            (Busy, "busy", 8),
+            (Database, "database", 9),
+        ];
+        for (error, category, status) in cases {
+            let Error::Cli(failure) = selection_failure("select-preacceptance", error) else {
+                panic!("expected bounded CLI failure");
+            };
+            assert_eq!(failure.command, "select-preacceptance");
+            assert_eq!(failure.category, category);
+            assert_eq!(failure.status, status);
+        }
+        let Error::Cli(failure) = recovery_failure("recover-selected-preacceptance") else {
+            panic!("expected bounded CLI failure");
+        };
+        assert_eq!(failure.category, "recovery");
+        assert_eq!(failure.status, 10);
+    }
 
     #[test]
     fn init_tracing_is_idempotent() {

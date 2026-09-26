@@ -10,6 +10,9 @@ use crate::config::ConfigError;
 /// `#[from]` / `#[source]` without restructuring existing code.
 #[derive(Debug, Error)]
 pub enum Error {
+    /// A bounded command-line result rendered by the binary entry point.
+    #[error("cli failure")]
+    Cli(CliFailure),
     /// The shutdown signal (Ctrl-C) could not be awaited.
     #[error("failed to await shutdown signal: {0}")]
     Shutdown(#[source] std::io::Error),
@@ -25,6 +28,13 @@ pub enum Error {
     /// Production assembly, adapter, health, or lifecycle failure.
     #[error("application error: {0}")]
     Application(#[from] crate::app::AppError),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CliFailure {
+    pub command: &'static str,
+    pub category: &'static str,
+    pub status: u8,
 }
 
 #[cfg(test)]

@@ -19,7 +19,7 @@ pub enum SelectedRecoveryError {
     #[error("selected pre-acceptance rejected: empty")]
     Empty,
     #[error("selected pre-acceptance rejected: selection")]
-    Selection,
+    Selection(readonly_tuple::SelectionError),
     #[error("selected pre-acceptance rejected: recovery")]
     Recovery,
 }
@@ -64,7 +64,7 @@ pub async fn recover_with_ack_drift_snapshot(
 ) -> (Result<usize, SelectedRecoveryError>, Vec<u8>) {
     let selected = match readonly_tuple::select(database.as_ref()).await {
         Ok(value) => value,
-        Err(_error) => return (Err(SelectedRecoveryError::Selection), Vec::new()),
+        Err(error) => return (Err(SelectedRecoveryError::Selection(error)), Vec::new()),
     };
     let opts = sqlx::sqlite::SqliteConnectOptions::new()
         .filename(database.as_ref())
@@ -93,13 +93,15 @@ async fn recover_inner(
 ) -> Result<usize, SelectedRecoveryError> {
     #[cfg(not(test))]
     let _ = inject_ack_drift;
-    let selected =
-        readonly_tuple::select(database.as_ref())
-            .await
-            .map_err(|error| match error {
-                readonly_tuple::SelectionError::Empty => SelectedRecoveryError::Empty,
-                _ => SelectedRecoveryError::Selection,
-            })?;
+    let selected = readonly_tuple::select(database.as_ref())
+        .await
+        .map_err(|error| {
+            if error == readonly_tuple::SelectionError::Empty {
+                SelectedRecoveryError::Empty
+            } else {
+                SelectedRecoveryError::Selection(error)
+            }
+        })?;
     let tuple = offline_preacceptance::PreAcceptanceTuple {
         delivery_id: selected.delivery_id,
         task_id: selected.task_id,

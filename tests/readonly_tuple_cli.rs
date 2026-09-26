@@ -14,7 +14,9 @@ fn select_preacceptance_cli_has_fixed_success_and_rejection_shapes() {
         ])
         .output()
         .unwrap();
-    assert!(!rejected.status.success());
+    assert_eq!(rejected.status.code(), Some(9));
+    assert_eq!(rejected.stdout, b"select-preacceptance result=database\n");
+    assert!(rejected.stderr.is_empty());
     let combined = format!(
         "{}{}",
         String::from_utf8_lossy(&rejected.stdout),
@@ -28,7 +30,12 @@ fn select_preacceptance_cli_has_fixed_success_and_rejection_shapes() {
         .args(["select-preacceptance", "--database"])
         .output()
         .unwrap();
-    assert!(!invalid.status.success());
+    assert_eq!(invalid.status.code(), Some(2));
+    assert_eq!(
+        invalid.stdout,
+        b"select-preacceptance result=invalid-arguments\n"
+    );
+    assert!(invalid.stderr.is_empty());
     let invalid_text = format!(
         "{}{}",
         String::from_utf8_lossy(&invalid.stdout),
@@ -47,7 +54,12 @@ fn combined_cli_rejection_is_fixed_and_redacted() {
         ])
         .output()
         .unwrap();
-    assert!(!output.status.success());
+    assert_eq!(output.status.code(), Some(9));
+    assert_eq!(
+        output.stdout,
+        b"recover-selected-preacceptance result=database\n"
+    );
+    assert!(output.stderr.is_empty());
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -56,6 +68,17 @@ fn combined_cli_rejection_is_fixed_and_redacted() {
     assert!(!text.contains("/missing/t039.db"));
     assert!(!text.contains("SELECT"));
     assert!(!text.contains("delivery"));
+
+    let invalid = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        .args(["recover-selected-preacceptance", "--database"])
+        .output()
+        .unwrap();
+    assert_eq!(invalid.status.code(), Some(2));
+    assert_eq!(
+        invalid.stdout,
+        b"recover-selected-preacceptance result=invalid-arguments\n"
+    );
+    assert!(invalid.stderr.is_empty());
 }
 
 #[tokio::test]
