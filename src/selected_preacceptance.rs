@@ -3,7 +3,12 @@ use crate::{offline_preacceptance, readonly_tuple};
 #[cfg(test)]
 use sqlx::Connection;
 use std::path::{Path, PathBuf};
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
 use thiserror::Error;
+
+#[cfg(test)]
+static T037_CALLS: AtomicUsize = AtomicUsize::new(0);
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum SelectedRecoveryError {
@@ -114,6 +119,8 @@ async fn call_t037(
     database: impl AsRef<Path>,
     tuple: offline_preacceptance::PreAcceptanceTuple,
 ) -> Result<usize, SelectedRecoveryError> {
+    #[cfg(test)]
+    T037_CALLS.fetch_add(1, Ordering::SeqCst);
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
     match offline_preacceptance::recover(database, &[tuple], &now).await {
         Ok(offline_preacceptance::PreAcceptanceOutcome::Recovered { count }) => Ok(count),
@@ -187,8 +194,13 @@ mod tests {
     async fn eligible_combined_path_closes_once_then_empty() {
         let path = std::env::temp_dir().join(format!("t039-success-{}.db", Uuid::now_v7()));
         let _ = eligible_db(&path).await;
+        T037_CALLS.store(0, Ordering::SeqCst);
         assert_eq!(recover(&path).await, Ok(1));
+        let calls_after_success = T037_CALLS.load(Ordering::SeqCst);
+        let snapshot = std::fs::read(&path).unwrap();
         assert_eq!(recover(&path).await, Err(SelectedRecoveryError::Empty));
+        assert_eq!(snapshot, std::fs::read(&path).unwrap());
+        assert_eq!(T037_CALLS.load(Ordering::SeqCst), calls_after_success);
         let _ = std::fs::remove_file(path);
     }
 
