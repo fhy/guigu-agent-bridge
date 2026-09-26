@@ -65,14 +65,7 @@ pub async fn recover_with_ack_drift_snapshot(
         task_id: selected.task_id,
         attempt: selected.attempt,
     };
-    let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-    let result = offline_preacceptance::recover(database, &[tuple], &now)
-        .await
-        .map(|outcome| match outcome {
-            offline_preacceptance::PreAcceptanceOutcome::Recovered { count } => count,
-            offline_preacceptance::PreAcceptanceOutcome::AlreadyReconciled => 0,
-        })
-        .map_err(|_| SelectedRecoveryError::Recovery);
+    let result = call_t037(database, tuple).await;
     (result, baseline)
 }
 
@@ -114,6 +107,13 @@ async fn recover_inner(
             .await
             .map_err(|_| SelectedRecoveryError::Recovery)?;
     }
+    call_t037(database, tuple).await
+}
+
+async fn call_t037(
+    database: impl AsRef<Path>,
+    tuple: offline_preacceptance::PreAcceptanceTuple,
+) -> Result<usize, SelectedRecoveryError> {
     let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
     match offline_preacceptance::recover(database, &[tuple], &now).await {
         Ok(offline_preacceptance::PreAcceptanceOutcome::Recovered { count }) => Ok(count),
