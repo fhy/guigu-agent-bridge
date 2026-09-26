@@ -9,7 +9,7 @@
 ## 快速开始
 
 ```bash
-cargo install guigu-agent-bridge --version 0.2.5
+cargo install guigu-agent-bridge --version 0.2.6
 install -m 600 config.example.toml "$HOME/.config/guigu-agent-bridge.toml"
 export MATRIX_USER_ID='@bridge:example.org'
 export MATRIX_ACCESS_TOKEN='replace-with-secret-manager-value'
@@ -24,6 +24,7 @@ guigu-agent-bridge "$HOME/.config/guigu-agent-bridge.toml"
 ## 文档
 
 - [0.2.5 发布说明](docs/RELEASE-0.2.5.md)
+- [0.2.6 发布说明](docs/RELEASE-0.2.6.md)
 - [产品与边界](docs/PRODUCT.md)
 - [用户指南](docs/USER_GUIDE.md)
 - [配置参考](docs/CONFIGURATION.md)
