@@ -10,6 +10,8 @@ use crate::config::ConfigError;
 /// `#[from]` / `#[source]` without restructuring existing code.
 #[derive(Debug, Error)]
 pub enum Error {
+    #[error("diagnostic conflict")]
+    Diagnostic(crate::readonly_tuple_diagnostics::ConflictSet),
     /// A bounded command-line result rendered by the binary entry point.
     #[error("cli failure")]
     Cli(CliFailure),
