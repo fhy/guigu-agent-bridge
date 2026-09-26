@@ -47,7 +47,7 @@ pub async fn recover_with_ack_drift_snapshot(
 ) -> (Result<usize, SelectedRecoveryError>, Vec<u8>) {
     let selected = match readonly_tuple::select(database.as_ref()).await {
         Ok(value) => value,
-        Err(error) => return (Err(SelectedRecoveryError::Selection), Vec::new()),
+        Err(_error) => return (Err(SelectedRecoveryError::Selection), Vec::new()),
     };
     let opts = sqlx::sqlite::SqliteConnectOptions::new()
         .filename(database.as_ref())
