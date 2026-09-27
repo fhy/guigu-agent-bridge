@@ -1,5 +1,9 @@
 # Local Rust Build Cache
 
+This project-specific guide instantiates the reusable
+[Rust build template](language-specific/RUST_BUILD_CACHE.md). Other languages
+must use their own language-specific build guidance.
+
 This guide configures disposable developer build outputs only. It does not change
 Rust/MSRV requirements, CI, release gates, runtime services, or published artifacts.
 

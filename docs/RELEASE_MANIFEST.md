@@ -23,6 +23,9 @@ annotated_tag: v0.2.7 (a42748dab81f24b1ded2a71ef38a862257659b32)
 crate_or_package_checksum: f1d871e83ec8e5db0f3e64ec339f8396cfee45e6439c6d6f512911e0b00759cc
 binary_sha256: 701101c71fa0f434fddc996154e8e62a25d5c141fb5b1723cf30b71831320377
 rollback_version: v0.2.6 (454917775de5d19a9297af030f3f5ecb6f75c727)
+build_language: Rust
+build_template: docs/language-specific/RUST_BUILD_CACHE.md
+build_profile: balanced
 ```
 
 The candidate must preserve the complete history of `base_version_or_tag`.
