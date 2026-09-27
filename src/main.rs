@@ -3,10 +3,12 @@ async fn main() -> std::process::ExitCode {
     match guigu_agent_bridge::run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(guigu_agent_bridge::Error::Cli(failure)) => {
-            if failure.command == "reconcile-lease-owner" {
+            if failure.command == "reconcile-lease-owner"
+                || failure.command == "reconcile-orphaned-preacceptance"
+            {
                 println!(
-                    "reconcile-lease-owner result={} status={}",
-                    failure.category, failure.status
+                    "{} result={} status={}",
+                    failure.command, failure.category, failure.status
                 );
                 return std::process::ExitCode::from(failure.status);
             }

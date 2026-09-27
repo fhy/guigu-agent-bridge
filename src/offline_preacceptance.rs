@@ -35,7 +35,7 @@ pub enum PreAcceptanceOutcome {
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct PlannerSets {
+pub(crate) struct PlannerSets {
     unfinished: BTreeSet<String>,
     unacknowledged: BTreeSet<String>,
     awaiting_outcome: BTreeSet<String>,
@@ -73,7 +73,7 @@ impl PlannerSets {
         Ok(())
     }
 
-    fn matches_plan(&self, plan: &crate::storage::RecoveryPlan) -> bool {
+    pub(crate) fn matches_plan(&self, plan: &crate::storage::RecoveryPlan) -> bool {
         let unfinished: BTreeSet<_> = plan.unfinished.iter().map(ToString::to_string).collect();
         let encode = |items: &[crate::storage::Delivery]| -> BTreeSet<String> {
             items
@@ -221,7 +221,7 @@ pub async fn recover(
     }
 }
 
-async fn recover_tx(
+pub(crate) async fn recover_tx(
     c: &mut SqliteConnection,
     tuples: &[PreAcceptanceTuple],
     now: &str,
