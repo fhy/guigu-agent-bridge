@@ -36,6 +36,15 @@ Suggested local budgets:
 | Each project target | 20 GiB | Review size before removing only that project's target directory |
 | sccache | 10 GiB | sccache's own bounded LRU eviction; inspect stats before changing it |
 
+Set the sccache budget in the shell environment used by Agents and terminals:
+
+```bash
+export SCCACHE_CACHE_SIZE=10G
+```
+
+The Cargo configuration selects the wrapper but cannot enforce this budget. Persist
+the variable in the user's shell profile, never in a committed project file.
+
 Check usage without changing data:
 
 ```bash
@@ -43,6 +52,7 @@ du -sh "$HOME/.cache/cargo-target/guigu-agent-bridge" \
   "$HOME/.cache/cargo-target/guigu" "$HOME/.cache/sccache" 2>/dev/null
 sccache --show-stats
 df -h "$HOME"
+./scripts/check-rust-build-cache.sh
 ```
 
 ## Safe cleanup
@@ -64,6 +74,17 @@ use its own bounded cache control (`sccache --show-stats` and, when necessary,
 delete Cargo registry/git downloads, databases, WAL/SHM files, crypto stores,
 credentials, logs, sessions, or another worktree's files. Do not run `cargo clean`
 against active projects.
+
+Matrix integration tests create disposable directories below
+`~/.guigu-agent-bridge-tests`. Reclaim only old fixture directories with:
+
+```bash
+GUI_TEST_TTL_DAYS=7 ./scripts/cleanup-test-artifacts.sh
+```
+
+Before any Agent build, run `./scripts/check-rust-build-cache.sh` and record the
+reported target directory. A command supplying `--target-dir` must use an approved
+cache root and be reported in the handoff.
 
 ## Rollback
 
