@@ -18,6 +18,7 @@ pub mod observer;
 pub mod offline_delivery;
 pub mod offline_preacceptance;
 pub mod offline_recovery;
+pub mod orphaned_preacceptance;
 pub mod readonly_tuple;
 pub mod readonly_tuple_diagnostics;
 pub mod runtime;
@@ -90,6 +91,35 @@ pub fn init_tracing() {
 /// Production entry point: initialize tracing, then run until an interrupt or
 /// termination signal.
 pub async fn run() -> Result<(), Error> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref().and_then(|v| v.to_str()) == Some("reconcile-orphaned-preacceptance") {
+        let mut cli = vec![std::ffi::OsString::from("reconcile-orphaned-preacceptance")];
+        cli.extend(args);
+        let database = orphaned_preacceptance::parse_args(&cli).map_err(|e| {
+            Error::Cli(error::CliFailure {
+                command: "reconcile-orphaned-preacceptance",
+                category: e.slug(),
+                status: e.status(),
+            })
+        })?;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        match orphaned_preacceptance::reconcile(database, &now).await {
+            Ok(orphaned_preacceptance::Outcome::Reconciled) => {
+                println!("reconcile-orphaned-preacceptance result=reconciled status=0")
+            }
+            Ok(orphaned_preacceptance::Outcome::AlreadyReconciled) => {
+                println!("reconcile-orphaned-preacceptance result=already-reconciled status=0")
+            }
+            Err(e) => {
+                return Err(Error::Cli(error::CliFailure {
+                    command: "reconcile-orphaned-preacceptance",
+                    category: e.slug(),
+                    status: e.status(),
+                }));
+            }
+        }
+        return Ok(());
+    }
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref().and_then(|v| v.to_str()) == Some("recover-runtime") {
         let mut cli = vec![std::ffi::OsString::from("recover-runtime")];
