@@ -694,17 +694,17 @@ mod tests {
             (
                 "event-status",
                 "UPDATE task_events SET status='completed'",
-                Category::Fenced,
+                Category::Malformed,
             ),
             (
                 "event-payload",
                 "UPDATE task_events SET payload='{}'",
-                Category::Fenced,
+                Category::Malformed,
             ),
             (
                 "event-binding",
                 "UPDATE deliveries SET attempt=2",
-                Category::Fenced,
+                Category::Malformed,
             ),
             (
                 "disposition",
@@ -714,6 +714,21 @@ mod tests {
             (
                 "session",
                 "UPDATE delivery_dispositions SET session_id='session'",
+                Category::Fenced,
+            ),
+            (
+                "child-fingerprint",
+                "UPDATE delivery_dispositions SET child_fingerprint='child'",
+                Category::Fenced,
+            ),
+            (
+                "reap-status",
+                "UPDATE delivery_dispositions SET reap_status='reaped'",
+                Category::Fenced,
+            ),
+            (
+                "disposition-missing",
+                "DELETE FROM delivery_dispositions",
                 Category::Fenced,
             ),
             ("queue", "DELETE FROM task_events", Category::Empty),
@@ -728,7 +743,7 @@ mod tests {
                 std::env::temp_dir().join(format!("t042-reject-{name}-{}.db", Uuid::now_v7()));
             let _tuple = eligible_fixture(&path, name, "2099-01-01T00:00:00Z").await;
             let pool = connect(&path).await.unwrap();
-            let _ = sqlx::query(mutation).execute(&pool).await;
+            sqlx::query(mutation).execute(&pool).await.unwrap();
             pool.close().await;
             let before = std::fs::read(&path).unwrap();
             assert_eq!(

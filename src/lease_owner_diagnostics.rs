@@ -154,14 +154,16 @@ async fn diagnose_read(c: &mut SqliteConnection) -> Category {
         let Some((status, payload)) = latest else {
             continue;
         };
-        if status != "dispatched"
-            || !matches!(
-                serde_json::from_str::<TaskEventPayload>(&payload),
-                Ok(TaskEventPayload::Dispatched { delivery_id: event_delivery, attempt: event_attempt }) if event_delivery.to_string() == delivery_id && i64::from(event_attempt) == attempt
-            )
-        {
-            fenced = true;
-            continue;
+        if status != "dispatched" {
+            return Category::Malformed;
+        }
+        match serde_json::from_str::<TaskEventPayload>(&payload) {
+            Ok(TaskEventPayload::Dispatched {
+                delivery_id: event_delivery,
+                attempt: event_attempt,
+            }) if event_delivery.to_string() == delivery_id
+                && i64::from(event_attempt) == attempt => {}
+            _ => return Category::Malformed,
         }
         let disposition: Option<String> =
             match sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=? AND task_id=? AND attempt=?")
