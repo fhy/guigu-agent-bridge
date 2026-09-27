@@ -96,14 +96,14 @@ async fn diagnose_read(c: &mut SqliteConnection) -> Category {
     let mut active = false;
     let mut fenced = false;
     for row in rows {
-        let delivery_id: String = row
-            .try_get("delivery_id")
-            .map_err(|_| Category::Malformed)
-            .unwrap_or_default();
-        let attempt: i64 = row
-            .try_get("attempt")
-            .map_err(|_| Category::Malformed)
-            .unwrap_or_default();
+        let delivery_id: String = match row.try_get("delivery_id") {
+            Ok(value) => value,
+            Err(_) => return Category::Malformed,
+        };
+        let attempt: i64 = match row.try_get("attempt") {
+            Ok(value) => value,
+            Err(_) => return Category::Malformed,
+        };
         let task: String = match row.try_get("task_id") {
             Ok(v) => v,
             Err(_) => return Category::Malformed,

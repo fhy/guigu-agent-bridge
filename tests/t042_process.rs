@@ -81,8 +81,13 @@ async fn t042_process_fixed_output_redaction_and_repeat() {
             .output()
             .unwrap()
     };
+    let before_empty = std::fs::read(&path).unwrap();
     let first = run();
+    let after_first_empty = std::fs::read(&path).unwrap();
     let second = run();
+    let after_second_empty = std::fs::read(&path).unwrap();
+    assert_eq!(before_empty, after_first_empty);
+    assert_eq!(after_first_empty, after_second_empty);
     for output in [first, second] {
         assert_eq!(output.status.code(), Some(3));
         assert_eq!(
@@ -92,30 +97,32 @@ async fn t042_process_fixed_output_redaction_and_repeat() {
         assert!(output.stderr.is_empty());
         assert!(!String::from_utf8_lossy(&output.stdout).contains(path_text));
     }
-    let missing = Command::new(binary())
-        .args([
-            "reconcile-lease-owner",
-            "--database",
-            "/no/such/t042.sqlite",
-        ])
-        .output()
-        .unwrap();
-    assert_eq!(missing.status.code(), Some(10));
-    assert_eq!(
-        missing.stdout,
-        b"reconcile-lease-owner result=database status=10\n"
-    );
-    assert!(missing.stderr.is_empty());
-    let invalid = Command::new(binary())
-        .args(["reconcile-lease-owner", "--database"])
-        .output()
-        .unwrap();
-    assert_eq!(invalid.status.code(), Some(2));
-    assert_eq!(
-        invalid.stdout,
-        b"reconcile-lease-owner result=invalid-arguments status=2\n"
-    );
-    assert!(invalid.stderr.is_empty());
+    for _ in 0..2 {
+        let missing = Command::new(binary())
+            .args([
+                "reconcile-lease-owner",
+                "--database",
+                "/no/such/t042.sqlite",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(missing.status.code(), Some(10));
+        assert_eq!(
+            missing.stdout,
+            b"reconcile-lease-owner result=database status=10\n"
+        );
+        assert!(missing.stderr.is_empty());
+        let invalid = Command::new(binary())
+            .args(["reconcile-lease-owner", "--database"])
+            .output()
+            .unwrap();
+        assert_eq!(invalid.status.code(), Some(2));
+        assert_eq!(
+            invalid.stdout,
+            b"reconcile-lease-owner result=invalid-arguments status=2\n"
+        );
+        assert!(invalid.stderr.is_empty());
+    }
     let _ = std::fs::remove_file(path);
 }
 

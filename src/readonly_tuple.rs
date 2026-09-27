@@ -687,6 +687,63 @@ mod tests {
         let _ = std::fs::remove_file(path);
     }
 
+    #[tokio::test]
+    async fn t042_rejection_families_are_snapshot_copy_repeatable() {
+        use crate::lease_owner_diagnostics::Category;
+        let cases = [
+            (
+                "event-status",
+                "UPDATE task_events SET status='completed'",
+                Category::Fenced,
+            ),
+            (
+                "event-payload",
+                "UPDATE task_events SET payload='{}'",
+                Category::Fenced,
+            ),
+            (
+                "event-binding",
+                "UPDATE deliveries SET attempt=2",
+                Category::Fenced,
+            ),
+            (
+                "disposition",
+                "UPDATE delivery_dispositions SET state='terminal'",
+                Category::Fenced,
+            ),
+            (
+                "session",
+                "UPDATE delivery_dispositions SET session_id='session'",
+                Category::Fenced,
+            ),
+            ("queue", "DELETE FROM task_events", Category::Empty),
+            (
+                "ack",
+                "UPDATE deliveries SET acknowledged_at='t'",
+                Category::Empty,
+            ),
+        ];
+        for (name, mutation, expected) in cases {
+            let path =
+                std::env::temp_dir().join(format!("t042-reject-{name}-{}.db", Uuid::now_v7()));
+            let _tuple = eligible_fixture(&path, name, "2099-01-01T00:00:00Z").await;
+            let pool = connect(&path).await.unwrap();
+            let _ = sqlx::query(mutation).execute(&pool).await;
+            pool.close().await;
+            let before = std::fs::read(&path).unwrap();
+            assert_eq!(
+                crate::lease_owner_diagnostics::diagnose(&path).await,
+                expected
+            );
+            assert_eq!(
+                crate::lease_owner_diagnostics::diagnose(&path).await,
+                expected
+            );
+            assert_eq!(before, std::fs::read(&path).unwrap());
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
     #[cfg(unix)]
     #[test]
     fn parser_is_strict_and_never_echoes_values() {
