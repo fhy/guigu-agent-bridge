@@ -806,6 +806,14 @@ mod tests {
             .execute(&pool)
             .await
             .unwrap();
+        let unacknowledged: i64 = sqlx::query_scalar("SELECT count(*) FROM deliveries WHERE delivery_id=? AND task_id=? AND attempt=? AND acknowledged_at IS NULL")
+            .bind(&planner_tuple.delivery_id).bind(&planner_tuple.task_id).bind(planner_tuple.attempt)
+            .fetch_one(&pool).await.unwrap();
+        let awaiting: i64 = sqlx::query_scalar("SELECT count(*) FROM deliveries d LEFT JOIN task_events e ON e.task_id=d.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=d.task_id) WHERE d.delivery_id=? AND d.task_id=? AND d.attempt=? AND d.acknowledged_at IS NOT NULL AND (e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled'))")
+            .bind(&planner_tuple.delivery_id).bind(&planner_tuple.task_id).bind(planner_tuple.attempt)
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(unacknowledged, 0);
+        assert_eq!(awaiting, 1);
         pool.close().await;
         let before = std::fs::read(&planner_path).unwrap();
         assert_eq!(
