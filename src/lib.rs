@@ -11,6 +11,7 @@ pub mod bus;
 pub mod config;
 pub mod error;
 pub mod gateway;
+pub mod lease_owner_diagnostics;
 pub mod matrix;
 pub mod models;
 pub mod observer;
@@ -173,6 +174,24 @@ pub async fn run() -> Result<(), Error> {
             Err(error) => return Err(diagnosed_failure(error)),
         }
         return Ok(());
+    }
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref().and_then(|v| v.to_str()) == Some("reconcile-lease-owner") {
+        let mut cli = vec![std::ffi::OsString::from("reconcile-lease-owner")];
+        cli.extend(args);
+        let database = lease_owner_diagnostics::parse_args(&cli).map_err(|category| {
+            Error::Cli(error::CliFailure {
+                command: "reconcile-lease-owner",
+                category: category.slug(),
+                status: category.status(),
+            })
+        })?;
+        let category = lease_owner_diagnostics::diagnose(database).await;
+        return Err(Error::Cli(error::CliFailure {
+            command: "reconcile-lease-owner",
+            category: category.slug(),
+            status: category.status(),
+        }));
     }
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref().and_then(|v| v.to_str()) == Some("recover-selected-preacceptance") {

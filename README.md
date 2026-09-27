@@ -27,6 +27,7 @@ guigu-agent-bridge "$HOME/.config/guigu-agent-bridge.toml"
 - [0.2.6 发布说明](docs/RELEASE-0.2.6.md)
 - [0.2.7 发布说明](docs/RELEASE-0.2.7.md)
 - [0.2.8 发布说明](docs/RELEASE-0.2.8.md)
+- [0.2.9 候选说明](docs/RELEASE-0.2.9.md)
 - [产品与边界](docs/PRODUCT.md)
 - [用户指南](docs/USER_GUIDE.md)
 - [配置参考](docs/CONFIGURATION.md)

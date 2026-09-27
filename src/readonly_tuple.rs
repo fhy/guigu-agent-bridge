@@ -316,7 +316,11 @@ mod tests {
         .unwrap();
         sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,1,'dispatched','2026-01-01T00:00:00Z',?)")
             .bind(Uuid::now_v7().to_string()).bind(&task).bind(payload).execute(&pool).await.unwrap();
-        let runtime_state = if suffix == "two" { "stopped" } else { "active" };
+        let runtime_state = if suffix.starts_with("two") {
+            "stopped"
+        } else {
+            "active"
+        };
         sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES(?,'t','t',?,'fixture')")
             .bind(&runtime).bind(runtime_state).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,created_at,updated_at) VALUES(?,'dispatching',4,?,'t','t')")
@@ -477,6 +481,103 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn t042_snapshot_categories_are_redacted_and_repeatable() {
+        use crate::lease_owner_diagnostics::Category;
+        let path = std::env::temp_dir().join(format!("t042-categories-{}.db", Uuid::now_v7()));
+        let tuple = eligible_fixture(&path, "two", "2099-01-01T00:00:00Z").await;
+        assert_eq!(
+            crate::lease_owner_diagnostics::diagnose(&path).await,
+            Category::Eligible
+        );
+        let before = std::fs::read(&path).unwrap();
+        let pool = connect(&path).await.unwrap();
+        sqlx::query("UPDATE execution_leases SET owner_token='orphan-owner' WHERE task_id=?")
+            .bind(&tuple.task_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        assert_eq!(
+            crate::lease_owner_diagnostics::diagnose(&path).await,
+            Category::NonActionableOrphan
+        );
+        assert_eq!(
+            crate::lease_owner_diagnostics::diagnose(&path).await,
+            Category::NonActionableOrphan
+        );
+        let after = std::fs::read(&path).unwrap();
+        assert_eq!(before.len(), after.len());
+        let pool = connect(&path).await.unwrap();
+        sqlx::query("UPDATE execution_leases SET owner_token='orphan-owner' WHERE task_id=?")
+            .bind(&tuple.task_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES('active-owner','t','t','active','fixture')").execute(&pool).await.unwrap();
+        sqlx::query("UPDATE task_admissions SET runtime_instance='active-owner' WHERE task_id=?")
+            .bind(&tuple.task_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE execution_leases SET owner_token='active-owner' WHERE task_id=?")
+            .bind(&tuple.task_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        assert_eq!(
+            crate::lease_owner_diagnostics::diagnose(&path).await,
+            Category::ActiveOwner
+        );
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn t042_remaining_categories_are_real_snapshot_cases() {
+        use crate::lease_owner_diagnostics::Category;
+        let fenced_path = std::env::temp_dir().join(format!("t042-fenced-{}.db", Uuid::now_v7()));
+        let fenced = eligible_fixture(&fenced_path, "two", "2099-01-01T00:00:00Z").await;
+        let pool = connect(&fenced_path).await.unwrap();
+        sqlx::query("UPDATE execution_leases SET state='active' WHERE task_id=?")
+            .bind(&fenced.task_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        assert_eq!(
+            crate::lease_owner_diagnostics::diagnose(&fenced_path).await,
+            Category::Fenced
+        );
+
+        let multiple_path =
+            std::env::temp_dir().join(format!("t042-multiple-{}.db", Uuid::now_v7()));
+        let _ = eligible_fixture(&multiple_path, "two-a", "2099-01-01T00:00:00Z").await;
+        let _ = eligible_fixture(&multiple_path, "two-b", "2099-01-01T00:00:00Z").await;
+        assert_eq!(
+            crate::lease_owner_diagnostics::diagnose(&multiple_path).await,
+            Category::Multiple
+        );
+
+        let malformed_path =
+            std::env::temp_dir().join(format!("t042-malformed-{}.db", Uuid::now_v7()));
+        let _ = eligible_fixture(&malformed_path, "two", "2099-01-01T00:00:00Z").await;
+        let pool = connect(&malformed_path).await.unwrap();
+        sqlx::query("DROP TABLE execution_leases")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        assert_eq!(
+            crate::lease_owner_diagnostics::diagnose(&malformed_path).await,
+            Category::Malformed
+        );
+
+        for path in [fenced_path, multiple_path, malformed_path] {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+
+    #[tokio::test]
     async fn diagnosis_reports_owner_mismatch_and_cardinality_without_mutation() {
         let path = std::env::temp_dir().join(format!("t041-mismatch-{}.db", Uuid::now_v7()));
         let tuple = eligible_fixture(&path, "mismatch", "2099-01-01T00:00:00Z").await;
@@ -584,6 +685,147 @@ mod tests {
         pool.close().await;
         assert_eq!(select(&path).await, Err(SelectionError::Empty));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn t042_rejection_families_are_snapshot_copy_repeatable() {
+        use crate::lease_owner_diagnostics::Category;
+        let cases = [
+            (
+                "event-status",
+                "UPDATE task_events SET status='completed'",
+                Category::Malformed,
+            ),
+            (
+                "event-payload",
+                "UPDATE task_events SET payload='{}'",
+                Category::Malformed,
+            ),
+            (
+                "event-binding",
+                "UPDATE deliveries SET attempt=2",
+                Category::Malformed,
+            ),
+            (
+                "disposition",
+                "UPDATE delivery_dispositions SET state='terminal'",
+                Category::Fenced,
+            ),
+            (
+                "session",
+                "UPDATE delivery_dispositions SET session_id='session'",
+                Category::Fenced,
+            ),
+            (
+                "child-fingerprint",
+                "UPDATE delivery_dispositions SET child_fingerprint='child'",
+                Category::Fenced,
+            ),
+            (
+                "reap-status",
+                "UPDATE delivery_dispositions SET reap_status='reaped'",
+                Category::Fenced,
+            ),
+            (
+                "disposition-missing",
+                "DELETE FROM delivery_dispositions",
+                Category::Fenced,
+            ),
+            (
+                "ack",
+                "UPDATE deliveries SET acknowledged_at='t'",
+                Category::Empty,
+            ),
+        ];
+        for (name, mutation, expected) in cases {
+            let path =
+                std::env::temp_dir().join(format!("t042-reject-{name}-{}.db", Uuid::now_v7()));
+            let _tuple = eligible_fixture(&path, name, "2099-01-01T00:00:00Z").await;
+            let pool = connect(&path).await.unwrap();
+            sqlx::query(mutation).execute(&pool).await.unwrap();
+            pool.close().await;
+            let before = std::fs::read(&path).unwrap();
+            assert_eq!(
+                crate::lease_owner_diagnostics::diagnose(&path).await,
+                expected
+            );
+            assert_eq!(
+                crate::lease_owner_diagnostics::diagnose(&path).await,
+                expected
+            );
+            assert_eq!(before, std::fs::read(&path).unwrap());
+            let _ = std::fs::remove_file(path);
+        }
+
+        let queue_path =
+            std::env::temp_dir().join(format!("t042-reject-queue-{}.db", Uuid::now_v7()));
+        let queue_tuple = eligible_fixture(&queue_path, "queue", "2099-01-01T00:00:00Z").await;
+        let pool = connect(&queue_path).await.unwrap();
+        sqlx::query("INSERT INTO agent_work_queue(queue_id,task_id,delivery_id,target_endpoint_id,room_id,sender_endpoint_id,idempotency_key,body_hash,lane,state,sequence,revision,created_at,updated_at) SELECT ?,task_id,delivery_id,target_endpoint_id,'room',target_endpoint_id,'key','hash','ordinary','queued',1,0,'t','t' FROM deliveries WHERE delivery_id=?")
+            .bind(Uuid::now_v7().to_string()).bind(&queue_tuple.delivery_id).execute(&pool).await.unwrap();
+        pool.close().await;
+        let before = std::fs::read(&queue_path).unwrap();
+        assert_eq!(
+            crate::lease_owner_diagnostics::diagnose(&queue_path).await,
+            Category::Fenced
+        );
+        assert_eq!(
+            crate::lease_owner_diagnostics::diagnose(&queue_path).await,
+            Category::Fenced
+        );
+        assert_eq!(before, std::fs::read(&queue_path).unwrap());
+        let _ = std::fs::remove_file(queue_path);
+
+        let continuation_path =
+            std::env::temp_dir().join(format!("t042-reject-continuation-{}.db", Uuid::now_v7()));
+        let continuation_tuple =
+            eligible_fixture(&continuation_path, "continuation", "2099-01-01T00:00:00Z").await;
+        let pool = connect(&continuation_path).await.unwrap();
+        sqlx::query("INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes) SELECT task_id,'resource-continuation',delivery_id,7,1,'ready',1,0,0,'prompt','t','t','t',0 FROM deliveries WHERE delivery_id=?")
+            .bind(&continuation_tuple.delivery_id).execute(&pool).await.unwrap();
+        pool.close().await;
+        let before = std::fs::read(&continuation_path).unwrap();
+        assert_eq!(
+            crate::lease_owner_diagnostics::diagnose(&continuation_path).await,
+            Category::Fenced
+        );
+        assert_eq!(
+            crate::lease_owner_diagnostics::diagnose(&continuation_path).await,
+            Category::Fenced
+        );
+        assert_eq!(before, std::fs::read(&continuation_path).unwrap());
+        let _ = std::fs::remove_file(continuation_path);
+
+        let planner_path =
+            std::env::temp_dir().join(format!("t042-reject-planner-{}.db", Uuid::now_v7()));
+        let planner_tuple =
+            eligible_fixture(&planner_path, "planner", "2099-01-01T00:00:00Z").await;
+        let pool = connect(&planner_path).await.unwrap();
+        sqlx::query("UPDATE deliveries SET acknowledged_at='t' WHERE delivery_id=?")
+            .bind(&planner_tuple.delivery_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let unacknowledged: i64 = sqlx::query_scalar("SELECT count(*) FROM deliveries WHERE delivery_id=? AND task_id=? AND attempt=? AND acknowledged_at IS NULL")
+            .bind(&planner_tuple.delivery_id).bind(&planner_tuple.task_id).bind(planner_tuple.attempt)
+            .fetch_one(&pool).await.unwrap();
+        let awaiting: i64 = sqlx::query_scalar("SELECT count(*) FROM deliveries d LEFT JOIN task_events e ON e.task_id=d.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=d.task_id) WHERE d.delivery_id=? AND d.task_id=? AND d.attempt=? AND d.acknowledged_at IS NOT NULL AND (e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled'))")
+            .bind(&planner_tuple.delivery_id).bind(&planner_tuple.task_id).bind(planner_tuple.attempt)
+            .fetch_one(&pool).await.unwrap();
+        assert_eq!(unacknowledged, 0);
+        assert_eq!(awaiting, 1);
+        pool.close().await;
+        let before = std::fs::read(&planner_path).unwrap();
+        assert_eq!(
+            crate::lease_owner_diagnostics::diagnose(&planner_path).await,
+            Category::Empty
+        );
+        assert_eq!(
+            crate::lease_owner_diagnostics::diagnose(&planner_path).await,
+            Category::Empty
+        );
+        assert_eq!(before, std::fs::read(&planner_path).unwrap());
+        let _ = std::fs::remove_file(planner_path);
     }
 
     #[cfg(unix)]

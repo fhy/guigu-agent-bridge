@@ -16,13 +16,13 @@ capability-by-capability evidence from the exact artifact.
 ## Release Identity
 
 ```text
-target_version: v0.2.7
-base_version_or_tag: v0.2.6 (454917775de5d19a9297af030f3f5ecb6f75c727)
-candidate_commit: 888d1d9709dd110621d6ef76c77efc5999d73b83
-annotated_tag: v0.2.7 (a42748dab81f24b1ded2a71ef38a862257659b32)
-crate_or_package_checksum: f1d871e83ec8e5db0f3e64ec339f8396cfee45e6439c6d6f512911e0b00759cc
-binary_sha256: 701101c71fa0f434fddc996154e8e62a25d5c141fb5b1723cf30b71831320377
-rollback_version: v0.2.6 (454917775de5d19a9297af030f3f5ecb6f75c727)
+target_version: v0.2.9 local candidate
+base_version_or_tag: v0.2.8 (d701644b8e00dc224730eb7db879d51d6e51c7da)
+candidate_commit: PENDING LOCAL REVIEW
+annotated_tag: NOT CREATED
+crate_or_package_checksum: PENDING LOCAL BUILD
+binary_sha256: PENDING LOCAL BUILD
+rollback_version: v0.2.8 (d701644b8e00dc224730eb7db879d51d6e51c7da)
 ```
 
 The candidate must preserve the complete history of `base_version_or_tag`.
@@ -36,8 +36,8 @@ source provenance, a test, and a check against the candidate binary.
 
 | Capability | Required by task | Source commit/path | Test or gate | Candidate binary check | Result |
 |---|---|---|---|---|---|
-| CLI/API | `select-preacceptance`, `recover-selected-preacceptance`, `reconcile-delivery`, `recover-runtime` | T038/T039/T040; `src/{readonly_tuple,selected_preacceptance,offline_delivery,offline_recovery}.rs` | Rust 1.94 gates; process probes | v0.2.7 binary fixed redacted output and rejection probes | PASS |
-| Migration/schema | Existing production schema and reviewed migrations | T008/T009 reviewed lineage | Locked tests and read-only schema preflight | v0.2.7 package contains reviewed schema code | PASS |
+| CLI/API | Existing recovery commands plus read-only `reconcile-lease-owner` | T038/T039/T040/T041/T042; `src/lease_owner_diagnostics.rs` | Rust 1.94 gates; process probes | v0.2.9 candidate fixed redacted output and rejection probes | PENDING REVIEW |
+| Migration/schema | Existing production schema; T042 adds no migration or write path | T008/T009 reviewed lineage | Locked tests and package audit | v0.2.9 candidate contains reviewed schema code | PENDING REVIEW |
 | Configuration | Observer unit and non-secret config path | T017/T040; installed unit is preflight-only | Read-only unit/ExecStart/PID check | Installed binary must hash to v0.2.7 before start | PENDING PREFLIGHT |
 | Recovery/rollback | T037 pre-acceptance CAS; T033 terminal reconciliation; T032 stale-owner recovery | T037 `0703952`, T033 `bb03a45`, T032 `392d5a0` | Reviewed SQLite/CAS/rollback matrices | Invoke only through v0.2.7 binary and exact typed identity | PENDING PREFLIGHT |
 | Operational behavior | Single Observer readiness and one authorized smoke path | T036 fixed sequence | Fresh snapshot, predicate, readiness and post-stop evidence | No mutation until all preflight rows close | PENDING PREFLIGHT |
