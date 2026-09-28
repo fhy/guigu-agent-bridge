@@ -1,5 +1,6 @@
 //! Authenticated matrix-sdk client construction.
 
+use matrix_sdk::sync::SyncResponse;
 use matrix_sdk::{
     Client, SessionTokens,
     authentication::matrix::MatrixSession,
@@ -161,12 +162,14 @@ impl MatrixClient {
         Ok(())
     }
 
-    pub(crate) async fn initialize_and_prove(&self) -> Result<(), MatrixError> {
-        self.inner
+    pub(crate) async fn initialize_and_prove(&self) -> Result<SyncResponse, MatrixError> {
+        let initial = self
+            .inner
             .sync_once(SyncSettings::new().timeout(std::time::Duration::from_secs(10)))
             .await
             .map_err(|_| MatrixError::CryptoInitialization)?;
-        self.prove_server_device_key().await
+        self.prove_server_device_key().await?;
+        Ok(initial)
     }
 }
 

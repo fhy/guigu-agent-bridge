@@ -12,6 +12,7 @@ use std::{
 
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::ruma::api::client::error::ErrorKind;
+use matrix_sdk::sync::SyncResponse;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -21,6 +22,8 @@ use super::{InboundMatrixEvent, MatrixClient, MatrixError, event::decode_event};
 
 /// Boxed future returned by [`SyncTokenStore`].
 pub type SyncTokenFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
+type Disposition = Result<(), MatrixError>;
+pub(crate) type FailureObserver = Arc<dyn Fn(&MatrixError) + Send + Sync>;
 
 pub trait RawMatrixEventConsumer: Send + Sync {
     fn consume<'a>(
@@ -74,6 +77,8 @@ pub struct MatrixSync {
     server_timeout: Duration,
     raw_consumer: Option<Arc<dyn RawMatrixEventConsumer>>,
     missing_key_observer: Option<Arc<dyn MissingRoomKeyObserver>>,
+    initial_response: Option<SyncResponse>,
+    failure_observer: Option<FailureObserver>,
 }
 
 impl std::fmt::Debug for MatrixSync {
@@ -102,6 +107,8 @@ impl MatrixSync {
             server_timeout: Duration::from_secs(30),
             raw_consumer: None,
             missing_key_observer: None,
+            initial_response: None,
+            failure_observer: None,
         })
     }
 
@@ -115,14 +122,55 @@ impl MatrixSync {
         self
     }
 
+    pub fn with_initial_response(mut self, response: SyncResponse) -> Self {
+        self.initial_response = Some(response);
+        self
+    }
+
+    pub(crate) fn with_failure_observer(mut self, observer: FailureObserver) -> Self {
+        self.failure_observer = Some(observer);
+        self
+    }
+
     /// Spawn the single sync owner task.
     pub fn start(self) -> (MatrixSyncHandle, mpsc::Receiver<InboundMatrixEvent>) {
+        let (handle, events, _) = self.start_inner(false);
+        (handle, events)
+    }
+
+    #[doc(hidden)]
+    pub fn start_with_dispositions(
+        self,
+    ) -> (
+        MatrixSyncHandle,
+        mpsc::Receiver<InboundMatrixEvent>,
+        mpsc::Sender<Disposition>,
+    ) {
+        self.start_inner(true)
+    }
+
+    fn start_inner(
+        self,
+        durable_dispositions: bool,
+    ) -> (
+        MatrixSyncHandle,
+        mpsc::Receiver<InboundMatrixEvent>,
+        mpsc::Sender<Disposition>,
+    ) {
         let (events_tx, events_rx) = mpsc::channel(self.capacity);
+        let (dispositions_tx, dispositions_rx) = mpsc::channel(self.capacity);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let alive = Arc::new(AtomicBool::new(true));
         let task_alive = Arc::clone(&alive);
+        let failure_observer = self.failure_observer.clone();
         let join = tokio::spawn(async move {
-            let result = self.run(events_tx, shutdown_rx).await;
+            let dispositions = durable_dispositions.then_some(dispositions_rx);
+            let result = self.run(events_tx, dispositions, shutdown_rx).await;
+            if let Err(error) = &result
+                && let Some(observer) = &failure_observer
+            {
+                observer(error);
+            }
             task_alive.store(false, Ordering::Release);
             result
         });
@@ -133,13 +181,82 @@ impl MatrixSync {
                 alive,
             },
             events_rx,
+            dispositions_tx,
         )
     }
 
     /// Run one initial or incremental sync and commit its checkpoint.
+    async fn process_response(
+        &self,
+        events: &mpsc::Sender<InboundMatrixEvent>,
+        dispositions: &mut Option<mpsc::Receiver<Disposition>>,
+        response: SyncResponse,
+    ) -> Result<usize, MatrixError> {
+        let mut delivered = 0;
+        for (room_id, update) in response.rooms.joined {
+            for timeline in update.timeline.events {
+                let raw = timeline.kind.raw().json().get();
+                if let Some(consumer) = &self.raw_consumer
+                    && consumer.consume(raw, room_id.as_str()).await?
+                {
+                    delivered += 1;
+                    continue;
+                }
+                match decode_event(raw, room_id.as_str(), &self.client.user_id) {
+                    Ok(Some(event)) => {
+                        events.try_send(event).map_err(|error| match error {
+                            mpsc::error::TrySendError::Full(_) => MatrixError::Backpressure,
+                            mpsc::error::TrySendError::Closed(_) => MatrixError::ConsumerClosed,
+                        })?;
+                        if let Some(dispositions) = dispositions {
+                            dispositions
+                                .recv()
+                                .await
+                                .ok_or(MatrixError::ConsumerClosed)??;
+                        }
+                        delivered += 1;
+                    }
+                    Ok(None) => {}
+                    Err(MatrixError::Protocol { .. }) => {
+                        // Malformed and unauthorized timeline items have a terminal
+                        // disposition. They are consumed from this batch without
+                        // advancing the bounded event channel.
+                    }
+                    Err(error) => return Err(error),
+                }
+                let missing_decryption = serde_json::from_str::<serde_json::Value>(raw)
+                    .ok()
+                    .and_then(|event| {
+                        event
+                            .get("type")
+                            .and_then(|value| value.as_str())
+                            .map(str::to_owned)
+                    })
+                    .as_deref()
+                    == Some("m.room.encrypted");
+                if missing_decryption {
+                    if let Some(observer) = &self.missing_key_observer {
+                        observer.record_missing_room_key();
+                    }
+                    return Err(MatrixError::CryptoInitialization);
+                }
+            }
+        }
+        self.tokens.save(&response.next_batch).await?;
+        Ok(delivered)
+    }
+
     pub async fn sync_once(
         &self,
         events: &mpsc::Sender<InboundMatrixEvent>,
+    ) -> Result<usize, MatrixError> {
+        self.sync_once_with_dispositions(events, &mut None).await
+    }
+
+    async fn sync_once_with_dispositions(
+        &self,
+        events: &mpsc::Sender<InboundMatrixEvent>,
+        dispositions: &mut Option<mpsc::Receiver<Disposition>>,
     ) -> Result<usize, MatrixError> {
         let token = self.tokens.load().await?;
         let mut settings = SyncSettings::new().timeout(self.server_timeout);
@@ -152,47 +269,19 @@ impl MatrixSync {
             .sync_once(settings)
             .await
             .map_err(classify_sdk_error)?;
-        let mut delivered = 0;
-        for (room_id, update) in response.rooms.joined {
-            for timeline in update.timeline.events {
-                let raw = timeline.kind.raw().json().get();
-                if let Some(consumer) = &self.raw_consumer
-                    && consumer.consume(raw, room_id.as_str()).await?
-                {
-                    delivered += 1;
-                    continue;
-                }
-                if let Some(event) = decode_event(raw, room_id.as_str(), &self.client.user_id)? {
-                    events.try_send(event).map_err(|error| match error {
-                        mpsc::error::TrySendError::Full(_) => MatrixError::Backpressure,
-                        mpsc::error::TrySendError::Closed(_) => MatrixError::ConsumerClosed,
-                    })?;
-                    delivered += 1;
-                } else if serde_json::from_str::<serde_json::Value>(raw)
-                    .ok()
-                    .and_then(|event| {
-                        event
-                            .get("type")
-                            .and_then(|value| value.as_str())
-                            .map(str::to_owned)
-                    })
-                    .as_deref()
-                    == Some("m.room.encrypted")
-                    && let Some(observer) = &self.missing_key_observer
-                {
-                    observer.record_missing_room_key();
-                }
-            }
-        }
-        self.tokens.save(&response.next_batch).await?;
-        Ok(delivered)
+        self.process_response(events, dispositions, response).await
     }
 
     async fn run(
-        self,
+        mut self,
         events: mpsc::Sender<InboundMatrixEvent>,
+        mut dispositions: Option<mpsc::Receiver<Disposition>>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), MatrixError> {
+        if let Some(response) = self.initial_response.take() {
+            self.process_response(&events, &mut dispositions, response)
+                .await?;
+        }
         let mut failures = 0_u8;
         loop {
             let response = tokio::select! {
@@ -201,7 +290,7 @@ impl MatrixSync {
                     let _ = changed;
                     return Ok(());
                 }
-                response = self.sync_once(&events) => response,
+                response = self.sync_once_with_dispositions(&events, &mut dispositions) => response,
             };
             match response {
                 Ok(_) => {

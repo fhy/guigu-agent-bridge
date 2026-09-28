@@ -47,6 +47,12 @@ pub enum MatrixFailure {
     CryptoInitialization,
     DeviceKeyUpload,
     RequiredTaskExited,
+    SyncStorage,
+    SyncBackpressure,
+    SyncConsumerClosed,
+    SyncProtocol,
+    SyncDecryption,
+    SyncTransport,
     Timeout,
 }
 
@@ -64,6 +70,12 @@ impl MatrixFailure {
             Self::CryptoInitialization => "matrix-crypto-initialization-failed",
             Self::DeviceKeyUpload => "matrix-device-key-upload-failed",
             Self::RequiredTaskExited => "matrix-required-task-exited",
+            Self::SyncStorage => "matrix-sync-storage",
+            Self::SyncBackpressure => "matrix-sync-backpressure",
+            Self::SyncConsumerClosed => "matrix-sync-consumer-closed",
+            Self::SyncProtocol => "matrix-sync-protocol",
+            Self::SyncDecryption => "matrix-sync-decryption",
+            Self::SyncTransport => "matrix-sync-transport",
             Self::Timeout => "matrix-startup-timeout",
         }
     }

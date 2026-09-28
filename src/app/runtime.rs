@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     future::Future,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, Mutex},
     time::Duration,
 };
 
@@ -48,6 +48,11 @@ pub enum AppError {
     Matrix,
     #[error("application assembly failed: {0}")]
     Assembly(&'static str),
+    #[error("required owner failed: {component}/{class}")]
+    RequiredOwner {
+        component: &'static str,
+        class: &'static str,
+    },
     #[error("application health listener failed")]
     Health(#[source] std::io::Error),
     #[error("application reload failed")]
@@ -75,6 +80,18 @@ pub struct AppRuntime {
     shutdown_timeout: Duration,
     reliability: crate::storage::ReliabilityStore,
     runtime_instance: Option<String>,
+    first_failure: Arc<Mutex<Option<RequiredOwnerFailure>>>,
+}
+
+#[derive(Clone, Copy)]
+struct RequiredOwnerFailure {
+    component: &'static str,
+    class: &'static str,
+}
+
+fn retain_failure(slot: &Arc<Mutex<Option<RequiredOwnerFailure>>>, failure: RequiredOwnerFailure) {
+    let mut value = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    value.get_or_insert(failure);
 }
 
 impl AppRuntime {
@@ -207,6 +224,7 @@ impl AppRuntime {
         };
         health_state.set_insecure_a2a_peers(insecure_a2a_peers);
         health_state.set_recovery_blocked(recovery_blocked);
+        let first_failure = Arc::new(Mutex::new(None));
         let mut runtime = Self {
             pool: Some(pool.clone()),
             reload,
@@ -226,6 +244,7 @@ impl AppRuntime {
             shutdown_timeout: Duration::from_secs(config.bridge.shutdown_timeout_seconds),
             reliability: reliability.clone(),
             runtime_instance: owns_runtime.then_some(runtime_instance.clone()),
+            first_failure: Arc::clone(&first_failure),
         };
         if recovery_blocked {
             if let Some(generation) = matrix_generation {
@@ -282,10 +301,10 @@ impl AppRuntime {
             );
             let proof =
                 tokio::time::timeout(Duration::from_secs(30), client.initialize_and_prove()).await;
-            let proof_error = match proof {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(matrix_failure(&error)),
-                Err(_) => Some(MatrixFailure::Timeout),
+            let (initial_response, proof_error) = match proof {
+                Ok(Ok(response)) => (Some(response), None),
+                Ok(Err(error)) => (None, Some(matrix_failure(&error))),
+                Err(_) => (None, Some(MatrixFailure::Timeout)),
             };
             if let Some(reason) = proof_error {
                 runtime.health_state.matrix().transition(
@@ -307,7 +326,10 @@ impl AppRuntime {
                 &[MatrixPhase::StoreBound],
                 MatrixPhase::KeyProved,
             );
-            Some(client)
+            Some((
+                client,
+                initial_response.expect("successful Matrix proof has initial response"),
+            ))
         } else {
             None
         };
@@ -470,14 +492,34 @@ impl AppRuntime {
             Vec::new()
         };
 
-        let matrix = if let Some(client) = matrix_client {
+        let matrix = if let Some((client, initial_response)) = matrix_client {
             let sdk = Arc::new(SdkMatrixSender::new(client.clone()));
+            let failure_slot = Arc::clone(&first_failure);
+            let health_for_failure = Arc::clone(&runtime.health_state);
+            let matrix_failure_generation =
+                matrix_generation.expect("enabled Matrix has a generation");
             let mut sync = MatrixSync::new(
                 client,
                 Arc::new(MemorySyncTokenStore::default()),
                 config.transports.matrix.sync_capacity,
             )
+            .map(|sync| sync.with_initial_response(initial_response))
             .map_err(|_| AppError::Matrix)?
+            .with_failure_observer(Arc::new(move |error| {
+                let reason = matrix_runtime_failure(error);
+                retain_failure(
+                    &failure_slot,
+                    RequiredOwnerFailure {
+                        component: "matrix-sync",
+                        class: matrix_error_class(error),
+                    },
+                );
+                health_for_failure.matrix().transition(
+                    matrix_failure_generation,
+                    &[MatrixPhase::Registering, MatrixPhase::Ready],
+                    MatrixPhase::Failed(reason),
+                );
+            }))
             .with_missing_key_observer(runtime.health_state.clone());
             let gateway = if config.transports.gateway.enabled {
                 let gateway = Arc::new(MatrixGateway::new(
@@ -532,7 +574,7 @@ impl AppRuntime {
                 &[MatrixPhase::KeyProved],
                 MatrixPhase::Registering,
             );
-            let (sync_handle, receiver) = sync.start();
+            let (sync_handle, receiver, dispositions) = sync.start_with_dispositions();
             let retry: Arc<dyn crate::matrix::RetryAdmission> =
                 Arc::new(crate::app::DurableRetryAdmission::new(
                     reliability.clone(),
@@ -554,6 +596,7 @@ impl AppRuntime {
                 replies,
                 4096,
             )
+            .with_dispositions(dispositions)
             .with_queue_control_store(Arc::new(reliability.clone()))
             .with_reap_control(acp.clone())
             .with_retry_admission(retry)
@@ -583,8 +626,18 @@ impl AppRuntime {
         runtime
             .health_state
             .register_required(Arc::clone(&worker_alive));
+        let worker_failure = Arc::clone(&first_failure);
         runtime.worker = Some(tokio::spawn(async move {
             let result = worker.run().await;
+            if result.is_err() {
+                retain_failure(
+                    &worker_failure,
+                    RequiredOwnerFailure {
+                        component: "task-worker",
+                        class: "failed",
+                    },
+                );
+            }
             worker_alive.store(false, std::sync::atomic::Ordering::Release);
             result
         }));
@@ -663,6 +716,17 @@ impl AppRuntime {
             }
         }
         self.reload.stop().await;
+        if let Some(sync) = self.matrix_sync.take()
+            && let Err(error) = sync.shutdown().await
+        {
+            retain_failure(
+                &self.first_failure,
+                RequiredOwnerFailure {
+                    component: "matrix-sync",
+                    class: matrix_error_class(&error),
+                },
+            );
+        }
         if let Some(ingress) = self.ingress.take() {
             ingress.shutdown().await;
         }
@@ -671,15 +735,15 @@ impl AppRuntime {
             match tokio::time::timeout(self.shutdown_timeout, &mut worker).await {
                 Ok(Ok(Ok(()))) => {}
                 Ok(Ok(Err(_))) => {
-                    shutdown_error = Some(AppError::Assembly("worker failed"));
+                    shutdown_error = Some(AppError::Assembly("task-worker/failed"));
                 }
                 Ok(Err(_)) => {
-                    shutdown_error = Some(AppError::Assembly("worker join failed"));
+                    shutdown_error = Some(AppError::Assembly("task-worker/join"));
                 }
                 Err(_) => {
                     worker.abort();
                     let _ = worker.await;
-                    shutdown_error = Some(AppError::Assembly("worker shutdown timed out"));
+                    shutdown_error = Some(AppError::Assembly("task-worker/timeout"));
                 }
             }
         }
@@ -720,9 +784,6 @@ impl AppRuntime {
             shutdown_error.get_or_insert(AppError::Assembly("outbox owner join failed"));
         }
         self.gateway.take();
-        if let Some(sync) = self.matrix_sync.take() {
-            let _ = sync.shutdown().await;
-        }
         if let Some(health) = self.health.take()
             && let Err(error) = health.shutdown().await
         {
@@ -742,10 +803,48 @@ impl AppRuntime {
             pool.close().await;
         }
         self.health_state.matrix().stopped();
+        if let Some(failure) = *self
+            .first_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+        {
+            return Err(AppError::RequiredOwner {
+                component: failure.component,
+                class: failure.class,
+            });
+        }
         match shutdown_error {
             Some(error) => Err(error),
             None => Ok(()),
         }
+    }
+}
+
+fn matrix_error_class(error: &crate::matrix::MatrixError) -> &'static str {
+    use crate::matrix::MatrixError;
+    match error {
+        MatrixError::Storage => "storage",
+        MatrixError::Backpressure => "backpressure",
+        MatrixError::ConsumerClosed => "consumer-closed",
+        MatrixError::Protocol { .. } => "protocol",
+        MatrixError::Transport => "transport",
+        MatrixError::DeviceKicked | MatrixError::Authentication => "authentication",
+        MatrixError::CryptoInitialization => "decryption",
+        MatrixError::Join => "join",
+        _ => "configuration",
+    }
+}
+
+fn matrix_runtime_failure(error: &crate::matrix::MatrixError) -> MatrixFailure {
+    use crate::matrix::MatrixError;
+    match error {
+        MatrixError::Storage => MatrixFailure::SyncStorage,
+        MatrixError::Backpressure => MatrixFailure::SyncBackpressure,
+        MatrixError::ConsumerClosed => MatrixFailure::SyncConsumerClosed,
+        MatrixError::Protocol { .. } => MatrixFailure::SyncProtocol,
+        MatrixError::CryptoInitialization => MatrixFailure::SyncDecryption,
+        MatrixError::Transport => MatrixFailure::SyncTransport,
+        _ => MatrixFailure::RequiredTaskExited,
     }
 }
 
@@ -855,7 +954,7 @@ mod assembly_tests {
         matchers::{method, path_regex},
     };
 
-    use super::AppRuntime;
+    use super::{AppRuntime, RequiredOwnerFailure, retain_failure};
     use crate::{
         config::load_from_str_with_env,
         storage::{ReliabilityStore, connect, migrate},
@@ -1043,5 +1142,27 @@ enabled = true
         ] {
             assert_matrix_failure_is_health_only(case).await;
         }
+    }
+
+    #[test]
+    fn required_owner_failure_retains_the_first_bounded_class() {
+        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
+        retain_failure(
+            &slot,
+            RequiredOwnerFailure {
+                component: "matrix-sync",
+                class: "storage",
+            },
+        );
+        retain_failure(
+            &slot,
+            RequiredOwnerFailure {
+                component: "task-worker",
+                class: "failed",
+            },
+        );
+        let retained = slot.lock().unwrap().unwrap();
+        assert_eq!(retained.component, "matrix-sync");
+        assert_eq!(retained.class, "storage");
     }
 }
