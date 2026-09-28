@@ -16,13 +16,13 @@ capability-by-capability evidence from the exact artifact.
 ## Release Identity
 
 ```text
-target_version: v0.2.10 local candidate
-base_version_or_tag: v0.2.9 (99ff0b3e596ba69895dfad19b0d1a3f380a2eb12)
+target_version: v0.2.11 local candidate
+base_version_or_tag: v0.2.10 (ddc477cf182db64885f0e18a16587a7b259d3c71)
 candidate_commit: PENDING LOCAL REVIEW
 annotated_tag: NOT CREATED
 crate_or_package_checksum: PENDING LOCAL BUILD
 binary_sha256: PENDING LOCAL BUILD
-rollback_version: v0.2.9 (99ff0b3e596ba69895dfad19b0d1a3f380a2eb12)
+rollback_version: v0.2.10 (ddc477cf182db64885f0e18a16587a7b259d3c71)
 ```
 
 The candidate must preserve the complete history of `base_version_or_tag`.
@@ -36,10 +36,10 @@ source provenance, a test, and a check against the candidate binary.
 
 | Capability | Required by task | Source commit/path | Test or gate | Candidate binary check | Result |
 |---|---|---|---|---|---|
-| CLI/API | Existing diagnostics plus `reconcile-orphaned-preacceptance --database PATH` | T038-T043; reviewed T043 `7fbfdb20e477878c6e585bf0a7bfaeeb94d4f48f` | Rust 1.94 gates; real SQLite/process probes | v0.2.10 candidate fixed redacted output, atomic closure, repeat and rejection probes | PENDING REVIEW |
+| CLI/API | Existing diagnostics plus `reconcile-orphaned-preacceptance --database PATH`; Matrix pre-start response recovery | T038-T044; reviewed T044 `5e79cae54336cd2f8ede3d5b86566ae289beef23` | Rust 1.94 gates; SQLite/process probes; offline Matrix ownership/cancellation/supervision probes | v0.2.11 candidate fixed redacted CLI output and reviewed initial-response/durable-disposition behavior | PENDING REVIEW |
 | Migration/schema | Existing production schema; T043 adds no migration | T008/T009 reviewed lineage | Locked tests and package audit | v0.2.10 candidate contains no migration delta | PENDING REVIEW |
 | Configuration | Observer unit and non-secret config path | T017/T040; installed unit is preflight-only | Read-only unit/ExecStart/PID check | Installed binary must hash to the published v0.2.10 artifact before start | PENDING PREFLIGHT |
-| Recovery/rollback | T043 atomic orphan proof plus shared T037 terminal closure; T033/T032 remain predicate-bound | T043 `7fbfdb2`, T037 `0703952`, T033 `bb03a45`, T032 `392d5a0` | Reviewed SQLite/CAS/rollback/post-commit matrices | Invoke only through a published v0.2.10 artifact after separate T036 authorization | PENDING PREFLIGHT |
+| Recovery/rollback | T043 atomic orphan proof plus shared T037 terminal closure; T044 retains pre-start sync response until durable disposition | T044 `5e79cae`, T043 `7fbfdb2`, T037 `0703952` | Reviewed SQLite/CAS/rollback matrices and offline Matrix cursor/supervision matrix | Invoke only through a published v0.2.11 artifact after separate T036 authorization | PENDING PREFLIGHT |
 | Operational behavior | Single Observer readiness and one authorized smoke path | T036 fixed sequence | Fresh snapshot, predicate, readiness and post-stop evidence | No mutation until all preflight rows close | PENDING PREFLIGHT |
 
 No production procedure may depend on a capability that is only present in an
