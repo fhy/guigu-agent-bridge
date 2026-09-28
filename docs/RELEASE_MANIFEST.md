@@ -37,8 +37,8 @@ source provenance, a test, and a check against the candidate binary.
 | Capability | Required by task | Source commit/path | Test or gate | Candidate binary check | Result |
 |---|---|---|---|---|---|
 | CLI/API | Existing diagnostics plus `reconcile-orphaned-preacceptance --database PATH`; Matrix pre-start response recovery | T038-T044; reviewed T044 `5e79cae54336cd2f8ede3d5b86566ae289beef23` | Rust 1.94 gates; SQLite/process probes; offline Matrix ownership/cancellation/supervision probes | v0.2.11 candidate fixed redacted CLI output and reviewed initial-response/durable-disposition behavior | PENDING REVIEW |
-| Migration/schema | Existing production schema; T043 adds no migration | T008/T009 reviewed lineage | Locked tests and package audit | v0.2.10 candidate contains no migration delta | PENDING REVIEW |
-| Configuration | Observer unit and non-secret config path | T017/T040; installed unit is preflight-only | Read-only unit/ExecStart/PID check | Installed binary must hash to the published v0.2.10 artifact before start | PENDING PREFLIGHT |
+| Migration/schema | Existing production schema; T043 adds no migration | T008/T009 reviewed lineage | Locked tests and package audit | v0.2.11 candidate contains no migration delta | PENDING REVIEW |
+| Configuration | Observer unit and non-secret config path | T017/T040; installed unit is preflight-only | Read-only unit/ExecStart/PID check | Installed binary must hash to the published v0.2.11 artifact after publication and before start | PENDING PREFLIGHT |
 | Recovery/rollback | T043 atomic orphan proof plus shared T037 terminal closure; T044 retains pre-start sync response until durable disposition | T044 `5e79cae`, T043 `7fbfdb2`, T037 `0703952` | Reviewed SQLite/CAS/rollback matrices and offline Matrix cursor/supervision matrix | Invoke only through a published v0.2.11 artifact after separate T036 authorization | PENDING PREFLIGHT |
 | Operational behavior | Single Observer readiness and one authorized smoke path | T036 fixed sequence | Fresh snapshot, predicate, readiness and post-stop evidence | No mutation until all preflight rows close | PENDING PREFLIGHT |
 
