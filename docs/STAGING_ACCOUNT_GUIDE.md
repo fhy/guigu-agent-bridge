@@ -15,6 +15,18 @@ Create roles only when a test requires them:
 | `reviewer` | Multi-user permissions and review routing |
 | `observer` | Observer-only monitoring and alert tests |
 
+The standard account set is:
+
+| Role | Standard user ID |
+|---|---|
+| `primary` | `@bridge-staging:example.test` |
+| `failure` | `@bridge-staging-failure:example.test` |
+| `reviewer` | `@bridge-staging-reviewer:example.test` |
+| `observer` | `@bridge-staging-observer:example.test` |
+
+Deployments replace `example.test` with the approved staging homeserver. The
+identifiers are documentation examples; the private registry holds actual IDs.
+
 Every task must select a role explicitly. Agents must not choose an account from
 an account pool or infer a production identity.
 
