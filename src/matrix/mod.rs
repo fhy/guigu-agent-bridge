@@ -38,6 +38,7 @@ pub use router::{
     DurableMatrixAdmission, MatrixAdmissionFuture, RouteError, RoutePolicy, route_event,
     route_event_durable, route_event_with_monitor, route_workflow,
 };
+pub(crate) use sync::FailureObserver;
 pub use sync::{
     MatrixSync, MatrixSyncHandle, MemorySyncTokenStore, MissingRoomKeyObserver,
     RawMatrixEventConsumer, SyncTokenFuture, SyncTokenStore,

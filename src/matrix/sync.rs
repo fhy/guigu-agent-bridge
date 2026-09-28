@@ -84,6 +84,8 @@ pub struct MatrixSync {
     missing_key_observer: Option<Arc<dyn MissingRoomKeyObserver>>,
     initial_response: Option<SyncResponse>,
     failure_observer: Option<FailureObserver>,
+    #[cfg(test)]
+    test_failure: Option<MatrixError>,
 }
 
 impl std::fmt::Debug for MatrixSync {
@@ -114,6 +116,8 @@ impl MatrixSync {
             missing_key_observer: None,
             initial_response: None,
             failure_observer: None,
+            #[cfg(test)]
+            test_failure: None,
         })
     }
 
@@ -134,6 +138,12 @@ impl MatrixSync {
 
     pub(crate) fn with_failure_observer(mut self, observer: FailureObserver) -> Self {
         self.failure_observer = Some(observer);
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_failure(mut self, error: MatrixError) -> Self {
+        self.test_failure = Some(error);
         self
     }
 
@@ -299,6 +309,10 @@ impl MatrixSync {
         mut dispositions: Option<mpsc::Receiver<Disposition>>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), MatrixError> {
+        #[cfg(test)]
+        if let Some(error) = self.test_failure.take() {
+            return Err(error);
+        }
         if let Some(response) = self.initial_response.take()
             && matches!(
                 self.process_response(&events, &mut dispositions, Some(&mut shutdown), response,)

@@ -31,6 +31,19 @@ impl std::fmt::Debug for MatrixClient {
 }
 
 impl MatrixClient {
+    #[cfg(test)]
+    pub(crate) async fn for_test() -> Self {
+        Self {
+            inner: Client::builder()
+                .homeserver_url("http://127.0.0.1:9")
+                .build()
+                .await
+                .expect("test Matrix client"),
+            user_id: "@bridge:example.test".into(),
+            device_id: "BRIDGE".into(),
+        }
+    }
+
     pub fn device_id(&self) -> &str {
         &self.device_id
     }
