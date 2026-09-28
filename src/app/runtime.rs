@@ -94,6 +94,42 @@ fn retain_failure(slot: &Arc<Mutex<Option<RequiredOwnerFailure>>>, failure: Requ
     value.get_or_insert(failure);
 }
 
+fn record_task_worker_result(
+    result: &Result<(), crate::bus::WorkerError>,
+    slot: &Arc<Mutex<Option<RequiredOwnerFailure>>>,
+) {
+    if result.is_err() {
+        retain_failure(
+            slot,
+            RequiredOwnerFailure {
+                component: "task-worker",
+                class: "failed",
+            },
+        );
+    }
+}
+
+fn record_matrix_owner_failure(
+    slot: &Arc<Mutex<Option<RequiredOwnerFailure>>>,
+    health: &HealthState,
+    generation: u64,
+    error: &crate::matrix::MatrixError,
+) {
+    let reason = matrix_runtime_failure(error);
+    retain_failure(
+        slot,
+        RequiredOwnerFailure {
+            component: "matrix-sync",
+            class: matrix_error_class(error),
+        },
+    );
+    health.matrix().transition(
+        generation,
+        &[MatrixPhase::Registering, MatrixPhase::Ready],
+        MatrixPhase::Failed(reason),
+    );
+}
+
 impl AppRuntime {
     pub async fn start(path: impl AsRef<Path>) -> Result<Self, AppError> {
         let path = path.as_ref().to_path_buf();
@@ -506,18 +542,11 @@ impl AppRuntime {
             .map(|sync| sync.with_initial_response(initial_response))
             .map_err(|_| AppError::Matrix)?
             .with_failure_observer(Arc::new(move |error| {
-                let reason = matrix_runtime_failure(error);
-                retain_failure(
+                record_matrix_owner_failure(
                     &failure_slot,
-                    RequiredOwnerFailure {
-                        component: "matrix-sync",
-                        class: matrix_error_class(error),
-                    },
-                );
-                health_for_failure.matrix().transition(
+                    health_for_failure.as_ref(),
                     matrix_failure_generation,
-                    &[MatrixPhase::Registering, MatrixPhase::Ready],
-                    MatrixPhase::Failed(reason),
+                    error,
                 );
             }))
             .with_missing_key_observer(runtime.health_state.clone());
@@ -629,15 +658,7 @@ impl AppRuntime {
         let worker_failure = Arc::clone(&first_failure);
         runtime.worker = Some(tokio::spawn(async move {
             let result = worker.run().await;
-            if result.is_err() {
-                retain_failure(
-                    &worker_failure,
-                    RequiredOwnerFailure {
-                        component: "task-worker",
-                        class: "failed",
-                    },
-                );
-            }
+            record_task_worker_result(&result, &worker_failure);
             worker_alive.store(false, std::sync::atomic::Ordering::Release);
             result
         }));
@@ -717,7 +738,7 @@ impl AppRuntime {
         }
         self.reload.stop().await;
         if let Some(sync) = self.matrix_sync.take()
-            && let Err(error) = sync.shutdown().await
+            && let Err(error) = sync.shutdown_bounded(self.shutdown_timeout).await
         {
             retain_failure(
                 &self.first_failure,
@@ -954,9 +975,14 @@ mod assembly_tests {
         matchers::{method, path_regex},
     };
 
-    use super::{AppRuntime, RequiredOwnerFailure, retain_failure};
+    use super::{
+        AppError, AppRuntime, MatrixPhase, record_matrix_owner_failure, record_task_worker_result,
+    };
     use crate::{
+        bus::WorkerError,
         config::load_from_str_with_env,
+        matrix::MatrixError,
+        models::TaskId,
         storage::{ReliabilityStore, connect, migrate},
     };
 
@@ -1144,25 +1170,101 @@ enabled = true
         }
     }
 
-    #[test]
-    fn required_owner_failure_retains_the_first_bounded_class() {
-        let slot = std::sync::Arc::new(std::sync::Mutex::new(None));
-        retain_failure(
-            &slot,
-            RequiredOwnerFailure {
+    async fn runtime_fixture() -> (AppRuntime, std::path::PathBuf) {
+        let root = std::env::temp_dir().join(format!("t044-runtime-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let config = root.join("bridge.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nhealth_bind = \"127.0.0.1:0\"\nshutdown_timeout_seconds = 1\n",
+                root.join("state.db").to_string_lossy(),
+                root.join("sessions").to_string_lossy(),
+            ),
+        )
+        .unwrap();
+        (AppRuntime::start(config).await.unwrap(), root)
+    }
+
+    async fn replace_worker_with_failure(runtime: &mut AppRuntime) {
+        if let Some(worker) = runtime.worker.take() {
+            worker.abort();
+            let _ = worker.await;
+        }
+        let slot = std::sync::Arc::clone(&runtime.first_failure);
+        runtime.worker = Some(tokio::spawn(async move {
+            let result = Err(WorkerError::EventStreamClosed {
+                task_id: TaskId::generate(),
+                seq: 1,
+            });
+            record_task_worker_result(&result, &slot);
+            result
+        }));
+        tokio::task::yield_now().await;
+    }
+
+    fn mark_matrix_ready(runtime: &AppRuntime) -> u64 {
+        let generation = runtime.health_state.matrix().begin();
+        for (from, to) in [
+            (MatrixPhase::Preflight, MatrixPhase::IdentityMatched),
+            (MatrixPhase::IdentityMatched, MatrixPhase::StoreBound),
+            (MatrixPhase::StoreBound, MatrixPhase::KeyProved),
+            (MatrixPhase::KeyProved, MatrixPhase::Registering),
+            (MatrixPhase::Registering, MatrixPhase::Ready),
+        ] {
+            assert!(
+                runtime
+                    .health_state
+                    .matrix()
+                    .transition(generation, &[from], to)
+            );
+        }
+        generation
+    }
+
+    #[tokio::test]
+    async fn runtime_shutdown_retains_matrix_failure_before_worker_failure() {
+        let (mut runtime, root) = runtime_fixture().await;
+        let generation = mark_matrix_ready(&runtime);
+        record_matrix_owner_failure(
+            &runtime.first_failure,
+            runtime.health_state.as_ref(),
+            generation,
+            &MatrixError::Storage,
+        );
+        assert_eq!(
+            runtime.health_state.snapshot().await.diagnostic,
+            Some("matrix-sync-storage")
+        );
+        replace_worker_with_failure(&mut runtime).await;
+        assert!(matches!(
+            runtime.shutdown().await,
+            Err(AppError::RequiredOwner {
                 component: "matrix-sync",
-                class: "storage",
-            },
+                class: "storage"
+            })
+        ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn runtime_shutdown_retains_task_worker_failure_before_matrix_failure() {
+        let (mut runtime, root) = runtime_fixture().await;
+        replace_worker_with_failure(&mut runtime).await;
+        let generation = mark_matrix_ready(&runtime);
+        record_matrix_owner_failure(
+            &runtime.first_failure,
+            runtime.health_state.as_ref(),
+            generation,
+            &MatrixError::Storage,
         );
-        retain_failure(
-            &slot,
-            RequiredOwnerFailure {
+        assert!(matches!(
+            runtime.shutdown().await,
+            Err(AppError::RequiredOwner {
                 component: "task-worker",
-                class: "failed",
-            },
-        );
-        let retained = slot.lock().unwrap().unwrap();
-        assert_eq!(retained.component, "matrix-sync");
-        assert_eq!(retained.class, "storage");
+                class: "failed"
+            })
+        ));
+        std::fs::remove_dir_all(root).unwrap();
     }
 }

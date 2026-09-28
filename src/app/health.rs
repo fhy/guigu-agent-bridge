@@ -189,7 +189,7 @@ fn legal_matrix_transition(from: MatrixPhase, to: MatrixPhase) -> bool {
             | (StoreBound, KeyProved | Failed(_))
             | (KeyProved, Registering | Failed(_))
             | (Registering, Ready | Failed(_))
-            | (Ready, Failed(MatrixFailure::RequiredTaskExited))
+            | (Ready, Failed(_))
     )
 }
 

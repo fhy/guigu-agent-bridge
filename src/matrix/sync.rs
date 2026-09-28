@@ -25,6 +25,11 @@ pub type SyncTokenFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 type Disposition = Result<(), MatrixError>;
 pub(crate) type FailureObserver = Arc<dyn Fn(&MatrixError) + Send + Sync>;
 
+enum ProcessResult {
+    Complete(usize),
+    Cancelled,
+}
+
 pub trait RawMatrixEventConsumer: Send + Sync {
     fn consume<'a>(
         &'a self,
@@ -190,8 +195,9 @@ impl MatrixSync {
         &self,
         events: &mpsc::Sender<InboundMatrixEvent>,
         dispositions: &mut Option<mpsc::Receiver<Disposition>>,
+        mut shutdown: Option<&mut watch::Receiver<bool>>,
         response: SyncResponse,
-    ) -> Result<usize, MatrixError> {
+    ) -> Result<ProcessResult, MatrixError> {
         let mut delivered = 0;
         for (room_id, update) in response.rooms.joined {
             for timeline in update.timeline.events {
@@ -209,10 +215,19 @@ impl MatrixSync {
                             mpsc::error::TrySendError::Closed(_) => MatrixError::ConsumerClosed,
                         })?;
                         if let Some(dispositions) = dispositions {
-                            dispositions
-                                .recv()
-                                .await
-                                .ok_or(MatrixError::ConsumerClosed)??;
+                            let disposition = if let Some(shutdown) = shutdown.as_deref_mut() {
+                                tokio::select! {
+                                    biased;
+                                    changed = shutdown.changed() => {
+                                        let _ = changed;
+                                        return Ok(ProcessResult::Cancelled);
+                                    }
+                                    disposition = dispositions.recv() => disposition,
+                                }
+                            } else {
+                                dispositions.recv().await
+                            };
+                            disposition.ok_or(MatrixError::ConsumerClosed)??;
                         }
                         delivered += 1;
                     }
@@ -243,7 +258,7 @@ impl MatrixSync {
             }
         }
         self.tokens.save(&response.next_batch).await?;
-        Ok(delivered)
+        Ok(ProcessResult::Complete(delivered))
     }
 
     pub async fn sync_once(
@@ -269,7 +284,13 @@ impl MatrixSync {
             .sync_once(settings)
             .await
             .map_err(classify_sdk_error)?;
-        self.process_response(events, dispositions, response).await
+        match self
+            .process_response(events, dispositions, None, response)
+            .await?
+        {
+            ProcessResult::Complete(delivered) => Ok(delivered),
+            ProcessResult::Cancelled => unreachable!("sync_once has no cancellation receiver"),
+        }
     }
 
     async fn run(
@@ -278,24 +299,25 @@ impl MatrixSync {
         mut dispositions: Option<mpsc::Receiver<Disposition>>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), MatrixError> {
-        if let Some(response) = self.initial_response.take() {
-            self.process_response(&events, &mut dispositions, response)
-                .await?;
+        if let Some(response) = self.initial_response.take()
+            && matches!(
+                self.process_response(&events, &mut dispositions, Some(&mut shutdown), response,)
+                    .await?,
+                ProcessResult::Cancelled
+            )
+        {
+            return Ok(());
         }
         let mut failures = 0_u8;
         loop {
-            let response = tokio::select! {
-                biased;
-                changed = shutdown.changed() => {
-                    let _ = changed;
-                    return Ok(());
-                }
-                response = self.sync_once_with_dispositions(&events, &mut dispositions) => response,
-            };
+            let response = self
+                .sync_once_with_shutdown(&events, &mut dispositions, &mut shutdown)
+                .await;
             match response {
-                Ok(_) => {
+                Ok(ProcessResult::Complete(_)) => {
                     failures = 0;
                 }
+                Ok(ProcessResult::Cancelled) => return Ok(()),
                 Err(MatrixError::Transport) if failures < 2 => {
                     failures += 1;
                     tokio::select! {
@@ -311,6 +333,31 @@ impl MatrixSync {
                 Err(error) => return Err(error),
             }
         }
+    }
+
+    async fn sync_once_with_shutdown(
+        &self,
+        events: &mpsc::Sender<InboundMatrixEvent>,
+        dispositions: &mut Option<mpsc::Receiver<Disposition>>,
+        shutdown: &mut watch::Receiver<bool>,
+    ) -> Result<ProcessResult, MatrixError> {
+        let token = self.tokens.load().await?;
+        let mut settings = SyncSettings::new().timeout(self.server_timeout);
+        if let Some(token) = token {
+            settings = settings.token(token);
+        }
+        let response = tokio::select! {
+            biased;
+            changed = shutdown.changed() => {
+                let _ = changed;
+                return Ok(ProcessResult::Cancelled);
+            }
+            response = self.client.inner.sync_once(settings) => {
+                response.map_err(classify_sdk_error)?
+            }
+        };
+        self.process_response(events, dispositions, Some(shutdown), response)
+            .await
     }
 }
 
@@ -344,6 +391,18 @@ impl MatrixSyncHandle {
     pub async fn shutdown(self) -> Result<(), MatrixError> {
         let _ = self.shutdown_tx.send(true);
         self.join.await.map_err(|_| MatrixError::Join)?
+    }
+
+    pub async fn shutdown_bounded(mut self, timeout: Duration) -> Result<(), MatrixError> {
+        let _ = self.shutdown_tx.send(true);
+        match tokio::time::timeout(timeout, &mut self.join).await {
+            Ok(result) => result.map_err(|_| MatrixError::Join)?,
+            Err(_) => {
+                self.join.abort();
+                let _ = self.join.await;
+                Err(MatrixError::Join)
+            }
+        }
     }
 
     /// Wait for a terminal sync failure without requesting shutdown.

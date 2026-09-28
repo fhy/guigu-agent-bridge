@@ -427,6 +427,31 @@ async fn initial_response_checkpoint_is_owned_before_the_second_sync() {
 }
 
 #[tokio::test]
+async fn shutdown_cancels_pending_disposition_without_checkpointing() {
+    let server = MockServer::start().await;
+    mount_versions(&server).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"/_matrix/client/.*/sync"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(sync_response("blocked", "$one:x")))
+        .mount(&server)
+        .await;
+    let tokens: Arc<dyn SyncTokenStore> = Arc::new(MemorySyncTokenStore::default());
+    let sync = MatrixSync::new(
+        MatrixClient::restore(&config(&server.uri())).await.unwrap(),
+        Arc::clone(&tokens),
+        4,
+    )
+    .unwrap();
+    let (handle, mut events, _dispositions) = sync.start_with_dispositions();
+    assert_eq!(events.recv().await.unwrap().event_id, "$one:x");
+    tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tokens.load().await.unwrap(), None);
+}
+
+#[tokio::test]
 async fn state_and_redacted_events_do_not_block_delivery_or_checkpoint() {
     let server = MockServer::start().await;
     mount_versions(&server).await;
