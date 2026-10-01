@@ -158,8 +158,39 @@ fn matrix_failure_observer(
 
 impl AppRuntime {
     pub async fn start(path: impl AsRef<Path>) -> Result<Self, AppError> {
-        let path = path.as_ref().to_path_buf();
+        Self::start_inner(path.as_ref().to_path_buf(), Arc::new(crate::a2a::NoFault)).await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn start_with_a2a_faults(
+        path: impl AsRef<Path>,
+        faults: Arc<dyn crate::a2a::IngressFaultInjector>,
+    ) -> Result<Self, AppError> {
+        Self::start_inner(path.as_ref().to_path_buf(), faults).await
+    }
+
+    #[cfg(feature = "test-support")]
+    pub async fn start_with_config_and_a2a_faults(
+        path: impl AsRef<Path>,
+        config: Config,
+        faults: Arc<dyn crate::a2a::IngressFaultInjector>,
+    ) -> Result<Self, AppError> {
+        Self::start_config_inner(path.as_ref().to_path_buf(), config, faults).await
+    }
+
+    async fn start_inner(
+        path: PathBuf,
+        a2a_faults: Arc<dyn crate::a2a::IngressFaultInjector>,
+    ) -> Result<Self, AppError> {
         let config = crate::config::load(&path)?;
+        Self::start_config_inner(path, config, a2a_faults).await
+    }
+
+    async fn start_config_inner(
+        path: PathBuf,
+        config: Config,
+        a2a_faults: Arc<dyn crate::a2a::IngressFaultInjector>,
+    ) -> Result<Self, AppError> {
         prepare_directories(&config).map_err(AppError::Health)?;
         let pool = connect(&config.bridge.database).await?;
         if let Err(error) = migrate(&pool).await {
@@ -180,6 +211,7 @@ impl AppRuntime {
             reliability.clone(),
             runtime_instance.clone(),
             owns_runtime,
+            a2a_faults,
         )
         .await
         {
@@ -208,6 +240,7 @@ impl AppRuntime {
         reliability: crate::storage::ReliabilityStore,
         runtime_instance: String,
         owns_runtime: bool,
+        a2a_faults: Arc<dyn crate::a2a::IngressFaultInjector>,
     ) -> Result<Self, AppError> {
         let repository = Arc::new(SqliteRepository::new(pool.clone()));
         let repository_trait: Arc<dyn Repository> = repository.clone();
@@ -715,12 +748,15 @@ impl AppRuntime {
             runtime.a2a = Some(
                 crate::a2a::assembly::server(
                     &config,
-                    pool.clone(),
-                    repository_trait.clone(),
-                    repository.as_ref().clone(),
-                    durable_bus,
-                    cancellation,
-                    Arc::clone(&registry),
+                    crate::a2a::assembly::ServerDependencies {
+                        pool: pool.clone(),
+                        repository: repository_trait.clone(),
+                        concrete: repository.as_ref().clone(),
+                        bus: durable_bus,
+                        cancellation,
+                        registry: Arc::clone(&registry),
+                        faults: a2a_faults,
+                    },
                 )
                 .await
                 .map_err(|_| AppError::Assembly("A2A listener startup failed"))?,
@@ -741,6 +777,11 @@ impl AppRuntime {
 
     pub fn health_addr(&self) -> Option<std::net::SocketAddr> {
         self.health.as_ref().map(HealthServer::local_addr)
+    }
+
+    #[cfg(feature = "test-support")]
+    pub fn a2a_addr(&self) -> Option<std::net::SocketAddr> {
+        self.a2a.as_ref().and_then(A2aServerHandle::local_addr)
     }
 
     pub async fn shutdown(mut self) -> Result<(), AppError> {
@@ -988,7 +1029,7 @@ where
 
 #[cfg(test)]
 mod assembly_tests {
-    use std::collections::BTreeMap;
+    use std::{collections::BTreeMap, sync::Arc};
 
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1143,9 +1184,17 @@ enabled = true
                 .unwrap()
         );
 
-        let runtime = AppRuntime::build(config_path, config, pool, reliability, instance, true)
-            .await
-            .unwrap();
+        let runtime = AppRuntime::build(
+            config_path,
+            config,
+            pool,
+            reliability,
+            instance,
+            true,
+            Arc::new(crate::a2a::NoFault),
+        )
+        .await
+        .unwrap();
         assert!(runtime.bus.is_none());
         assert!(runtime.worker.is_none());
         assert!(runtime.broadcaster.is_none());

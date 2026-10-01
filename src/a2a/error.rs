@@ -1,8 +1,78 @@
+use serde::Serialize;
 use thiserror::Error;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngressStage {
+    HttpBody,
+    Authentication,
+    Authorization,
+    RpcEnvelope,
+    Method,
+    ParamsDecode,
+    VersionValidate,
+    IdempotencyReserve,
+    ContentPersist,
+    EndpointResolve,
+    PeerPersist,
+    Conversation,
+    Admission,
+    Binding,
+    Snapshot,
+    ResponseEncode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IngressCause {
+    BodyTooLarge,
+    MalformedJson,
+    InvalidParams,
+    AuthenticationFailed,
+    TargetUnavailable,
+    Unsupported,
+    IdempotencyConflict,
+    Storage,
+    AdmissionBusy,
+    AdmissionClosed,
+    BindingIncomplete,
+    RecoveryRequired,
+    Internal,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Retryability {
+    Never,
+    CredentialsChange,
+    PolicyChange,
+    SameRequest,
+    Backoff,
+    ServiceRecovery,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct IngressFailure {
+    pub stage: IngressStage,
+    pub cause: IngressCause,
+    pub retryability: Retryability,
+}
+
+impl IngressFailure {
+    pub const fn new(stage: IngressStage, cause: IngressCause, retryability: Retryability) -> Self {
+        Self {
+            stage,
+            cause,
+            retryability,
+        }
+    }
+}
 
 /// Bounded A2A adapter failures. Values never contain credentials or bodies.
 #[derive(Debug, Error)]
 pub enum A2aError {
+    #[error("A2A ingress failed")]
+    Ingress(IngressFailure),
     #[error("invalid A2A configuration: {0}")]
     Config(&'static str),
     #[error("A2A authentication failed")]
@@ -23,6 +93,16 @@ pub enum A2aError {
     Storage(#[source] sqlx::Error),
     #[error("A2A network operation failed")]
     Network(#[source] reqwest::Error),
+}
+
+impl A2aError {
+    pub const fn ingress(
+        stage: IngressStage,
+        cause: IngressCause,
+        retryability: Retryability,
+    ) -> Self {
+        Self::Ingress(IngressFailure::new(stage, cause, retryability))
+    }
 }
 
 impl From<sqlx::Error> for A2aError {

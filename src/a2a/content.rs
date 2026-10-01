@@ -1,5 +1,5 @@
 use chrono::{DateTime, Utc};
-use sqlx::SqlitePool;
+use sqlx::{SqliteConnection, SqlitePool};
 
 use super::{
     A2aError,
@@ -15,7 +15,16 @@ pub(super) async fn store_message(
     if message.parts.len() > 64 {
         return Err(A2aError::TooLarge);
     }
-    let mut tx = pool.begin().await?;
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
+    if message_matches_on(&mut tx, exchange_id, message).await? {
+        let bytes =
+            sqlx::query_scalar("SELECT content_bytes FROM a2a_exchanges WHERE exchange_id=?")
+                .bind(exchange_id)
+                .fetch_one(&mut *tx)
+                .await?;
+        tx.commit().await?;
+        return Ok(bytes);
+    }
     let stored_id = uuid::Uuid::now_v7().to_string();
     sqlx::query("INSERT INTO a2a_messages (message_id,exchange_id,external_message_id,role,ordinal,created_at) VALUES (?,?,?,?,0,?)")
         .bind(&stored_id).bind(exchange_id).bind(&message.message_id)
@@ -45,6 +54,62 @@ pub(super) async fn store_message(
         .bind(total).bind(now.to_rfc3339()).bind(exchange_id).execute(&mut *tx).await?;
     tx.commit().await?;
     Ok(total)
+}
+
+pub(super) async fn message_matches(
+    pool: &SqlitePool,
+    exchange_id: &str,
+    message: &Message,
+) -> Result<bool, A2aError> {
+    let mut connection = pool.acquire().await?;
+    message_matches_on(&mut connection, exchange_id, message).await
+}
+
+async fn message_matches_on(
+    connection: &mut SqliteConnection,
+    exchange_id: &str,
+    message: &Message,
+) -> Result<bool, A2aError> {
+    let header: Option<(String, String, i64)> = sqlx::query_as(
+        "SELECT external_message_id,role,(SELECT COUNT(*) FROM a2a_message_parts p WHERE p.message_id=m.message_id) FROM a2a_messages m WHERE exchange_id=?",
+    )
+    .bind(exchange_id)
+    .fetch_optional(&mut *connection)
+    .await?;
+    let role = match message.role {
+        Role::User => "user",
+        Role::Agent => "agent",
+    };
+    let Some((external_id, stored_role, count)) = header else {
+        return Ok(false);
+    };
+    if external_id != message.message_id
+        || stored_role != role
+        || count != message.parts.len() as i64
+    {
+        return Ok(false);
+    }
+    let hashes: Vec<(i64, String)> = sqlx::query_as(
+        "SELECT p.ordinal,p.content_hash FROM a2a_message_parts p JOIN a2a_messages m ON m.message_id=p.message_id WHERE m.exchange_id=? ORDER BY p.ordinal",
+    )
+    .bind(exchange_id)
+    .fetch_all(&mut *connection)
+    .await?;
+    for (ordinal, part) in message.parts.iter().enumerate() {
+        let encoded = encode(part)?;
+        let source = encoded
+            .text
+            .as_deref()
+            .or(encoded.json.as_deref())
+            .map(str::as_bytes)
+            .or(encoded.blob.as_deref())
+            .unwrap_or_default();
+        let expected = uuid::Uuid::new_v5(&uuid::Uuid::NAMESPACE_OID, source).to_string();
+        if hashes.get(ordinal) != Some(&(ordinal as i64, expected)) {
+            return Ok(false);
+        }
+    }
+    Ok(true)
 }
 
 pub(super) async fn store_artifacts(

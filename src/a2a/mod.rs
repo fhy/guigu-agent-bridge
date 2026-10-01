@@ -6,19 +6,25 @@ mod client;
 mod content;
 mod dispatcher;
 mod error;
+mod fault;
 mod identity;
 mod ingress;
+mod ingress_support;
 mod mapping;
 mod policy;
 mod projection;
 pub mod server;
+mod server_response;
 mod store;
 pub mod wire;
 
 pub use cleanup::{CleanupHandle, CleanupPolicy, start_cleanup};
 pub use client::{A2aClient, ClientPeer, TrustPolicy};
 pub use dispatcher::{A2aDispatcher, A2aDispatcherRouter};
-pub use error::A2aError;
+pub use error::{A2aError, IngressCause, IngressFailure, IngressStage, Retryability};
+#[cfg(feature = "test-support")]
+pub use fault::FaultPlan;
+pub use fault::{FaultPoint, IngressFaultInjector, NoFault};
 pub use identity::derive_peer_endpoint_id;
 pub use ingress::A2aIngress;
 pub use mapping::{internal_status, outbound_outcome};

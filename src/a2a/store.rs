@@ -9,6 +9,7 @@ pub struct ExchangeRecord {
     pub peer_id: String,
     pub request_id: String,
     pub request_hash: String,
+    pub external_context_id: Option<String>,
     pub external_task_id: Option<String>,
     pub internal_task_id: Option<String>,
     pub state: String,
@@ -47,7 +48,7 @@ impl A2aStore {
         context_id: &str,
         now: DateTime<Utc>,
     ) -> Result<InboundReservation, A2aError> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         if let Some(existing) = read_request(&mut tx, peer_id, "inbound", request_id).await? {
             tx.commit().await?;
             return if existing.request_hash == request_hash {
@@ -191,7 +192,7 @@ impl A2aStore {
     ) -> Result<bool, A2aError> {
         let changed = sqlx::query(
             "UPDATE a2a_exchanges SET internal_task_id=?,external_task_id=?,state='submitted',revision=revision+1,content_bytes=?,updated_at=? \
-             WHERE exchange_id=? AND state='reserved'",
+             WHERE exchange_id=? AND state='reserved' AND internal_task_id IS NULL AND external_task_id IS NULL",
         )
         .bind(internal_task_id)
         .bind(external_task_id)
@@ -211,6 +212,39 @@ impl A2aStore {
         now: DateTime<Utc>,
     ) -> Result<i64, A2aError> {
         super::content::store_message(&self.pool, exchange_id, message, now).await
+    }
+
+    pub async fn message_matches(
+        &self,
+        exchange_id: &str,
+        message: &Message,
+    ) -> Result<bool, A2aError> {
+        super::content::message_matches(&self.pool, exchange_id, message).await
+    }
+
+    pub async fn admitted_task(&self, request_id: &str) -> Result<Option<String>, A2aError> {
+        let row: Option<(String, Option<String>, String)> = sqlx::query_as(
+            "SELECT receipt_kind,task_id,state FROM transport_receipts WHERE transport='a2a' AND external_event_id=?",
+        )
+        .bind(request_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            None => Ok(None),
+            Some((kind, Some(task), state)) if kind == "ordinary" && state == "admitted" => {
+                let exists: bool =
+                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM tasks WHERE task_id=?)")
+                        .bind(&task)
+                        .fetch_one(&self.pool)
+                        .await?;
+                if exists {
+                    Ok(Some(task))
+                } else {
+                    Err(A2aError::RecoveryNeeded)
+                }
+            }
+            Some(_) => Err(A2aError::RecoveryNeeded),
+        }
     }
 
     pub async fn store_artifacts(
@@ -474,6 +508,7 @@ fn decode(row: sqlx::sqlite::SqliteRow) -> ExchangeRecord {
         peer_id: row.get("peer_id"),
         request_id: row.get("request_id"),
         request_hash: row.get("request_hash"),
+        external_context_id: row.get("external_context_id"),
         external_task_id: row.get("external_task_id"),
         internal_task_id: row.get("internal_task_id"),
         state: row.get("state"),

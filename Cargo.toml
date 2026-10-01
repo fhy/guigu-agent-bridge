@@ -11,6 +11,7 @@ documentation = "https://docs.rs/guigu-agent-bridge"
 readme = "README.md"
 keywords = ["agent", "matrix", "acp", "a2a", "sqlite"]
 categories = ["asynchronous", "command-line-utilities"]
+
 include = [
     "!/.agent-governance/**",
     "!/AGENTS.md",
@@ -44,6 +45,9 @@ include = [
     "/migrations/**",
     "/src/**",
 ]
+
+[features]
+test-support = []
 
 [dependencies]
 # `time` backs the production `Timer` (`TokioTimer`, T006 D1/Q2 = T-B): the

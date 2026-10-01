@@ -7,18 +7,22 @@ use crate::{
     a2a::{
         server::{A2aHandler, HandlerFuture},
         wire::{
-            JsonRpcRequest, PROTOCOL_VERSION, Part, SendParams, TaskQuery, TaskSnapshot, TaskState,
+            JsonRpcRequest, NormalizedSend, TaskSnapshot, TaskState, normalize_send,
+            normalize_task_query,
         },
     },
     bus::{AdmissionContext, Bus, Cancellation},
     models::{
         AgentEndpoint, AgentTask, Conversation, ConversationId, EndpointAddress, ExternalRef,
-        Priority, TaskId, TaskStatus, TransportType,
+        Priority, TaskId, TransportType,
     },
     storage::{Repository, SqliteRepository},
 };
 
-use super::{A2aError, A2aStore, ExchangeRecord, InboundReservation, derive_peer_endpoint_id};
+use super::{
+    A2aError, A2aStore, ExchangeRecord, FaultPoint, InboundReservation, IngressFaultInjector,
+    IngressStage, NoFault, derive_peer_endpoint_id, ingress_support::*,
+};
 
 pub struct A2aIngress {
     store: A2aStore,
@@ -27,6 +31,15 @@ pub struct A2aIngress {
     bus: Arc<dyn Bus>,
     cancellation: Cancellation,
     endpoints: BTreeMap<String, crate::models::EndpointId>,
+    faults: Arc<dyn IngressFaultInjector>,
+}
+
+struct PreparedSend {
+    params: NormalizedSend,
+    row: ExchangeRecord,
+    to_agent: crate::models::EndpointId,
+    task_text: String,
+    content_bytes: i64,
 }
 
 impl A2aIngress {
@@ -45,7 +58,13 @@ impl A2aIngress {
             bus,
             cancellation,
             endpoints,
+            faults: Arc::new(NoFault),
         }
+    }
+
+    pub(crate) fn with_faults(mut self, faults: Arc<dyn IngressFaultInjector>) -> Self {
+        self.faults = faults;
+        self
     }
 
     async fn dispatch(
@@ -55,23 +74,43 @@ impl A2aIngress {
         request: JsonRpcRequest,
     ) -> Result<Value, A2aError> {
         match request.method.as_str() {
-            "message/send" => self.send(peer, endpoint, request.params).await,
+            "message/send" => self.send(peer, endpoint, request.id, request.params).await,
             "tasks/get" => self.query(peer, request.params, false).await,
             "tasks/cancel" => self.query(peer, request.params, true).await,
             _ => Err(A2aError::Unsupported),
         }
     }
 
-    async fn send(&self, peer: &str, endpoint: &str, value: Value) -> Result<Value, A2aError> {
-        let params: SendParams = serde_json::from_value(value)
-            .map_err(|_| A2aError::Protocol("invalid message/send params"))?;
-        require_version(&params.protocol_version)?;
-        let canonical =
-            serde_json::to_vec(&params).map_err(|_| A2aError::Protocol("invalid request"))?;
-        if canonical.len() > 1_048_576 || params.message.parts.len() > 64 {
-            return Err(A2aError::TooLarge);
-        }
-        let hash = Uuid::new_v5(&Uuid::NAMESPACE_OID, &canonical).to_string();
+    async fn send(
+        &self,
+        peer: &str,
+        endpoint: &str,
+        rpc_id: Value,
+        value: Value,
+    ) -> Result<Value, A2aError> {
+        let prepared = self.prepare_send(peer, endpoint, rpc_id, value).await?;
+        let (from_agent, conversation) = self.prepare_identity(peer, &prepared).await?;
+        let winner = self.admit(&prepared, from_agent, &conversation).await?;
+        self.bind_and_snapshot(&prepared, &winner).await
+    }
+
+    async fn prepare_send(
+        &self,
+        peer: &str,
+        endpoint: &str,
+        rpc_id: Value,
+        value: Value,
+    ) -> Result<PreparedSend, A2aError> {
+        reject_bad_version(&value)?;
+        let params =
+            normalize_send(value, &rpc_id).map_err(|_| invalid(IngressStage::ParamsDecode))?;
+        let task_text = text_parts(&params.message.parts)?;
+        let to_agent = *self
+            .endpoints
+            .get(endpoint)
+            .ok_or_else(|| target_unavailable(IngressStage::EndpointResolve))?;
+        let hash = Uuid::new_v5(&Uuid::NAMESPACE_OID, &params.canonical).to_string();
+        self.faults.inject(FaultPoint::BeforeReservation)?;
         let reservation = self
             .store
             .reserve_inbound(
@@ -82,21 +121,42 @@ impl A2aIngress {
                 chrono::Utc::now(),
             )
             .await?;
-        if let InboundReservation::Replay(row) = &reservation {
-            return to_value(self.snapshot(row).await?);
-        }
-        let new_row = match &reservation {
-            InboundReservation::New(row) => row,
-            InboundReservation::Replay(_) => unreachable!(),
+        self.faults.inject(FaultPoint::AfterReservation)?;
+        let row = match reservation {
+            InboundReservation::New(row) | InboundReservation::Replay(row) => row,
         };
-        let content_bytes = self
+        let content_bytes = if self
             .store
-            .store_message(&new_row.exchange_id, &params.message, chrono::Utc::now())
-            .await?;
-        let to_agent = *self
-            .endpoints
-            .get(endpoint)
-            .ok_or(A2aError::Protocol("unknown endpoint"))?;
+            .message_matches(&row.exchange_id, &params.message)
+            .await?
+        {
+            row.content_bytes
+        } else if row.content_bytes == 0 {
+            self.faults.inject(FaultPoint::BeforeContent)?;
+            let bytes = self
+                .store
+                .store_message(&row.exchange_id, &params.message, chrono::Utc::now())
+                .await?;
+            self.faults.inject(FaultPoint::AfterContent)?;
+            bytes
+        } else {
+            return Err(recovery(IngressStage::ContentPersist));
+        };
+        Ok(PreparedSend {
+            params,
+            row,
+            to_agent,
+            task_text,
+            content_bytes,
+        })
+    }
+
+    async fn prepare_identity(
+        &self,
+        peer: &str,
+        prepared: &PreparedSend,
+    ) -> Result<(crate::models::EndpointId, Conversation), A2aError> {
+        self.faults.inject(FaultPoint::BeforePrerequisites)?;
         let from_agent = derive_peer_endpoint_id(peer);
         self.concrete
             .upsert_agent(
@@ -110,69 +170,133 @@ impl A2aIngress {
                 },
             )
             .await
-            .map_err(|_| A2aError::Protocol("peer persistence failed"))?;
+            .map_err(|_| storage(IngressStage::PeerPersist))?;
         let external = ExternalRef {
             transport: TransportType::A2a,
-            external_id: format!("{peer}/{}", params.context_id),
+            external_id: format!("{peer}/{}", prepared.params.context_id),
             thread_ref: None,
         };
-        let conversation = self.conversation(external, from_agent, to_agent).await?;
-        let task_id = TaskId::generate();
+        let conversation = self
+            .conversation(external, from_agent, prepared.to_agent)
+            .await?;
+        self.faults.inject(FaultPoint::AfterPrerequisites)?;
+        Ok((from_agent, conversation))
+    }
+
+    async fn admit(
+        &self,
+        prepared: &PreparedSend,
+        from_agent: crate::models::EndpointId,
+        conversation: &Conversation,
+    ) -> Result<String, A2aError> {
+        let existing = self
+            .store
+            .admitted_task(&prepared.params.request_id)
+            .await?;
+        let proposed_id = TaskId::generate();
         let task = AgentTask {
-            task_id,
-            root_task_id: task_id,
+            task_id: proposed_id,
+            root_task_id: proposed_id,
             parent_task_id: None,
             from_agent,
-            to_agent,
+            to_agent: prepared.to_agent,
             conversation_id: conversation.id,
             reply_to: None,
-            text: text_parts(&params.message.parts)?,
+            text: prepared.task_text.clone(),
             priority: Priority::DEFAULT,
             depth: 0,
             hops: 0,
             deadline: None,
             version: 0,
         };
-        self.bus
-            .submit_with_context(
-                task,
-                AdmissionContext {
-                    transport: "a2a".into(),
-                    external_event_id: params.request_id.clone(),
-                    room_id: params.context_id.clone(),
-                    thread_root: None,
-                    reply_event_id: params.message.message_id,
-                    monitor_room: None,
-                    monitor_generation: 0,
-                },
-            )
-            .await
-            .map_err(|_| A2aError::Protocol("task admission failed"))?;
-        let row = match reservation {
-            InboundReservation::New(row) => row,
-            _ => unreachable!(),
-        };
-        let external_task = Uuid::now_v7().to_string();
-        if !self
-            .store
-            .bind_task(
-                &row.exchange_id,
-                &task_id.to_string(),
-                &external_task,
-                content_bytes,
-                chrono::Utc::now(),
-            )
-            .await?
-        {
-            return Err(A2aError::RecoveryNeeded);
+        if existing.is_none() {
+            self.faults.inject(FaultPoint::AdmissionBusy)?;
+            self.faults.inject(FaultPoint::BeforeAdmission)?;
+            self.bus
+                .submit_with_context(
+                    task.clone(),
+                    AdmissionContext {
+                        transport: "a2a".into(),
+                        external_event_id: prepared.params.request_id.clone(),
+                        room_id: prepared.params.context_id.clone(),
+                        thread_root: None,
+                        reply_event_id: prepared.params.message.message_id.clone(),
+                        monitor_room: None,
+                        monitor_generation: 0,
+                    },
+                )
+                .await
+                .map_err(admission_error)?;
+            self.faults.inject(FaultPoint::AfterAdmission)?;
         }
-        to_value(TaskSnapshot {
-            id: external_task,
-            context_id: params.context_id,
-            status: TaskState::Submitted,
-            artifacts: vec![],
-            metadata: None,
-        })
+        let winner = self
+            .store
+            .admitted_task(&prepared.params.request_id)
+            .await?
+            .ok_or_else(|| recovery(IngressStage::Admission))?;
+        let winner_id: TaskId = winner
+            .parse()
+            .map_err(|_| recovery(IngressStage::Admission))?;
+        let winner_task = self
+            .repository
+            .get_task(winner_id)
+            .await
+            .map_err(|_| storage(IngressStage::Admission))?
+            .ok_or_else(|| recovery(IngressStage::Admission))?;
+        if winner_task.from_agent != from_agent
+            || winner_task.to_agent != prepared.to_agent
+            || winner_task.conversation_id != conversation.id
+        {
+            return Err(recovery(IngressStage::Admission));
+        }
+        Ok(winner)
+    }
+
+    async fn bind_and_snapshot(
+        &self,
+        prepared: &PreparedSend,
+        winner: &str,
+    ) -> Result<Value, A2aError> {
+        let external_task = external_task_id(&prepared.row.exchange_id);
+        if prepared.row.state == "submitted" {
+            if prepared.row.internal_task_id.as_deref() != Some(winner)
+                || prepared.row.external_task_id.as_deref() != Some(&external_task)
+            {
+                return Err(recovery(IngressStage::Binding));
+            }
+        } else {
+            self.faults.inject(FaultPoint::BeforeBinding)?;
+            if !self
+                .store
+                .bind_task(
+                    &prepared.row.exchange_id,
+                    winner,
+                    &external_task,
+                    prepared.content_bytes,
+                    chrono::Utc::now(),
+                )
+                .await?
+            {
+                let rebound = self
+                    .store
+                    .exchange(&prepared.row.exchange_id)
+                    .await?
+                    .ok_or_else(|| recovery(IngressStage::Binding))?;
+                if rebound.internal_task_id.as_deref() != Some(winner)
+                    || rebound.external_task_id.as_deref() != Some(&external_task)
+                {
+                    return Err(recovery(IngressStage::Binding));
+                }
+            }
+            self.faults.inject(FaultPoint::AfterBinding)?;
+        }
+        self.faults.inject(FaultPoint::BeforeSnapshot)?;
+        let bound = self
+            .store
+            .exchange(&prepared.row.exchange_id)
+            .await?
+            .ok_or_else(|| recovery(IngressStage::Snapshot))?;
+        to_value(self.snapshot(&bound).await?)
     }
 
     async fn conversation(
@@ -185,7 +309,7 @@ impl A2aIngress {
             .repository
             .conversation_by_external_ref(&external)
             .await
-            .map_err(|_| A2aError::Protocol("conversation lookup failed"))?
+            .map_err(|_| storage(IngressStage::Conversation))?
         {
             return Ok(value);
         }
@@ -200,19 +324,18 @@ impl A2aIngress {
         self.repository
             .conversation_by_external_ref(&external)
             .await
-            .map_err(|_| A2aError::Protocol("conversation race failed"))?
-            .ok_or(A2aError::Protocol("conversation race failed"))
+            .map_err(|_| storage(IngressStage::Conversation))?
+            .ok_or_else(|| recovery(IngressStage::Conversation))
     }
 
     async fn query(&self, peer: &str, value: Value, cancel: bool) -> Result<Value, A2aError> {
-        let query: TaskQuery =
-            serde_json::from_value(value).map_err(|_| A2aError::Protocol("invalid task query"))?;
-        require_version(&query.protocol_version)?;
+        reject_bad_version(&value)?;
+        let query = normalize_task_query(value).map_err(|_| invalid(IngressStage::ParamsDecode))?;
         let row = self
             .store
             .by_external_task(peer, "inbound", &query.task_id)
             .await?
-            .ok_or(A2aError::Protocol("unknown task"))?;
+            .ok_or_else(|| target_unavailable(IngressStage::Snapshot))?;
         if cancel {
             let id = parse_task(&row)?;
             self.cancellation.cancel(id, "remote_a2a_cancel");
@@ -225,13 +348,13 @@ impl A2aIngress {
             .repository
             .latest_event(parse_task(row)?)
             .await
-            .map_err(|_| A2aError::Protocol("task lookup failed"))?;
+            .map_err(|_| storage(IngressStage::Snapshot))?;
         Ok(TaskSnapshot {
             id: row
                 .external_task_id
                 .clone()
                 .ok_or(A2aError::RecoveryNeeded)?,
-            context_id: String::new(),
+            context_id: row.external_context_id.clone().unwrap_or_default(),
             status: event
                 .map(|event| project(event.status))
                 .unwrap_or(TaskState::Submitted),
@@ -250,40 +373,4 @@ impl A2aHandler for A2aIngress {
     ) -> HandlerFuture<'a> {
         Box::pin(async move { self.dispatch(peer, endpoint, request).await })
     }
-}
-
-fn require_version(version: &str) -> Result<(), A2aError> {
-    (version == PROTOCOL_VERSION)
-        .then_some(())
-        .ok_or(A2aError::Unsupported)
-}
-fn parse_task(row: &ExchangeRecord) -> Result<TaskId, A2aError> {
-    row.internal_task_id
-        .as_deref()
-        .ok_or(A2aError::RecoveryNeeded)?
-        .parse()
-        .map_err(|_| A2aError::RecoveryNeeded)
-}
-fn text_parts(parts: &[Part]) -> Result<String, A2aError> {
-    let mut values = Vec::new();
-    for part in parts {
-        match part {
-            Part::Text { text } => values.push(text.as_str()),
-            Part::Data { .. } | Part::FileInline { .. } => {}
-            Part::FileUri { .. } => return Err(A2aError::Unsupported),
-        }
-    }
-    Ok(values.join("\n"))
-}
-fn project(status: TaskStatus) -> TaskState {
-    match status {
-        TaskStatus::Queued => TaskState::Submitted,
-        TaskStatus::Dispatched | TaskStatus::Running => TaskState::Working,
-        TaskStatus::Completed => TaskState::Completed,
-        TaskStatus::Failed | TaskStatus::TimedOut => TaskState::Failed,
-        TaskStatus::Cancelled => TaskState::Canceled,
-    }
-}
-fn to_value<T: serde::Serialize>(value: T) -> Result<Value, A2aError> {
-    serde_json::to_value(value).map_err(|_| A2aError::Protocol("response encoding failed"))
 }
