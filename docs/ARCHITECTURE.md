@@ -181,6 +181,18 @@ Agent B -> Agent A -> Matrix -> 用户
 
 ## 12. 当前开发协作与运行时能力的边界
 
-当前项目的开发协作采用 Coordinator、Architect-Developer、Reviewer 三个逻辑角色，使用 Matrix、任务文档、Git branch/worktree 和 Review 报告完成协作。公开仓库仅保留 [AGENTS.md](../AGENTS.md) 启动入口；动态任务状态和项目专用治理规则由私有治理仓库维护。
+当前项目的开发协作采用按职责定义、按资源部署的 Agent 角色模型。正式总控角色为 **Project Controller / Technical Decision Owner（项目总控 / 技术决策负责人）**；`bridge-coordinator` 只是兼容的消息路由身份。公开仓库保留角色和协作原则，动态任务状态和项目专用治理规则仍由治理仓库维护。
+
+最小三 Agent 闭环为：
+
+```text
+Project Controller -> Architect-Developer -> Reviewer -> Project Controller
+```
+
+Project Controller 负责目标拆解、优先级、范围冻结、普通技术裁决、任务派发、证据核验和收尾；Architect-Developer 负责实现与测试；Reviewer 负责独立设计/代码验证。总控不是消息转发器，也不因可选增强、未来兼容性或额外文档而暂停当前交付。
+
+复杂运行时、发布或恢复问题可增加第四个 Agent，承担 **Verification/Diagnostic**：复现问题、准备隔离 fixture、执行只读诊断并整理回归证据。该角色不改变任务状态、不替代 Reviewer，也不成为第二个决策中心。
+
+更多 Agent 只按可隔离的任务边界扩展 Developer、Investigator、Reviewer 或 Verification。共享接口、数据库迁移、发布候选和同一文件必须指定单一 owner，并由 Project Controller 管理依赖、并行顺序和冲突裁决。增加 Agent 不增加决策中心；所有任务状态和普通工程决策仍归 Project Controller。
 
 结构化 `AgentTask`、Agent Bus、任务状态机和持久化协作是本项目完成后提供的运行时能力。现有 OpenCode、ACP 和 Matrix 工具尚不支持这些能力，因此实现前不能把 `AgentTask` 当作现有协作工具使用。
