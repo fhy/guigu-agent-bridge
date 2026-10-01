@@ -90,7 +90,9 @@ impl A2aIngress {
     ) -> Result<Value, A2aError> {
         let prepared = self.prepare_send(peer, endpoint, rpc_id, value).await?;
         let (from_agent, conversation) = self.prepare_identity(peer, &prepared).await?;
-        let winner = self.admit(&prepared, from_agent, &conversation).await?;
+        let winner = self
+            .admit(peer, &prepared, from_agent, &conversation)
+            .await?;
         self.bind_and_snapshot(&prepared, &winner).await
     }
 
@@ -185,14 +187,13 @@ impl A2aIngress {
 
     async fn admit(
         &self,
+        peer: &str,
         prepared: &PreparedSend,
         from_agent: crate::models::EndpointId,
         conversation: &Conversation,
     ) -> Result<String, A2aError> {
-        let existing = self
-            .store
-            .admitted_task(&prepared.params.request_id)
-            .await?;
+        let key = admission_key(peer, &prepared.params.request_id);
+        let existing = self.store.admitted_task(&key).await?;
         let proposed_id = TaskId::generate();
         let task = AgentTask {
             task_id: proposed_id,
@@ -217,7 +218,7 @@ impl A2aIngress {
                     task.clone(),
                     AdmissionContext {
                         transport: "a2a".into(),
-                        external_event_id: prepared.params.request_id.clone(),
+                        external_event_id: key.clone(),
                         room_id: prepared.params.context_id.clone(),
                         thread_root: None,
                         reply_event_id: prepared.params.message.message_id.clone(),
@@ -231,7 +232,7 @@ impl A2aIngress {
         }
         let winner = self
             .store
-            .admitted_task(&prepared.params.request_id)
+            .admitted_task(&key)
             .await?
             .ok_or_else(|| recovery(IngressStage::Admission))?;
         let winner_id: TaskId = winner

@@ -111,3 +111,12 @@ pub(super) fn external_task_id(exchange_id: &str) -> String {
     )
     .to_string()
 }
+
+pub(super) fn admission_key(peer: &str, request_id: &str) -> String {
+    let mut name = b"guigu-agent-bridge:a2a:admission-key\0".to_vec();
+    name.extend_from_slice(&(peer.len() as u64).to_be_bytes());
+    name.extend_from_slice(peer.as_bytes());
+    name.extend_from_slice(&(request_id.len() as u64).to_be_bytes());
+    name.extend_from_slice(request_id.as_bytes());
+    Uuid::new_v5(&Uuid::NAMESPACE_OID, &name).to_string()
+}

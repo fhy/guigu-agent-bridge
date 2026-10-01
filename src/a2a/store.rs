@@ -222,11 +222,11 @@ impl A2aStore {
         super::content::message_matches(&self.pool, exchange_id, message).await
     }
 
-    pub async fn admitted_task(&self, request_id: &str) -> Result<Option<String>, A2aError> {
+    pub async fn admitted_task(&self, admission_key: &str) -> Result<Option<String>, A2aError> {
         let row: Option<(String, Option<String>, String)> = sqlx::query_as(
             "SELECT receipt_kind,task_id,state FROM transport_receipts WHERE transport='a2a' AND external_event_id=?",
         )
-        .bind(request_id)
+        .bind(admission_key)
         .fetch_optional(&self.pool)
         .await?;
         match row {

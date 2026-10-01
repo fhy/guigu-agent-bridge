@@ -44,6 +44,12 @@ expected_peer_id = "peer-a"
 token = "{{env:T049_TOKEN}}"
 allowed_targets = ["worker"]
 
+[transports.a2a.peers.other]
+url = "http://127.0.0.1:9/a2a/worker/rpc"
+expected_peer_id = "peer-b"
+token = "{{env:T049_TOKEN_B}}"
+allowed_targets = ["worker"]
+
 [agents.worker]
 transport = "acp"
 command = "t049-command-is-not-executed-before-acceptance"
@@ -55,6 +61,7 @@ enabled = true
         let env = BTreeMap::from([
             ("HOME".into(), root.to_string_lossy().into_owned()),
             ("T049_TOKEN".into(), "t049-secret-sentinel".into()),
+            ("T049_TOKEN_B".into(), "t049-peer-b-sentinel".into()),
         ]);
         let config = load_from_str_with_env(&source, &env).unwrap();
         Self {
@@ -132,6 +139,10 @@ async fn post(runtime: &AppRuntime, token: &str, body: &Value) -> (u16, Value) {
     let status = response.status().as_u16();
     let body = response.json().await.unwrap();
     (status, body)
+}
+
+async fn post_peer(runtime: &AppRuntime, token: &str, body: &Value) -> (u16, Value) {
+    post(runtime, token, body).await
 }
 
 async fn counts(path: &PathBuf) -> (i64, i64, i64) {
@@ -392,4 +403,34 @@ async fn concurrent_winners_and_restart_replay_are_deterministic() {
     assert_eq!(replay["result"]["id"], identical_id);
     assert_eq!(counts(&fixture.database).await, (1, 1, 1));
     shutdown_after_admission(restarted).await;
+}
+
+#[tokio::test]
+async fn peer_scoped_admission_keys_isolate_reused_standard_numeric_and_legacy_ids() {
+    for (index, request) in [
+        standard("shared-string", "string"),
+        json!({"jsonrpc":"2.0","id":7,"method":"message/send","params":{"message":{"messageId":"numeric","role":"user","parts":[{"kind":"text","text":"numeric"}]}}}),
+        legacy("shared-legacy"),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let fixture = Fixture::new();
+        let runtime = fixture.start_clean().await;
+        let left = post(&runtime, "t049-secret-sentinel", &request).await;
+        assert_eq!(left.0, 200, "case {index}: {left:?}");
+        shutdown_after_admission(runtime).await;
+        let runtime = fixture.start_clean().await;
+        let right = post_peer(&runtime, "t049-peer-b-sentinel", &request).await;
+        assert_eq!(right.0, 200, "case {index}: {right:?}");
+        assert_ne!(left.1["result"]["id"], right.1["result"]["id"]);
+        assert_eq!(counts(&fixture.database).await, (2, 2, 2));
+        let (status, replay_a) = post(&runtime, "t049-secret-sentinel", &request).await;
+        let (status_b, replay_b) = post_peer(&runtime, "t049-peer-b-sentinel", &request).await;
+        assert_eq!(status, 200);
+        assert_eq!(status_b, 200);
+        assert_eq!(replay_a["result"]["id"], left.1["result"]["id"]);
+        assert_eq!(replay_b["result"]["id"], right.1["result"]["id"]);
+        shutdown_after_admission(runtime).await;
+    }
 }
