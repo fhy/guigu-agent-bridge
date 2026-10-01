@@ -90,6 +90,17 @@ Before any Agent build, run `./scripts/check-rust-build-cache.sh` and record the
 reported target directory. A command supplying `--target-dir` must use an approved
 cache root and be reported in the handoff.
 
+## Agent scheduling rule
+
+The Project Controller assigns one `build_owner` for the project's full Rust gates.
+Only that owner may run the full `fmt/check/clippy/test` sequence at a time. Other
+Agents may inspect, analyze, or run narrowly scoped tests, but must not create a
+second full target tree in another worktree. Every handoff records the build lock,
+target path and budget. When the shared target reaches 20 GiB, full builds pause
+until the owner finishes and the verified target is cleaned or explicitly retained.
+This prevents parallel worktrees from silently consuming the disk while preserving
+parallel non-build investigation.
+
 ## Rollback
 
 The per-checkout `.cargo/config.toml` files are local and ignored. To restore Cargo's
