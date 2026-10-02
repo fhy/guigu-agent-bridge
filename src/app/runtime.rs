@@ -291,6 +291,7 @@ impl AppRuntime {
             counts.recovery_backlog as usize,
         ));
         tracing::info!(category = "t050-recovery", emission = %recovery_diagnostic.line());
+        eprintln!("{}", recovery_diagnostic.line());
         let recovery_blocked = recovery_diagnostic.blocker.is_some();
 
         let reload = Arc::new(ReloadController::new(
