@@ -617,6 +617,38 @@ async fn production_runtime_starts_and_shuts_down_without_resource_residue() {
 }
 
 #[tokio::test]
+async fn app_runtime_owns_real_a2a_listener_and_agent_card_until_shutdown() {
+    let temp = TempDir::new();
+    let config_path = temp.0.join("bridge.toml");
+    let database = temp.0.join("state.db");
+    let sessions = temp.0.join("sessions");
+    unsafe {
+        std::env::set_var("T050_TOKEN", "test-token");
+    }
+    std::fs::write(
+        &config_path,
+        format!(
+            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nshutdown_timeout_seconds = 1\n\n[transports.a2a]\nenabled = true\nlisten = \"tcp:127.0.0.1:0\"\nallow_private_plaintext = true\nexposed_endpoints = [\"worker\"]\n\n[transports.a2a.peers.test]\nurl = \"http://127.0.0.1:9/a2a/worker/rpc\"\nexpected_peer_id = \"peer\"\ntoken = \"{{env:T050_TOKEN}}\"\nallowed_targets = [\"worker\"]\n\n[agents.worker]\ntransport = \"acp\"\ncommand = \"true\"\nworkspace = \"/tmp\"\nenabled = true\n",
+            database.to_string_lossy(),
+            sessions.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let runtime = AppRuntime::start(&config_path).await.unwrap();
+    let address = runtime.a2a_addr().expect("real A2A listener");
+    let response = reqwest::get(format!("http://{address}/.well-known/agent-card.json"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers()[reqwest::header::CONTENT_TYPE],
+        "application/json"
+    );
+    let _ = runtime.shutdown().await;
+    assert!(tokio::net::TcpListener::bind(address).await.is_ok());
+}
+
+#[tokio::test]
 async fn startup_recovery_backlog_blocks_readiness_without_spawning_acp() {
     let temp = TempDir::new();
     let config_path = temp.0.join("bridge.toml");

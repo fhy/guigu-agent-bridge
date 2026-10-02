@@ -785,7 +785,6 @@ impl AppRuntime {
         self.health.as_ref().map(HealthServer::local_addr)
     }
 
-    #[cfg(feature = "test-support")]
     pub fn a2a_addr(&self) -> Option<std::net::SocketAddr> {
         self.a2a.as_ref().and_then(A2aServerHandle::local_addr)
     }
