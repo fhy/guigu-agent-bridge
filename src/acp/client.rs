@@ -349,6 +349,26 @@ impl AcpClient {
             .await
     }
 
+    pub(crate) async fn prompt_stream_durable(
+        &self,
+        session_id: &str,
+        text: &str,
+        capacity: usize,
+        durable: tokio::sync::mpsc::Sender<String>,
+    ) -> Result<AcpTurnHandle, AcpError> {
+        let session_id = validate_session_id(session_id.to_owned())?;
+        self.transport
+            .request_stream_with_durable(
+                Phase::Prompt,
+                schema::METHOD_SESSION_PROMPT,
+                schema::text_prompt(&session_id, text),
+                self.limits.request_deadline,
+                capacity,
+                Some(durable),
+            )
+            .await
+    }
+
     pub(crate) fn decode_prompt_completion(
         completed: crate::acp::CompletedRequest,
     ) -> Result<PromptTurn, AcpError> {

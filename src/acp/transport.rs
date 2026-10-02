@@ -177,6 +177,7 @@ enum Outgoing {
         params: Value,
         responder: oneshot::Sender<Result<CompletedRequest, AcpError>>,
         updates: Option<mpsc::Sender<TurnUpdate>>,
+        durable_updates: Option<mpsc::Sender<String>>,
     },
     Shutdown,
     Notification {
@@ -216,6 +217,7 @@ struct Pending {
     output: String,
     output_truncated: bool,
     updates: Option<mpsc::Sender<TurnUpdate>>,
+    durable_updates: Option<mpsc::Sender<String>>,
 }
 
 impl AcpTransport {
@@ -316,6 +318,7 @@ impl AcpTransport {
                 params,
                 responder,
                 updates: None,
+                durable_updates: None,
             })
             .await
             .map_err(|_| AcpError::TransportClosed)?;
@@ -348,6 +351,19 @@ impl AcpTransport {
         deadline: Duration,
         capacity: usize,
     ) -> Result<AcpTurnHandle, AcpError> {
+        self.request_stream_with_durable(phase, method, params, deadline, capacity, None)
+            .await
+    }
+
+    pub(crate) async fn request_stream_with_durable(
+        &self,
+        phase: Phase,
+        method: &str,
+        params: Value,
+        deadline: Duration,
+        capacity: usize,
+        durable_updates: Option<mpsc::Sender<String>>,
+    ) -> Result<AcpTurnHandle, AcpError> {
         if !self.is_alive() {
             return Err(AcpError::TransportClosed);
         }
@@ -362,6 +378,7 @@ impl AcpTransport {
                 params,
                 responder,
                 updates: Some(updates),
+                durable_updates,
             })
             .await
             .map_err(|_| AcpError::TransportClosed)?;
@@ -514,7 +531,7 @@ async fn run_loop(
                 }
             },
             message = outgoing.recv() => match message {
-                Some(Outgoing::Request { id, phase, method, params, responder, updates }) => {
+                Some(Outgoing::Request { id, phase, method, params, responder, updates, durable_updates }) => {
                     let session = prompt_session(&method, &params);
                     let envelope = jsonrpc::request(id, &method, params);
                     if let Err(source) = framing::write_frame(&mut stdin, &envelope).await {
@@ -531,6 +548,7 @@ async fn run_loop(
                         output: String::new(),
                         output_truncated: false,
                         updates,
+                        durable_updates,
                     });
                 }
                 Some(Outgoing::Cancel(id)) => {
@@ -672,7 +690,7 @@ async fn route(
         }
         jsonrpc::JsonRpcMessage::Notification(notification) => {
             if notification.method == schema::METHOD_SESSION_UPDATE {
-                accumulate(&notification.params, pending, limits)?;
+                accumulate(&notification.params, pending, limits).await?;
             }
             Ok(())
         }
@@ -692,7 +710,7 @@ async fn route(
 }
 
 /// Add a streamed chunk to the matching in-flight prompt.
-fn accumulate(
+async fn accumulate(
     params: &Value,
     pending: &mut HashMap<i64, Pending>,
     limits: &TransportLimits,
@@ -720,7 +738,16 @@ fn accumulate(
             overflowed.push(*id);
             continue;
         }
-        if entry.output.len() + text.len() <= limits.max_output_bytes {
+        if let Some(durable) = &entry.durable_updates {
+            durable
+                .send(text.to_owned())
+                .await
+                .map_err(|_| AcpError::Schema {
+                    method: schema::METHOD_SESSION_PROMPT.into(),
+                    detail: "durable output owner stopped".into(),
+                })?;
+        }
+        if entry.output.len().saturating_add(text.len()) <= limits.max_output_bytes {
             entry.output.push_str(text);
         } else if !entry.output_truncated {
             entry.output.push_str(TRUNCATION_MARKER);
@@ -816,6 +843,7 @@ mod tests {
                 output: "stale".to_owned(),
                 output_truncated: false,
                 updates: None,
+                durable_updates: None,
             },
         )]);
         drop(receiver);

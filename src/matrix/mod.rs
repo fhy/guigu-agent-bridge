@@ -11,7 +11,7 @@ mod dedup;
 mod error;
 mod event;
 mod identity;
-mod outbound;
+pub(crate) mod outbound;
 mod permission;
 mod reply;
 mod router;
@@ -28,6 +28,7 @@ pub use dedup::EventDedup;
 pub use error::MatrixError;
 pub use event::InboundMatrixEvent;
 pub use identity::{derive_matrix_user_id, with_matrix_participant};
+pub(crate) use outbound::{DurableMatrixSender, DurableSendError};
 pub use outbound::{MatrixOutboxSender, SdkMatrixSender};
 pub use permission::PermissionPolicy;
 pub use reply::{

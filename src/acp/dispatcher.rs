@@ -63,6 +63,7 @@ pub struct AcpDispatcherBuilder {
     store: Option<SqliteSessionStore>,
     repository: Option<Arc<dyn Repository>>,
     reliability: Option<crate::storage::ReliabilityStore>,
+    durable_output: Option<(crate::acp::output::DurableOutputSpool, String)>,
     legacy_results: bool,
     allow_nonterminal_end_turn: bool,
 }
@@ -84,6 +85,7 @@ impl AcpDispatcherBuilder {
             store: None,
             repository: None,
             reliability: None,
+            durable_output: None,
             legacy_results: false,
             allow_nonterminal_end_turn: false,
         }
@@ -129,6 +131,15 @@ impl AcpDispatcherBuilder {
         self
     }
 
+    pub(crate) fn durable_output(
+        mut self,
+        spool: crate::acp::output::DurableOutputSpool,
+        owner: String,
+    ) -> Self {
+        self.durable_output = Some((spool, owner));
+        self
+    }
+
     pub fn legacy_results(mut self, enabled: bool) -> Self {
         self.legacy_results = enabled;
         self
@@ -153,6 +164,7 @@ impl AcpDispatcherBuilder {
             store,
             repository,
             reliability,
+            durable_output,
             legacy_results,
             allow_nonterminal_end_turn,
         } = self;
@@ -172,6 +184,7 @@ impl AcpDispatcherBuilder {
                 store,
                 repository,
                 reliability,
+                durable_output,
                 client: Mutex::new(None),
                 legacy_results,
                 allow_nonterminal_end_turn,
@@ -205,6 +218,7 @@ struct DispatcherInner {
     store: SqliteSessionStore,
     repository: Arc<dyn Repository>,
     reliability: Option<crate::storage::ReliabilityStore>,
+    durable_output: Option<(crate::acp::output::DurableOutputSpool, String)>,
     /// The negotiated backend, if one is running.
     ///
     /// The lock exists only to clone or replace an `Arc`; it is never held across
@@ -222,6 +236,7 @@ pub struct AcpStructuredTurn {
     endpoint: crate::models::EndpointId,
     session_id: String,
     handle: crate::acp::AcpTurnHandle,
+    output: Option<crate::acp::output::DurableTurnOutput>,
 }
 
 impl AcpStructuredTurn {
@@ -231,6 +246,18 @@ impl AcpStructuredTurn {
 
     pub async fn finish(self) -> Result<crate::acp::TurnResult, AcpError> {
         let completed = self.handle.finish().await;
+        let output_result = match (completed.is_ok(), self.output) {
+            (true, Some(output)) => output.finish().await.map_err(|_| AcpError::Schema {
+                method: crate::acp::schema::METHOD_SESSION_PROMPT.into(),
+                detail: "durable output publication failed".into(),
+            }),
+            (false, Some(output)) => output.cancel().await.map_err(|_| AcpError::Schema {
+                method: crate::acp::schema::METHOD_SESSION_PROMPT.into(),
+                detail: "durable output cancellation failed".into(),
+            }),
+            (_, None) => Ok(()),
+        };
+        output_result?;
         if let Err(error) = self
             .dispatcher
             .inner
@@ -286,6 +313,12 @@ impl AcpStructuredTurn {
     }
 
     pub async fn cancel_and_shutdown(self) -> Result<(), AcpError> {
+        if let Some(output) = self.output {
+            output.cancel().await.map_err(|_| AcpError::Schema {
+                method: crate::acp::schema::METHOD_SESSION_PROMPT.into(),
+                detail: "durable output cancellation failed".into(),
+            })?;
+        }
         let client = self
             .dispatcher
             .take_client()
@@ -393,13 +426,49 @@ impl AcpDispatcher {
                 self.inner.clock.now(),
             )
             .await?;
-        let handle = client.prompt_stream(&session_id, prompt, capacity).await?;
+        let mut output = if let Some((spool, owner)) = &self.inner.durable_output {
+            let now = self
+                .inner
+                .clock
+                .now()
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            spool
+                .start_turn(&request.task.task_id.to_string(), owner, &now)
+                .await
+                .map_err(|_| AcpError::Schema {
+                    method: crate::acp::schema::METHOD_SESSION_PROMPT.into(),
+                    detail: "durable output preparation failed".into(),
+                })?
+        } else {
+            None
+        };
+        let handle = match &output {
+            Some(output) => {
+                client
+                    .prompt_stream_durable(&session_id, prompt, capacity, output.sender())
+                    .await
+            }
+            None => client.prompt_stream(&session_id, prompt, capacity).await,
+        };
+        let handle = match handle {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Some(output) = output.take() {
+                    output.cancel().await.map_err(|_| AcpError::Schema {
+                        method: crate::acp::schema::METHOD_SESSION_PROMPT.into(),
+                        detail: "durable output cancellation failed".into(),
+                    })?;
+                }
+                return Err(error);
+            }
+        };
         Ok(AcpStructuredTurn {
             dispatcher: self.clone(),
             target: request.target.clone(),
             endpoint,
             session_id,
             handle,
+            output,
         })
     }
 
