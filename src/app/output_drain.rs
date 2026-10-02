@@ -159,6 +159,7 @@ mod tests {
     };
     use sqlx::SqlitePool;
     use std::{collections::VecDeque, future::pending, sync::Mutex};
+    use tokio::sync::Notify;
 
     enum Outcome {
         Ready(Result<(), DurableSendError>),
@@ -175,6 +176,7 @@ mod tests {
     struct Sender {
         outcomes: Mutex<VecDeque<Outcome>>,
         calls: Mutex<Vec<(String, String)>>,
+        pending_entered: Notify,
     }
     impl DurableMatrixSender for Sender {
         fn send_durable<'a>(
@@ -195,7 +197,10 @@ mod tests {
                     .unwrap_or(Outcome::Ready(Ok(())));
                 match outcome {
                     Outcome::Ready(result) => result,
-                    Outcome::Pending => pending().await,
+                    Outcome::Pending => {
+                        self.pending_entered.notify_one();
+                        pending().await
+                    }
                 }
             })
         }
@@ -248,6 +253,7 @@ mod tests {
         let sender = Arc::new(Sender {
             outcomes: Mutex::new(outcomes.into()),
             calls: Mutex::new(Vec::new()),
+            pending_entered: Notify::new(),
         });
         let drain = OutputSetDrain::new(store, spool, sender.clone());
         (temp, drain, sender, pool)
@@ -335,14 +341,25 @@ mod tests {
 
     #[tokio::test]
     async fn pending_and_healthy_shutdown_are_bounded_and_clean() {
-        let (_t, drain, _sender, pool) =
+        let (_t, drain, sender, pool) =
             fixture_with_timeout(vec![Outcome::Pending], Some(Duration::from_millis(20))).await;
         let handle = drain.start(Duration::from_secs(60));
-        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            sender.pending_entered.notified(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sender.calls.lock().unwrap().len(), 1);
         tokio::time::timeout(Duration::from_millis(200), handle.shutdown())
             .await
             .unwrap()
             .unwrap();
+        {
+            let calls = sender.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(!calls[0].1.is_empty());
+        }
         let state: (String, i64) = sqlx::query_as(
             "SELECT state,acknowledged_cursor FROM acp_output_sets WHERE set_id='set'",
         )
