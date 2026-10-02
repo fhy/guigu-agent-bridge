@@ -132,6 +132,7 @@ impl ReadinessProbe {
 }
 
 impl RecoveryFixture {
+    #[allow(clippy::too_many_arguments)]
     pub fn from_facts(
         owns_runtime: bool,
         admission_blocked: bool,
