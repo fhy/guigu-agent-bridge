@@ -151,7 +151,8 @@ pub use error::StorageError;
 pub use event_consumer::RepositoryEventConsumer;
 pub use pool::{DEFAULT_BUSY_TIMEOUT, MAX_CONNECTIONS, connect, migrate};
 pub use recovery::{
-    RecoveryBlocker, RecoveryDiagnostic, RecoveryPlan, RecoverySignals, plan_recovery, sync_agents,
+    RecoveryBlocker, RecoveryDiagnostic, RecoveryFixture, RecoveryPlan, RecoverySignals,
+    plan_recovery, sync_agents,
 };
 pub use reliability::{
     AdmissionRecovery, PendingProjection, QueueReservation, ReceiptOutcome, ReliabilityError,

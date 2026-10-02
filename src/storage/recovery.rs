@@ -96,6 +96,62 @@ pub struct RecoverySignals {
     pub capacity_overflow: bool,
 }
 
+/// Deterministic signal fixtures for isolated startup tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryFixture;
+
+impl RecoveryFixture {
+    pub const fn clean() -> RecoverySignals {
+        RecoverySignals {
+            owns_runtime: true,
+            ..RecoverySignals {
+                owns_runtime: false,
+                admission_blocked: false,
+                unfinished: 0,
+                unacknowledged: 0,
+                awaiting_outcome: 0,
+                runtime_ready: 0,
+                runtime_ambiguous: 0,
+                active_leases: 0,
+                recovery_leases: 0,
+                recovery_continuations: 0,
+                capacity_overflow: false,
+            }
+        }
+    }
+
+    pub const fn eligible_stale_owner() -> RecoverySignals {
+        RecoverySignals {
+            owns_runtime: false,
+            ..Self::clean()
+        }
+    }
+
+    pub const fn ambiguous_active_owner() -> RecoverySignals {
+        RecoverySignals {
+            owns_runtime: true,
+            runtime_ambiguous: 1,
+            ..Self::clean()
+        }
+    }
+
+    pub const fn recovery_lease() -> RecoverySignals {
+        RecoverySignals {
+            owns_runtime: true,
+            recovery_leases: 1,
+            ..Self::clean()
+        }
+    }
+
+    pub const fn recovery_continuation() -> RecoverySignals {
+        RecoverySignals {
+            owns_runtime: true,
+            recovery_continuations: 1,
+            ..Self::clean()
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryDiagnostic {
     pub status: u8,
