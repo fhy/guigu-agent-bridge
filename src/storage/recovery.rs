@@ -325,4 +325,29 @@ mod tests {
         assert_eq!(ambiguous.blocker, Some(RecoveryBlocker::RuntimeAmbiguous));
         assert_ne!(clean.line(), ambiguous.line());
     }
+
+    #[test]
+    fn fixture_matrix_has_stable_status_and_owner_precedence() {
+        let cases = [
+            (RecoveryFixture::clean(), 0, "none"),
+            (RecoveryFixture::eligible_stale_owner(), 3, "owner"),
+            (
+                RecoveryFixture::ambiguous_active_owner(),
+                3,
+                "runtime-ambiguous",
+            ),
+            (RecoveryFixture::recovery_lease(), 3, "recovery-lease"),
+            (
+                RecoveryFixture::recovery_continuation(),
+                3,
+                "recovery-continuation",
+            ),
+        ];
+        for (signals, status, blocker) in cases {
+            let diagnostic = RecoveryDiagnostic::classify(signals);
+            assert_eq!(diagnostic.status, status);
+            assert!(diagnostic.line().contains(&format!("blocking={blocker}")));
+            assert!(!diagnostic.line().contains("token"));
+        }
+    }
 }
