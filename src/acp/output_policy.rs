@@ -10,6 +10,7 @@ pub(crate) const MATRIX_SEGMENT: u64 = 24_576;
 pub(crate) const PROCESS_QUOTA: u64 = 268_435_456;
 pub(crate) const DELIVERY_ATTEMPTS: u32 = 8;
 pub(crate) const STALE_CLAIM: Duration = Duration::from_secs(300);
+pub(crate) const MATRIX_SEND_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct DurableOutputPolicy {
@@ -21,6 +22,7 @@ pub(crate) struct DurableOutputPolicy {
     pub(crate) process_quota_bytes: u64,
     pub(crate) delivery_attempt_limit: u32,
     pub(crate) stale_claim_after: Duration,
+    pub(crate) matrix_send_timeout: Duration,
 }
 
 impl DurableOutputPolicy {
@@ -40,6 +42,7 @@ impl DurableOutputPolicy {
             process_quota_bytes: PROCESS_QUOTA,
             delivery_attempt_limit: DELIVERY_ATTEMPTS,
             stale_claim_after: STALE_CLAIM,
+            matrix_send_timeout: MATRIX_SEND_TIMEOUT,
         };
         policy.validate()?;
         Ok(policy)
@@ -54,7 +57,8 @@ impl DurableOutputPolicy {
             && self.spool_segment_bytes <= self.max_output_bytes
             && self.matrix_segment_bytes <= self.spool_segment_bytes
             && self.max_output_bytes <= self.process_quota_bytes
-            && self.delivery_attempt_limit > 0;
+            && self.delivery_attempt_limit > 0
+            && !self.matrix_send_timeout.is_zero();
         if valid {
             Ok(())
         } else {
@@ -90,6 +94,7 @@ mod tests {
             ),
             (PROCESS_QUOTA, DELIVERY_ATTEMPTS, STALE_CLAIM)
         );
+        assert_eq!(full.matrix_send_timeout, MATRIX_SEND_TIMEOUT);
         for limit in [1, MATRIX_SEGMENT, SPOOL_SEGMENT, MEMORY_HIGH_WATER] {
             let policy = DurableOutputPolicy::derive(&root.join("state.db"), limit).unwrap();
             assert_eq!(policy.max_output_bytes, limit);

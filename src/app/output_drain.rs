@@ -2,6 +2,8 @@ use chrono::{SecondsFormat, Utc};
 use std::{sync::Arc, time::Duration};
 use tokio::sync::watch;
 
+const SHUTDOWN_SETTLE: Duration = Duration::from_secs(1);
+
 use crate::{
     acp::output::DurableOutputSpool,
     matrix::{DurableMatrixSender, DurableSendError},
@@ -50,17 +52,17 @@ impl OutputSetDrain {
             let bytes = self.spool.read_delivery(&segment).map_err(|_| ())?;
             let body = std::str::from_utf8(&bytes).map_err(|_| ())?;
             let txn = segment.part.stable_txn_id.as_str();
-            match self
-                .sender
-                .send_durable(
-                    &set.room_id,
-                    set.thread_root.as_deref(),
-                    set.reply_event_id.as_deref(),
-                    body,
-                    txn,
-                )
+            let send = self.sender.send_durable(
+                &set.room_id,
+                set.thread_root.as_deref(),
+                set.reply_event_id.as_deref(),
+                body,
+                txn,
+            );
+            let outcome = tokio::time::timeout(self.spool.policy().matrix_send_timeout, send)
                 .await
-            {
+                .unwrap_or(Err(DurableSendError::UnknownCommit));
+            match outcome {
                 Ok(()) => {
                     if !self
                         .store
@@ -105,6 +107,11 @@ impl OutputSetDrain {
     }
 
     pub(crate) fn start(self, interval: Duration) -> OutputSetDrainHandle {
+        let shutdown_timeout = self
+            .spool
+            .policy()
+            .matrix_send_timeout
+            .saturating_add(SHUTDOWN_SETTLE);
         let (shutdown, mut receiver) = watch::channel(false);
         let join = tokio::spawn(async move {
             loop {
@@ -112,18 +119,33 @@ impl OutputSetDrain {
                 tokio::select! { biased; _=receiver.changed()=>break, _=tokio::time::sleep(interval)=>{} }
             }
         });
-        OutputSetDrainHandle { shutdown, join }
+        OutputSetDrainHandle {
+            shutdown,
+            join,
+            shutdown_timeout,
+        }
     }
 }
 
 pub(crate) struct OutputSetDrainHandle {
     shutdown: watch::Sender<bool>,
     join: tokio::task::JoinHandle<()>,
+    shutdown_timeout: Duration,
 }
 impl OutputSetDrainHandle {
     pub(crate) async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
         let _ = self.shutdown.send(true);
-        self.join.await
+        let mut join = self.join;
+        match tokio::time::timeout(self.shutdown_timeout, &mut join).await {
+            Ok(result) => result,
+            Err(_) => {
+                join.abort();
+                match join.await {
+                    Err(error) if error.is_cancelled() => Ok(()),
+                    result => result,
+                }
+            }
+        }
     }
 }
 
@@ -136,7 +158,12 @@ mod tests {
         storage::OutputSetInput,
     };
     use sqlx::SqlitePool;
-    use std::{collections::VecDeque, sync::Mutex};
+    use std::{collections::VecDeque, future::pending, sync::Mutex};
+
+    enum Outcome {
+        Ready(Result<(), DurableSendError>),
+        Pending,
+    }
 
     struct Temp(std::path::PathBuf);
     impl Drop for Temp {
@@ -146,7 +173,7 @@ mod tests {
     }
     #[derive(Default)]
     struct Sender {
-        outcomes: Mutex<VecDeque<Result<(), DurableSendError>>>,
+        outcomes: Mutex<VecDeque<Outcome>>,
         calls: Mutex<Vec<(String, String)>>,
     }
     impl DurableMatrixSender for Sender {
@@ -160,13 +187,27 @@ mod tests {
         ) -> DurableSendFuture<'a> {
             Box::pin(async move {
                 self.calls.lock().unwrap().push((body.into(), txn.into()));
-                self.outcomes.lock().unwrap().pop_front().unwrap_or(Ok(()))
+                let outcome = self
+                    .outcomes
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Outcome::Ready(Ok(())));
+                match outcome {
+                    Outcome::Ready(result) => result,
+                    Outcome::Pending => pending().await,
+                }
             })
         }
     }
 
-    async fn fixture(
-        outcomes: Vec<Result<(), DurableSendError>>,
+    async fn fixture(outcomes: Vec<Outcome>) -> (Temp, OutputSetDrain, Arc<Sender>, SqlitePool) {
+        fixture_with_timeout(outcomes, None).await
+    }
+
+    async fn fixture_with_timeout(
+        outcomes: Vec<Outcome>,
+        send_timeout: Option<Duration>,
     ) -> (Temp, OutputSetDrain, Arc<Sender>, SqlitePool) {
         let root = std::env::temp_dir().join(format!("t051-drain-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir(&root).unwrap();
@@ -180,6 +221,9 @@ mod tests {
         let mut policy = DurableOutputPolicy::derive(&root.join("state.db"), 64).unwrap();
         policy.spool_segment_bytes = 8;
         policy.matrix_segment_bytes = 4;
+        if let Some(timeout) = send_timeout {
+            policy.matrix_send_timeout = timeout;
+        }
         let store = OutputSpoolStore::new(pool.clone(), policy.process_quota_bytes).unwrap();
         store
             .create_set(&OutputSetInput {
@@ -232,10 +276,10 @@ mod tests {
     #[tokio::test]
     async fn unknown_commit_reuses_transaction_and_permanent_stops() {
         let (_t, drain, sender, pool) = fixture(vec![
-            Err(DurableSendError::UnknownCommit),
-            Ok(()),
-            Ok(()),
-            Ok(()),
+            Outcome::Ready(Err(DurableSendError::UnknownCommit)),
+            Outcome::Ready(Ok(())),
+            Outcome::Ready(Ok(())),
+            Outcome::Ready(Ok(())),
         ])
         .await;
         assert_eq!(drain.drain_once().await, Ok(0));
@@ -250,7 +294,8 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(state, "cleaned");
-        let (_t, drain, sender, pool) = fixture(vec![Err(DurableSendError::Permanent)]).await;
+        let (_t, drain, sender, pool) =
+            fixture(vec![Outcome::Ready(Err(DurableSendError::Permanent))]).await;
         assert_eq!(drain.drain_once().await, Ok(0));
         assert_eq!(sender.calls.lock().unwrap().len(), 1);
         let state: String =
@@ -259,5 +304,66 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(state, "partial");
+    }
+
+    #[tokio::test]
+    async fn pending_send_times_out_and_retries_the_same_transaction() {
+        let (_t, drain, sender, pool) = fixture_with_timeout(
+            vec![
+                Outcome::Pending,
+                Outcome::Ready(Ok(())),
+                Outcome::Ready(Ok(())),
+                Outcome::Ready(Ok(())),
+            ],
+            Some(Duration::from_millis(20)),
+        )
+        .await;
+        assert_eq!(drain.drain_once().await, Ok(0));
+        let first: (String, i64) = sqlx::query_as(
+            "SELECT state,acknowledged_cursor FROM acp_output_sets WHERE set_id='set'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(first, ("sealed".into(), -1));
+        assert_eq!(drain.drain_once().await, Ok(1));
+        let calls = sender.calls.lock().unwrap();
+        assert_eq!(calls[0].1, calls[1].1);
+        assert_eq!(calls[0].0, "abcd");
+        assert_eq!(calls[1].0, "abcd");
+    }
+
+    #[tokio::test]
+    async fn pending_and_healthy_shutdown_are_bounded_and_clean() {
+        let (_t, drain, _sender, pool) =
+            fixture_with_timeout(vec![Outcome::Pending], Some(Duration::from_millis(20))).await;
+        let handle = drain.start(Duration::from_secs(60));
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        tokio::time::timeout(Duration::from_millis(200), handle.shutdown())
+            .await
+            .unwrap()
+            .unwrap();
+        let state: (String, i64) = sqlx::query_as(
+            "SELECT state,acknowledged_cursor FROM acp_output_sets WHERE set_id='set'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state, ("sealed".into(), -1));
+
+        let (_t, drain, sender, pool) = fixture(vec![]).await;
+        assert_eq!(drain.drain_once().await, Ok(1));
+        drain
+            .start(Duration::from_secs(60))
+            .shutdown()
+            .await
+            .unwrap();
+        assert_eq!(sender.calls.lock().unwrap().len(), 3);
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "cleaned");
     }
 }
