@@ -206,6 +206,7 @@ pub struct HealthState {
     owner: AtomicU8,
     adapter_ready: AtomicBool,
     recovery_blocked: AtomicBool,
+    recovery_diagnostic: Mutex<Option<String>>,
     insecure_a2a_peers: AtomicU64,
     required: Mutex<Vec<Arc<AtomicBool>>>,
     matrix_required: Mutex<Vec<Arc<AtomicBool>>>,
@@ -225,6 +226,7 @@ impl HealthState {
             owner: AtomicU8::new(OwnerState::Starting as u8),
             adapter_ready: AtomicBool::new(false),
             recovery_blocked: AtomicBool::new(false),
+            recovery_diagnostic: Mutex::new(None),
             insecure_a2a_peers: AtomicU64::new(0),
             required: Mutex::new(Vec::new()),
             matrix_required: Mutex::new(Vec::new()),
@@ -242,6 +244,20 @@ impl HealthState {
 
     pub fn set_recovery_blocked(&self, blocked: bool) {
         self.recovery_blocked.store(blocked, Ordering::Release);
+    }
+
+    pub fn set_recovery_diagnostic(&self, diagnostic: String) {
+        *self
+            .recovery_diagnostic
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(diagnostic);
+    }
+
+    pub fn recovery_diagnostic_line(&self) -> Option<String> {
+        self.recovery_diagnostic
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     pub fn set_insecure_a2a_peers(&self, count: usize) {

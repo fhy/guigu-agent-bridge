@@ -323,6 +323,7 @@ impl AppRuntime {
         };
         health_state.set_insecure_a2a_peers(insecure_a2a_peers);
         health_state.set_recovery_blocked(recovery_blocked);
+        health_state.set_recovery_diagnostic(recovery_diagnostic.line());
         let first_failure = Arc::new(Mutex::new(None));
         let mut runtime = Self {
             pool: Some(pool.clone()),
