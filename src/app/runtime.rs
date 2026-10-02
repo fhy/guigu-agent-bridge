@@ -25,7 +25,7 @@ use crate::{
         SystemRuntimeClock, TokioRuntimeTimer, WorkspaceId,
     },
     storage::{
-        RecoveryDiagnostic, RecoverySignals, Repository, RepositoryEventConsumer, SqliteRepository,
+        RecoveryDiagnostic, RecoveryFixture, Repository, RepositoryEventConsumer, SqliteRepository,
         StorageError, connect, migrate, plan_recovery, sync_agents,
     },
 };
@@ -280,19 +280,17 @@ impl AppRuntime {
             .counts()
             .await
             .map_err(|_| AppError::Runtime)?;
-        let recovery_diagnostic = RecoveryDiagnostic::classify(RecoverySignals {
+        let recovery_diagnostic = RecoveryDiagnostic::classify(RecoveryFixture::from_facts(
             owns_runtime,
-            admission_blocked: admission_recovery.blocked,
-            unfinished: recovery.unfinished.len(),
-            unacknowledged: recovery.unacknowledged.len(),
-            awaiting_outcome: recovery.awaiting_outcome.len(),
-            runtime_ready: runtime_recovery.ready.len(),
-            runtime_ambiguous: runtime_recovery.ambiguous.len(),
-            active_leases: counts.active_leases as usize,
-            recovery_leases: counts.recovery_needed_leases as usize,
-            recovery_continuations: counts.recovery_backlog as usize,
-            capacity_overflow: false,
-        });
+            admission_recovery.blocked,
+            &recovery,
+            runtime_recovery.ready.len(),
+            runtime_recovery.ambiguous.len(),
+            counts.active_leases as usize,
+            counts.recovery_needed_leases as usize,
+            counts.recovery_backlog as usize,
+        ));
+        tracing::info!(category = "t050-recovery", emission = %recovery_diagnostic.line());
         let recovery_blocked = recovery_diagnostic.blocker.is_some();
 
         let reload = Arc::new(ReloadController::new(

@@ -132,6 +132,31 @@ impl ReadinessProbe {
 }
 
 impl RecoveryFixture {
+    pub fn from_facts(
+        owns_runtime: bool,
+        admission_blocked: bool,
+        plan: &RecoveryPlan,
+        runtime_ready: usize,
+        runtime_ambiguous: usize,
+        active_leases: usize,
+        recovery_leases: usize,
+        recovery_continuations: usize,
+    ) -> RecoverySignals {
+        RecoverySignals {
+            owns_runtime,
+            admission_blocked,
+            unfinished: plan.unfinished.len(),
+            unacknowledged: plan.unacknowledged.len(),
+            awaiting_outcome: plan.awaiting_outcome.len(),
+            runtime_ready,
+            runtime_ambiguous,
+            active_leases,
+            recovery_leases,
+            recovery_continuations,
+            capacity_overflow: false,
+        }
+    }
+
     pub const fn clean() -> RecoverySignals {
         RecoverySignals {
             owns_runtime: true,
