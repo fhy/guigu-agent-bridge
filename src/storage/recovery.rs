@@ -100,6 +100,37 @@ pub struct RecoverySignals {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RecoveryFixture;
 
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadinessProbe {
+    pub pid: u32,
+    pub port: u16,
+    pub card_status: u16,
+    pub content_type: &'static str,
+    pub listener_identity: u64,
+}
+
+#[allow(dead_code)]
+impl ReadinessProbe {
+    pub fn owned(pid: u32, identity: u64) -> Self {
+        Self {
+            pid,
+            port: 9292,
+            card_status: 200,
+            content_type: "application/json",
+            listener_identity: identity,
+        }
+    }
+
+    pub fn is_ready_for(&self, expected_pid: u32, expected_identity: u64) -> bool {
+        self.pid == expected_pid
+            && self.port == 9292
+            && self.card_status == 200
+            && self.content_type == "application/json"
+            && self.listener_identity == expected_identity
+    }
+}
+
 impl RecoveryFixture {
     pub const fn clean() -> RecoverySignals {
         RecoverySignals {
@@ -349,5 +380,21 @@ mod tests {
             assert!(diagnostic.line().contains(&format!("blocking={blocker}")));
             assert!(!diagnostic.line().contains("token"));
         }
+    }
+
+    #[test]
+    fn readiness_harness_rejects_stale_identity_and_models_shutdown_repeat() {
+        let ready = ReadinessProbe::owned(1712267, 44);
+        assert!(ready.is_ready_for(1712267, 44));
+        assert!(!ready.is_ready_for(1712266, 44));
+        assert!(!ready.is_ready_for(1712267, 43));
+        let shutdown = ReadinessProbe {
+            port: 0,
+            card_status: 0,
+            ..ready.clone()
+        };
+        assert!(!shutdown.is_ready_for(1712267, 44));
+        let repeat = ReadinessProbe::owned(1712268, 45);
+        assert!(repeat.is_ready_for(1712268, 45));
     }
 }
