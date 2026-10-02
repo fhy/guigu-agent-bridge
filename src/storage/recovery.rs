@@ -47,6 +47,116 @@ pub struct RecoveryPlan {
     pub awaiting_outcome: Vec<Delivery>,
 }
 
+/// Stable, redacted startup diagnosis used by isolated recovery probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryBlocker {
+    Owner,
+    Admission,
+    Unfinished,
+    Unacknowledged,
+    Outcome,
+    RuntimeReady,
+    RuntimeAmbiguous,
+    ActiveLease,
+    RecoveryLease,
+    RecoveryContinuation,
+    Capacity,
+}
+
+impl RecoveryBlocker {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Admission => "admission",
+            Self::Unfinished => "unfinished",
+            Self::Unacknowledged => "unacknowledged",
+            Self::Outcome => "outcome",
+            Self::RuntimeReady => "runtime-ready",
+            Self::RuntimeAmbiguous => "runtime-ambiguous",
+            Self::ActiveLease => "active-lease",
+            Self::RecoveryLease => "recovery-lease",
+            Self::RecoveryContinuation => "recovery-continuation",
+            Self::Capacity => "capacity",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecoverySignals {
+    pub owns_runtime: bool,
+    pub admission_blocked: bool,
+    pub unfinished: usize,
+    pub unacknowledged: usize,
+    pub awaiting_outcome: usize,
+    pub runtime_ready: usize,
+    pub runtime_ambiguous: usize,
+    pub active_leases: usize,
+    pub recovery_leases: usize,
+    pub recovery_continuations: usize,
+    pub capacity_overflow: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryDiagnostic {
+    pub status: u8,
+    pub blocker: Option<RecoveryBlocker>,
+    pub counts: RecoverySignals,
+}
+
+impl RecoveryDiagnostic {
+    pub fn classify(signals: RecoverySignals) -> Self {
+        let blocker = if !signals.owns_runtime {
+            Some(RecoveryBlocker::Owner)
+        } else if signals.admission_blocked {
+            Some(RecoveryBlocker::Admission)
+        } else if signals.unfinished != 0 {
+            Some(RecoveryBlocker::Unfinished)
+        } else if signals.unacknowledged != 0 {
+            Some(RecoveryBlocker::Unacknowledged)
+        } else if signals.awaiting_outcome != 0 {
+            Some(RecoveryBlocker::Outcome)
+        } else if signals.runtime_ready != 0 {
+            Some(RecoveryBlocker::RuntimeReady)
+        } else if signals.runtime_ambiguous != 0 {
+            Some(RecoveryBlocker::RuntimeAmbiguous)
+        } else if signals.active_leases != 0 {
+            Some(RecoveryBlocker::ActiveLease)
+        } else if signals.recovery_leases != 0 {
+            Some(RecoveryBlocker::RecoveryLease)
+        } else if signals.recovery_continuations != 0 {
+            Some(RecoveryBlocker::RecoveryContinuation)
+        } else if signals.capacity_overflow {
+            Some(RecoveryBlocker::Capacity)
+        } else {
+            None
+        };
+        Self {
+            status: u8::from(blocker.is_some()) * 3,
+            blocker,
+            counts: signals,
+        }
+    }
+
+    pub fn line(&self) -> String {
+        let blocking = self.blocker.map_or("none", RecoveryBlocker::name);
+        let c = self.counts;
+        format!(
+            "t050-recovery status={} blocking={} counts=unfinished:{},unacknowledged:{},outcome:{},runtime-ready:{},runtime-ambiguous:{},active-lease:{},recovery-lease:{},recovery-continuation:{},capacity:{}",
+            self.status,
+            blocking,
+            c.unfinished,
+            c.unacknowledged,
+            c.awaiting_outcome,
+            c.runtime_ready,
+            c.runtime_ambiguous,
+            c.active_leases,
+            c.recovery_leases,
+            c.recovery_continuations,
+            u8::from(c.capacity_overflow)
+        )
+    }
+}
+
 impl RecoveryPlan {
     /// Whether the store has nothing to recover.
     ///
@@ -125,5 +235,38 @@ mod tests {
             ..RecoveryPlan::default()
         };
         assert!(!plan.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_uses_fixed_precedence_and_redacted_line() {
+        let diagnostic = RecoveryDiagnostic::classify(RecoverySignals {
+            owns_runtime: true,
+            unfinished: 2,
+            active_leases: 1,
+            ..RecoverySignals::default()
+        });
+        assert_eq!(diagnostic.status, 3);
+        assert_eq!(diagnostic.blocker, Some(RecoveryBlocker::Unfinished));
+        assert_eq!(
+            diagnostic.line(),
+            "t050-recovery status=3 blocking=unfinished counts=unfinished:2,unacknowledged:0,outcome:0,runtime-ready:0,runtime-ambiguous:0,active-lease:1,recovery-lease:0,recovery-continuation:0,capacity:0"
+        );
+    }
+
+    #[test]
+    fn clean_and_ambiguous_fixtures_are_distinct_without_mutation() {
+        let clean = RecoveryDiagnostic::classify(RecoverySignals {
+            owns_runtime: true,
+            ..Default::default()
+        });
+        assert_eq!(clean.status, 0);
+        assert_eq!(clean.blocker, None);
+        let ambiguous = RecoveryDiagnostic::classify(RecoverySignals {
+            owns_runtime: true,
+            runtime_ambiguous: 1,
+            ..Default::default()
+        });
+        assert_eq!(ambiguous.blocker, Some(RecoveryBlocker::RuntimeAmbiguous));
+        assert_ne!(clean.line(), ambiguous.line());
     }
 }
