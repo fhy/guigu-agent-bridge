@@ -646,6 +646,15 @@ async fn app_runtime_owns_real_a2a_listener_and_agent_card_until_shutdown() {
     );
     let _ = runtime.shutdown().await;
     assert!(tokio::net::TcpListener::bind(address).await.is_ok());
+    let restarted = AppRuntime::start(&config_path).await.unwrap();
+    let replacement = restarted.a2a_addr().expect("replacement listener");
+    assert_ne!(replacement, address);
+    let card = reqwest::get(format!("http://{replacement}/.well-known/agent-card.json"))
+        .await
+        .unwrap();
+    assert_eq!(card.status(), reqwest::StatusCode::OK);
+    let _ = restarted.shutdown().await;
+    assert!(tokio::net::TcpListener::bind(replacement).await.is_ok());
 }
 
 #[tokio::test]
