@@ -294,7 +294,7 @@ async fn sqlx_migrator_rolls_back_rebuild_and_ledger_then_clean_retry_succeeds()
             .fetch_one(&pool)
             .await
             .unwrap(),
-        12
+        13
     );
     assert_integrity(&pool).await;
     pool.close().await;
