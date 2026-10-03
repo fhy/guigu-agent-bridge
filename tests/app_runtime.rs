@@ -628,7 +628,7 @@ async fn app_runtime_owns_real_a2a_listener_and_agent_card_until_shutdown() {
     std::fs::write(
         &config_path,
         format!(
-            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nshutdown_timeout_seconds = 1\n\n[transports.a2a]\nenabled = true\nlisten = \"tcp:127.0.0.1:0\"\nallow_private_plaintext = true\nexposed_endpoints = [\"worker\"]\n\n[transports.a2a.peers.test]\nurl = \"http://127.0.0.1:9/a2a/worker/rpc\"\nexpected_peer_id = \"peer\"\ntoken = \"{{env:T050_TOKEN}}\"\nallowed_targets = [\"worker\"]\n\n[agents.worker]\ntransport = \"acp\"\ncommand = \"true\"\nworkspace = \"/tmp\"\nenabled = true\n",
+            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nshutdown_timeout_seconds = 1\n\n[transports.a2a]\nenabled = true\nlisten = \"tcp:127.0.0.1:9292\"\nallow_private_plaintext = true\nexposed_endpoints = [\"worker\"]\n\n[transports.a2a.peers.test]\nurl = \"http://127.0.0.1:9/a2a/worker/rpc\"\nexpected_peer_id = \"peer\"\ntoken = \"{{env:T050_TOKEN}}\"\nallowed_targets = [\"worker\"]\n\n[agents.worker]\ntransport = \"acp\"\ncommand = \"true\"\nworkspace = \"/tmp\"\nenabled = true\n",
             database.to_string_lossy(),
             sessions.to_string_lossy()
         ),
@@ -636,6 +636,7 @@ async fn app_runtime_owns_real_a2a_listener_and_agent_card_until_shutdown() {
     .unwrap();
     let runtime = AppRuntime::start(&config_path).await.unwrap();
     let address = runtime.a2a_addr().expect("real A2A listener");
+    assert_eq!(address.port(), 9292);
     let response = reqwest::get(format!("http://{address}/.well-known/agent-card.json"))
         .await
         .unwrap();
@@ -648,7 +649,7 @@ async fn app_runtime_owns_real_a2a_listener_and_agent_card_until_shutdown() {
     assert!(tokio::net::TcpListener::bind(address).await.is_ok());
     let restarted = AppRuntime::start(&config_path).await.unwrap();
     let replacement = restarted.a2a_addr().expect("replacement listener");
-    assert_ne!(replacement, address);
+    assert_eq!(replacement, address);
     let card = reqwest::get(format!("http://{replacement}/.well-known/agent-card.json"))
         .await
         .unwrap();
