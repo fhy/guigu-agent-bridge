@@ -94,6 +94,33 @@ pub fn init_tracing() {
 /// termination signal.
 pub async fn run() -> Result<(), Error> {
     let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref().and_then(|v| v.to_str())
+        == Some("prepare-isolated-legacy-owner-manifest")
+    {
+        let mut cli = vec![std::ffi::OsString::from(
+            "prepare-isolated-legacy-owner-manifest",
+        )];
+        cli.extend(args);
+        let prepare = legacy_owner_reconciliation::parse_prepare_args(&cli).map_err(|e| {
+            Error::Cli(error::CliFailure {
+                command: "prepare-isolated-legacy-owner-manifest",
+                category: e.slug(),
+                status: e.status(),
+            })
+        })?;
+        legacy_owner_reconciliation::prepare_manifest(prepare)
+            .await
+            .map_err(|e| {
+                Error::Cli(error::CliFailure {
+                    command: "prepare-isolated-legacy-owner-manifest",
+                    category: e.slug(),
+                    status: e.status(),
+                })
+            })?;
+        println!("prepare-isolated-legacy-owner-manifest result=prepared status=0");
+        return Ok(());
+    }
+    let mut args = std::env::args_os().skip(1);
     if args.next().as_deref().and_then(|v| v.to_str()) == Some("reconcile-isolated-legacy-owner") {
         let mut cli = vec![std::ffi::OsString::from("reconcile-isolated-legacy-owner")];
         cli.extend(args);

@@ -5,44 +5,7 @@ use std::{
 };
 
 use guigu_agent_bridge::storage::{connect, migrate};
-use serde_json::json;
-use sha2::{Digest, Sha256};
-use sqlx::{Connection, Row, SqliteConnection, sqlite::SqliteConnectOptions};
-
-fn digest(parts: &[&str]) -> String {
-    let mut h = Sha256::new();
-    for part in parts {
-        h.update((part.len() as u64).to_be_bytes());
-        h.update(part);
-    }
-    format!("{:x}", h.finalize())
-}
-
-fn path_identity(path: &Path, include_content: bool) -> String {
-    use std::io::Read;
-    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
-    let canonical = path.canonicalize().unwrap();
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(0o400000)
-        .open(path)
-        .unwrap();
-    let meta = file.metadata().unwrap();
-    let content = if include_content {
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).unwrap();
-        format!("{:x}", Sha256::digest(bytes))
-    } else {
-        "identity-only".to_owned()
-    };
-    digest(&[
-        &canonical.to_string_lossy(),
-        &meta.dev().to_string(),
-        &meta.ino().to_string(),
-        &meta.mode().to_string(),
-        &content,
-    ])
-}
+use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
 
 fn tree(root: &Path) -> Vec<(String, u32, Vec<u8>)> {
     use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
@@ -127,116 +90,6 @@ fn foreign_uid_proc_view(pid: u32, real_network: bool, foreign_uid: u32) -> Path
     root
 }
 
-async fn logical_digest(c: &mut SqliteConnection) -> String {
-    const TABLES: &[(&str, &str, &[&str])] = &[
-        (
-            "runtime_instances",
-            "instance_token",
-            &[
-                "instance_token",
-                "started_at",
-                "heartbeat_at",
-                "state",
-                "process_fingerprint",
-            ],
-        ),
-        (
-            "task_admissions",
-            "task_id",
-            &[
-                "task_id",
-                "state",
-                "revision",
-                "runtime_instance",
-                "updated_at",
-            ],
-        ),
-        (
-            "agent_work_queue",
-            "queue_id",
-            &[
-                "queue_id",
-                "state",
-                "revision",
-                "runtime_owner",
-                "owner_fence",
-                "send_started",
-                "updated_at",
-            ],
-        ),
-        (
-            "execution_leases",
-            "resource_key",
-            &[
-                "resource_key",
-                "task_id",
-                "owner_token",
-                "fence",
-                "state",
-                "heartbeat_at",
-                "expires_at",
-            ],
-        ),
-        (
-            "task_continuations",
-            "task_id",
-            &[
-                "task_id",
-                "resource_key",
-                "delivery_id",
-                "lease_fence",
-                "revision",
-                "state",
-                "heartbeat_at",
-            ],
-        ),
-        (
-            "delivery_dispositions",
-            "delivery_id,task_id,attempt",
-            &["delivery_id", "task_id", "attempt", "state", "reason_code"],
-        ),
-    ];
-    let mut h = Sha256::new();
-    let schema: i64 = sqlx::query_scalar("PRAGMA schema_version")
-        .fetch_one(&mut *c)
-        .await
-        .unwrap();
-    let user: i64 = sqlx::query_scalar("PRAGMA user_version")
-        .fetch_one(&mut *c)
-        .await
-        .unwrap();
-    for value in [schema.to_string(), user.to_string()] {
-        h.update((value.len() as u64).to_be_bytes());
-        h.update(value);
-    }
-    for (table, order, columns) in TABLES {
-        let query = format!(
-            "SELECT {} FROM {table} ORDER BY {order}",
-            columns
-                .iter()
-                .map(|v| format!("quote({v})"))
-                .collect::<Vec<_>>()
-                .join(",")
-        );
-        let rows = sqlx::query(sqlx::AssertSqlSafe(query))
-            .fetch_all(&mut *c)
-            .await
-            .unwrap();
-        h.update((table.len() as u64).to_be_bytes());
-        h.update(table);
-        for row in rows {
-            for (index, column) in columns.iter().enumerate() {
-                h.update((column.len() as u64).to_be_bytes());
-                h.update(column.as_bytes());
-                let value: String = row.try_get(index).unwrap();
-                h.update((value.len() as u64).to_be_bytes());
-                h.update(value);
-            }
-        }
-    }
-    format!("{:x}", h.finalize())
-}
-
 struct Fixture {
     root: PathBuf,
     db: PathBuf,
@@ -259,9 +112,6 @@ impl Fixture {
         let pool = connect(&db).await.unwrap();
         migrate(&pool).await.unwrap();
         sqlx::query("INSERT INTO runtime_instances VALUES('legacy','start','heart','active','legacy-owner')").execute(&pool).await.unwrap();
-        if extra_stopping {
-            sqlx::query("INSERT INTO runtime_instances VALUES('other','start','heart','stopping','other-legacy')").execute(&pool).await.unwrap();
-        }
         pool.close().await;
         let config = root.join("config.toml");
         let runtime_root =
@@ -276,33 +126,12 @@ impl Fixture {
         std::fs::write(&config, &config_bytes).unwrap();
         let evidence = root.join("evidence.txt");
         let manifest = root.join("operation.json");
-        let marker = root.join(".t050-isolated-marker");
-        std::fs::write(
-            &marker,
-            b"t050-isolated-root-v1\noperation_id=operation\nunit=fixture.service\n",
-        )
-        .unwrap();
-        std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o600)).unwrap();
         let systemctl = root.join("systemctl-fixture");
         std::fs::write(&systemctl, b"#!/bin/sh\nprintf 'inactive\\ndead\\n0\\n'\n").unwrap();
         std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut c = SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(&db))
             .await
             .unwrap();
-        if active_lease {
-            sqlx::query("INSERT INTO conversations VALUES('conversation',NULL,NULL,NULL,'[]')")
-                .execute(&mut c)
-                .await
-                .unwrap();
-            sqlx::query("INSERT INTO tasks VALUES('task','task',NULL,'from','to','conversation',NULL,'text',5,0,0,NULL,0)")
-                .execute(&mut c).await.unwrap();
-            sqlx::query("INSERT INTO execution_leases VALUES('resource','task','owner',1,'active','start','heart','expires')")
-                .execute(&mut c).await.unwrap();
-        }
-        let pre = logical_digest(&mut c).await;
-        sqlx::query("UPDATE runtime_instances SET state='stopped',heartbeat_at='commit' WHERE instance_token='legacy'").execute(&mut c).await.unwrap();
-        let post = logical_digest(&mut c).await;
-        sqlx::query("UPDATE runtime_instances SET state='active',heartbeat_at='heart' WHERE instance_token='legacy'").execute(&mut c).await.unwrap();
         sqlx::query("PRAGMA wal_checkpoint(TRUNCATE)")
             .execute(&mut c)
             .await
@@ -311,41 +140,51 @@ impl Fixture {
         for suffix in ["-wal", "-shm"] {
             let _ = std::fs::remove_file(format!("{}{suffix}", db.to_string_lossy()));
         }
-        let binary = PathBuf::from(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
-            .canonicalize()
+        let proc_root = proc_view(None, false);
+        let prepare = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+            .env("T050_RECONCILE_TEST_SYSTEMCTL", &systemctl)
+            .env("T050_RECONCILE_TEST_PROC_ROOT", &proc_root)
+            .args(["prepare-isolated-legacy-owner-manifest", "--root"])
+            .arg(&root)
+            .arg("--config")
+            .arg(&config)
+            .arg("--database")
+            .arg(&db)
+            .arg("--unit")
+            .arg("guigu-codex-test.service")
+            .arg("--manifest")
+            .arg(&manifest)
+            .arg("--evidence")
+            .arg(&evidence)
+            .arg("--operation-id")
+            .arg("00000000-0000-7000-8000-000000000050")
+            .arg("--commit-heartbeat")
+            .arg("2026-10-03T15:00:00.000000000Z")
+            .output()
             .unwrap();
-        let config_s = config
-            .canonicalize()
-            .unwrap()
-            .to_string_lossy()
-            .into_owned();
-        let db_s = db.canonicalize().unwrap().to_string_lossy().into_owned();
-        let binary_s = binary.to_string_lossy().into_owned();
-        let evidence_s = evidence.to_string_lossy().into_owned();
-        let config_identity = path_identity(&config, true);
-        let database_identity = path_identity(&db, false);
-        let binary_identity = path_identity(&binary, true);
-        let root_s = root.to_string_lossy().into_owned();
-        let marker_s = marker.to_string_lossy().into_owned();
-        let md = digest(&[
-            "operation",
-            &root_s,
-            &marker_s,
-            &config_s,
-            &config_identity,
-            &db_s,
-            &database_identity,
-            &binary_s,
-            &binary_identity,
-            "fixture.service",
-            &evidence_s,
-            &pre,
-            &post,
-            "commit",
-        ]);
-        let rd = digest(&["operation", &md, &pre, &post, "commit", "recovered"]);
-        std::fs::write(&manifest,serde_json::to_vec(&json!({"operation_id":"operation","isolated_root":root_s,"marker":marker_s,"config":config_s,"config_identity":config_identity,"database":db_s,"database_identity":database_identity,"binary":binary_s,"binary_identity":binary_identity,"unit":"fixture.service","evidence":evidence_s,"manifest_digest":md,"pre_owner_state_digest":pre,"post_owner_state_digest":post,"receipt_digest":rd,"receipt_sibling_digest":digest(&[]),"commit_heartbeat":"commit"})).unwrap()).unwrap();
-        std::fs::set_permissions(&manifest, std::fs::Permissions::from_mode(0o600)).unwrap();
+        assert!(
+            prepare.status.success(),
+            "prepare failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&prepare.stdout),
+            String::from_utf8_lossy(&prepare.stderr)
+        );
+        if extra_stopping || active_lease {
+            let pool = connect(&db).await.unwrap();
+            if extra_stopping {
+                sqlx::query("INSERT INTO runtime_instances VALUES('other','start','heart','stopping','other-legacy')").execute(&pool).await.unwrap();
+            }
+            if active_lease {
+                sqlx::query("INSERT INTO conversations VALUES('conversation',NULL,NULL,NULL,'[]')")
+                    .execute(&pool)
+                    .await
+                    .unwrap();
+                sqlx::query("INSERT INTO tasks VALUES('task','task',NULL,'from','to','conversation',NULL,'text',5,0,0,NULL,0)")
+                    .execute(&pool).await.unwrap();
+                sqlx::query("INSERT INTO execution_leases VALUES('resource','task','owner',1,'active','start','heart','expires')")
+                    .execute(&pool).await.unwrap();
+            }
+            pool.close().await;
+        }
         Self {
             root,
             db,
@@ -354,13 +193,34 @@ impl Fixture {
             evidence,
             systemctl,
             config_bytes,
-            proc_root: proc_view(None, false),
+            proc_root,
         }
     }
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"));
         command.env("T050_RECONCILE_TEST_SYSTEMCTL", &self.systemctl);
         command.env("T050_RECONCILE_TEST_PROC_ROOT", &self.proc_root);
+        command
+    }
+    fn prepare_command(&self) -> Command {
+        let mut command = self.command();
+        command
+            .args(["prepare-isolated-legacy-owner-manifest", "--root"])
+            .arg(&self.root)
+            .arg("--config")
+            .arg(&self.config)
+            .arg("--database")
+            .arg(&self.db)
+            .arg("--unit")
+            .arg("guigu-codex-test.service")
+            .arg("--manifest")
+            .arg(&self.manifest)
+            .arg("--evidence")
+            .arg(&self.evidence)
+            .arg("--operation-id")
+            .arg("00000000-0000-7000-8000-000000000050")
+            .arg("--commit-heartbeat")
+            .arg("2026-10-03T15:00:00.000000000Z");
         command
     }
     fn run(&self) -> std::process::Output {
@@ -455,6 +315,18 @@ impl Fixture {
 #[tokio::test]
 async fn eligible_commit_repeat_and_unknown_evidence_adoption_use_real_cli() {
     let f = Fixture::new(false, false).await;
+    use std::os::unix::fs::MetadataExt;
+    assert_eq!(
+        std::fs::metadata(&f.manifest).unwrap().mode() & 0o777,
+        0o600
+    );
+    assert_eq!(
+        std::fs::metadata(f.root.join(".t050-isolated-marker"))
+            .unwrap()
+            .mode()
+            & 0o777,
+        0o600
+    );
     let first = f.run();
     assert_eq!(
         first.status.code(),
@@ -476,6 +348,63 @@ async fn eligible_commit_repeat_and_unknown_evidence_adoption_use_real_cli() {
     let sibling_drift = f.run();
     assert_eq!(sibling_drift.status.code(), Some(3));
     assert_eq!(f.rows().await, committed);
+}
+
+#[tokio::test]
+async fn manifest_prepare_rejects_mapped_process_without_database_or_tree_mutation() {
+    let f = Fixture::new(false, false).await;
+    std::fs::remove_file(&f.manifest).unwrap();
+    std::fs::remove_file(f.root.join(".t050-isolated-marker")).unwrap();
+    let before_rows = f.rows().await;
+    let mut mapped = f.mapped_process();
+    let mapped_proc = foreign_uid_proc_view(mapped.id(), false, f.foreign_uid());
+    let before_tree = tree(&f.root);
+    let rejected = f
+        .prepare_command()
+        .env("T050_RECONCILE_TEST_PROC_ROOT", &mapped_proc)
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(3));
+    assert_eq!(f.rows().await, before_rows);
+    assert_eq!(tree(&f.root), before_tree);
+    assert!(!f.manifest.exists());
+    assert!(!f.root.join(".t050-isolated-marker").exists());
+    mapped.kill().unwrap();
+    assert!(!mapped.wait().unwrap().success());
+
+    std::fs::write(&f.systemctl, b"#!/bin/sh\nprintf 'active\nrunning\n42\n'\n").unwrap();
+    let before_tree = tree(&f.root);
+    let rejected = f.prepare_command().output().unwrap();
+    assert_eq!(rejected.status.code(), Some(3));
+    assert_eq!(f.rows().await, before_rows);
+    assert_eq!(tree(&f.root), before_tree);
+    std::fs::write(&f.systemctl, b"#!/bin/sh\nprintf 'inactive\ndead\n0\n'\n").unwrap();
+
+    let unknown_proc = proc_view(None, false);
+    std::fs::remove_file(unknown_proc.join("net/tcp6")).unwrap();
+    let before_tree = tree(&f.root);
+    let rejected = f
+        .prepare_command()
+        .env("T050_RECONCILE_TEST_PROC_ROOT", &unknown_proc)
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(3));
+    assert_eq!(f.rows().await, before_rows);
+    assert_eq!(tree(&f.root), before_tree);
+
+    let mut listener = f.listener_process(9292);
+    let listener_proc = foreign_uid_proc_view(listener.id(), true, f.foreign_uid());
+    let before_tree = tree(&f.root);
+    let rejected = f
+        .prepare_command()
+        .env("T050_RECONCILE_TEST_PROC_ROOT", &listener_proc)
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(3));
+    assert_eq!(f.rows().await, before_rows);
+    assert_eq!(tree(&f.root), before_tree);
+    listener.kill().unwrap();
+    assert!(!listener.wait().unwrap().success());
 }
 
 #[tokio::test]

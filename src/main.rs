@@ -6,6 +6,7 @@ async fn main() -> std::process::ExitCode {
             if failure.command == "reconcile-lease-owner"
                 || failure.command == "reconcile-orphaned-preacceptance"
                 || failure.command == "reconcile-isolated-legacy-owner"
+                || failure.command == "prepare-isolated-legacy-owner-manifest"
             {
                 println!(
                     "{} result={} status={}",

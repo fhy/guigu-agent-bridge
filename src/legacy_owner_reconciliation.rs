@@ -4,7 +4,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, Row, SqliteConnection, sqlite::SqliteConnectOptions};
 
@@ -110,7 +110,7 @@ pub enum Outcome {
     AlreadyStopped,
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct Manifest {
     operation_id: String,
@@ -132,11 +132,73 @@ struct Manifest {
     commit_heartbeat: String,
 }
 
+#[derive(Debug)]
+pub struct PrepareArgs {
+    root: PathBuf,
+    config: PathBuf,
+    database: PathBuf,
+    unit: String,
+    manifest: PathBuf,
+    evidence: PathBuf,
+    operation_id: String,
+    commit_heartbeat: String,
+}
+
 pub fn parse_args(args: &[std::ffi::OsString]) -> Result<PathBuf, Error> {
     if args.len() != 3 || args[0] != "reconcile-isolated-legacy-owner" || args[1] != "--manifest" {
         return Err(Error::Rejected);
     }
     Ok(PathBuf::from(&args[2]))
+}
+
+pub fn parse_prepare_args(args: &[std::ffi::OsString]) -> Result<PrepareArgs, Error> {
+    const FLAGS: &[&str] = &[
+        "--root",
+        "--config",
+        "--database",
+        "--unit",
+        "--manifest",
+        "--evidence",
+        "--operation-id",
+        "--commit-heartbeat",
+    ];
+    if args.len() != 17 || args[0] != "prepare-isolated-legacy-owner-manifest" {
+        return Err(Error::Rejected);
+    }
+    let mut values = Vec::with_capacity(FLAGS.len());
+    for (index, flag) in FLAGS.iter().enumerate() {
+        if args[index * 2 + 1] != *flag {
+            return Err(Error::Rejected);
+        }
+        values.push(args[index * 2 + 2].clone());
+    }
+    let text = |index: usize| {
+        values[index]
+            .to_str()
+            .filter(|value| !value.is_empty())
+            .map(ToOwned::to_owned)
+            .ok_or(Error::Rejected)
+    };
+    let operation_id = text(6)?;
+    uuid::Uuid::parse_str(&operation_id).map_err(|_| Error::Rejected)?;
+    let commit_heartbeat = text(7)?;
+    let parsed = chrono::DateTime::parse_from_rfc3339(&commit_heartbeat)
+        .map_err(|_| Error::Rejected)?
+        .with_timezone(&chrono::Utc)
+        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    if parsed != commit_heartbeat {
+        return Err(Error::Rejected);
+    }
+    Ok(PrepareArgs {
+        root: PathBuf::from(&values[0]),
+        config: PathBuf::from(&values[1]),
+        database: PathBuf::from(&values[2]),
+        unit: text(3)?,
+        manifest: PathBuf::from(&values[4]),
+        evidence: PathBuf::from(&values[5]),
+        operation_id,
+        commit_heartbeat,
+    })
 }
 fn digest(parts: &[&str]) -> String {
     let mut h = Sha256::new();
@@ -181,7 +243,10 @@ fn path_identity(path: &Path, include_content: bool) -> Result<String, Error> {
         &content,
     ]))
 }
-async fn logical_digest(c: &mut SqliteConnection) -> Result<String, Error> {
+async fn logical_digest_projected(
+    c: &mut SqliteConnection,
+    stopped_owner: Option<(&str, &str)>,
+) -> Result<String, Error> {
     const TABLES: &[(&str, &str, &[&str])] = &[
         (
             "runtime_instances",
@@ -283,13 +348,32 @@ async fn logical_digest(c: &mut SqliteConnection) -> Result<String, Error> {
             for (index, column) in columns.iter().enumerate() {
                 h.update((column.len() as u64).to_be_bytes());
                 h.update(column.as_bytes());
-                let value: String = row.try_get(index).map_err(|_| Error::Database)?;
+                let mut value: String = row.try_get(index).map_err(|_| Error::Database)?;
+                if *table == "runtime_instances"
+                    && row.try_get::<String, _>(0).map_err(|_| Error::Database)?
+                        == stopped_owner
+                            .map(|projection| projection.0)
+                            .unwrap_or_default()
+                {
+                    if *column == "heartbeat_at" {
+                        value = format!(
+                            "'{}'",
+                            stopped_owner.ok_or(Error::Rejected)?.1.replace('\'', "''")
+                        );
+                    } else if *column == "state" {
+                        value = "'stopped'".to_owned();
+                    }
+                }
                 h.update((value.len() as u64).to_be_bytes());
                 h.update(value);
             }
         }
     }
     Ok(format!("{:x}", h.finalize()))
+}
+
+async fn logical_digest(c: &mut SqliteConnection) -> Result<String, Error> {
+    logical_digest_projected(c, None).await
 }
 
 async fn sibling_digest(c: &mut SqliteConnection, operation: &str) -> Result<String, Error> {
@@ -488,6 +572,7 @@ fn process_or_listener_present(
     binary: &Path,
     config: &Path,
     listener_inodes: &std::collections::BTreeSet<u64>,
+    ignored_pid: Option<u32>,
 ) -> Result<bool, Error> {
     use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 
@@ -504,6 +589,14 @@ fn process_or_listener_present(
             .and_then(|value| value.parse::<u32>().ok())
             .is_none()
         {
+            continue;
+        }
+        let pid = entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+            .ok_or(Error::Rejected)?;
+        if Some(pid) == ignored_pid {
             continue;
         }
         let process = entry.path();
@@ -594,9 +687,13 @@ fn fixed_listener_inodes() -> Result<std::collections::BTreeSet<u64>, Error> {
     Ok(inodes)
 }
 
-fn preflight_runtime_absence(binary: &Path, config: &Path) -> Result<(), Error> {
+fn preflight_runtime_absence(
+    binary: &Path,
+    config: &Path,
+    ignored_pid: Option<u32>,
+) -> Result<(), Error> {
     let listener_inodes = fixed_listener_inodes()?;
-    if process_or_listener_present(binary, config, &listener_inodes)? {
+    if process_or_listener_present(binary, config, &listener_inodes, ignored_pid)? {
         Err(Error::Rejected)
     } else {
         Ok(())
@@ -635,6 +732,101 @@ fn preflight_publication(path: &Path) -> Result<(), Error> {
         Ok(_) => Err(Error::Rejected),
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(_) => Err(Error::Rejected),
+    }
+}
+
+fn publish_new(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    use std::os::unix::{
+        ffi::OsStrExt,
+        fs::{MetadataExt, OpenOptionsExt},
+    };
+
+    fn rename_noreplace(from: &Path, to: &Path) -> std::io::Result<()> {
+        use std::ffi::{CString, c_char, c_int, c_uint};
+        const AT_FDCWD: c_int = -100;
+        const RENAME_NOREPLACE: c_uint = 1;
+        unsafe extern "C" {
+            fn renameat2(
+                olddirfd: c_int,
+                oldpath: *const c_char,
+                newdirfd: c_int,
+                newpath: *const c_char,
+                flags: c_uint,
+            ) -> c_int;
+        }
+        let from = CString::new(from.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::other("invalid temporary path"))?;
+        let to = CString::new(to.as_os_str().as_bytes())
+            .map_err(|_| std::io::Error::other("invalid publication path"))?;
+        // Linux renameat2 provides the atomic no-replace publication required here.
+        if unsafe {
+            renameat2(
+                AT_FDCWD,
+                from.as_ptr(),
+                AT_FDCWD,
+                to.as_ptr(),
+                RENAME_NOREPLACE,
+            )
+        } == 0
+        {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+    let parent = path.parent().ok_or(Error::Rejected)?;
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err(Error::Rejected),
+    }
+    let temp = parent.join(format!(".t050-manifest.{}", uuid::Uuid::now_v7()));
+    let mut file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(O_NOFOLLOW)
+        .open(&temp)
+        .map_err(|_| Error::Rejected)?;
+    file.write_all(bytes)
+        .and_then(|_| file.sync_all())
+        .map_err(|_| Error::Rejected)?;
+    let metadata = file.metadata().map_err(|_| Error::Rejected)?;
+    if !metadata.is_file() || metadata.mode() & 0o777 != 0o600 || metadata.nlink() != 1 {
+        let _ = std::fs::remove_file(&temp);
+        return Err(Error::Rejected);
+    }
+    if rename_noreplace(&temp, path).is_err() {
+        let _ = std::fs::remove_file(&temp);
+        return Err(Error::Rejected);
+    }
+    std::fs::File::open(parent)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| Error::Rejected)?;
+    Ok(())
+}
+
+fn ensure_marker(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata)
+            if metadata.is_file() && metadata.mode() & 0o777 == 0o600 && metadata.nlink() == 1 =>
+        {
+            let mut file = OpenOptions::new()
+                .read(true)
+                .custom_flags(O_NOFOLLOW)
+                .open(path)
+                .map_err(|_| Error::Rejected)?;
+            let mut observed = Vec::new();
+            file.read_to_end(&mut observed)
+                .map_err(|_| Error::Rejected)?;
+            if observed == bytes {
+                Ok(())
+            } else {
+                Err(Error::Rejected)
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => publish_new(path, bytes),
+        _ => Err(Error::Rejected),
     }
 }
 
@@ -711,7 +903,7 @@ pub async fn reconcile(path: impl AsRef<Path>) -> Result<Outcome, Error> {
         return Err(Error::Rejected);
     }
     preflight_unit(&m.unit)?;
-    preflight_runtime_absence(&binary, Path::new(&m.config))?;
+    preflight_runtime_absence(&binary, Path::new(&m.config), None)?;
     preflight_publication(Path::new(&m.evidence))?;
     let sidecars = Sidecars::capture(Path::new(&m.database))?;
     let opts = SqliteConnectOptions::new()
@@ -723,7 +915,7 @@ pub async fn reconcile(path: impl AsRef<Path>) -> Result<Outcome, Error> {
         .map_err(|_| Error::Database)?;
     sidecars.revalidate(Path::new(&m.database))?;
     preflight_unit(&m.unit)?;
-    preflight_runtime_absence(&binary, Path::new(&m.config))?;
+    preflight_runtime_absence(&binary, Path::new(&m.config), None)?;
     let (_, revalidated_manifest) = read_manifest(path.as_ref())?;
     if revalidated_manifest != manifest_bytes {
         return Err(Error::Rejected);
@@ -757,7 +949,7 @@ pub async fn reconcile(path: impl AsRef<Path>) -> Result<Outcome, Error> {
         Ok(v) => {
             admission.revalidate().map_err(|_| Error::Rejected)?;
             preflight_unit(&m.unit)?;
-            preflight_runtime_absence(&binary, Path::new(&m.config))?;
+            preflight_runtime_absence(&binary, Path::new(&m.config), None)?;
             sqlx::query("COMMIT")
                 .execute(&mut c)
                 .await
@@ -789,6 +981,161 @@ pub async fn reconcile(path: impl AsRef<Path>) -> Result<Outcome, Error> {
             Err(e)
         }
     }
+}
+
+pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
+    use std::os::unix::fs::MetadataExt;
+
+    let root = args.root.canonicalize().map_err(|_| Error::Rejected)?;
+    let root_metadata = std::fs::symlink_metadata(&root).map_err(|_| Error::Rejected)?;
+    if root != args.root
+        || !root_metadata.is_dir()
+        || root_metadata.mode() & 0o022 != 0
+        || args.unit != "guigu-codex-test.service"
+    {
+        return Err(Error::Rejected);
+    }
+    let config = args.config.canonicalize().map_err(|_| Error::Rejected)?;
+    let database = args.database.canonicalize().map_err(|_| Error::Rejected)?;
+    let binary = std::env::current_exe()
+        .map_err(|_| Error::Rejected)?
+        .canonicalize()
+        .map_err(|_| Error::Rejected)?;
+    if config != args.config || database != args.database {
+        return Err(Error::Rejected);
+    }
+    let initial_config_identity = path_identity(&config, true)?;
+    let initial_database_identity = path_identity(&database, false)?;
+    let initial_binary_identity = path_identity(&binary, true)?;
+    let marker = root.join(".t050-isolated-marker");
+    if args.database.parent() != Some(root.as_path())
+        || args.manifest.parent() != Some(root.as_path())
+        || args.evidence.parent() != Some(root.as_path())
+    {
+        return Err(Error::Rejected);
+    }
+    match std::fs::symlink_metadata(&args.manifest) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err(Error::Rejected),
+    }
+    let admission = crate::runtime_admission::Guard::acquire(&database, &config, "reconcile")
+        .map_err(|_| Error::Rejected)?;
+    preflight_unit(&args.unit)?;
+    preflight_runtime_absence(&binary, &config, Some(std::process::id()))?;
+    preflight_publication(&args.evidence)?;
+    let sidecars = Sidecars::capture(&database)?;
+    let mut connection = SqliteConnection::connect_with(
+        &SqliteConnectOptions::new()
+            .filename(&database)
+            .create_if_missing(false)
+            .foreign_keys(true),
+    )
+    .await
+    .map_err(|_| Error::Database)?;
+    sidecars.revalidate(&database)?;
+    preflight_unit(&args.unit)?;
+    preflight_runtime_absence(&binary, &config, Some(std::process::id()))?;
+    admission.revalidate().map_err(|_| Error::Rejected)?;
+    sqlx::query("BEGIN")
+        .execute(&mut connection)
+        .await
+        .map_err(|_| Error::Database)?;
+    let generated = async {
+        eligible(&mut connection).await?;
+        let owners = sqlx::query(
+            "SELECT quote(instance_token) FROM runtime_instances WHERE state IN ('active','stopping')",
+        )
+        .fetch_all(&mut connection)
+        .await
+        .map_err(|_| Error::Database)?;
+        if owners.len() != 1 {
+            return Err(Error::Rejected);
+        }
+        let owner: String = owners[0].try_get(0).map_err(|_| Error::Database)?;
+        let pre = logical_digest(&mut connection).await?;
+        let post =
+            logical_digest_projected(&mut connection, Some((&owner, &args.commit_heartbeat)))
+                .await?;
+        let siblings = sibling_digest(&mut connection, &args.operation_id).await?;
+        Ok((pre, post, siblings))
+    }
+    .await;
+    let _ = sqlx::query("ROLLBACK").execute(&mut connection).await;
+    connection.close().await.map_err(|_| Error::Database)?;
+    let (pre, post, receipt_sibling_digest) = generated?;
+    sidecars.revalidate(&database)?;
+    admission.revalidate().map_err(|_| Error::Rejected)?;
+    preflight_unit(&args.unit)?;
+    preflight_runtime_absence(&binary, &config, Some(std::process::id()))?;
+    let config_identity = path_identity(&config, true)?;
+    let database_identity = path_identity(&database, false)?;
+    let binary_identity = path_identity(&binary, true)?;
+    if config_identity != initial_config_identity
+        || database_identity != initial_database_identity
+        || binary_identity != initial_binary_identity
+    {
+        return Err(Error::Rejected);
+    }
+    let strings = (
+        root.to_string_lossy().into_owned(),
+        marker.to_string_lossy().into_owned(),
+        config.to_string_lossy().into_owned(),
+        database.to_string_lossy().into_owned(),
+        binary.to_string_lossy().into_owned(),
+        args.evidence.to_string_lossy().into_owned(),
+    );
+    let manifest_digest = digest(&[
+        &args.operation_id,
+        &strings.0,
+        &strings.1,
+        &strings.2,
+        &config_identity,
+        &strings.3,
+        &database_identity,
+        &strings.4,
+        &binary_identity,
+        &args.unit,
+        &strings.5,
+        &pre,
+        &post,
+        &args.commit_heartbeat,
+    ]);
+    let receipt_digest = digest(&[
+        &args.operation_id,
+        &manifest_digest,
+        &pre,
+        &post,
+        &args.commit_heartbeat,
+        "recovered",
+    ]);
+    let manifest = Manifest {
+        operation_id: args.operation_id.clone(),
+        isolated_root: strings.0,
+        marker: strings.1,
+        config: strings.2,
+        config_identity,
+        database: strings.3,
+        database_identity,
+        binary: strings.4,
+        binary_identity,
+        unit: args.unit.clone(),
+        evidence: strings.5,
+        manifest_digest,
+        pre_owner_state_digest: pre,
+        post_owner_state_digest: post,
+        receipt_digest,
+        receipt_sibling_digest,
+        commit_heartbeat: args.commit_heartbeat,
+    };
+    let marker_bytes = format!(
+        "t050-isolated-root-v1\noperation_id={}\nunit={}\n",
+        args.operation_id, args.unit
+    );
+    ensure_marker(&marker, marker_bytes.as_bytes())?;
+    let manifest_bytes = serde_json::to_vec(&manifest).map_err(|_| Error::Rejected)?;
+    publish_new(&args.manifest, &manifest_bytes)?;
+    admission.revalidate().map_err(|_| Error::Rejected)?;
+    Ok(())
 }
 
 #[cfg(test)]
