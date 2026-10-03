@@ -255,6 +255,9 @@ impl AppRuntime {
             return Err(error.into());
         }
         let reliability = crate::storage::ReliabilityStore::new(pool.clone());
+        let admission_guard =
+            crate::runtime_admission::Guard::acquire(&config.bridge.database, &path, "startup")
+                .map_err(|_| AppError::Runtime)?;
         let runtime_instance = uuid::Uuid::now_v7().to_string();
         let process_fingerprint = format!("pid:{}", std::process::id());
         let startup_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
@@ -304,6 +307,10 @@ impl AppRuntime {
                     .map_err(|_| AppError::Runtime)?;
             }
         }
+        admission_guard
+            .revalidate()
+            .map_err(|_| AppError::Runtime)?;
+        drop(admission_guard);
         match Self::build(
             path,
             config,

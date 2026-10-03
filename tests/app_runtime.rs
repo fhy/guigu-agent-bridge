@@ -723,6 +723,27 @@ fn stop_child(mut child: Child) {
     assert!(status.success(), "child shutdown failed: {status}");
 }
 
+async fn wait_for_child_diagnostic(child: &mut Child, path: &std::path::Path, needle: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    loop {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "runtime exited before diagnostic"
+        );
+        if std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .contains(needle)
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "runtime diagnostic timed out"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
 #[tokio::test]
 async fn child_process_restart_replaces_9292_pid_and_listener_inode() {
     let temp = TempDir::new();
@@ -796,18 +817,21 @@ async fn concurrent_second_start_rejects_live_owner_without_takeover() {
         ),
     )
     .unwrap();
+    let first_stderr = temp.0.join("first.stderr");
     let mut first = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
         .arg(&config_path)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::fs::File::create(&first_stderr).unwrap())
         .spawn()
         .unwrap();
     let first_pid = first.id();
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    assert!(first.try_wait().unwrap().is_none());
-    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", database.display()))
-        .await
-        .unwrap();
+    wait_for_child_diagnostic(
+        &mut first,
+        &first_stderr,
+        "t050-recovery status=0 blocking=none",
+    )
+    .await;
+    let pool = connect(&database).await.unwrap();
     let before: (i64, String, String) = sqlx::query_as(
         "SELECT count(*),state,process_fingerprint FROM runtime_instances WHERE state='active'",
     )
@@ -817,15 +841,20 @@ async fn concurrent_second_start_rejects_live_owner_without_takeover() {
     assert_eq!(before.0, 1);
     assert_eq!(before.1, "active");
     assert_eq!(before.2, format!("pid:{first_pid}"));
+    let second_stderr = temp.0.join("second.stderr");
     let mut second = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
         .arg(&config_path)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::piped())
+        .stderr(std::fs::File::create(&second_stderr).unwrap())
         .spawn()
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     assert!(first_pid != second.id());
-    assert!(second.try_wait().unwrap().is_none());
+    wait_for_child_diagnostic(
+        &mut second,
+        &second_stderr,
+        "t050-recovery status=3 blocking=owner",
+    )
+    .await;
     let after: (i64, String, String) = sqlx::query_as(
         "SELECT count(*),state,process_fingerprint FROM runtime_instances WHERE state='active'",
     )
@@ -853,31 +882,40 @@ async fn stale_owner_startup_recovers_then_acquires_durable_generation() {
         ),
     )
     .unwrap();
+    let first_stderr = temp.0.join("first.stderr");
     let mut first = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
         .arg(&config_path)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&first_stderr).unwrap())
         .spawn()
         .unwrap();
     let first_pid = first.id();
-    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-    assert!(first.try_wait().unwrap().is_none());
+    wait_for_child_diagnostic(
+        &mut first,
+        &first_stderr,
+        "t050-recovery status=0 blocking=none",
+    )
+    .await;
     Command::new("kill")
         .args(["-KILL", &first_pid.to_string()])
         .status()
         .unwrap();
     let first_status = first.wait().unwrap();
     assert!(!first_status.success());
-    let second = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+    let second_stderr = temp.0.join("second.stderr");
+    let mut second = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
         .arg(&config_path)
         .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stderr(std::fs::File::create(&second_stderr).unwrap())
         .spawn()
         .unwrap();
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
-    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", database.display()))
-        .await
-        .unwrap();
+    wait_for_child_diagnostic(
+        &mut second,
+        &second_stderr,
+        "t050-recovery status=0 blocking=none",
+    )
+    .await;
+    let pool = connect(&database).await.unwrap();
     let stopped: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM runtime_instances WHERE state='stopped' AND process_fingerprint=?",
     )

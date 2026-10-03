@@ -23,6 +23,7 @@ pub mod orphaned_preacceptance;
 pub mod readonly_tuple;
 pub mod readonly_tuple_diagnostics;
 pub mod runtime;
+pub mod runtime_admission;
 pub mod selected_preacceptance;
 pub mod storage;
 pub(crate) mod terminal_closure;
@@ -113,7 +114,7 @@ pub async fn run() -> Result<(), Error> {
                 })
             })?;
         println!(
-            "reconcile-isolated-legacy-owner result={}",
+            "reconcile-isolated-legacy-owner result={} status=0",
             match outcome {
                 legacy_owner_reconciliation::Outcome::Recovered => "recovered",
                 legacy_owner_reconciliation::Outcome::AlreadyStopped => "already-stopped",

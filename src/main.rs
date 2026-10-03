@@ -5,6 +5,7 @@ async fn main() -> std::process::ExitCode {
         Err(guigu_agent_bridge::Error::Cli(failure)) => {
             if failure.command == "reconcile-lease-owner"
                 || failure.command == "reconcile-orphaned-preacceptance"
+                || failure.command == "reconcile-isolated-legacy-owner"
             {
                 println!(
                     "{} result={} status={}",
