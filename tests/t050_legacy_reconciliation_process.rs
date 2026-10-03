@@ -1,6 +1,6 @@
 use std::{
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Stdio},
     time::{Duration, Instant},
 };
 
@@ -80,6 +80,28 @@ fn tree(root: &Path) -> Vec<(String, u32, Vec<u8>)> {
     let mut out = Vec::new();
     walk(root, root, &mut out);
     out
+}
+
+fn proc_view(pid: Option<u32>, real_network: bool) -> PathBuf {
+    let root = std::env::temp_dir().join(format!("t050-proc-view-{}", uuid::Uuid::now_v7()));
+    let net = root.join("net");
+    std::fs::create_dir_all(&net).unwrap();
+    for table in ["tcp", "tcp6"] {
+        let destination = net.join(table);
+        if real_network {
+            std::os::unix::fs::symlink(format!("/proc/net/{table}"), destination).unwrap();
+        } else {
+            std::fs::write(
+                destination,
+                b"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n",
+            )
+            .unwrap();
+        }
+    }
+    if let Some(pid) = pid {
+        std::os::unix::fs::symlink(format!("/proc/{pid}"), root.join(pid.to_string())).unwrap();
+    }
+    root
 }
 
 async fn logical_digest(c: &mut SqliteConnection) -> String {
@@ -199,6 +221,8 @@ struct Fixture {
     manifest: PathBuf,
     evidence: PathBuf,
     systemctl: PathBuf,
+    config_bytes: Vec<u8>,
+    proc_root: PathBuf,
 }
 
 impl Fixture {
@@ -217,7 +241,16 @@ impl Fixture {
         }
         pool.close().await;
         let config = root.join("config.toml");
-        std::fs::write(&config, b"fixture=true\n").unwrap();
+        let runtime_root =
+            std::env::temp_dir().join(format!("t050-mapped-runtime-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&runtime_root).unwrap();
+        let config_bytes = format!(
+            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nhealth_bind = \"127.0.0.1:0\"\n",
+            runtime_root.join("state.db").to_string_lossy(),
+            runtime_root.join("sessions").to_string_lossy()
+        )
+        .into_bytes();
+        std::fs::write(&config, &config_bytes).unwrap();
         let evidence = root.join("evidence.txt");
         let manifest = root.join("operation.json");
         let marker = root.join(".t050-isolated-marker");
@@ -297,11 +330,14 @@ impl Fixture {
             manifest,
             evidence,
             systemctl,
+            config_bytes,
+            proc_root: proc_view(None, false),
         }
     }
     fn command(&self) -> Command {
         let mut command = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"));
         command.env("T050_RECONCILE_TEST_SYSTEMCTL", &self.systemctl);
+        command.env("T050_RECONCILE_TEST_PROC_ROOT", &self.proc_root);
         command
     }
     fn run(&self) -> std::process::Output {
@@ -322,6 +358,69 @@ impl Fixture {
         let rows=sqlx::query_as("SELECT instance_token,state,heartbeat_at FROM runtime_instances ORDER BY instance_token").fetch_all(&mut connection).await.unwrap();
         connection.close().await.unwrap();
         rows
+    }
+    fn mapped_process(&self) -> Child {
+        let mut child = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+            .arg(&self.config)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "mapped fixture process exited"
+            );
+            let cmdline = std::fs::read(format!("/proc/{}/cmdline", child.id())).unwrap();
+            if cmdline
+                .split(|byte| *byte == 0)
+                .any(|argument| argument == self.config.as_os_str().as_encoded_bytes())
+            {
+                return child;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mapped process was not observable"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+    fn listener_process(&self, port: u16) -> Child {
+        let runtime_root =
+            std::env::temp_dir().join(format!("t050-listener-runtime-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&runtime_root).unwrap();
+        let config = runtime_root.join("config.toml");
+        std::fs::write(
+            &config,
+            format!(
+                "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nhealth_bind = \"127.0.0.1:{port}\"\n",
+                runtime_root.join("state.db").to_string_lossy(),
+                runtime_root.join("sessions").to_string_lossy()
+            ),
+        )
+        .unwrap();
+        let mut child = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+            .arg(config)
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            assert!(
+                child.try_wait().unwrap().is_none(),
+                "listener fixture process exited"
+            );
+            if std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+                return child;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "listener fixture was not observable"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 }
 
@@ -391,7 +490,7 @@ async fn live_interlock_and_hostile_sidecar_refuse_before_sqlite_mutation() {
     let rejected = f.run();
     assert_eq!(rejected.status.code(), Some(3));
     assert_eq!(tree(&f.root), before_tree);
-    std::fs::write(&f.config, b"fixture=true\n").unwrap();
+    std::fs::write(&f.config, &f.config_bytes).unwrap();
     use std::os::unix::fs::PermissionsExt;
     let marker = f.root.join(".t050-isolated-marker");
     std::fs::set_permissions(&marker, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -411,6 +510,170 @@ async fn live_interlock_and_hostile_sidecar_refuse_before_sqlite_mutation() {
     assert_eq!(rejected.status.code(), Some(3));
     assert_eq!(std::fs::read(&outside).unwrap(), b"unchanged");
     assert_eq!(std::fs::read(&f.db).unwrap(), database_before);
+}
+
+#[tokio::test]
+async fn process_listener_and_unknown_proc_facts_fail_closed_before_and_after_open() {
+    let f = Fixture::new(false, false).await;
+    let mut mapped = f.mapped_process();
+    let mapped_proc = proc_view(Some(mapped.id()), false);
+    let before = tree(&f.root);
+    let rejected = f
+        .command()
+        .env("T050_RECONCILE_TEST_PROC_ROOT", &mapped_proc)
+        .args(["reconcile-isolated-legacy-owner", "--manifest"])
+        .arg(&f.manifest)
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(3));
+    assert_eq!(tree(&f.root), before);
+
+    let missing_proc = proc_view(None, false);
+    std::fs::remove_file(missing_proc.join("net/tcp6")).unwrap();
+    let rejected = f
+        .command()
+        .env("T050_RECONCILE_TEST_PROC_ROOT", &missing_proc)
+        .args(["reconcile-isolated-legacy-owner", "--manifest"])
+        .arg(&f.manifest)
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(3));
+    assert_eq!(tree(&f.root), before);
+
+    let permission_proc = proc_view(None, false);
+    let candidate = permission_proc.join("424242");
+    std::fs::create_dir(&candidate).unwrap();
+    std::os::unix::fs::symlink(
+        env!("CARGO_BIN_EXE_guigu-agent-bridge"),
+        candidate.join("exe"),
+    )
+    .unwrap();
+    std::fs::write(candidate.join("cmdline"), b"candidate\0").unwrap();
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(
+        candidate.join("cmdline"),
+        std::fs::Permissions::from_mode(0o000),
+    )
+    .unwrap();
+    let rejected = f
+        .command()
+        .env("T050_RECONCILE_TEST_PROC_ROOT", &permission_proc)
+        .args(["reconcile-isolated-legacy-owner", "--manifest"])
+        .arg(&f.manifest)
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(3));
+    assert_eq!(tree(&f.root), before);
+    mapped.kill().unwrap();
+    assert!(!mapped.wait().unwrap().success());
+
+    let mut listener = f.listener_process(9292);
+    let listener_proc = proc_view(Some(listener.id()), true);
+    let before = tree(&f.root);
+    let rejected = f
+        .command()
+        .env("T050_RECONCILE_TEST_PROC_ROOT", &listener_proc)
+        .args(["reconcile-isolated-legacy-owner", "--manifest"])
+        .arg(&f.manifest)
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(3));
+    assert_eq!(tree(&f.root), before);
+    listener.kill().unwrap();
+    assert!(!listener.wait().unwrap().success());
+
+    let fake_proc = f.root.join("fake-proc");
+    std::fs::create_dir_all(fake_proc.join("net")).unwrap();
+    std::fs::write(fake_proc.join("net/tcp"), b"malformed\n").unwrap();
+    std::fs::write(fake_proc.join("net/tcp6"), b"malformed\n").unwrap();
+    let before = tree(&f.root);
+    let rejected = f
+        .command()
+        .env("T050_RECONCILE_TEST_PROC_ROOT", &fake_proc)
+        .args(["reconcile-isolated-legacy-owner", "--manifest"])
+        .arg(&f.manifest)
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(3));
+    assert_eq!(tree(&f.root), before);
+
+    let f = Fixture::new(false, false).await;
+    let before_rows = f.rows().await;
+    let pause = f.root.join("precommit-runtime.ready");
+    let precommit_proc = proc_view(None, false);
+    let mut reconcile = f
+        .command()
+        .args(["reconcile-isolated-legacy-owner", "--manifest"])
+        .arg(&f.manifest)
+        .env("T050_RECONCILE_TEST_PRECOMMIT", &pause)
+        .env("T050_RECONCILE_TEST_PROC_ROOT", &precommit_proc)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !pause.exists() {
+        assert!(reconcile.try_wait().unwrap().is_none());
+        assert!(Instant::now() < deadline, "precommit pause was not reached");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut mapped = f.mapped_process();
+    std::os::unix::fs::symlink(
+        format!("/proc/{}", mapped.id()),
+        precommit_proc.join(mapped.id().to_string()),
+    )
+    .unwrap();
+    std::fs::write(pause.with_extension("continue"), b"continue\n").unwrap();
+    assert_eq!(reconcile.wait().unwrap().code(), Some(3));
+    mapped.kill().unwrap();
+    assert!(!mapped.wait().unwrap().success());
+    assert_eq!(f.rows().await, before_rows);
+    let pool = connect(&f.db).await.unwrap();
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM legacy_owner_reconciliation_receipts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    pool.close().await;
+    assert_eq!(receipts, 0);
+    assert!(!f.evidence.exists());
+
+    let f = Fixture::new(false, false).await;
+    let before_rows = f.rows().await;
+    let pause = f.root.join("precommit-listener.ready");
+    let precommit_proc = proc_view(None, true);
+    let mut reconcile = f
+        .command()
+        .args(["reconcile-isolated-legacy-owner", "--manifest"])
+        .arg(&f.manifest)
+        .env("T050_RECONCILE_TEST_PRECOMMIT", &pause)
+        .env("T050_RECONCILE_TEST_PROC_ROOT", &precommit_proc)
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !pause.exists() {
+        assert!(reconcile.try_wait().unwrap().is_none());
+        assert!(Instant::now() < deadline, "precommit pause was not reached");
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let mut listener = f.listener_process(9292);
+    std::os::unix::fs::symlink(
+        format!("/proc/{}", listener.id()),
+        precommit_proc.join(listener.id().to_string()),
+    )
+    .unwrap();
+    std::fs::write(pause.with_extension("continue"), b"continue\n").unwrap();
+    assert_eq!(reconcile.wait().unwrap().code(), Some(3));
+    listener.kill().unwrap();
+    assert!(!listener.wait().unwrap().success());
+    assert_eq!(f.rows().await, before_rows);
+    let pool = connect(&f.db).await.unwrap();
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM legacy_owner_reconciliation_receipts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    pool.close().await;
+    assert_eq!(receipts, 0);
+    assert!(!f.evidence.exists());
 }
 
 #[tokio::test]

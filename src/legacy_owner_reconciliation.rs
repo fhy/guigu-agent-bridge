@@ -446,6 +446,135 @@ fn preflight_unit(unit: &str) -> Result<(), Error> {
     }
 }
 
+fn proc_root() -> PathBuf {
+    #[cfg(debug_assertions)]
+    if let Some(root) = std::env::var_os("T050_RECONCILE_TEST_PROC_ROOT") {
+        return PathBuf::from(root);
+    }
+    PathBuf::from("/proc")
+}
+
+fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    left.dev() == right.dev() && left.ino() == right.ino()
+}
+
+fn process_or_listener_present(
+    binary: &Path,
+    config: &Path,
+    listener_inodes: &std::collections::BTreeSet<u64>,
+) -> Result<bool, Error> {
+    use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
+
+    let root = proc_root();
+    let binary_meta = std::fs::metadata(binary).map_err(|_| Error::Rejected)?;
+    let config_meta = std::fs::metadata(config).map_err(|_| Error::Rejected)?;
+    let own_uid = config_meta.uid();
+    let entries = std::fs::read_dir(&root).map_err(|_| Error::Rejected)?;
+    for entry in entries {
+        let entry = entry.map_err(|_| Error::Rejected)?;
+        if entry
+            .file_name()
+            .to_str()
+            .and_then(|value| value.parse::<u32>().ok())
+            .is_none()
+        {
+            continue;
+        }
+        let process = entry.path();
+        let process_meta = match std::fs::metadata(&process) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(Error::Rejected),
+        };
+        if process_meta.uid() != own_uid {
+            continue;
+        }
+        let executable_meta = match std::fs::metadata(process.join("exe")) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(Error::Rejected),
+        };
+        if !same_file(&executable_meta, &binary_meta) {
+            continue;
+        }
+
+        let command_line = match std::fs::read(process.join("cmdline")) {
+            Ok(bytes) => bytes,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(Error::Rejected),
+        };
+        if command_line.is_empty() || *command_line.last().ok_or(Error::Rejected)? != 0 {
+            return Err(Error::Rejected);
+        }
+        if command_line
+            .split(|byte| *byte == 0)
+            .any(|argument| argument == config.as_os_str().as_bytes())
+        {
+            return Ok(true);
+        }
+
+        let descriptors = match std::fs::read_dir(process.join("fd")) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(_) => return Err(Error::Rejected),
+        };
+        for descriptor in descriptors {
+            let descriptor = descriptor.map_err(|_| Error::Rejected)?;
+            match std::fs::metadata(descriptor.path()) {
+                Ok(metadata)
+                    if same_file(&metadata, &config_meta)
+                        || listener_inodes.contains(&metadata.ino()) =>
+                {
+                    return Ok(true);
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(_) => return Err(Error::Rejected),
+            }
+        }
+    }
+    Ok(false)
+}
+
+fn fixed_listener_inodes() -> Result<std::collections::BTreeSet<u64>, Error> {
+    let root = proc_root();
+    let mut inodes = std::collections::BTreeSet::new();
+    for table in [root.join("net/tcp"), root.join("net/tcp6")] {
+        let text = std::fs::read_to_string(table).map_err(|_| Error::Rejected)?;
+        let mut lines = text.lines();
+        let header = lines.next().ok_or(Error::Rejected)?;
+        if !header
+            .split_whitespace()
+            .any(|field| field == "local_address")
+            || !header.split_whitespace().any(|field| field == "st")
+        {
+            return Err(Error::Rejected);
+        }
+        for line in lines {
+            let fields = line.split_whitespace().collect::<Vec<_>>();
+            if fields.len() < 10 {
+                return Err(Error::Rejected);
+            }
+            let (_, port) = fields[1].rsplit_once(':').ok_or(Error::Rejected)?;
+            let port = u16::from_str_radix(port, 16).map_err(|_| Error::Rejected)?;
+            if fields[3] == "0A" && matches!(port, 9291 | 9292) {
+                inodes.insert(fields[9].parse::<u64>().map_err(|_| Error::Rejected)?);
+            }
+        }
+    }
+    Ok(inodes)
+}
+
+fn preflight_runtime_absence(binary: &Path, config: &Path) -> Result<(), Error> {
+    let listener_inodes = fixed_listener_inodes()?;
+    if process_or_listener_present(binary, config, &listener_inodes)? {
+        Err(Error::Rejected)
+    } else {
+        Ok(())
+    }
+}
+
 fn publish(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let parent = path.parent().ok_or(Error::Rejected)?;
@@ -554,6 +683,7 @@ pub async fn reconcile(path: impl AsRef<Path>) -> Result<Outcome, Error> {
         return Err(Error::Rejected);
     }
     preflight_unit(&m.unit)?;
+    preflight_runtime_absence(&binary, Path::new(&m.config))?;
     preflight_publication(Path::new(&m.evidence))?;
     let sidecars = Sidecars::capture(Path::new(&m.database))?;
     let opts = SqliteConnectOptions::new()
@@ -565,6 +695,7 @@ pub async fn reconcile(path: impl AsRef<Path>) -> Result<Outcome, Error> {
         .map_err(|_| Error::Database)?;
     sidecars.revalidate(Path::new(&m.database))?;
     preflight_unit(&m.unit)?;
+    preflight_runtime_absence(&binary, Path::new(&m.config))?;
     let (_, revalidated_manifest) = read_manifest(path.as_ref())?;
     if revalidated_manifest != manifest_bytes {
         return Err(Error::Rejected);
@@ -597,6 +728,8 @@ pub async fn reconcile(path: impl AsRef<Path>) -> Result<Outcome, Error> {
     match result {
         Ok(v) => {
             admission.revalidate().map_err(|_| Error::Rejected)?;
+            preflight_unit(&m.unit)?;
+            preflight_runtime_absence(&binary, Path::new(&m.config))?;
             sqlx::query("COMMIT")
                 .execute(&mut c)
                 .await
@@ -692,8 +825,18 @@ mod tests {
         let systemctl = root.join("systemctl-fixture");
         std::fs::write(&systemctl, "#!/bin/sh\nprintf 'inactive\\ndead\\n0\\n'\n").unwrap();
         std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let proc_root = root.join("proc");
+        std::fs::create_dir_all(proc_root.join("net")).unwrap();
+        for table in ["tcp", "tcp6"] {
+            std::fs::write(
+                proc_root.join("net").join(table),
+                b"  sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt uid timeout inode\n",
+            )
+            .unwrap();
+        }
         unsafe {
             std::env::set_var("T050_RECONCILE_TEST_SYSTEMCTL", &systemctl);
+            std::env::set_var("T050_RECONCILE_TEST_PROC_ROOT", &proc_root);
         }
         let root_s = root.to_string_lossy().into_owned();
         let marker_s = marker.to_string_lossy().into_owned();
@@ -729,6 +872,7 @@ mod tests {
         assert_eq!(reconcile(&manifest).await.unwrap(), Outcome::AlreadyStopped);
         unsafe {
             std::env::remove_var("T050_RECONCILE_TEST_SYSTEMCTL");
+            std::env::remove_var("T050_RECONCILE_TEST_PROC_ROOT");
         }
     }
 }
