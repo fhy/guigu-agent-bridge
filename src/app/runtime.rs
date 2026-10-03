@@ -6,6 +6,32 @@ use std::{
     time::Duration,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OwnerLiveness {
+    Live,
+    Stale,
+    Unknown,
+}
+
+fn owner_liveness(pid: u32) -> OwnerLiveness {
+    match std::fs::metadata(format!("/proc/{pid}")) {
+        Ok(_) => OwnerLiveness::Live,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => OwnerLiveness::Stale,
+        Err(_) => OwnerLiveness::Unknown,
+    }
+}
+
+#[cfg(test)]
+mod owner_liveness_tests {
+    use super::{OwnerLiveness, owner_liveness};
+
+    #[test]
+    fn current_pid_is_live_and_missing_pid_is_the_only_stale_proof() {
+        assert_eq!(owner_liveness(std::process::id()), OwnerLiveness::Live);
+        assert_eq!(owner_liveness(u32::MAX), OwnerLiveness::Stale);
+    }
+}
+
 use chrono::Utc;
 use sqlx::SqlitePool;
 
@@ -215,6 +241,8 @@ impl AppRuntime {
             .fetch_all(&pool)
             .await
             .map_err(|_| AppError::Runtime)?;
+            let mut proven_stale = false;
+            let mut blocked = false;
             for row in stale {
                 let token: String =
                     sqlx::Row::try_get(&row, "instance_token").map_err(|_| AppError::Runtime)?;
@@ -224,23 +252,33 @@ impl AppRuntime {
                     .strip_prefix("pid:")
                     .and_then(|v| v.parse::<u32>().ok())
                 else {
+                    blocked = true;
                     continue;
                 };
-                if std::fs::metadata(format!("/proc/{pid}")).is_ok() {
-                    continue;
+                match owner_liveness(pid) {
+                    OwnerLiveness::Live | OwnerLiveness::Unknown => blocked = true,
+                    OwnerLiveness::Stale => {
+                        proven_stale = true;
+                        if crate::offline_recovery::recover_stale_runtime(
+                            &config.bridge.database,
+                            &token,
+                            &fingerprint,
+                            &startup_at,
+                        )
+                        .await
+                        .is_err()
+                        {
+                            blocked = true;
+                        }
+                    }
                 }
-                let _ = crate::offline_recovery::recover_stale_runtime(
-                    &config.bridge.database,
-                    &token,
-                    &fingerprint,
-                    &startup_at,
-                )
-                .await;
             }
-            owns_runtime = reliability
-                .begin_runtime(&runtime_instance, &process_fingerprint, &startup_at)
-                .await
-                .map_err(|_| AppError::Runtime)?;
+            if proven_stale && !blocked {
+                owns_runtime = reliability
+                    .begin_runtime(&runtime_instance, &process_fingerprint, &startup_at)
+                    .await
+                    .map_err(|_| AppError::Runtime)?;
+            }
         }
         match Self::build(
             path,
