@@ -11,6 +11,7 @@ pub mod bus;
 pub mod config;
 pub mod error;
 pub mod gateway;
+pub mod isolated_fixture_migration;
 pub mod lease_owner_diagnostics;
 pub mod legacy_owner_reconciliation;
 pub mod matrix;
@@ -93,6 +94,62 @@ pub fn init_tracing() {
 /// Production entry point: initialize tracing, then run until an interrupt or
 /// termination signal.
 pub async fn run() -> Result<(), Error> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref().and_then(|v| v.to_str())
+        == Some("prepare-isolated-legacy-fixture-migration-manifest")
+    {
+        let mut cli = vec![std::ffi::OsString::from(
+            "prepare-isolated-legacy-fixture-migration-manifest",
+        )];
+        cli.extend(args);
+        let prepare = isolated_fixture_migration::parse_prepare_args(&cli).map_err(|e| {
+            Error::Cli(error::CliFailure {
+                command: "prepare-isolated-legacy-fixture-migration-manifest",
+                category: e.slug(),
+                status: e.status(),
+            })
+        })?;
+        isolated_fixture_migration::prepare_manifest(prepare)
+            .await
+            .map_err(|e| {
+                Error::Cli(error::CliFailure {
+                    command: "prepare-isolated-legacy-fixture-migration-manifest",
+                    category: e.slug(),
+                    status: e.status(),
+                })
+            })?;
+        println!("prepare-isolated-legacy-fixture-migration-manifest result=prepared status=0");
+        return Ok(());
+    }
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref().and_then(|v| v.to_str()) == Some("migrate-isolated-legacy-fixture") {
+        let mut cli = vec![std::ffi::OsString::from("migrate-isolated-legacy-fixture")];
+        cli.extend(args);
+        let manifest = isolated_fixture_migration::parse_args(&cli).map_err(|e| {
+            Error::Cli(error::CliFailure {
+                command: "migrate-isolated-legacy-fixture",
+                category: e.slug(),
+                status: e.status(),
+            })
+        })?;
+        let outcome = isolated_fixture_migration::migrate(manifest)
+            .await
+            .map_err(|e| {
+                Error::Cli(error::CliFailure {
+                    command: "migrate-isolated-legacy-fixture",
+                    category: e.slug(),
+                    status: e.status(),
+                })
+            })?;
+        println!(
+            "migrate-isolated-legacy-fixture result={} status=0",
+            match outcome {
+                isolated_fixture_migration::Outcome::Migrated => "migrated",
+                isolated_fixture_migration::Outcome::AlreadyMigrated => "already-migrated",
+            }
+        );
+        return Ok(());
+    }
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref().and_then(|v| v.to_str())
         == Some("prepare-isolated-legacy-owner-manifest")

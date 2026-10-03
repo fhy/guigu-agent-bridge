@@ -22,7 +22,7 @@ enum Sidecar {
 }
 
 #[derive(Clone, Debug)]
-struct Sidecars {
+pub(crate) struct Sidecars {
     wal: Sidecar,
     shm: Sidecar,
     parent_device: u64,
@@ -30,7 +30,7 @@ struct Sidecars {
 }
 
 impl Sidecars {
-    fn capture(database: &Path) -> Result<Self, Error> {
+    pub(crate) fn capture(database: &Path) -> Result<Self, Error> {
         use std::os::unix::fs::MetadataExt;
         let database_meta = std::fs::symlink_metadata(database).map_err(|_| Error::Rejected)?;
         if !database_meta.is_file() || database_meta.nlink() != 1 {
@@ -68,7 +68,7 @@ impl Sidecars {
         })
     }
 
-    fn revalidate(&self, database: &Path) -> Result<(), Error> {
+    pub(crate) fn revalidate(&self, database: &Path) -> Result<(), Error> {
         let after = Self::capture(database)?;
         if self.parent_device != after.parent_device || self.database_uid != after.database_uid {
             return Err(Error::Rejected);
@@ -200,7 +200,7 @@ pub fn parse_prepare_args(args: &[std::ffi::OsString]) -> Result<PrepareArgs, Er
         commit_heartbeat,
     })
 }
-fn digest(parts: &[&str]) -> String {
+pub(crate) fn digest(parts: &[&str]) -> String {
     let mut h = Sha256::new();
     for p in parts {
         h.update((p.len() as u64).to_be_bytes());
@@ -209,7 +209,7 @@ fn digest(parts: &[&str]) -> String {
     format!("{:x}", h.finalize())
 }
 
-fn path_identity(path: &Path, include_content: bool) -> Result<String, Error> {
+pub(crate) fn path_identity(path: &Path, include_content: bool) -> Result<String, Error> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let canonical = path.canonicalize().map_err(|_| Error::Rejected)?;
     if canonical != path {
@@ -492,7 +492,7 @@ fn authenticate_root(m: &Manifest, manifest_path: &Path) -> Result<(), Error> {
     Ok(())
 }
 
-fn preflight_unit(unit: &str) -> Result<(), Error> {
+pub(crate) fn preflight_unit(unit: &str) -> Result<(), Error> {
     let mut command = {
         #[cfg(debug_assertions)]
         {
@@ -687,7 +687,7 @@ fn fixed_listener_inodes() -> Result<std::collections::BTreeSet<u64>, Error> {
     Ok(inodes)
 }
 
-fn preflight_runtime_absence(
+pub(crate) fn preflight_runtime_absence(
     binary: &Path,
     config: &Path,
     ignored_pid: Option<u32>,
@@ -700,7 +700,7 @@ fn preflight_runtime_absence(
     }
 }
 
-fn publish(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+pub(crate) fn publish(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     let parent = path.parent().ok_or(Error::Rejected)?;
     if let Ok(meta) = std::fs::symlink_metadata(path)
@@ -725,7 +725,7 @@ fn publish(path: &Path, bytes: &[u8]) -> Result<(), Error> {
         .map_err(|_| Error::Rejected)
 }
 
-fn preflight_publication(path: &Path) -> Result<(), Error> {
+pub(crate) fn preflight_publication(path: &Path) -> Result<(), Error> {
     use std::os::unix::fs::MetadataExt;
     match std::fs::symlink_metadata(path) {
         Ok(meta) if meta.is_file() && meta.mode() & 0o777 == 0o600 && meta.nlink() == 1 => Ok(()),
@@ -735,7 +735,7 @@ fn preflight_publication(path: &Path) -> Result<(), Error> {
     }
 }
 
-fn publish_new(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+pub(crate) fn publish_new(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     use std::os::unix::{
         ffi::OsStrExt,
         fs::{MetadataExt, OpenOptionsExt},
@@ -805,7 +805,7 @@ fn publish_new(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     Ok(())
 }
 
-fn ensure_marker(path: &Path, bytes: &[u8]) -> Result<(), Error> {
+pub(crate) fn ensure_marker(path: &Path, bytes: &[u8]) -> Result<(), Error> {
     use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
     match std::fs::symlink_metadata(path) {
         Ok(metadata)

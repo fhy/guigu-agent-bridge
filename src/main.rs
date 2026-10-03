@@ -7,6 +7,8 @@ async fn main() -> std::process::ExitCode {
                 || failure.command == "reconcile-orphaned-preacceptance"
                 || failure.command == "reconcile-isolated-legacy-owner"
                 || failure.command == "prepare-isolated-legacy-owner-manifest"
+                || failure.command == "prepare-isolated-legacy-fixture-migration-manifest"
+                || failure.command == "migrate-isolated-legacy-fixture"
             {
                 println!(
                     "{} result={} status={}",
