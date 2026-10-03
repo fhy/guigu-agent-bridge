@@ -670,6 +670,17 @@ async fn app_runtime_owns_real_a2a_listener_and_agent_card_until_shutdown() {
 }
 
 fn child_listener_inode(pid: u32) -> Option<u64> {
+    let listener_inodes = std::fs::read_to_string("/proc/net/tcp")
+        .ok()?
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            (fields.get(1)?.ends_with(":244C") && *fields.get(3)? == "0A")
+                .then(|| fields.get(9)?.parse::<u64>().ok())
+                .flatten()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
     let dir = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
     for entry in dir.flatten() {
         let link = std::fs::read_link(entry.path()).ok()?;
@@ -678,6 +689,7 @@ fn child_listener_inode(pid: u32) -> Option<u64> {
             .strip_prefix("socket:[")
             .and_then(|v| v.strip_suffix(']'))
             && let Ok(inode) = value.parse()
+            && listener_inodes.contains(&inode)
         {
             return Some(inode);
         }
@@ -703,10 +715,12 @@ async fn wait_for_child_listener(pid: u32) -> u64 {
 }
 
 fn stop_child(mut child: Child) {
-    let _ = Command::new("kill")
-        .args(["-TERM", &child.id().to_string()])
-        .status();
-    let _ = child.wait();
+    Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("send child shutdown");
+    let status = child.wait().expect("wait for child shutdown");
+    assert!(status.success(), "child shutdown failed: {status}");
 }
 
 #[tokio::test]
@@ -719,7 +733,7 @@ async fn child_process_restart_replaces_9292_pid_and_listener_inode() {
         std::env::set_var("T050_TOKEN", "test-token");
     }
     std::fs::write(&config_path, format!(
-        "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nshutdown_timeout_seconds = 1\n\n[transports.a2a]\nenabled = true\nlisten = \"tcp:127.0.0.1:9292\"\nallow_private_plaintext = true\nexposed_endpoints = [\"worker\"]\n\n[agents.worker]\ntransport = \"acp\"\ncommand = \"true\"\nworkspace = \"/tmp\"\nenabled = true\n",
+        "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nshutdown_timeout_seconds = 10\n\n[transports.a2a]\nenabled = true\nlisten = \"tcp:127.0.0.1:9292\"\nallow_private_plaintext = true\nexposed_endpoints = []\n",
         database.to_string_lossy(), sessions.to_string_lossy())).unwrap();
     assert!(config_path.exists());
     assert!(std::fs::metadata(&config_path).is_ok());
@@ -745,6 +759,7 @@ async fn child_process_restart_replaces_9292_pid_and_listener_inode() {
         card.headers()[reqwest::header::CONTENT_TYPE],
         "application/json"
     );
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     stop_child(first);
     assert!(
         tokio::net::TcpListener::bind("127.0.0.1:9292")

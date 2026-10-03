@@ -4,6 +4,7 @@ use chrono::{DateTime, Utc};
 use guigu_agent_bridge::{
     bus::derive_endpoint_id,
     models::{DeliveryId, TaskId},
+    offline_recovery::{RecoveryError, RecoveryOutcome, recover_stale_runtime},
     runtime::{
         AcquireOutcome, ContinuationPolicy, ContinuationState, Degradation, ExecutionResourceKey,
         Lease, Metric, PolicyLimit, Readiness, ReleaseDisposition, RuntimeError, RuntimeMetrics,
@@ -740,6 +741,26 @@ async fn sqlite_cas_facts_drive_ambiguous_recovery_block() {
         .claim_turn(&lease, continuation.revision, at())
         .await
         .unwrap();
+    let owner_token = "t050-owner-proof-v1";
+    let process_fingerprint = "t050-process-proof-v1";
+    sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES(?,?,?,?,?)")
+        .bind(owner_token)
+        .bind(at().to_rfc3339())
+        .bind(at().to_rfc3339())
+        .bind("active")
+        .bind(process_fingerprint)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let recovery = recover_stale_runtime(
+        &db.path,
+        owner_token,
+        process_fingerprint,
+        "2026-09-17T12:01:00Z",
+    )
+    .await;
+    assert!(matches!(recovery, Err(RecoveryError::WorkPresent)));
+    assert!(!matches!(recovery, Ok(RecoveryOutcome::Recovered)));
     let snapshot = store.recovery_snapshot(at(), 8).await.unwrap();
     let counts = store.counts_at(at()).await.unwrap();
     assert_eq!(snapshot.ambiguous, vec![db.task]);

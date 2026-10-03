@@ -821,6 +821,18 @@ impl AppRuntime {
         if let Some(ingress) = self.ingress.take() {
             ingress.shutdown().await;
         }
+        // Close the external listener before draining internal event ownership so
+        // no new ingress can keep the broadcaster alive during bounded shutdown.
+        if let Some(a2a) = self.a2a.take()
+            && a2a.shutdown().await.is_err()
+        {
+            shutdown_error.get_or_insert(AppError::Assembly("A2A server join failed"));
+        }
+        if let Some(cleanup) = self.a2a_cleanup.take()
+            && cleanup.shutdown().await.is_err()
+        {
+            shutdown_error.get_or_insert(AppError::Assembly("A2A cleanup join failed"));
+        }
         self.bus.take();
         if let Some(mut worker) = self.worker.take() {
             match tokio::time::timeout(self.shutdown_timeout, &mut worker).await {
@@ -853,16 +865,6 @@ impl AppRuntime {
         }
         if let Some(acp) = self.acp.take() {
             acp.shutdown().await;
-        }
-        if let Some(a2a) = self.a2a.take()
-            && a2a.shutdown().await.is_err()
-        {
-            shutdown_error.get_or_insert(AppError::Assembly("A2A server join failed"));
-        }
-        if let Some(cleanup) = self.a2a_cleanup.take()
-            && cleanup.shutdown().await.is_err()
-        {
-            shutdown_error.get_or_insert(AppError::Assembly("A2A cleanup join failed"));
         }
         if let Some(cleanup) = self.gateway_cleanup.take()
             && cleanup.shutdown().await.is_err()
