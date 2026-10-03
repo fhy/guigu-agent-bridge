@@ -1,5 +1,7 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
 use axum::body::{Body, to_bytes};
@@ -59,6 +61,7 @@ pub struct A2aServerHandle {
     owner: tokio::task::JoinHandle<std::io::Result<()>>,
     unix_path: Option<(std::path::PathBuf, u64)>,
     local_addr: Option<SocketAddr>,
+    listener_inode: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -160,6 +163,11 @@ impl A2aServer {
     pub fn start(self) -> A2aServerHandle {
         let (stop, stopped) = tokio::sync::oneshot::channel();
         let local_addr = self.local_addr().ok();
+        let listener_inode = match &self.listener {
+            ServerListener::Tcp(listener) => socket_inode(listener),
+            #[cfg(unix)]
+            ServerListener::Unix(_) => None,
+        };
         let unix_path = self.unix_path;
         let owner = tokio::spawn(async move {
             match self.listener {
@@ -185,6 +193,7 @@ impl A2aServer {
             owner,
             unix_path,
             local_addr,
+            listener_inode,
         }
     }
 }
@@ -192,6 +201,10 @@ impl A2aServer {
 impl A2aServerHandle {
     pub fn local_addr(&self) -> Option<SocketAddr> {
         self.local_addr
+    }
+
+    pub fn listener_inode(&self) -> Option<u64> {
+        self.listener_inode
     }
 
     pub async fn shutdown(mut self) -> Result<(), A2aError> {
@@ -215,6 +228,21 @@ impl A2aServerHandle {
         }
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn socket_inode(listener: &TcpListener) -> Option<u64> {
+    let link = std::fs::read_link(format!("/proc/self/fd/{}", listener.as_raw_fd())).ok()?;
+    let text = link.to_string_lossy();
+    text.strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+#[cfg(not(unix))]
+fn socket_inode(_listener: &TcpListener) -> Option<u64> {
+    None
 }
 
 async fn card(State(state): State<ServerState>) -> Json<AgentCard> {

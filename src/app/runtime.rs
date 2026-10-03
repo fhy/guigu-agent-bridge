@@ -787,6 +787,10 @@ impl AppRuntime {
         self.a2a.as_ref().and_then(A2aServerHandle::local_addr)
     }
 
+    pub fn a2a_listener_inode(&self) -> Option<u64> {
+        self.a2a.as_ref().and_then(A2aServerHandle::listener_inode)
+    }
+
     pub async fn shutdown(mut self) -> Result<(), AppError> {
         self.health_state.matrix().stop();
         let mut shutdown_error = None;

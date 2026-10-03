@@ -636,6 +636,8 @@ async fn app_runtime_owns_real_a2a_listener_and_agent_card_until_shutdown() {
     .unwrap();
     let runtime = AppRuntime::start(&config_path).await.unwrap();
     let address = runtime.a2a_addr().expect("real A2A listener");
+    let first_pid = std::process::id();
+    let first_inode = runtime.a2a_listener_inode().expect("listener inode");
     assert_eq!(address.port(), 9292);
     let response = reqwest::get(format!("http://{address}/.well-known/agent-card.json"))
         .await
@@ -650,6 +652,9 @@ async fn app_runtime_owns_real_a2a_listener_and_agent_card_until_shutdown() {
     let restarted = AppRuntime::start(&config_path).await.unwrap();
     let replacement = restarted.a2a_addr().expect("replacement listener");
     assert_eq!(replacement, address);
+    assert_eq!(std::process::id(), first_pid);
+    let replacement_inode = restarted.a2a_listener_inode().expect("replacement inode");
+    assert_ne!(replacement_inode, first_inode);
     let card = reqwest::get(format!("http://{replacement}/.well-known/agent-card.json"))
         .await
         .unwrap();
