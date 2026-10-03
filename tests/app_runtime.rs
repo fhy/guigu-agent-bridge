@@ -656,7 +656,9 @@ async fn app_runtime_owns_real_a2a_listener_and_agent_card_until_shutdown() {
     assert_eq!(card.status(), reqwest::StatusCode::OK);
     let _ = restarted.shutdown().await;
     assert!(tokio::net::TcpListener::bind(replacement).await.is_ok());
-    let stale = tokio::net::TcpListener::bind("127.0.0.1:9292").await.unwrap();
+    let stale = tokio::net::TcpListener::bind("127.0.0.1:9292")
+        .await
+        .unwrap();
     assert!(AppRuntime::start(&config_path).await.is_err());
     drop(stale);
 }
@@ -711,6 +713,11 @@ async fn startup_recovery_backlog_blocks_readiness_without_spawning_acp() {
     assert_eq!(
         runtime.health_state().snapshot().await.diagnostic,
         Some("recovery-blocked")
+    );
+    assert!(
+        tokio::net::TcpListener::bind("127.0.0.1:9292")
+            .await
+            .is_ok()
     );
     runtime.shutdown().await.unwrap();
 }
