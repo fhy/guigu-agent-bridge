@@ -1,5 +1,6 @@
 use std::{
     collections::BTreeMap,
+    process::{Child, Command},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
@@ -666,6 +667,103 @@ async fn app_runtime_owns_real_a2a_listener_and_agent_card_until_shutdown() {
         .unwrap();
     assert!(AppRuntime::start(&config_path).await.is_err());
     drop(stale);
+}
+
+fn child_listener_inode(pid: u32) -> Option<u64> {
+    let dir = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    for entry in dir.flatten() {
+        let link = std::fs::read_link(entry.path()).ok()?;
+        let text = link.to_string_lossy();
+        if let Some(value) = text
+            .strip_prefix("socket:[")
+            .and_then(|v| v.strip_suffix(']'))
+            && let Ok(inode) = value.parse()
+        {
+            return Some(inode);
+        }
+    }
+    None
+}
+
+async fn wait_for_child_listener(pid: u32) -> u64 {
+    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if tokio::net::TcpStream::connect("127.0.0.1:9292")
+                .await
+                .is_ok()
+                && let Some(inode) = child_listener_inode(pid)
+            {
+                break inode;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("child did not bind 9292")
+}
+
+fn stop_child(mut child: Child) {
+    let _ = Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status();
+    let _ = child.wait();
+}
+
+#[tokio::test]
+async fn child_process_restart_replaces_9292_pid_and_listener_inode() {
+    let temp = TempDir::new();
+    let config_path = temp.0.join("bridge.toml");
+    let database = temp.0.join("state.db");
+    let sessions = temp.0.join("sessions");
+    unsafe {
+        std::env::set_var("T050_TOKEN", "test-token");
+    }
+    std::fs::write(&config_path, format!(
+        "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nshutdown_timeout_seconds = 1\n\n[transports.a2a]\nenabled = true\nlisten = \"tcp:127.0.0.1:9292\"\nallow_private_plaintext = true\nexposed_endpoints = [\"worker\"]\n\n[agents.worker]\ntransport = \"acp\"\ncommand = \"true\"\nworkspace = \"/tmp\"\nenabled = true\n",
+        database.to_string_lossy(), sessions.to_string_lossy())).unwrap();
+    assert!(config_path.exists());
+    assert!(std::fs::metadata(&config_path).is_ok());
+    let first = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        .arg(&config_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let first_pid = first.id();
+    let first_inode = wait_for_child_listener(first_pid).await;
+    let card = reqwest::get("http://127.0.0.1:9292/.well-known/agent-card.json")
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "card request failed: {error}; config={:?} exists={}",
+                config_path,
+                config_path.exists()
+            )
+        });
+    assert_eq!(card.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        card.headers()[reqwest::header::CONTENT_TYPE],
+        "application/json"
+    );
+    stop_child(first);
+    assert!(
+        tokio::net::TcpListener::bind("127.0.0.1:9292")
+            .await
+            .is_ok()
+    );
+    let second = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        .arg(&config_path)
+        .spawn()
+        .unwrap();
+    let second_pid = second.id();
+    let second_inode = wait_for_child_listener(second_pid).await;
+    assert_ne!(second_pid, first_pid);
+    assert_ne!(second_inode, first_inode);
+    let card = reqwest::get("http://127.0.0.1:9292/.well-known/agent-card.json")
+        .await
+        .unwrap();
+    assert_eq!(card.status(), reqwest::StatusCode::OK);
+    stop_child(second);
 }
 
 #[tokio::test]

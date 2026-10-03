@@ -9,7 +9,7 @@ use guigu_agent_bridge::{
         Lease, Metric, PolicyLimit, Readiness, ReleaseDisposition, RuntimeError, RuntimeMetrics,
         SqliteRuntimeStore, WorkspaceId, health_snapshot,
     },
-    storage::{connect, migrate},
+    storage::{RecoveryDiagnostic, RecoveryFixture, RecoveryPlan, connect, migrate},
 };
 
 fn at() -> DateTime<Utc> {
@@ -716,6 +716,46 @@ async fn restart_snapshot_separates_ready_from_ambiguous_without_replay() {
     let snapshot = store.recovery_snapshot(at(), 8).await.unwrap();
     assert!(snapshot.ready.is_empty());
     assert_eq!(snapshot.ambiguous, vec![db.task]);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_cas_facts_drive_ambiguous_recovery_block() {
+    let db = Db::new().await;
+    let store = SqliteRuntimeStore::new(db.pool.clone());
+    let lease = match store
+        .acquire(key(), db.task, at(), Duration::from_secs(30))
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Acquired(value) => value,
+        _ => panic!("acquire"),
+    };
+    store
+        .begin_continuation(&lease, db.delivery, "durable", at())
+        .await
+        .unwrap();
+    let continuation = store.continuation(db.task).await.unwrap().unwrap();
+    store
+        .claim_turn(&lease, continuation.revision, at())
+        .await
+        .unwrap();
+    let snapshot = store.recovery_snapshot(at(), 8).await.unwrap();
+    let counts = store.counts_at(at()).await.unwrap();
+    assert_eq!(snapshot.ambiguous, vec![db.task]);
+    let signals = RecoveryFixture::from_runtime_facts(
+        true,
+        false,
+        &RecoveryPlan::default(),
+        &snapshot,
+        &counts,
+    );
+    let diagnostic = RecoveryDiagnostic::classify(signals);
+    assert_eq!(diagnostic.status, 3);
+    assert_eq!(
+        diagnostic.blocker.map(|b| b.name()),
+        Some("runtime-ambiguous")
+    );
     db.close().await;
 }
 
