@@ -7,6 +7,25 @@ use std::{
 use guigu_agent_bridge::storage::{connect, migrate};
 use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
 
+type DispositionRow = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
+
+#[derive(Debug, PartialEq, Eq)]
+struct DurableRows {
+    owners: Vec<(String, String, String)>,
+    continuation: (String, i64, String),
+    receipts: i64,
+    sessions: Vec<(String, String, String, String)>,
+    dispositions: Vec<DispositionRow>,
+    witnesses: Vec<String>,
+}
+
 fn proc_view() -> PathBuf {
     let root = std::env::temp_dir().join(format!("t050-migration-proc-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(root.join("net")).unwrap();
@@ -16,7 +35,7 @@ fn proc_view() -> PathBuf {
     root
 }
 
-async fn durable_rows(path: &Path) -> (Vec<(String, String, String)>, (String, i64, String), i64) {
+async fn durable_rows(path: &Path) -> DurableRows {
     let mut c = SqliteConnection::connect_with(
         &SqliteConnectOptions::new()
             .filename(path)
@@ -38,8 +57,69 @@ async fn durable_rows(path: &Path) -> (Vec<(String, String, String)>, (String, i
         .fetch_one(&mut c)
         .await
         .unwrap();
+    let sessions = sqlx::query_as(
+        "SELECT session_id,state,updated_at,compatibility_hash FROM sessions ORDER BY session_id,endpoint_id",
+    )
+    .fetch_all(&mut c)
+    .await
+    .unwrap();
+    let dispositions = sqlx::query_as("SELECT delivery_id,state,session_id,child_fingerprint,reap_status,reap_at FROM delivery_dispositions ORDER BY delivery_id")
+        .fetch_all(&mut c)
+        .await
+        .unwrap();
+    let witnesses = sqlx::query_scalar(
+        "SELECT value FROM (
+           SELECT 'task:'||quote(task_id)||':'||quote(version) AS value FROM tasks
+           UNION ALL SELECT 'event:'||quote(event_id)||':'||quote(seq)||':'||quote(status)||':'||quote(payload) FROM task_events
+           UNION ALL SELECT 'lease:'||quote(resource_key)||':'||quote(task_id)||':'||quote(owner_token)||':'||quote(fence)||':'||quote(state) FROM execution_leases
+           UNION ALL SELECT 'admission:'||quote(task_id)||':'||quote(state)||':'||quote(revision)||':'||quote(runtime_instance) FROM task_admissions
+           UNION ALL SELECT 'delivery:'||quote(delivery_id)||':'||quote(task_id)||':'||quote(attempt)||':'||quote(acknowledged_at) FROM deliveries
+           UNION ALL SELECT 'response:'||quote(idempotency_key)||':'||quote(response_hash)||':'||quote(outcome)||':'||quote(output_bytes) FROM continuation_response_receipts
+           UNION ALL SELECT 'queue:'||quote(queue_id)||':'||quote(state)||':'||quote(revision) FROM agent_work_queue
+           UNION ALL SELECT 'claim:'||quote(claim_id)||':'||quote(state)||':'||quote(revision) FROM workspace_claims
+           UNION ALL SELECT 'projection:'||quote(source_kind)||':'||quote(source_id)||':'||quote(projection)||':'||quote(state) FROM projection_outbox
+         ) ORDER BY value",
+    )
+    .fetch_all(&mut c)
+    .await
+    .unwrap();
     c.close().await.unwrap();
-    (owners, continuation, receipts)
+    DurableRows {
+        owners,
+        continuation,
+        receipts,
+        sessions,
+        dispositions,
+        witnesses,
+    }
+}
+
+fn fixture_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
+    let mut entries = std::fs::read_dir(root)
+        .unwrap()
+        .map(|entry| entry.unwrap())
+        .filter_map(|entry| {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name.starts_with("state.db") {
+                return None;
+            }
+            let metadata = std::fs::symlink_metadata(entry.path()).unwrap();
+            let bytes = if metadata.is_file() {
+                std::fs::read(entry.path()).unwrap()
+            } else if metadata.file_type().is_symlink() {
+                std::fs::read_link(entry.path())
+                    .unwrap()
+                    .as_os_str()
+                    .as_encoded_bytes()
+                    .to_vec()
+            } else {
+                Vec::new()
+            };
+            Some((name, bytes))
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| left.0.cmp(&right.0));
+    entries
 }
 
 struct Fixture {
@@ -73,6 +153,7 @@ impl Fixture {
         sqlx::query("INSERT INTO runtime_instances VALUES('owner-s','2026-09-30T23:00:00.000000000Z','2026-09-30T23:30:00.000000000Z','stopping','legacy-stopping'),('owner-a','2026-10-01T00:00:00.000000000Z','2026-10-01T00:00:03.000000000Z','active','legacy-active')").execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,created_at,updated_at) VALUES('task','terminal',4,'owner-a','2026-10-01T00:00:00.000000000Z','2026-10-01T00:00:03.000000000Z')").execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state) VALUES('delivery','task',1,'terminal')").execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO sessions(session_id,endpoint_id,conversation_id,cwd,backend_id,protocol_version,state,created_at,updated_at) VALUES('closed-session','agent-b','conversation','/tmp','agent-b@1',1,'closed','2026-10-01T00:00:00.000000000Z','2026-10-01T00:00:03.000000000Z')").execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO execution_leases VALUES('resource','task','owner-a',7,'released','2026-10-01T00:00:00.000000000Z','2026-10-01T00:00:03.000000000Z','2026-10-01T00:00:03.000000000Z')").execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes,runtime_generation,runtime_generation_version) VALUES('task','resource','delivery',7,2,'blocked',1,1,0,'','2026-10-01T00:00:00.000000000Z','2026-10-01T00:00:03.000000000Z','2026-10-01T00:00:03.000000000Z',12,'generation.v1:strict',1)").execute(&pool).await.unwrap();
         let response_hash = uuid::Uuid::new_v5(
@@ -155,12 +236,16 @@ async fn exact_closed_fixture_migrates_repeats_and_adopts_unknown_commit() {
     );
     let committed = durable_rows(&f.db).await;
     assert_eq!(
-        committed.0.iter().filter(|row| row.1 == "stopped").count(),
+        committed
+            .owners
+            .iter()
+            .filter(|row| row.1 == "stopped")
+            .count(),
         2
     );
-    assert_eq!(committed.1.0, "terminal");
-    assert_eq!(committed.1.1, 3);
-    assert_eq!(committed.2, 1);
+    assert_eq!(committed.continuation.0, "terminal");
+    assert_eq!(committed.continuation.1, 3);
+    assert_eq!(committed.receipts, 1);
     std::fs::remove_file(&f.evidence).unwrap();
     let repeat = f.run().output().unwrap();
     assert_eq!(repeat.status.code(), Some(0));
@@ -175,7 +260,7 @@ async fn exact_closed_fixture_migrates_repeats_and_adopts_unknown_commit() {
     assert_eq!(lost.status.code(), Some(3));
     assert!(!f.evidence.exists());
     let committed = durable_rows(&f.db).await;
-    assert_eq!(committed.2, 1);
+    assert_eq!(committed.receipts, 1);
     assert_eq!(f.run().output().unwrap().status.code(), Some(0));
     assert_eq!(durable_rows(&f.db).await, committed);
 }
@@ -234,6 +319,56 @@ async fn missing_extra_and_drifted_facts_are_rejected_without_mutation() {
     let before = durable_rows(&f.db).await;
     assert_eq!(f.run().output().unwrap().status.code(), Some(3));
     assert_eq!(durable_rows(&f.db).await, before);
+}
+
+async fn assert_prepare_refusal(name: &str, sql: &'static str) {
+    let f = Fixture::new().await;
+    std::fs::remove_file(&f.manifest).unwrap();
+    let pool = connect(&f.db).await.unwrap();
+    sqlx::query(sql).execute(&pool).await.unwrap();
+    pool.close().await;
+    let before = durable_rows(&f.db).await;
+    let tree = fixture_tree(&f.root);
+    let rejected = f.prepare().output().unwrap();
+    assert_eq!(rejected.status.code(), Some(3), "{name}");
+    assert_eq!(durable_rows(&f.db).await, before, "{name}");
+    assert_eq!(fixture_tree(&f.root), tree, "{name}");
+    assert!(!f.manifest.exists(), "{name}");
+    assert!(!f.evidence.exists(), "{name}");
+}
+
+#[tokio::test]
+async fn open_session_refuses_before_manifest_publication() {
+    assert_prepare_refusal(
+        "open-session",
+        "UPDATE sessions SET state='prompting' WHERE session_id='closed-session'",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn unreaped_child_refuses_before_manifest_publication() {
+    assert_prepare_refusal(
+        "unreaped-child",
+        "UPDATE delivery_dispositions SET child_fingerprint='child:legacy',reap_status=NULL,reap_at=NULL WHERE delivery_id='delivery'",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn session_drift_after_cas_rolls_back_rows_receipt_evidence_and_tree() {
+    let f = Fixture::new().await;
+    let before = durable_rows(&f.db).await;
+    let tree = fixture_tree(&f.root);
+    let rejected = f
+        .run()
+        .env("T050_FIXTURE_MIGRATION_TEST_DRIFT_SESSION", "1")
+        .output()
+        .unwrap();
+    assert_eq!(rejected.status.code(), Some(3));
+    assert_eq!(durable_rows(&f.db).await, before);
+    assert_eq!(fixture_tree(&f.root), tree);
+    assert!(!f.evidence.exists());
 }
 
 #[tokio::test]

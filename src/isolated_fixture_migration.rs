@@ -223,7 +223,7 @@ async fn eligible(c: &mut SqliteConnection) -> Result<Facts, Error> {
     if continuation.state != "blocked" || continuation.revision < 2 {
         return Err(Error::Rejected);
     }
-    let exact: i64 = sqlx::query_scalar("SELECT count(*) FROM execution_leases l JOIN task_admissions a ON a.task_id=l.task_id JOIN deliveries d ON d.task_id=l.task_id JOIN delivery_dispositions p ON p.delivery_id=d.delivery_id AND p.task_id=d.task_id AND p.attempt=d.attempt JOIN tasks t ON t.task_id=l.task_id WHERE l.resource_key=? AND l.task_id=? AND l.owner_token=? AND l.fence=? AND l.state='released' AND a.state='terminal' AND a.runtime_instance=? AND d.delivery_id=? AND d.acknowledged_at IS NOT NULL AND p.state='terminal' AND t.version+1=(SELECT max(seq) FROM task_events WHERE task_id=t.task_id) AND (SELECT status FROM task_events WHERE task_id=t.task_id ORDER BY seq DESC LIMIT 1) IN ('completed','failed','timed_out','cancelled')")
+    let exact: i64 = sqlx::query_scalar("SELECT count(*) FROM execution_leases l JOIN task_admissions a ON a.task_id=l.task_id JOIN deliveries d ON d.task_id=l.task_id JOIN delivery_dispositions p ON p.delivery_id=d.delivery_id AND p.task_id=d.task_id AND p.attempt=d.attempt JOIN tasks t ON t.task_id=l.task_id WHERE l.resource_key=? AND l.task_id=? AND l.owner_token=? AND l.fence=? AND l.state='released' AND a.state='terminal' AND a.runtime_instance=? AND d.delivery_id=? AND d.acknowledged_at IS NOT NULL AND p.state='terminal' AND ((p.child_fingerprint IS NULL AND p.reap_status IS NULL AND p.reap_at IS NULL) OR (p.child_fingerprint IS NOT NULL AND p.reap_status='reaped' AND p.reap_at IS NOT NULL)) AND t.version+1=(SELECT max(seq) FROM task_events WHERE task_id=t.task_id) AND (SELECT status FROM task_events WHERE task_id=t.task_id ORDER BY seq DESC LIMIT 1) IN ('completed','failed','timed_out','cancelled')")
         .bind(&continuation.resource).bind(&continuation.task).bind(&active.token).bind(continuation.fence).bind(&active.token).bind(&continuation.delivery).fetch_one(&mut *c).await.map_err(|_|Error::Database)?;
     let response = sqlx::query("SELECT r.response_hash,r.output_bytes,r.outcome,e.payload FROM continuation_response_receipts r JOIN task_events e ON e.task_id=r.task_id WHERE r.task_id=? AND r.delivery_id=? AND r.resource_key=? AND r.lease_fence=? AND r.continuation_revision=? AND r.runtime_generation=? ORDER BY e.seq DESC LIMIT 1")
         .bind(&continuation.task).bind(&continuation.delivery).bind(&continuation.resource).bind(continuation.fence).bind(continuation.revision-1).bind(&continuation.generation).fetch_optional(&mut *c).await.map_err(|_|Error::Database)?;
@@ -248,11 +248,17 @@ async fn eligible(c: &mut SqliteConnection) -> Result<Facts, Error> {
         .bind(&stopping.token).bind(&stopping.token).bind(&stopping.token).bind(&stopping.token).fetch_one(&mut *c).await.map_err(|_|Error::Database)?;
     let other_owners: i64 = sqlx::query_scalar("SELECT count(*) FROM runtime_instances WHERE state<>'stopped' AND instance_token NOT IN (?,?)")
         .bind(&active.token).bind(&stopping.token).fetch_one(&mut *c).await.map_err(|_|Error::Database)?;
+    let open_sessions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM sessions WHERE state <> 'closed'")
+            .fetch_one(&mut *c)
+            .await
+            .map_err(|_| Error::Database)?;
     if exact != 1
         || !response_valid
         || counts != (1, 1, 1, 1, 0, 0, 0)
         || stopping_refs != 0
         || other_owners != 0
+        || open_sessions != 0
     {
         return Err(Error::Rejected);
     }
@@ -326,6 +332,11 @@ async fn snapshot(
         (
             "task_admissions",
             "SELECT quote(task_id),quote(state),quote(revision),quote(runtime_instance),quote(reply_room),quote(reply_thread_root),quote(reply_event_id),quote(monitor_room),quote(monitor_generation),quote(render_version),quote(created_at),quote(updated_at) FROM task_admissions ORDER BY task_id",
+            12,
+        ),
+        (
+            "sessions",
+            "SELECT quote(session_id),quote(endpoint_id),quote(conversation_id),quote(cwd),quote(backend_id),quote(protocol_version),quote(state),quote(created_at),quote(updated_at),quote(additional_directories),quote(compatibility_version),quote(compatibility_hash) FROM sessions ORDER BY session_id,endpoint_id",
             12,
         ),
         (
@@ -759,6 +770,7 @@ async fn execute_transaction(c: &mut SqliteConnection, m: &Manifest) -> Result<O
     update_owner(c, &facts.stopping, "stopping", &m.commit_timestamp).await?;
     fail_after("stopping")?;
     update_continuation(c, &facts.continuation, &m.commit_timestamp).await?;
+    drift_session(c).await?;
     if snapshot(c, None).await? != m.post_state_digest {
         return Err(Error::Rejected);
     }
@@ -832,6 +844,17 @@ fn fail_after(stage: &str) -> Result<(), Error> {
     #[cfg(debug_assertions)]
     if std::env::var("T050_FIXTURE_MIGRATION_TEST_FAIL_AFTER").as_deref() == Ok(stage) {
         return Err(Error::Rejected);
+    }
+    Ok(())
+}
+
+async fn drift_session(c: &mut SqliteConnection) -> Result<(), Error> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("T050_FIXTURE_MIGRATION_TEST_DRIFT_SESSION").is_some() {
+        sqlx::query("UPDATE sessions SET updated_at='2026-10-04T00:00:01.000000000Z'")
+            .execute(c)
+            .await
+            .map_err(|_| Error::Database)?;
     }
     Ok(())
 }
