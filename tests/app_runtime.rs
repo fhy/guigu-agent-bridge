@@ -782,6 +782,43 @@ async fn child_process_restart_replaces_9292_pid_and_listener_inode() {
 }
 
 #[tokio::test]
+async fn concurrent_second_start_rejects_live_owner_without_takeover() {
+    let temp = TempDir::new();
+    let config_path = temp.0.join("bridge.toml");
+    let database = temp.0.join("state.db");
+    let sessions = temp.0.join("sessions");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nhealth_bind = \"127.0.0.1:0\"\nshutdown_timeout_seconds = 10\n\n[transports.matrix]\nenabled = false\n\n[transports.a2a]\nenabled = false\n",
+            database.to_string_lossy(),
+            sessions.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let mut first = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        .arg(&config_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let first_pid = first.id();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(first.try_wait().unwrap().is_none());
+    let mut second = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        .arg(&config_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(first_pid != second.id());
+    assert!(second.try_wait().unwrap().is_none());
+    stop_child(second);
+    stop_child(first);
+}
+
+#[tokio::test]
 async fn startup_recovery_backlog_blocks_readiness_without_spawning_acp() {
     let temp = TempDir::new();
     let config_path = temp.0.join("bridge.toml");
