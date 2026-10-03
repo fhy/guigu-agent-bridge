@@ -199,9 +199,10 @@ impl AppRuntime {
         }
         let reliability = crate::storage::ReliabilityStore::new(pool.clone());
         let runtime_instance = uuid::Uuid::now_v7().to_string();
+        let process_fingerprint = format!("pid:{}", std::process::id());
         let startup_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         let mut owns_runtime = reliability
-            .begin_runtime(&runtime_instance, &runtime_instance, &startup_at)
+            .begin_runtime(&runtime_instance, &process_fingerprint, &startup_at)
             .await
             .map_err(|_| AppError::Runtime)?;
         if !owns_runtime {
@@ -219,6 +220,15 @@ impl AppRuntime {
                     sqlx::Row::try_get(&row, "instance_token").map_err(|_| AppError::Runtime)?;
                 let fingerprint: String = sqlx::Row::try_get(&row, "process_fingerprint")
                     .map_err(|_| AppError::Runtime)?;
+                let Some(pid) = fingerprint
+                    .strip_prefix("pid:")
+                    .and_then(|v| v.parse::<u32>().ok())
+                else {
+                    continue;
+                };
+                if std::fs::metadata(format!("/proc/{pid}")).is_ok() {
+                    continue;
+                }
                 let _ = crate::offline_recovery::recover_stale_runtime(
                     &config.bridge.database,
                     &token,
@@ -228,7 +238,7 @@ impl AppRuntime {
                 .await;
             }
             owns_runtime = reliability
-                .begin_runtime(&runtime_instance, &runtime_instance, &startup_at)
+                .begin_runtime(&runtime_instance, &process_fingerprint, &startup_at)
                 .await
                 .map_err(|_| AppError::Runtime)?;
         }
