@@ -200,10 +200,38 @@ impl AppRuntime {
         let reliability = crate::storage::ReliabilityStore::new(pool.clone());
         let runtime_instance = uuid::Uuid::now_v7().to_string();
         let startup_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-        let owns_runtime = reliability
+        let mut owns_runtime = reliability
             .begin_runtime(&runtime_instance, &runtime_instance, &startup_at)
             .await
             .map_err(|_| AppError::Runtime)?;
+        if !owns_runtime {
+            // A prior isolated generation may have stopped before publishing its
+            // terminal runtime row. Reuse the reviewed CAS recovery boundary for
+            // each durable owner identity, then retry the fresh generation.
+            let stale = sqlx::query(
+                "SELECT instance_token,process_fingerprint FROM runtime_instances WHERE state IN ('active','stopping')",
+            )
+            .fetch_all(&pool)
+            .await
+            .map_err(|_| AppError::Runtime)?;
+            for row in stale {
+                let token: String =
+                    sqlx::Row::try_get(&row, "instance_token").map_err(|_| AppError::Runtime)?;
+                let fingerprint: String = sqlx::Row::try_get(&row, "process_fingerprint")
+                    .map_err(|_| AppError::Runtime)?;
+                let _ = crate::offline_recovery::recover_stale_runtime(
+                    &config.bridge.database,
+                    &token,
+                    &fingerprint,
+                    &startup_at,
+                )
+                .await;
+            }
+            owns_runtime = reliability
+                .begin_runtime(&runtime_instance, &runtime_instance, &startup_at)
+                .await
+                .map_err(|_| AppError::Runtime)?;
+        }
         match Self::build(
             path,
             config,
