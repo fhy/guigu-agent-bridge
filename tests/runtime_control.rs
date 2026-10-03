@@ -781,6 +781,39 @@ async fn sqlite_cas_facts_drive_ambiguous_recovery_block() {
 }
 
 #[tokio::test]
+async fn recovery_cas_fingerprint_mismatch_stays_blocked_without_takeover() {
+    let db = Db::new().await;
+    let owner = "pid:4294967295";
+    sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES(?,?,?,?,?)")
+        .bind(owner)
+        .bind(at().to_rfc3339())
+        .bind(at().to_rfc3339())
+        .bind("active")
+        .bind("pid:4294967295")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let result = guigu_agent_bridge::offline_recovery::recover_stale_runtime(
+        &db.path,
+        owner,
+        "pid:wrong-fingerprint",
+        "2026-09-17T12:01:00Z",
+    )
+    .await;
+    assert!(matches!(result, Err(RecoveryError::OwnerIdentity)));
+    let (state, fingerprint): (String, String) = sqlx::query_as(
+        "SELECT state,process_fingerprint FROM runtime_instances WHERE instance_token=?",
+    )
+    .bind(owner)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "active");
+    assert_eq!(fingerprint, "pid:4294967295");
+    db.close().await;
+}
+
+#[tokio::test]
 async fn policy_health_and_metrics_use_only_bounded_dimensions() {
     let db = Db::new().await;
     let store = SqliteRuntimeStore::new(db.pool.clone());
