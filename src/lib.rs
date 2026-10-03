@@ -12,6 +12,7 @@ pub mod config;
 pub mod error;
 pub mod gateway;
 pub mod lease_owner_diagnostics;
+pub mod legacy_owner_reconciliation;
 pub mod matrix;
 pub mod models;
 pub mod observer;
@@ -91,6 +92,35 @@ pub fn init_tracing() {
 /// Production entry point: initialize tracing, then run until an interrupt or
 /// termination signal.
 pub async fn run() -> Result<(), Error> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref().and_then(|v| v.to_str()) == Some("reconcile-isolated-legacy-owner") {
+        let mut cli = vec![std::ffi::OsString::from("reconcile-isolated-legacy-owner")];
+        cli.extend(args);
+        let manifest = legacy_owner_reconciliation::parse_args(&cli).map_err(|e| {
+            Error::Cli(error::CliFailure {
+                command: "reconcile-isolated-legacy-owner",
+                category: e.slug(),
+                status: e.status(),
+            })
+        })?;
+        let outcome = legacy_owner_reconciliation::reconcile(manifest)
+            .await
+            .map_err(|e| {
+                Error::Cli(error::CliFailure {
+                    command: "reconcile-isolated-legacy-owner",
+                    category: e.slug(),
+                    status: e.status(),
+                })
+            })?;
+        println!(
+            "reconcile-isolated-legacy-owner result={}",
+            match outcome {
+                legacy_owner_reconciliation::Outcome::Recovered => "recovered",
+                legacy_owner_reconciliation::Outcome::AlreadyStopped => "already-stopped",
+            }
+        );
+        return Ok(());
+    }
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref().and_then(|v| v.to_str()) == Some("reconcile-orphaned-preacceptance") {
         let mut cli = vec![std::ffi::OsString::from("reconcile-orphaned-preacceptance")];
