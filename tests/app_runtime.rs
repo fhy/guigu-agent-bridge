@@ -805,6 +805,18 @@ async fn concurrent_second_start_rejects_live_owner_without_takeover() {
     let first_pid = first.id();
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     assert!(first.try_wait().unwrap().is_none());
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", database.display()))
+        .await
+        .unwrap();
+    let before: (i64, String, String) = sqlx::query_as(
+        "SELECT count(*),state,process_fingerprint FROM runtime_instances WHERE state='active'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(before.0, 1);
+    assert_eq!(before.1, "active");
+    assert_eq!(before.2, format!("pid:{first_pid}"));
     let mut second = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
         .arg(&config_path)
         .stdout(std::process::Stdio::null())
@@ -814,8 +826,74 @@ async fn concurrent_second_start_rejects_live_owner_without_takeover() {
     tokio::time::sleep(std::time::Duration::from_millis(250)).await;
     assert!(first_pid != second.id());
     assert!(second.try_wait().unwrap().is_none());
+    let after: (i64, String, String) = sqlx::query_as(
+        "SELECT count(*),state,process_fingerprint FROM runtime_instances WHERE state='active'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after, before);
+    pool.close().await;
     stop_child(second);
     stop_child(first);
+}
+
+#[tokio::test]
+async fn stale_owner_startup_recovers_then_acquires_durable_generation() {
+    let temp = TempDir::new();
+    let config_path = temp.0.join("bridge.toml");
+    let database = temp.0.join("state.db");
+    let sessions = temp.0.join("sessions");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nhealth_bind = \"127.0.0.1:0\"\nshutdown_timeout_seconds = 10\n\n[transports.matrix]\nenabled = false\n\n[transports.a2a]\nenabled = false\n",
+            database.to_string_lossy(),
+            sessions.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let mut first = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        .arg(&config_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let first_pid = first.id();
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert!(first.try_wait().unwrap().is_none());
+    Command::new("kill")
+        .args(["-KILL", &first_pid.to_string()])
+        .status()
+        .unwrap();
+    let first_status = first.wait().unwrap();
+    assert!(!first_status.success());
+    let second = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        .arg(&config_path)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    let pool = sqlx::SqlitePool::connect(&format!("sqlite://{}", database.display()))
+        .await
+        .unwrap();
+    let stopped: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM runtime_instances WHERE state='stopped' AND process_fingerprint=?",
+    )
+    .bind(format!("pid:{first_pid}"))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let active: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM runtime_instances WHERE state='active'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stopped, 1);
+    assert_eq!(active, 1);
+    pool.close().await;
+    stop_child(second);
 }
 
 #[tokio::test]
