@@ -459,6 +459,31 @@ fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
+fn observed_process_uid(process: &Path, metadata: &std::fs::Metadata) -> Result<u32, Error> {
+    use std::os::unix::fs::MetadataExt;
+    #[cfg(debug_assertions)]
+    {
+        // Process fixtures preserve real exe/cmdline/fd facts while varying ownership.
+        let override_path = process.join(".t050-test-uid");
+        match std::fs::read_to_string(override_path) {
+            Ok(value) => return value.trim().parse().map_err(|_| Error::Rejected),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(Error::Rejected),
+        }
+    }
+    Ok(metadata.uid())
+}
+
+fn is_deployment_presence(
+    _process_uid: u32,
+    _config_uid: u32,
+    executable_matches: bool,
+    config_matches: bool,
+    listener_matches: bool,
+) -> bool {
+    executable_matches && (config_matches || listener_matches)
+}
+
 fn process_or_listener_present(
     binary: &Path,
     config: &Path,
@@ -469,7 +494,7 @@ fn process_or_listener_present(
     let root = proc_root();
     let binary_meta = std::fs::metadata(binary).map_err(|_| Error::Rejected)?;
     let config_meta = std::fs::metadata(config).map_err(|_| Error::Rejected)?;
-    let own_uid = config_meta.uid();
+    let config_uid = config_meta.uid();
     let entries = std::fs::read_dir(&root).map_err(|_| Error::Rejected)?;
     for entry in entries {
         let entry = entry.map_err(|_| Error::Rejected)?;
@@ -487,9 +512,7 @@ fn process_or_listener_present(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => return Err(Error::Rejected),
         };
-        if process_meta.uid() != own_uid {
-            continue;
-        }
+        let process_uid = observed_process_uid(&process, &process_meta)?;
         let executable_meta = match std::fs::metadata(process.join("exe")) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -507,31 +530,36 @@ fn process_or_listener_present(
         if command_line.is_empty() || *command_line.last().ok_or(Error::Rejected)? != 0 {
             return Err(Error::Rejected);
         }
-        if command_line
+        let config_argument = command_line
             .split(|byte| *byte == 0)
-            .any(|argument| argument == config.as_os_str().as_bytes())
-        {
-            return Ok(true);
-        }
+            .any(|argument| argument == config.as_os_str().as_bytes());
 
         let descriptors = match std::fs::read_dir(process.join("fd")) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(_) => return Err(Error::Rejected),
         };
+        let mut config_descriptor = false;
+        let mut listener_descriptor = false;
         for descriptor in descriptors {
             let descriptor = descriptor.map_err(|_| Error::Rejected)?;
             match std::fs::metadata(descriptor.path()) {
-                Ok(metadata)
-                    if same_file(&metadata, &config_meta)
-                        || listener_inodes.contains(&metadata.ino()) =>
-                {
-                    return Ok(true);
+                Ok(metadata) => {
+                    config_descriptor |= same_file(&metadata, &config_meta);
+                    listener_descriptor |= listener_inodes.contains(&metadata.ino());
                 }
-                Ok(_) => {}
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
                 Err(_) => return Err(Error::Rejected),
             }
+        }
+        if is_deployment_presence(
+            process_uid,
+            config_uid,
+            true,
+            config_argument || config_descriptor,
+            listener_descriptor,
+        ) {
+            return Ok(true);
         }
     }
     Ok(false)
@@ -768,6 +796,14 @@ mod tests {
     use super::*;
     use crate::storage::{connect, migrate};
     use serde_json::json;
+
+    #[test]
+    fn deployment_identity_is_not_filtered_by_uid() {
+        assert!(is_deployment_presence(65_534, 1_000, true, true, false));
+        assert!(is_deployment_presence(0, 1_000, true, false, true));
+        assert!(!is_deployment_presence(65_534, 1_000, true, false, false));
+        assert!(!is_deployment_presence(65_534, 1_000, false, true, true));
+    }
 
     #[tokio::test]
     async fn real_sqlite_legacy_owner_cas_and_repeat_are_atomic() {

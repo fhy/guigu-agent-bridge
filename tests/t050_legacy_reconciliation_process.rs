@@ -104,6 +104,29 @@ fn proc_view(pid: Option<u32>, real_network: bool) -> PathBuf {
     root
 }
 
+fn add_foreign_uid_process(root: &Path, pid: u32, foreign_uid: u32) {
+    let process = root.join(pid.to_string());
+    let descriptors = process.join("fd");
+    std::fs::create_dir_all(&descriptors).unwrap();
+    std::os::unix::fs::symlink(format!("/proc/{pid}/exe"), process.join("exe")).unwrap();
+    std::fs::write(
+        process.join("cmdline"),
+        std::fs::read(format!("/proc/{pid}/cmdline")).unwrap(),
+    )
+    .unwrap();
+    std::fs::write(process.join(".t050-test-uid"), foreign_uid.to_string()).unwrap();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/fd")).unwrap() {
+        let entry = entry.unwrap();
+        std::os::unix::fs::symlink(entry.path(), descriptors.join(entry.file_name())).unwrap();
+    }
+}
+
+fn foreign_uid_proc_view(pid: u32, real_network: bool, foreign_uid: u32) -> PathBuf {
+    let root = proc_view(None, real_network);
+    add_foreign_uid_process(&root, pid, foreign_uid);
+    root
+}
+
 async fn logical_digest(c: &mut SqliteConnection) -> String {
     const TABLES: &[(&str, &str, &[&str])] = &[
         (
@@ -422,6 +445,11 @@ impl Fixture {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
+    fn foreign_uid(&self) -> u32 {
+        use std::os::unix::fs::MetadataExt;
+        let owner = std::fs::metadata(&self.config).unwrap().uid();
+        owner.checked_add(1).unwrap()
+    }
 }
 
 #[tokio::test]
@@ -516,7 +544,7 @@ async fn live_interlock_and_hostile_sidecar_refuse_before_sqlite_mutation() {
 async fn process_listener_and_unknown_proc_facts_fail_closed_before_and_after_open() {
     let f = Fixture::new(false, false).await;
     let mut mapped = f.mapped_process();
-    let mapped_proc = proc_view(Some(mapped.id()), false);
+    let mapped_proc = foreign_uid_proc_view(mapped.id(), false, f.foreign_uid());
     let before = tree(&f.root);
     let rejected = f
         .command()
@@ -568,7 +596,7 @@ async fn process_listener_and_unknown_proc_facts_fail_closed_before_and_after_op
     assert!(!mapped.wait().unwrap().success());
 
     let mut listener = f.listener_process(9292);
-    let listener_proc = proc_view(Some(listener.id()), true);
+    let listener_proc = foreign_uid_proc_view(listener.id(), true, f.foreign_uid());
     let before = tree(&f.root);
     let rejected = f
         .command()
@@ -616,11 +644,7 @@ async fn process_listener_and_unknown_proc_facts_fail_closed_before_and_after_op
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut mapped = f.mapped_process();
-    std::os::unix::fs::symlink(
-        format!("/proc/{}", mapped.id()),
-        precommit_proc.join(mapped.id().to_string()),
-    )
-    .unwrap();
+    add_foreign_uid_process(&precommit_proc, mapped.id(), f.foreign_uid());
     std::fs::write(pause.with_extension("continue"), b"continue\n").unwrap();
     assert_eq!(reconcile.wait().unwrap().code(), Some(3));
     mapped.kill().unwrap();
@@ -655,11 +679,7 @@ async fn process_listener_and_unknown_proc_facts_fail_closed_before_and_after_op
         std::thread::sleep(Duration::from_millis(10));
     }
     let mut listener = f.listener_process(9292);
-    std::os::unix::fs::symlink(
-        format!("/proc/{}", listener.id()),
-        precommit_proc.join(listener.id().to_string()),
-    )
-    .unwrap();
+    add_foreign_uid_process(&precommit_proc, listener.id(), f.foreign_uid());
     std::fs::write(pause.with_extension("continue"), b"continue\n").unwrap();
     assert_eq!(reconcile.wait().unwrap().code(), Some(3));
     listener.kill().unwrap();
