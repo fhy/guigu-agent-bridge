@@ -280,16 +280,14 @@ impl AppRuntime {
             .counts()
             .await
             .map_err(|_| AppError::Runtime)?;
-        let recovery_diagnostic = RecoveryDiagnostic::classify(RecoveryFixture::from_facts(
-            owns_runtime,
-            admission_recovery.blocked,
-            &recovery,
-            runtime_recovery.ready.len(),
-            runtime_recovery.ambiguous.len(),
-            counts.active_leases as usize,
-            counts.recovery_needed_leases as usize,
-            counts.recovery_backlog as usize,
-        ));
+        let recovery_diagnostic =
+            RecoveryDiagnostic::classify(RecoveryFixture::from_runtime_facts(
+                owns_runtime,
+                admission_recovery.blocked,
+                &recovery,
+                &runtime_recovery,
+                &counts,
+            ));
         tracing::info!(category = "t050-recovery", emission = %recovery_diagnostic.line());
         eprintln!("{}", recovery_diagnostic.line());
         let recovery_blocked = recovery_diagnostic.blocker.is_some();

@@ -132,6 +132,32 @@ impl ReadinessProbe {
 }
 
 impl RecoveryFixture {
+    /// Build startup signals from the durable SQLite recovery facts. This is
+    /// the production adapter used by AppRuntime; tests must provide a real
+    /// snapshot/counts pair rather than synthetic readiness booleans.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_runtime_facts(
+        owns_runtime: bool,
+        admission_blocked: bool,
+        plan: &RecoveryPlan,
+        snapshot: &crate::runtime::RecoverySnapshot,
+        counts: &crate::runtime::RuntimeCounts,
+    ) -> RecoverySignals {
+        RecoverySignals {
+            owns_runtime,
+            admission_blocked,
+            unfinished: plan.unfinished.len(),
+            unacknowledged: plan.unacknowledged.len(),
+            awaiting_outcome: plan.awaiting_outcome.len(),
+            runtime_ready: snapshot.ready.len(),
+            runtime_ambiguous: snapshot.ambiguous.len(),
+            active_leases: counts.active_leases as usize,
+            recovery_leases: counts.recovery_needed_leases as usize,
+            recovery_continuations: counts.recovery_backlog as usize,
+            capacity_overflow: false,
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn from_facts(
         owns_runtime: bool,
@@ -422,5 +448,23 @@ mod tests {
         assert!(!shutdown.is_ready_for(1712267, 44));
         let repeat = ReadinessProbe::owned(1712268, 45);
         assert!(repeat.is_ready_for(1712268, 45));
+    }
+
+    #[test]
+    fn sqlite_fact_snapshot_classifies_legal_ambiguous_runtime_as_blocked() {
+        let task = TaskId::generate();
+        let signals = RecoveryFixture::from_runtime_facts(
+            true,
+            false,
+            &RecoveryPlan::default(),
+            &crate::runtime::RecoverySnapshot {
+                ready: Vec::new(),
+                ambiguous: vec![task],
+            },
+            &crate::runtime::RuntimeCounts::default(),
+        );
+        let diagnostic = RecoveryDiagnostic::classify(signals);
+        assert_eq!(diagnostic.status, 3);
+        assert_eq!(diagnostic.blocker, Some(RecoveryBlocker::RuntimeAmbiguous));
     }
 }
