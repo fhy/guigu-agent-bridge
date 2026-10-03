@@ -21,14 +21,45 @@ fn owner_liveness(pid: u32) -> OwnerLiveness {
     }
 }
 
+fn owner_fingerprint_liveness(fingerprint: &str) -> OwnerLiveness {
+    fingerprint
+        .strip_prefix("pid:")
+        .and_then(|value| value.parse::<u32>().ok())
+        .map_or(OwnerLiveness::Unknown, owner_liveness)
+}
+
 #[cfg(test)]
 mod owner_liveness_tests {
-    use super::{OwnerLiveness, owner_liveness};
+    use super::{OwnerLiveness, owner_fingerprint_liveness, owner_liveness};
 
     #[test]
     fn current_pid_is_live_and_missing_pid_is_the_only_stale_proof() {
         assert_eq!(owner_liveness(std::process::id()), OwnerLiveness::Live);
         assert_eq!(owner_liveness(u32::MAX), OwnerLiveness::Stale);
+    }
+
+    #[test]
+    fn unknown_fingerprint_cannot_enter_recovery() {
+        assert_eq!(
+            owner_fingerprint_liveness("legacy-owner"),
+            OwnerLiveness::Unknown
+        );
+        assert_eq!(
+            owner_fingerprint_liveness("pid:not-a-pid"),
+            OwnerLiveness::Unknown
+        );
+    }
+
+    #[test]
+    fn stale_pid_is_the_only_recovery_candidate() {
+        assert_eq!(
+            owner_fingerprint_liveness("pid:4294967295"),
+            OwnerLiveness::Stale
+        );
+        assert_eq!(
+            owner_fingerprint_liveness(&format!("pid:{}", std::process::id())),
+            OwnerLiveness::Live
+        );
     }
 }
 
@@ -248,14 +279,7 @@ impl AppRuntime {
                     sqlx::Row::try_get(&row, "instance_token").map_err(|_| AppError::Runtime)?;
                 let fingerprint: String = sqlx::Row::try_get(&row, "process_fingerprint")
                     .map_err(|_| AppError::Runtime)?;
-                let Some(pid) = fingerprint
-                    .strip_prefix("pid:")
-                    .and_then(|v| v.parse::<u32>().ok())
-                else {
-                    blocked = true;
-                    continue;
-                };
-                match owner_liveness(pid) {
+                match owner_fingerprint_liveness(&fingerprint) {
                     OwnerLiveness::Live | OwnerLiveness::Unknown => blocked = true,
                     OwnerLiveness::Stale => {
                         proven_stale = true;
