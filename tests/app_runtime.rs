@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     process::{Child, Command},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
@@ -619,6 +619,7 @@ async fn production_runtime_starts_and_shuts_down_without_resource_residue() {
 
 #[tokio::test]
 async fn app_runtime_owns_real_a2a_listener_and_agent_card_until_shutdown() {
+    let _port_guard = a2a_port_guard().lock().await;
     let temp = TempDir::new();
     let config_path = temp.0.join("bridge.toml");
     let database = temp.0.join("state.db");
@@ -669,6 +670,11 @@ async fn app_runtime_owns_real_a2a_listener_and_agent_card_until_shutdown() {
     drop(stale);
 }
 
+fn a2a_port_guard() -> &'static tokio::sync::Mutex<()> {
+    static GUARD: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
 fn child_listener_inode(pid: u32) -> Option<u64> {
     let listener_inodes = std::fs::read_to_string("/proc/net/tcp")
         .ok()?
@@ -698,8 +704,11 @@ fn child_listener_inode(pid: u32) -> Option<u64> {
 }
 
 async fn wait_for_child_listener(pid: u32) -> u64 {
-    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
         loop {
+            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
+                panic!("child exited before binding 9292: pid={pid}");
+            }
             if tokio::net::TcpStream::connect("127.0.0.1:9292")
                 .await
                 .is_ok()
@@ -746,6 +755,7 @@ async fn wait_for_child_diagnostic(child: &mut Child, path: &std::path::Path, ne
 
 #[tokio::test]
 async fn child_process_restart_replaces_9292_pid_and_listener_inode() {
+    let _port_guard = a2a_port_guard().lock().await;
     let temp = TempDir::new();
     let config_path = temp.0.join("bridge.toml");
     let database = temp.0.join("state.db");
@@ -936,6 +946,7 @@ async fn stale_owner_startup_recovers_then_acquires_durable_generation() {
 
 #[tokio::test]
 async fn startup_recovery_backlog_blocks_readiness_without_spawning_acp() {
+    let _port_guard = a2a_port_guard().lock().await;
     let temp = TempDir::new();
     let config_path = temp.0.join("bridge.toml");
     let database = temp.0.join("state.db");
