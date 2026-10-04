@@ -723,6 +723,20 @@ async fn wait_for_child_listener(pid: u32) -> u64 {
     .expect("child did not bind 9292")
 }
 
+async fn wait_for_port_free() {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:9292").await {
+                drop(listener);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("9292 remained occupied before child spawn");
+}
+
 fn stop_child(mut child: Child) {
     Command::new("kill")
         .args(["-INT", &child.id().to_string()])
@@ -756,6 +770,7 @@ async fn wait_for_child_diagnostic(child: &mut Child, path: &std::path::Path, ne
 #[tokio::test]
 async fn child_process_restart_replaces_9292_pid_and_listener_inode() {
     let _port_guard = a2a_port_guard().lock().await;
+    wait_for_port_free().await;
     let temp = TempDir::new();
     let config_path = temp.0.join("bridge.toml");
     let database = temp.0.join("state.db");
@@ -792,11 +807,7 @@ async fn child_process_restart_replaces_9292_pid_and_listener_inode() {
     );
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     stop_child(first);
-    assert!(
-        tokio::net::TcpListener::bind("127.0.0.1:9292")
-            .await
-            .is_ok()
-    );
+    wait_for_port_free().await;
     let second = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
         .arg(&config_path)
         .spawn()
