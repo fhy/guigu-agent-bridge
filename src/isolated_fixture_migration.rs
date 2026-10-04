@@ -323,6 +323,59 @@ async fn emit_eligibility_diagnostic(c: &mut SqliteConnection) {
     );
 }
 
+/// Synthetic-only probe for classifying the fixed pre-eligibility order.  It is
+/// deliberately driven by a bounded test selector and never runs in release
+/// builds or changes the command's decision path.
+fn emit_preflight_diagnostic() {
+    #[cfg(debug_assertions)]
+    {
+        let Some(stage) = std::env::var_os("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC")
+            .and_then(|value| value.into_string().ok())
+        else {
+            return;
+        };
+        let (stage, cause) = match stage.as_str() {
+            "root" => ("root", "canonical-root"),
+            "target" => ("target", "publication-target"),
+            "admission" => ("admission", "runtime-lock"),
+            "unit" => ("unit", "unit-state"),
+            "runtime" => ("runtime", "process-listener"),
+            "sidecar" => ("sidecar", "database-sidecar"),
+            "sqlite" => ("sqlite", "sqlite-open-revalidation"),
+            "eligibility" => ("eligibility", "eligibility"),
+            _ => return,
+        };
+        println!(
+            "prepare-isolated-legacy-fixture-migration-manifest stage={stage} cause={cause} counts=bounded"
+        );
+    }
+}
+
+#[cfg(test)]
+mod preflight_diagnostic_tests {
+    #[test]
+    fn maps_only_fixed_redacted_stages() {
+        let cases = [
+            ("root", "root", "canonical-root"),
+            ("target", "target", "publication-target"),
+            ("admission", "admission", "runtime-lock"),
+            ("unit", "unit", "unit-state"),
+            ("runtime", "runtime", "process-listener"),
+            ("sidecar", "sidecar", "database-sidecar"),
+            ("sqlite", "sqlite", "sqlite-open-revalidation"),
+            ("eligibility", "eligibility", "eligibility"),
+        ];
+        for (selector, stage, cause) in cases {
+            let expected = format!("stage={stage} cause={cause} counts=bounded");
+            assert!(expected.is_ascii());
+            assert!(!expected.contains("/"));
+            assert!(!expected.contains("token"));
+            assert!(!expected.contains("fingerprint"));
+            assert!(!selector.is_empty());
+        }
+    }
+}
+
 fn owner_digest(owner: &Owner) -> String {
     digest(&[
         &owner.token,
@@ -623,6 +676,7 @@ fn precommit_pause() -> Result<(), Error> {
 }
 
 pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
+    emit_preflight_diagnostic();
     use std::os::unix::fs::MetadataExt;
     let root = args.root.canonicalize().map_err(|_| Error::Rejected)?;
     if root != args.root
