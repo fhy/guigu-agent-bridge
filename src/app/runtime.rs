@@ -277,14 +277,25 @@ impl AppRuntime {
             .map_err(|_| AppError::Runtime)?;
             let mut proven_stale = false;
             let mut blocked = false;
+            let mut live_count = 0usize;
+            let mut unknown_count = 0usize;
+            let mut stale_count = 0usize;
             for row in stale {
                 let token: String =
                     sqlx::Row::try_get(&row, "instance_token").map_err(|_| AppError::Runtime)?;
                 let fingerprint: String = sqlx::Row::try_get(&row, "process_fingerprint")
                     .map_err(|_| AppError::Runtime)?;
                 match owner_fingerprint_liveness(&fingerprint) {
-                    OwnerLiveness::Live | OwnerLiveness::Unknown => blocked = true,
+                    OwnerLiveness::Live => {
+                        live_count += 1;
+                        blocked = true;
+                    }
+                    OwnerLiveness::Unknown => {
+                        unknown_count += 1;
+                        blocked = true;
+                    }
                     OwnerLiveness::Stale => {
+                        stale_count += 1;
                         proven_stale = true;
                         if crate::offline_recovery::recover_stale_runtime(
                             &config.bridge.database,
@@ -300,6 +311,13 @@ impl AppRuntime {
                     }
                 }
             }
+            tracing::info!(
+                category = "t050-recovery",
+                owner_live = live_count,
+                owner_unknown = unknown_count,
+                owner_stale = stale_count,
+                "owner liveness classification"
+            );
             if proven_stale && !blocked {
                 owns_runtime = reliability
                     .begin_runtime(&runtime_instance, &process_fingerprint, &startup_at)
