@@ -508,7 +508,8 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
         SocketIo,
         SocketParse,
         ProcfsPermission,
-        ProcessExecutableLinkPermission,
+        ProcessExecutableLinkDeploymentOwnerPermission,
+        ProcessExecutableLinkOtherOwnerPermission,
         ProcessExecutableMetadataPermission,
         CmdlineParse,
         CmdlinePermission,
@@ -520,8 +521,12 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
         (Setup::SocketParse, "runtime-unknown-socket-parse"),
         (Setup::ProcfsPermission, "runtime-unknown-procfs-permission"),
         (
-            Setup::ProcessExecutableLinkPermission,
-            "runtime-unknown-process-executable-link-permission",
+            Setup::ProcessExecutableLinkDeploymentOwnerPermission,
+            "runtime-unknown-process-executable-link-deployment-owner-permission",
+        ),
+        (
+            Setup::ProcessExecutableLinkOtherOwnerPermission,
+            "runtime-unknown-process-executable-link-other-owner-permission",
         ),
         (
             Setup::ProcessExecutableMetadataPermission,
@@ -548,10 +553,14 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
                 )
                 .unwrap();
             }
-            Setup::ProcessExecutableLinkPermission => {
+            Setup::ProcessExecutableLinkDeploymentOwnerPermission
+            | Setup::ProcessExecutableLinkOtherOwnerPermission => {
                 let process = fixture.proc_root.join("424242");
                 std::fs::create_dir(&process).unwrap();
                 std::fs::write(process.join(".t050-test-exe-link-permission"), b"1").unwrap();
+                if matches!(setup, Setup::ProcessExecutableLinkOtherOwnerPermission) {
+                    std::fs::write(process.join(".t050-test-uid"), u32::MAX.to_string()).unwrap();
+                }
             }
             Setup::ProcessExecutableMetadataPermission => {
                 let process = fixture.proc_root.join("424242");
@@ -612,6 +621,7 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
         for forbidden in [
             fixture.root.to_string_lossy().as_ref(),
             "424242",
+            "4294967295",
             "inode",
             "fingerprint",
             "token",

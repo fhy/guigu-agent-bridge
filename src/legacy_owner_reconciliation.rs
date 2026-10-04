@@ -625,7 +625,8 @@ enum RuntimeUnknownArea {
     Procfs,
     Identity,
     DeploymentMetadata,
-    ProcessExecutableLink,
+    ProcessExecutableLinkDeploymentOwner,
+    ProcessExecutableLinkOtherOwner,
     ProcessExecutableMetadata,
     Cmdline,
     Descriptor,
@@ -691,14 +692,27 @@ impl RuntimeAbsenceUnknown {
             (RuntimeUnknownArea::DeploymentMetadata, RuntimeUnknownReason::Parse) => {
                 "runtime-unknown-deployment-metadata-parse"
             }
-            (RuntimeUnknownArea::ProcessExecutableLink, RuntimeUnknownReason::Permission) => {
-                "runtime-unknown-process-executable-link-permission"
+            (
+                RuntimeUnknownArea::ProcessExecutableLinkDeploymentOwner,
+                RuntimeUnknownReason::Permission,
+            ) => "runtime-unknown-process-executable-link-deployment-owner-permission",
+            (
+                RuntimeUnknownArea::ProcessExecutableLinkDeploymentOwner,
+                RuntimeUnknownReason::Io,
+            ) => "runtime-unknown-process-executable-link-deployment-owner-io",
+            (
+                RuntimeUnknownArea::ProcessExecutableLinkDeploymentOwner,
+                RuntimeUnknownReason::Parse,
+            ) => "runtime-unknown-process-executable-link-deployment-owner-parse",
+            (
+                RuntimeUnknownArea::ProcessExecutableLinkOtherOwner,
+                RuntimeUnknownReason::Permission,
+            ) => "runtime-unknown-process-executable-link-other-owner-permission",
+            (RuntimeUnknownArea::ProcessExecutableLinkOtherOwner, RuntimeUnknownReason::Io) => {
+                "runtime-unknown-process-executable-link-other-owner-io"
             }
-            (RuntimeUnknownArea::ProcessExecutableLink, RuntimeUnknownReason::Io) => {
-                "runtime-unknown-process-executable-link-io"
-            }
-            (RuntimeUnknownArea::ProcessExecutableLink, RuntimeUnknownReason::Parse) => {
-                "runtime-unknown-process-executable-link-parse"
+            (RuntimeUnknownArea::ProcessExecutableLinkOtherOwner, RuntimeUnknownReason::Parse) => {
+                "runtime-unknown-process-executable-link-other-owner-parse"
             }
             (RuntimeUnknownArea::ProcessExecutableMetadata, RuntimeUnknownReason::Permission) => {
                 "runtime-unknown-process-executable-metadata-permission"
@@ -736,25 +750,23 @@ impl RuntimeAbsenceUnknown {
 
 fn process_executable_metadata(
     process: &Path,
+    deployment_owner: bool,
 ) -> Result<Option<std::fs::Metadata>, RuntimeAbsenceUnknown> {
     let executable = process.join("exe");
+    let link_area = if deployment_owner {
+        RuntimeUnknownArea::ProcessExecutableLinkDeploymentOwner
+    } else {
+        RuntimeUnknownArea::ProcessExecutableLinkOtherOwner
+    };
     #[cfg(debug_assertions)]
     if process.join(".t050-test-exe-link-permission").exists() {
         let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        return Err(RuntimeAbsenceUnknown::io(
-            RuntimeUnknownArea::ProcessExecutableLink,
-            &error,
-        ));
+        return Err(RuntimeAbsenceUnknown::io(link_area, &error));
     }
     match std::fs::read_link(&executable) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => {
-            return Err(RuntimeAbsenceUnknown::io(
-                RuntimeUnknownArea::ProcessExecutableLink,
-                &error,
-            ));
-        }
+        Err(error) => return Err(RuntimeAbsenceUnknown::io(link_area, &error)),
     }
     match std::fs::metadata(executable) {
         Ok(metadata) => Ok(Some(metadata)),
@@ -815,10 +827,11 @@ fn classify_process_or_listener(
             }
         };
         let process_uid = observed_process_uid(&process, &process_meta)?;
-        let executable_meta = match process_executable_metadata(&process)? {
-            Some(metadata) => metadata,
-            None => continue,
-        };
+        let executable_meta =
+            match process_executable_metadata(&process, process_uid == config_uid)? {
+                Some(metadata) => metadata,
+                None => continue,
+            };
         if !same_file(&executable_meta, &binary_meta) {
             continue;
         }
@@ -1413,9 +1426,20 @@ mod tests {
             "runtime-unknown-deployment-metadata-permission"
         );
         assert_eq!(
-            RuntimeAbsenceUnknown::io(RuntimeUnknownArea::ProcessExecutableLink, &permission)
-                .cause(),
-            "runtime-unknown-process-executable-link-permission"
+            RuntimeAbsenceUnknown::io(
+                RuntimeUnknownArea::ProcessExecutableLinkDeploymentOwner,
+                &permission,
+            )
+            .cause(),
+            "runtime-unknown-process-executable-link-deployment-owner-permission"
+        );
+        assert_eq!(
+            RuntimeAbsenceUnknown::io(
+                RuntimeUnknownArea::ProcessExecutableLinkOtherOwner,
+                &permission,
+            )
+            .cause(),
+            "runtime-unknown-process-executable-link-other-owner-permission"
         );
         assert_eq!(
             RuntimeAbsenceUnknown::io(RuntimeUnknownArea::ProcessExecutableMetadata, &permission)
