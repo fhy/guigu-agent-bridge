@@ -706,8 +706,12 @@ pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
                 Error::Rejected,
             ));
         }
-        Err(error) => {
-            return Err(prepare_rejected("preflight", "runtime-unknown", error));
+        Err(unknown) => {
+            return Err(prepare_rejected(
+                "preflight",
+                unknown.cause(),
+                Error::Rejected,
+            ));
         }
     }
     let sidecars = Sidecars::capture(&database)

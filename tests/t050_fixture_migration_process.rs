@@ -500,6 +500,114 @@ async fn unit_state_process_matrix_is_fail_closed_redacted_and_repeatable() {
 }
 
 #[tokio::test]
+async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant() {
+    use std::os::unix::fs::PermissionsExt;
+
+    #[derive(Clone, Copy)]
+    enum Setup {
+        SocketIo,
+        SocketParse,
+        ProcfsPermission,
+        IdentityParse,
+        IdentityPermission,
+        FdIo,
+    }
+
+    for (setup, cause) in [
+        (Setup::SocketIo, "runtime-unknown-socket-io"),
+        (Setup::SocketParse, "runtime-unknown-socket-parse"),
+        (Setup::ProcfsPermission, "runtime-unknown-procfs-permission"),
+        (Setup::IdentityParse, "runtime-unknown-identity-parse"),
+        (
+            Setup::IdentityPermission,
+            "runtime-unknown-identity-permission",
+        ),
+        (Setup::FdIo, "runtime-unknown-fd-io"),
+    ] {
+        let fixture = Fixture::new().await;
+        std::fs::remove_file(&fixture.manifest).unwrap();
+        match setup {
+            Setup::SocketIo => std::fs::remove_file(fixture.proc_root.join("net/tcp6")).unwrap(),
+            Setup::SocketParse => {
+                std::fs::write(fixture.proc_root.join("net/tcp"), b"malformed\n").unwrap();
+            }
+            Setup::ProcfsPermission => {
+                std::fs::set_permissions(
+                    &fixture.proc_root,
+                    std::fs::Permissions::from_mode(0o111),
+                )
+                .unwrap();
+            }
+            Setup::IdentityParse | Setup::IdentityPermission | Setup::FdIo => {
+                let process = fixture.proc_root.join("424242");
+                std::fs::create_dir(&process).unwrap();
+                std::os::unix::fs::symlink(
+                    env!("CARGO_BIN_EXE_guigu-agent-bridge"),
+                    process.join("exe"),
+                )
+                .unwrap();
+                std::fs::write(
+                    process.join("cmdline"),
+                    if matches!(setup, Setup::IdentityParse) {
+                        b"not-terminated".as_slice()
+                    } else {
+                        b"candidate\0".as_slice()
+                    },
+                )
+                .unwrap();
+                if matches!(setup, Setup::IdentityPermission) {
+                    std::fs::set_permissions(
+                        process.join("cmdline"),
+                        std::fs::Permissions::from_mode(0o000),
+                    )
+                    .unwrap();
+                } else if matches!(setup, Setup::FdIo) {
+                    std::fs::write(process.join("fd"), b"not-a-directory").unwrap();
+                }
+            }
+        }
+        let before_rows = durable_rows(&fixture.db).await;
+        let before = fixture_tree(&fixture.root);
+        let run = || {
+            fixture
+                .prepare()
+                .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+                .output()
+                .unwrap()
+        };
+        let first = run();
+        let second = run();
+        assert_eq!(first.status.code(), Some(3), "{cause}");
+        assert_eq!(second.status.code(), Some(3), "{cause}");
+        assert_eq!(first.stdout, second.stdout, "{cause}");
+        let stdout = String::from_utf8_lossy(&first.stdout);
+        assert!(
+            stdout.contains(&format!("stage=preflight cause={cause} counts=failures=1")),
+            "{stdout}"
+        );
+        for forbidden in [
+            fixture.root.to_string_lossy().as_ref(),
+            "424242",
+            "inode",
+            "fingerprint",
+            "token",
+            "row",
+            "credential",
+            "bearer",
+            "manifest.json",
+        ] {
+            assert!(!stdout.contains(forbidden), "{cause}: {stdout}");
+        }
+        assert_eq!(durable_rows(&fixture.db).await, before_rows, "{cause}");
+        assert_eq!(fixture_tree(&fixture.root), before, "{cause}");
+        if matches!(setup, Setup::ProcfsPermission) {
+            std::fs::set_permissions(&fixture.proc_root, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+        }
+    }
+}
+
+#[tokio::test]
 async fn unreaped_child_refuses_before_manifest_publication() {
     assert_prepare_refusal(
         "unreaped-child",

@@ -565,16 +565,29 @@ fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
-fn observed_process_uid(process: &Path, metadata: &std::fs::Metadata) -> Result<u32, Error> {
+fn observed_process_uid(
+    process: &Path,
+    metadata: &std::fs::Metadata,
+) -> Result<u32, RuntimeAbsenceUnknown> {
     use std::os::unix::fs::MetadataExt;
     #[cfg(debug_assertions)]
     {
         // Process fixtures preserve real exe/cmdline/fd facts while varying ownership.
         let override_path = process.join(".t050-test-uid");
         match std::fs::read_to_string(override_path) {
-            Ok(value) => return value.trim().parse().map_err(|_| Error::Rejected),
+            Ok(value) => {
+                return value
+                    .trim()
+                    .parse()
+                    .map_err(|_| RuntimeAbsenceUnknown::parse(RuntimeUnknownArea::Identity));
+            }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(_) => return Err(Error::Rejected),
+            Err(error) => {
+                return Err(RuntimeAbsenceUnknown::io(
+                    RuntimeUnknownArea::Identity,
+                    &error,
+                ));
+            }
         }
     }
     Ok(metadata.uid())
@@ -607,21 +620,101 @@ pub(crate) enum RuntimeAbsence {
     Listener,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeUnknownArea {
+    Procfs,
+    Identity,
+    Descriptor,
+    Socket,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RuntimeUnknownReason {
+    Permission,
+    Io,
+    Parse,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct RuntimeAbsenceUnknown {
+    area: RuntimeUnknownArea,
+    reason: RuntimeUnknownReason,
+}
+
+impl RuntimeAbsenceUnknown {
+    fn io(area: RuntimeUnknownArea, error: &std::io::Error) -> Self {
+        Self {
+            area,
+            reason: if error.kind() == std::io::ErrorKind::PermissionDenied {
+                RuntimeUnknownReason::Permission
+            } else {
+                RuntimeUnknownReason::Io
+            },
+        }
+    }
+
+    fn parse(area: RuntimeUnknownArea) -> Self {
+        Self {
+            area,
+            reason: RuntimeUnknownReason::Parse,
+        }
+    }
+
+    pub(crate) fn cause(self) -> &'static str {
+        match (self.area, self.reason) {
+            (RuntimeUnknownArea::Procfs, RuntimeUnknownReason::Permission) => {
+                "runtime-unknown-procfs-permission"
+            }
+            (RuntimeUnknownArea::Procfs, RuntimeUnknownReason::Io) => "runtime-unknown-procfs-io",
+            (RuntimeUnknownArea::Procfs, RuntimeUnknownReason::Parse) => {
+                "runtime-unknown-procfs-parse"
+            }
+            (RuntimeUnknownArea::Identity, RuntimeUnknownReason::Permission) => {
+                "runtime-unknown-identity-permission"
+            }
+            (RuntimeUnknownArea::Identity, RuntimeUnknownReason::Io) => {
+                "runtime-unknown-identity-io"
+            }
+            (RuntimeUnknownArea::Identity, RuntimeUnknownReason::Parse) => {
+                "runtime-unknown-identity-parse"
+            }
+            (RuntimeUnknownArea::Descriptor, RuntimeUnknownReason::Permission) => {
+                "runtime-unknown-fd-permission"
+            }
+            (RuntimeUnknownArea::Descriptor, RuntimeUnknownReason::Io) => "runtime-unknown-fd-io",
+            (RuntimeUnknownArea::Descriptor, RuntimeUnknownReason::Parse) => {
+                "runtime-unknown-fd-parse"
+            }
+            (RuntimeUnknownArea::Socket, RuntimeUnknownReason::Permission) => {
+                "runtime-unknown-socket-permission"
+            }
+            (RuntimeUnknownArea::Socket, RuntimeUnknownReason::Io) => "runtime-unknown-socket-io",
+            (RuntimeUnknownArea::Socket, RuntimeUnknownReason::Parse) => {
+                "runtime-unknown-socket-parse"
+            }
+        }
+    }
+}
+
 fn classify_process_or_listener(
     binary: &Path,
     config: &Path,
     listener_inodes: &std::collections::BTreeSet<u64>,
     ignored_pid: Option<u32>,
-) -> Result<RuntimeAbsence, Error> {
+) -> Result<RuntimeAbsence, RuntimeAbsenceUnknown> {
     use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 
     let root = proc_root();
-    let binary_meta = std::fs::metadata(binary).map_err(|_| Error::Rejected)?;
-    let config_meta = std::fs::metadata(config).map_err(|_| Error::Rejected)?;
+    let binary_meta = std::fs::metadata(binary)
+        .map_err(|error| RuntimeAbsenceUnknown::io(RuntimeUnknownArea::Identity, &error))?;
+    let config_meta = std::fs::metadata(config)
+        .map_err(|error| RuntimeAbsenceUnknown::io(RuntimeUnknownArea::Identity, &error))?;
     let config_uid = config_meta.uid();
-    let entries = std::fs::read_dir(&root).map_err(|_| Error::Rejected)?;
+    let entries = std::fs::read_dir(&root)
+        .map_err(|error| RuntimeAbsenceUnknown::io(RuntimeUnknownArea::Procfs, &error))?;
     for entry in entries {
-        let entry = entry.map_err(|_| Error::Rejected)?;
+        let entry =
+            entry.map_err(|error| RuntimeAbsenceUnknown::io(RuntimeUnknownArea::Procfs, &error))?;
         if entry
             .file_name()
             .to_str()
@@ -634,7 +727,7 @@ fn classify_process_or_listener(
             .file_name()
             .to_str()
             .and_then(|value| value.parse::<u32>().ok())
-            .ok_or(Error::Rejected)?;
+            .ok_or_else(|| RuntimeAbsenceUnknown::parse(RuntimeUnknownArea::Procfs))?;
         if Some(pid) == ignored_pid {
             continue;
         }
@@ -642,13 +735,23 @@ fn classify_process_or_listener(
         let process_meta = match std::fs::metadata(&process) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Err(Error::Rejected),
+            Err(error) => {
+                return Err(RuntimeAbsenceUnknown::io(
+                    RuntimeUnknownArea::Procfs,
+                    &error,
+                ));
+            }
         };
         let process_uid = observed_process_uid(&process, &process_meta)?;
         let executable_meta = match std::fs::metadata(process.join("exe")) {
             Ok(metadata) => metadata,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Err(Error::Rejected),
+            Err(error) => {
+                return Err(RuntimeAbsenceUnknown::io(
+                    RuntimeUnknownArea::Identity,
+                    &error,
+                ));
+            }
         };
         if !same_file(&executable_meta, &binary_meta) {
             continue;
@@ -657,10 +760,15 @@ fn classify_process_or_listener(
         let command_line = match std::fs::read(process.join("cmdline")) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Err(Error::Rejected),
+            Err(error) => {
+                return Err(RuntimeAbsenceUnknown::io(
+                    RuntimeUnknownArea::Identity,
+                    &error,
+                ));
+            }
         };
-        if command_line.is_empty() || *command_line.last().ok_or(Error::Rejected)? != 0 {
-            return Err(Error::Rejected);
+        if command_line.is_empty() || command_line.last() != Some(&0) {
+            return Err(RuntimeAbsenceUnknown::parse(RuntimeUnknownArea::Identity));
         }
         let config_argument = command_line
             .split(|byte| *byte == 0)
@@ -669,19 +777,31 @@ fn classify_process_or_listener(
         let descriptors = match std::fs::read_dir(process.join("fd")) {
             Ok(entries) => entries,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(_) => return Err(Error::Rejected),
+            Err(error) => {
+                return Err(RuntimeAbsenceUnknown::io(
+                    RuntimeUnknownArea::Descriptor,
+                    &error,
+                ));
+            }
         };
         let mut config_descriptor = false;
         let mut listener_descriptor = false;
         for descriptor in descriptors {
-            let descriptor = descriptor.map_err(|_| Error::Rejected)?;
+            let descriptor = descriptor.map_err(|error| {
+                RuntimeAbsenceUnknown::io(RuntimeUnknownArea::Descriptor, &error)
+            })?;
             match std::fs::metadata(descriptor.path()) {
                 Ok(metadata) => {
                     config_descriptor |= same_file(&metadata, &config_meta);
                     listener_descriptor |= listener_inodes.contains(&metadata.ino());
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(_) => return Err(Error::Rejected),
+                Err(error) => {
+                    return Err(RuntimeAbsenceUnknown::io(
+                        RuntimeUnknownArea::Descriptor,
+                        &error,
+                    ));
+                }
             }
         }
         if is_deployment_presence(
@@ -700,29 +820,39 @@ fn classify_process_or_listener(
     Ok(RuntimeAbsence::Clean)
 }
 
-fn fixed_listener_inodes() -> Result<std::collections::BTreeSet<u64>, Error> {
+fn fixed_listener_inodes() -> Result<std::collections::BTreeSet<u64>, RuntimeAbsenceUnknown> {
     let root = proc_root();
     let mut inodes = std::collections::BTreeSet::new();
     for table in [root.join("net/tcp"), root.join("net/tcp6")] {
-        let text = std::fs::read_to_string(table).map_err(|_| Error::Rejected)?;
+        let text = std::fs::read_to_string(table)
+            .map_err(|error| RuntimeAbsenceUnknown::io(RuntimeUnknownArea::Socket, &error))?;
         let mut lines = text.lines();
-        let header = lines.next().ok_or(Error::Rejected)?;
+        let header = lines
+            .next()
+            .ok_or_else(|| RuntimeAbsenceUnknown::parse(RuntimeUnknownArea::Socket))?;
         if !header
             .split_whitespace()
             .any(|field| field == "local_address")
             || !header.split_whitespace().any(|field| field == "st")
         {
-            return Err(Error::Rejected);
+            return Err(RuntimeAbsenceUnknown::parse(RuntimeUnknownArea::Socket));
         }
         for line in lines {
             let fields = line.split_whitespace().collect::<Vec<_>>();
             if fields.len() < 10 {
-                return Err(Error::Rejected);
+                return Err(RuntimeAbsenceUnknown::parse(RuntimeUnknownArea::Socket));
             }
-            let (_, port) = fields[1].rsplit_once(':').ok_or(Error::Rejected)?;
-            let port = u16::from_str_radix(port, 16).map_err(|_| Error::Rejected)?;
+            let (_, port) = fields[1]
+                .rsplit_once(':')
+                .ok_or_else(|| RuntimeAbsenceUnknown::parse(RuntimeUnknownArea::Socket))?;
+            let port = u16::from_str_radix(port, 16)
+                .map_err(|_| RuntimeAbsenceUnknown::parse(RuntimeUnknownArea::Socket))?;
             if fields[3] == "0A" && matches!(port, 9291 | 9292) {
-                inodes.insert(fields[9].parse::<u64>().map_err(|_| Error::Rejected)?);
+                inodes.insert(
+                    fields[9]
+                        .parse::<u64>()
+                        .map_err(|_| RuntimeAbsenceUnknown::parse(RuntimeUnknownArea::Socket))?,
+                );
             }
         }
     }
@@ -734,7 +864,7 @@ pub(crate) fn preflight_runtime_absence(
     config: &Path,
     ignored_pid: Option<u32>,
 ) -> Result<(), Error> {
-    match classify_runtime_absence(binary, config, ignored_pid)? {
+    match classify_runtime_absence(binary, config, ignored_pid).map_err(|_| Error::Rejected)? {
         RuntimeAbsence::Clean => Ok(()),
         RuntimeAbsence::Process | RuntimeAbsence::Listener => Err(Error::Rejected),
     }
@@ -744,7 +874,7 @@ pub(crate) fn classify_runtime_absence(
     binary: &Path,
     config: &Path,
     ignored_pid: Option<u32>,
-) -> Result<RuntimeAbsence, Error> {
+) -> Result<RuntimeAbsence, RuntimeAbsenceUnknown> {
     let listener_inodes = fixed_listener_inodes()?;
     classify_process_or_listener(binary, config, &listener_inodes, ignored_pid)
 }
