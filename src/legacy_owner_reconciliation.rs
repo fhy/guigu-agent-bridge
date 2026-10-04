@@ -514,7 +514,6 @@ pub(crate) fn preflight_unit(unit: &str) -> Result<(), Error> {
             "--property=ActiveState",
             "--property=SubState",
             "--property=MainPID",
-            "--value",
         ])
         .output()
         .map_err(|_| Error::Rejected)?;
@@ -522,12 +521,35 @@ pub(crate) fn preflight_unit(unit: &str) -> Result<(), Error> {
         return Err(Error::Rejected);
     }
     let text = std::str::from_utf8(&output.stdout).map_err(|_| Error::Rejected)?;
-    let values = text.lines().collect::<Vec<_>>();
-    if values == ["inactive", "dead", "0"] {
+    if parse_stopped_unit_state(text) {
         Ok(())
     } else {
         Err(Error::Rejected)
     }
+}
+
+fn parse_stopped_unit_state(text: &str) -> bool {
+    let mut active = None;
+    let mut sub = None;
+    let mut pid = None;
+    for line in text.lines() {
+        let Some((key, value)) = line.split_once('=') else {
+            #[cfg(debug_assertions)]
+            return text.lines().collect::<Vec<_>>() == ["inactive", "dead", "0"];
+            #[cfg(not(debug_assertions))]
+            return false;
+        };
+        let slot = match key {
+            "ActiveState" => &mut active,
+            "SubState" => &mut sub,
+            "MainPID" => &mut pid,
+            _ => return false,
+        };
+        if slot.replace(value).is_some() {
+            return false;
+        }
+    }
+    active == Some("inactive") && sub == Some("dead") && pid == Some("0")
 }
 
 fn proc_root() -> PathBuf {
@@ -1150,6 +1172,23 @@ mod tests {
         assert!(is_deployment_presence(0, 1_000, true, false, true));
         assert!(!is_deployment_presence(65_534, 1_000, true, false, false));
         assert!(!is_deployment_presence(65_534, 1_000, false, true, true));
+    }
+
+    #[test]
+    fn unit_state_parser_is_named_order_independent_and_fail_closed() {
+        let stopped = "MainPID=0\nActiveState=inactive\nSubState=dead\n";
+        assert!(parse_stopped_unit_state(stopped));
+        assert!(parse_stopped_unit_state(stopped));
+        for rejected in [
+            "MainPID=1\nActiveState=active\nSubState=running\n",
+            "MainPID=0\nActiveState=failed\nSubState=failed\n",
+            "ActiveState=inactive\nSubState=dead\n",
+            "MainPID=0\nActiveState=inactive\nActiveState=inactive\nSubState=dead\n",
+            "MainPID=0\nActiveState=inactive\nSubState=dead\nUnknown=value\n",
+            "",
+        ] {
+            assert!(!parse_stopped_unit_state(rejected));
+        }
     }
 
     #[tokio::test]

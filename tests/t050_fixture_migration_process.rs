@@ -166,7 +166,11 @@ impl Fixture {
         let config = root.join("config.toml");
         std::fs::write(&config, b"fixture=true\n").unwrap();
         let systemctl = root.join("systemctl");
-        std::fs::write(&systemctl, b"#!/bin/sh\nprintf 'inactive\ndead\n0\n'\n").unwrap();
+        std::fs::write(
+            &systemctl,
+            b"#!/bin/sh\nprintf 'MainPID=0\nActiveState=inactive\nSubState=dead\n'\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o700)).unwrap();
         let fixture = Self {
             manifest: root.join("manifest.json"),
@@ -457,6 +461,42 @@ async fn publication_and_sqlite_open_diagnostics_are_fixed_and_invariant() {
     assert!(stdout.contains("stage=sqlite-open cause=sidecar-auth counts=failures=1"));
     assert!(!stdout.contains(sqlite.root.to_str().unwrap()));
     assert_eq!(fixture_tree(&sqlite.root), sqlite_tree);
+}
+
+#[tokio::test]
+async fn unit_state_process_matrix_is_fail_closed_redacted_and_repeatable() {
+    let fixture = Fixture::new().await;
+    for response in [
+        "ActiveState=active\nSubState=running\nMainPID=42\n",
+        "ActiveState=failed\nSubState=failed\nMainPID=0\n",
+        "ActiveState=inactive\nSubState=dead\n",
+        "ActiveState=inactive\nSubState=dead\nMainPID=0\nMainPID=0\n",
+    ] {
+        std::fs::write(
+            &fixture.systemctl,
+            format!("#!/bin/sh\nprintf '{response}'\n"),
+        )
+        .unwrap();
+        let tree = fixture_tree(&fixture.root);
+        let first = fixture
+            .prepare()
+            .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+            .output()
+            .unwrap();
+        let second = fixture
+            .prepare()
+            .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+            .output()
+            .unwrap();
+        assert_eq!(first.status.code(), Some(3));
+        assert_eq!(second.status.code(), Some(3));
+        assert_eq!(first.stdout, second.stdout);
+        let stdout = String::from_utf8_lossy(&first.stdout);
+        assert!(stdout.contains("stage=preflight cause=unit-state counts=failures=1"));
+        assert!(!stdout.contains(fixture.root.to_str().unwrap()));
+        assert!(!stdout.contains("MainPID"));
+        assert_eq!(fixture_tree(&fixture.root), tree);
+    }
 }
 
 #[tokio::test]

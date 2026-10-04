@@ -127,7 +127,11 @@ impl Fixture {
         let evidence = root.join("evidence.txt");
         let manifest = root.join("operation.json");
         let systemctl = root.join("systemctl-fixture");
-        std::fs::write(&systemctl, b"#!/bin/sh\nprintf 'inactive\\ndead\\n0\\n'\n").unwrap();
+        std::fs::write(
+            &systemctl,
+            b"#!/bin/sh\nprintf 'MainPID=0\\nActiveState=inactive\\nSubState=dead\\n'\n",
+        )
+        .unwrap();
         std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o700)).unwrap();
         let mut c = SqliteConnection::connect_with(&SqliteConnectOptions::new().filename(&db))
             .await
