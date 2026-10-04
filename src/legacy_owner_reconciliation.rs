@@ -624,7 +624,8 @@ pub(crate) enum RuntimeAbsence {
 enum RuntimeUnknownArea {
     Procfs,
     Identity,
-    Executable,
+    DeploymentMetadata,
+    ProcessExecutable,
     Cmdline,
     Descriptor,
     Socket,
@@ -680,14 +681,23 @@ impl RuntimeAbsenceUnknown {
             (RuntimeUnknownArea::Identity, RuntimeUnknownReason::Parse) => {
                 "runtime-unknown-identity-parse"
             }
-            (RuntimeUnknownArea::Executable, RuntimeUnknownReason::Permission) => {
-                "runtime-unknown-executable-permission"
+            (RuntimeUnknownArea::DeploymentMetadata, RuntimeUnknownReason::Permission) => {
+                "runtime-unknown-deployment-metadata-permission"
             }
-            (RuntimeUnknownArea::Executable, RuntimeUnknownReason::Io) => {
-                "runtime-unknown-executable-io"
+            (RuntimeUnknownArea::DeploymentMetadata, RuntimeUnknownReason::Io) => {
+                "runtime-unknown-deployment-metadata-io"
             }
-            (RuntimeUnknownArea::Executable, RuntimeUnknownReason::Parse) => {
-                "runtime-unknown-executable-parse"
+            (RuntimeUnknownArea::DeploymentMetadata, RuntimeUnknownReason::Parse) => {
+                "runtime-unknown-deployment-metadata-parse"
+            }
+            (RuntimeUnknownArea::ProcessExecutable, RuntimeUnknownReason::Permission) => {
+                "runtime-unknown-process-executable-permission"
+            }
+            (RuntimeUnknownArea::ProcessExecutable, RuntimeUnknownReason::Io) => {
+                "runtime-unknown-process-executable-io"
+            }
+            (RuntimeUnknownArea::ProcessExecutable, RuntimeUnknownReason::Parse) => {
+                "runtime-unknown-process-executable-parse"
             }
             (RuntimeUnknownArea::Cmdline, RuntimeUnknownReason::Permission) => {
                 "runtime-unknown-cmdline-permission"
@@ -723,10 +733,12 @@ fn classify_process_or_listener(
     use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 
     let root = proc_root();
-    let binary_meta = std::fs::metadata(binary)
-        .map_err(|error| RuntimeAbsenceUnknown::io(RuntimeUnknownArea::Executable, &error))?;
-    let config_meta = std::fs::metadata(config)
-        .map_err(|error| RuntimeAbsenceUnknown::io(RuntimeUnknownArea::Executable, &error))?;
+    let binary_meta = std::fs::metadata(binary).map_err(|error| {
+        RuntimeAbsenceUnknown::io(RuntimeUnknownArea::DeploymentMetadata, &error)
+    })?;
+    let config_meta = std::fs::metadata(config).map_err(|error| {
+        RuntimeAbsenceUnknown::io(RuntimeUnknownArea::DeploymentMetadata, &error)
+    })?;
     let config_uid = config_meta.uid();
     let entries = std::fs::read_dir(&root)
         .map_err(|error| RuntimeAbsenceUnknown::io(RuntimeUnknownArea::Procfs, &error))?;
@@ -766,7 +778,7 @@ fn classify_process_or_listener(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(RuntimeAbsenceUnknown::io(
-                    RuntimeUnknownArea::Executable,
+                    RuntimeUnknownArea::ProcessExecutable,
                     &error,
                 ));
             }
@@ -1358,6 +1370,15 @@ mod tests {
         assert_eq!(
             deployment_presence_kind(false, false),
             RuntimeAbsence::Clean
+        );
+        let permission = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert_eq!(
+            RuntimeAbsenceUnknown::io(RuntimeUnknownArea::DeploymentMetadata, &permission).cause(),
+            "runtime-unknown-deployment-metadata-permission"
+        );
+        assert_eq!(
+            RuntimeAbsenceUnknown::io(RuntimeUnknownArea::ProcessExecutable, &permission).cause(),
+            "runtime-unknown-process-executable-permission"
         );
     }
 
