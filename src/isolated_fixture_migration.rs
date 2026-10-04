@@ -269,6 +269,60 @@ async fn eligible(c: &mut SqliteConnection) -> Result<Facts, Error> {
     })
 }
 
+async fn emit_eligibility_diagnostic(c: &mut SqliteConnection) {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("T050_FIXTURE_MIGRATION_DIAGNOSTIC").is_none() {
+        return;
+    }
+    let counts = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64)>(
+        "SELECT
+         (SELECT count(*) FROM runtime_instances WHERE state IN ('active','stopping')),
+         (SELECT count(*) FROM task_continuations),
+         (SELECT count(*) FROM sessions WHERE state <> 'closed'),
+         (SELECT count(*) FROM delivery_dispositions WHERE
+            NOT ((child_fingerprint IS NULL AND reap_status IS NULL AND reap_at IS NULL)
+              OR (child_fingerprint IS NOT NULL AND reap_status='reaped' AND reap_at IS NOT NULL))),
+         (SELECT count(*) FROM execution_leases),
+         (SELECT count(*) FROM task_admissions),
+         (SELECT count(*) FROM agent_work_queue WHERE state NOT IN ('completed','expired','superseded'))",
+    )
+    .fetch_one(&mut *c)
+    .await;
+    let (cause, values) = match counts {
+        Ok((owners, continuations, sessions, children, leases, admissions, work)) => {
+            let cause = if owners != 2 {
+                "owner-topology"
+            } else if continuations != 1 {
+                "continuation-topology"
+            } else if sessions != 0 {
+                "open-sessions"
+            } else if children != 0 {
+                "child-reap"
+            } else if leases != 1 || admissions != 1 {
+                "lease-admission"
+            } else if work != 0 {
+                "work-queue"
+            } else {
+                "witness-or-binding"
+            };
+            (
+                cause,
+                format!(
+                    "owners={owners},continuations={continuations},sessions={sessions},children={children},leases={leases},admissions={admissions},work={work}"
+                ),
+            )
+        }
+        Err(_) => (
+            "database-facts",
+            "owners=0,continuations=0,sessions=0,children=0,leases=0,admissions=0,work=0"
+                .to_owned(),
+        ),
+    };
+    println!(
+        "prepare-isolated-legacy-fixture-migration-manifest stage=eligibility cause={cause} counts={values}"
+    );
+}
+
 fn owner_digest(owner: &Owner) -> String {
     digest(&[
         &owner.token,
@@ -613,7 +667,14 @@ pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
         .execute(&mut c)
         .await
         .map_err(|_| Error::Database)?;
-    let facts = eligible(&mut c).await?;
+    let facts = match eligible(&mut c).await {
+        Ok(facts) => facts,
+        Err(error) => {
+            emit_eligibility_diagnostic(&mut c).await;
+            let _ = sqlx::query("ROLLBACK").execute(&mut c).await;
+            return Err(error);
+        }
+    };
     let pre = snapshot(&mut c, None).await?;
     let post = snapshot(&mut c, Some((&facts, &args.commit_timestamp))).await?;
     let siblings = sibling_digest(&mut c, &args.operation_id).await?;

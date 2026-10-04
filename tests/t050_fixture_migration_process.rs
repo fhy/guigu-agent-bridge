@@ -347,6 +347,29 @@ async fn open_session_refuses_before_manifest_publication() {
 }
 
 #[tokio::test]
+async fn eligibility_diagnostic_is_fixed_and_redacted() {
+    let f = Fixture::new().await;
+    std::fs::remove_file(&f.manifest).unwrap();
+    let pool = connect(&f.db).await.unwrap();
+    sqlx::query("UPDATE sessions SET state='prompting' WHERE session_id='closed-session'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let output = f
+        .prepare()
+        .env("T050_FIXTURE_MIGRATION_DIAGNOSTIC", "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("stage=eligibility cause=open-sessions"));
+    assert!(stdout.contains("counts=owners=2,continuations=1,sessions=1"));
+    assert!(!stdout.contains("owner-a"));
+    assert!(!stdout.contains("closed-session"));
+}
+
+#[tokio::test]
 async fn unreaped_child_refuses_before_manifest_publication() {
     assert_prepare_refusal(
         "unreaped-child",
