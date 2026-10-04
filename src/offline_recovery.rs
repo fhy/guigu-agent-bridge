@@ -36,7 +36,11 @@ pub fn parse_cli_args(
         return Err(RecoveryError::InvalidArguments);
     }
     let mut values = [None, None, None];
-    for pair in args[1..].chunks_exact(2) {
+    let (pairs, remainder) = args[1..].as_chunks::<2>();
+    if !remainder.is_empty() {
+        return Err(RecoveryError::InvalidArguments);
+    }
+    for pair in pairs {
         let flag = pair[0].to_str().ok_or(RecoveryError::InvalidArguments)?;
         let value = pair[1].to_str().ok_or(RecoveryError::InvalidArguments)?;
         let slot = match flag {

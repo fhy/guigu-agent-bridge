@@ -370,6 +370,51 @@ async fn eligibility_diagnostic_is_fixed_and_redacted() {
 }
 
 #[tokio::test]
+async fn preflight_diagnostic_process_exits_within_bound() {
+    let root = std::env::temp_dir().join(format!("t050-preflight-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&root).unwrap();
+    let process_root = root.clone();
+    let binary = std::env::var_os("CARGO_BIN_EXE_guigu-agent-bridge").unwrap();
+    let result = tokio::time::timeout(
+        Duration::from_secs(20),
+        tokio::task::spawn_blocking(move || {
+            Command::new(binary)
+                .args([
+                    "prepare-isolated-legacy-fixture-migration-manifest",
+                    "--root",
+                    process_root.to_str().unwrap(),
+                    "--config",
+                    "/nonexistent/config",
+                    "--database",
+                    "/nonexistent/state.db",
+                    "--unit",
+                    "guigu-codex-test.service",
+                    "--manifest",
+                    "/nonexistent/manifest",
+                    "--evidence",
+                    "/nonexistent/evidence",
+                    "--operation-id",
+                    "00000000-0000-4000-8000-000000000000",
+                    "--commit-timestamp",
+                    "2026-10-04T00:00:00.000000000Z",
+                ])
+                .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "root")
+                .output()
+                .unwrap()
+        }),
+    )
+    .await
+    .expect("diagnostic process timeout")
+    .expect("diagnostic process task failed");
+    assert_eq!(result.status.code(), Some(3));
+    let stdout = String::from_utf8_lossy(&result.stdout);
+    assert!(stdout.contains("stage=root cause=canonical-root counts=bounded"));
+    assert!(!stdout.contains("state.db"));
+    assert!(!stdout.contains("fingerprint"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn unreaped_child_refuses_before_manifest_publication() {
     assert_prepare_refusal(
         "unreaped-child",
