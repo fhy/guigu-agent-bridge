@@ -508,8 +508,9 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
         SocketIo,
         SocketParse,
         ProcfsPermission,
-        IdentityParse,
-        IdentityPermission,
+        ExecutablePermission,
+        CmdlineParse,
+        CmdlinePermission,
         FdIo,
     }
 
@@ -517,10 +518,14 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
         (Setup::SocketIo, "runtime-unknown-socket-io"),
         (Setup::SocketParse, "runtime-unknown-socket-parse"),
         (Setup::ProcfsPermission, "runtime-unknown-procfs-permission"),
-        (Setup::IdentityParse, "runtime-unknown-identity-parse"),
         (
-            Setup::IdentityPermission,
-            "runtime-unknown-identity-permission",
+            Setup::ExecutablePermission,
+            "runtime-unknown-executable-permission",
+        ),
+        (Setup::CmdlineParse, "runtime-unknown-cmdline-parse"),
+        (
+            Setup::CmdlinePermission,
+            "runtime-unknown-cmdline-permission",
         ),
         (Setup::FdIo, "runtime-unknown-fd-io"),
     ] {
@@ -538,7 +543,16 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
                 )
                 .unwrap();
             }
-            Setup::IdentityParse | Setup::IdentityPermission | Setup::FdIo => {
+            Setup::ExecutablePermission => {
+                let process = fixture.proc_root.join("424242");
+                let denied = fixture.proc_root.join("denied-executable");
+                std::fs::create_dir(&process).unwrap();
+                std::fs::create_dir(&denied).unwrap();
+                std::fs::write(denied.join("binary"), b"fixture").unwrap();
+                std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+                std::os::unix::fs::symlink(denied.join("binary"), process.join("exe")).unwrap();
+            }
+            Setup::CmdlineParse | Setup::CmdlinePermission | Setup::FdIo => {
                 let process = fixture.proc_root.join("424242");
                 std::fs::create_dir(&process).unwrap();
                 std::os::unix::fs::symlink(
@@ -548,14 +562,14 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
                 .unwrap();
                 std::fs::write(
                     process.join("cmdline"),
-                    if matches!(setup, Setup::IdentityParse) {
+                    if matches!(setup, Setup::CmdlineParse) {
                         b"not-terminated".as_slice()
                     } else {
                         b"candidate\0".as_slice()
                     },
                 )
                 .unwrap();
-                if matches!(setup, Setup::IdentityPermission) {
+                if matches!(setup, Setup::CmdlinePermission) {
                     std::fs::set_permissions(
                         process.join("cmdline"),
                         std::fs::Permissions::from_mode(0o000),
@@ -603,6 +617,12 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
         if matches!(setup, Setup::ProcfsPermission) {
             std::fs::set_permissions(&fixture.proc_root, std::fs::Permissions::from_mode(0o700))
                 .unwrap();
+        } else if matches!(setup, Setup::ExecutablePermission) {
+            std::fs::set_permissions(
+                fixture.proc_root.join("denied-executable"),
+                std::fs::Permissions::from_mode(0o700),
+            )
+            .unwrap();
         }
     }
 }

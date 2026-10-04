@@ -624,6 +624,8 @@ pub(crate) enum RuntimeAbsence {
 enum RuntimeUnknownArea {
     Procfs,
     Identity,
+    Executable,
+    Cmdline,
     Descriptor,
     Socket,
 }
@@ -678,6 +680,22 @@ impl RuntimeAbsenceUnknown {
             (RuntimeUnknownArea::Identity, RuntimeUnknownReason::Parse) => {
                 "runtime-unknown-identity-parse"
             }
+            (RuntimeUnknownArea::Executable, RuntimeUnknownReason::Permission) => {
+                "runtime-unknown-executable-permission"
+            }
+            (RuntimeUnknownArea::Executable, RuntimeUnknownReason::Io) => {
+                "runtime-unknown-executable-io"
+            }
+            (RuntimeUnknownArea::Executable, RuntimeUnknownReason::Parse) => {
+                "runtime-unknown-executable-parse"
+            }
+            (RuntimeUnknownArea::Cmdline, RuntimeUnknownReason::Permission) => {
+                "runtime-unknown-cmdline-permission"
+            }
+            (RuntimeUnknownArea::Cmdline, RuntimeUnknownReason::Io) => "runtime-unknown-cmdline-io",
+            (RuntimeUnknownArea::Cmdline, RuntimeUnknownReason::Parse) => {
+                "runtime-unknown-cmdline-parse"
+            }
             (RuntimeUnknownArea::Descriptor, RuntimeUnknownReason::Permission) => {
                 "runtime-unknown-fd-permission"
             }
@@ -706,9 +724,9 @@ fn classify_process_or_listener(
 
     let root = proc_root();
     let binary_meta = std::fs::metadata(binary)
-        .map_err(|error| RuntimeAbsenceUnknown::io(RuntimeUnknownArea::Identity, &error))?;
+        .map_err(|error| RuntimeAbsenceUnknown::io(RuntimeUnknownArea::Executable, &error))?;
     let config_meta = std::fs::metadata(config)
-        .map_err(|error| RuntimeAbsenceUnknown::io(RuntimeUnknownArea::Identity, &error))?;
+        .map_err(|error| RuntimeAbsenceUnknown::io(RuntimeUnknownArea::Executable, &error))?;
     let config_uid = config_meta.uid();
     let entries = std::fs::read_dir(&root)
         .map_err(|error| RuntimeAbsenceUnknown::io(RuntimeUnknownArea::Procfs, &error))?;
@@ -748,7 +766,7 @@ fn classify_process_or_listener(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(RuntimeAbsenceUnknown::io(
-                    RuntimeUnknownArea::Identity,
+                    RuntimeUnknownArea::Executable,
                     &error,
                 ));
             }
@@ -762,13 +780,13 @@ fn classify_process_or_listener(
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
             Err(error) => {
                 return Err(RuntimeAbsenceUnknown::io(
-                    RuntimeUnknownArea::Identity,
+                    RuntimeUnknownArea::Cmdline,
                     &error,
                 ));
             }
         };
         if command_line.is_empty() || command_line.last() != Some(&0) {
-            return Err(RuntimeAbsenceUnknown::parse(RuntimeUnknownArea::Identity));
+            return Err(RuntimeAbsenceUnknown::parse(RuntimeUnknownArea::Cmdline));
         }
         let config_argument = command_line
             .split(|byte| *byte == 0)
