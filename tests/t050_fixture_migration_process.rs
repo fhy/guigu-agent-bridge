@@ -509,7 +509,8 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
         SocketParse,
         ProcfsPermission,
         ProcessExecutableLinkDeploymentOwnerPermission,
-        ProcessExecutableLinkOtherOwnerPermission,
+        ProcessExecutableLinkPrivilegedOtherOwnerPermission,
+        ProcessExecutableLinkUnprivilegedOtherOwnerPermission,
         ProcessExecutableMetadataPermission,
         CmdlineParse,
         CmdlinePermission,
@@ -525,8 +526,12 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
             "runtime-unknown-process-executable-link-deployment-owner-permission",
         ),
         (
-            Setup::ProcessExecutableLinkOtherOwnerPermission,
-            "runtime-unknown-process-executable-link-other-owner-permission",
+            Setup::ProcessExecutableLinkPrivilegedOtherOwnerPermission,
+            "runtime-unknown-process-executable-link-privileged-other-owner-permission",
+        ),
+        (
+            Setup::ProcessExecutableLinkUnprivilegedOtherOwnerPermission,
+            "runtime-unknown-process-executable-link-unprivileged-other-owner-permission",
         ),
         (
             Setup::ProcessExecutableMetadataPermission,
@@ -554,12 +559,18 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
                 .unwrap();
             }
             Setup::ProcessExecutableLinkDeploymentOwnerPermission
-            | Setup::ProcessExecutableLinkOtherOwnerPermission => {
+            | Setup::ProcessExecutableLinkPrivilegedOtherOwnerPermission
+            | Setup::ProcessExecutableLinkUnprivilegedOtherOwnerPermission => {
                 let process = fixture.proc_root.join("424242");
                 std::fs::create_dir(&process).unwrap();
                 std::fs::write(process.join(".t050-test-exe-link-permission"), b"1").unwrap();
-                if matches!(setup, Setup::ProcessExecutableLinkOtherOwnerPermission) {
-                    std::fs::write(process.join(".t050-test-uid"), u32::MAX.to_string()).unwrap();
+                let owner = match setup {
+                    Setup::ProcessExecutableLinkPrivilegedOtherOwnerPermission => Some(0),
+                    Setup::ProcessExecutableLinkUnprivilegedOtherOwnerPermission => Some(u32::MAX),
+                    _ => None,
+                };
+                if let Some(owner) = owner {
+                    std::fs::write(process.join(".t050-test-uid"), owner.to_string()).unwrap();
                 }
             }
             Setup::ProcessExecutableMetadataPermission => {

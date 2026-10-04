@@ -626,7 +626,8 @@ enum RuntimeUnknownArea {
     Identity,
     DeploymentMetadata,
     ProcessExecutableLinkDeploymentOwner,
-    ProcessExecutableLinkOtherOwner,
+    ProcessExecutableLinkPrivilegedOtherOwner,
+    ProcessExecutableLinkUnprivilegedOtherOwner,
     ProcessExecutableMetadata,
     Cmdline,
     Descriptor,
@@ -705,15 +706,29 @@ impl RuntimeAbsenceUnknown {
                 RuntimeUnknownReason::Parse,
             ) => "runtime-unknown-process-executable-link-deployment-owner-parse",
             (
-                RuntimeUnknownArea::ProcessExecutableLinkOtherOwner,
+                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedOtherOwner,
                 RuntimeUnknownReason::Permission,
-            ) => "runtime-unknown-process-executable-link-other-owner-permission",
-            (RuntimeUnknownArea::ProcessExecutableLinkOtherOwner, RuntimeUnknownReason::Io) => {
-                "runtime-unknown-process-executable-link-other-owner-io"
-            }
-            (RuntimeUnknownArea::ProcessExecutableLinkOtherOwner, RuntimeUnknownReason::Parse) => {
-                "runtime-unknown-process-executable-link-other-owner-parse"
-            }
+            ) => "runtime-unknown-process-executable-link-privileged-other-owner-permission",
+            (
+                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedOtherOwner,
+                RuntimeUnknownReason::Io,
+            ) => "runtime-unknown-process-executable-link-privileged-other-owner-io",
+            (
+                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedOtherOwner,
+                RuntimeUnknownReason::Parse,
+            ) => "runtime-unknown-process-executable-link-privileged-other-owner-parse",
+            (
+                RuntimeUnknownArea::ProcessExecutableLinkUnprivilegedOtherOwner,
+                RuntimeUnknownReason::Permission,
+            ) => "runtime-unknown-process-executable-link-unprivileged-other-owner-permission",
+            (
+                RuntimeUnknownArea::ProcessExecutableLinkUnprivilegedOtherOwner,
+                RuntimeUnknownReason::Io,
+            ) => "runtime-unknown-process-executable-link-unprivileged-other-owner-io",
+            (
+                RuntimeUnknownArea::ProcessExecutableLinkUnprivilegedOtherOwner,
+                RuntimeUnknownReason::Parse,
+            ) => "runtime-unknown-process-executable-link-unprivileged-other-owner-parse",
             (RuntimeUnknownArea::ProcessExecutableMetadata, RuntimeUnknownReason::Permission) => {
                 "runtime-unknown-process-executable-metadata-permission"
             }
@@ -750,13 +765,16 @@ impl RuntimeAbsenceUnknown {
 
 fn process_executable_metadata(
     process: &Path,
-    deployment_owner: bool,
+    process_uid: u32,
+    config_uid: u32,
 ) -> Result<Option<std::fs::Metadata>, RuntimeAbsenceUnknown> {
     let executable = process.join("exe");
-    let link_area = if deployment_owner {
+    let link_area = if process_uid == config_uid {
         RuntimeUnknownArea::ProcessExecutableLinkDeploymentOwner
+    } else if process_uid == 0 {
+        RuntimeUnknownArea::ProcessExecutableLinkPrivilegedOtherOwner
     } else {
-        RuntimeUnknownArea::ProcessExecutableLinkOtherOwner
+        RuntimeUnknownArea::ProcessExecutableLinkUnprivilegedOtherOwner
     };
     #[cfg(debug_assertions)]
     if process.join(".t050-test-exe-link-permission").exists() {
@@ -827,11 +845,11 @@ fn classify_process_or_listener(
             }
         };
         let process_uid = observed_process_uid(&process, &process_meta)?;
-        let executable_meta =
-            match process_executable_metadata(&process, process_uid == config_uid)? {
-                Some(metadata) => metadata,
-                None => continue,
-            };
+        let executable_meta = match process_executable_metadata(&process, process_uid, config_uid)?
+        {
+            Some(metadata) => metadata,
+            None => continue,
+        };
         if !same_file(&executable_meta, &binary_meta) {
             continue;
         }
@@ -1435,11 +1453,19 @@ mod tests {
         );
         assert_eq!(
             RuntimeAbsenceUnknown::io(
-                RuntimeUnknownArea::ProcessExecutableLinkOtherOwner,
+                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedOtherOwner,
                 &permission,
             )
             .cause(),
-            "runtime-unknown-process-executable-link-other-owner-permission"
+            "runtime-unknown-process-executable-link-privileged-other-owner-permission"
+        );
+        assert_eq!(
+            RuntimeAbsenceUnknown::io(
+                RuntimeUnknownArea::ProcessExecutableLinkUnprivilegedOtherOwner,
+                &permission,
+            )
+            .cause(),
+            "runtime-unknown-process-executable-link-unprivileged-other-owner-permission"
         );
         assert_eq!(
             RuntimeAbsenceUnknown::io(RuntimeUnknownArea::ProcessExecutableMetadata, &permission)
