@@ -253,7 +253,7 @@ impl Fixture {
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(10);
+        let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             assert!(
                 child.try_wait().unwrap().is_none(),

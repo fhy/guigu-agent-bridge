@@ -590,12 +590,29 @@ fn is_deployment_presence(
     executable_matches && (config_matches || listener_matches)
 }
 
-fn process_or_listener_present(
+fn deployment_presence_kind(config_matches: bool, listener_matches: bool) -> RuntimeAbsence {
+    if config_matches {
+        RuntimeAbsence::Process
+    } else if listener_matches {
+        RuntimeAbsence::Listener
+    } else {
+        RuntimeAbsence::Clean
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RuntimeAbsence {
+    Clean,
+    Process,
+    Listener,
+}
+
+fn classify_process_or_listener(
     binary: &Path,
     config: &Path,
     listener_inodes: &std::collections::BTreeSet<u64>,
     ignored_pid: Option<u32>,
-) -> Result<bool, Error> {
+) -> Result<RuntimeAbsence, Error> {
     use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
 
     let root = proc_root();
@@ -674,10 +691,13 @@ fn process_or_listener_present(
             config_argument || config_descriptor,
             listener_descriptor,
         ) {
-            return Ok(true);
+            return Ok(deployment_presence_kind(
+                config_argument || config_descriptor,
+                listener_descriptor,
+            ));
         }
     }
-    Ok(false)
+    Ok(RuntimeAbsence::Clean)
 }
 
 fn fixed_listener_inodes() -> Result<std::collections::BTreeSet<u64>, Error> {
@@ -714,12 +734,19 @@ pub(crate) fn preflight_runtime_absence(
     config: &Path,
     ignored_pid: Option<u32>,
 ) -> Result<(), Error> {
-    let listener_inodes = fixed_listener_inodes()?;
-    if process_or_listener_present(binary, config, &listener_inodes, ignored_pid)? {
-        Err(Error::Rejected)
-    } else {
-        Ok(())
+    match classify_runtime_absence(binary, config, ignored_pid)? {
+        RuntimeAbsence::Clean => Ok(()),
+        RuntimeAbsence::Process | RuntimeAbsence::Listener => Err(Error::Rejected),
     }
+}
+
+pub(crate) fn classify_runtime_absence(
+    binary: &Path,
+    config: &Path,
+    ignored_pid: Option<u32>,
+) -> Result<RuntimeAbsence, Error> {
+    let listener_inodes = fixed_listener_inodes()?;
+    classify_process_or_listener(binary, config, &listener_inodes, ignored_pid)
 }
 
 pub(crate) fn publish(path: &Path, bytes: &[u8]) -> Result<(), Error> {
@@ -1172,6 +1199,18 @@ mod tests {
         assert!(is_deployment_presence(0, 1_000, true, false, true));
         assert!(!is_deployment_presence(65_534, 1_000, true, false, false));
         assert!(!is_deployment_presence(65_534, 1_000, false, true, true));
+        assert_eq!(
+            deployment_presence_kind(true, true),
+            RuntimeAbsence::Process
+        );
+        assert_eq!(
+            deployment_presence_kind(false, true),
+            RuntimeAbsence::Listener
+        );
+        assert_eq!(
+            deployment_presence_kind(false, false),
+            RuntimeAbsence::Clean
+        );
     }
 
     #[test]

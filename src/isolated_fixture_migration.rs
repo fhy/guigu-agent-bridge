@@ -9,8 +9,9 @@ use sha2::{Digest, Sha256};
 use sqlx::{Connection, Row, SqliteConnection, sqlite::SqliteConnectOptions};
 
 use crate::legacy_owner_reconciliation::{
-    Error, Sidecars, digest, ensure_marker, path_identity, preflight_publication,
-    preflight_runtime_absence, preflight_unit, publish, publish_new,
+    Error, RuntimeAbsence, Sidecars, classify_runtime_absence, digest, ensure_marker,
+    path_identity, preflight_publication, preflight_runtime_absence, preflight_unit, publish,
+    publish_new,
 };
 
 const O_NOFOLLOW: i32 = 0o400000;
@@ -689,8 +690,26 @@ pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
         .map_err(|_| prepare_rejected("preflight", "admission-lock", Error::Rejected))?;
     preflight_unit(&args.unit)
         .map_err(|error| prepare_rejected("preflight", "unit-state", error))?;
-    preflight_runtime_absence(&binary, &config, Some(std::process::id()))
-        .map_err(|error| prepare_rejected("preflight", "runtime-absence", error))?;
+    match classify_runtime_absence(&binary, &config, Some(std::process::id())) {
+        Ok(RuntimeAbsence::Clean) => {}
+        Ok(RuntimeAbsence::Process) => {
+            return Err(prepare_rejected(
+                "preflight",
+                "runtime-process",
+                Error::Rejected,
+            ));
+        }
+        Ok(RuntimeAbsence::Listener) => {
+            return Err(prepare_rejected(
+                "preflight",
+                "runtime-listener",
+                Error::Rejected,
+            ));
+        }
+        Err(error) => {
+            return Err(prepare_rejected("preflight", "runtime-unknown", error));
+        }
+    }
     let sidecars = Sidecars::capture(&database)
         .map_err(|error| prepare_rejected("sqlite-open", "sidecar-auth", error))?;
     let mut c = SqliteConnection::connect_with(
