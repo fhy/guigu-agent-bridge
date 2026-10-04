@@ -359,10 +359,12 @@ async fn eligibility_diagnostic_is_fixed_and_redacted() {
     let output = f
         .prepare()
         .env("T050_FIXTURE_MIGRATION_DIAGNOSTIC", "1")
+        .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
         .output()
         .unwrap();
     assert_eq!(output.status.code(), Some(3));
     let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("stage=eligibility cause=durable-facts counts=failures=1"));
     assert!(stdout.contains("stage=eligibility cause=open-sessions"));
     assert!(stdout.contains("counts=owners=2,continuations=1,sessions=1"));
     assert!(!stdout.contains("owner-a"));
@@ -378,40 +380,83 @@ async fn preflight_diagnostic_process_exits_within_bound() {
     let result = tokio::time::timeout(
         Duration::from_secs(20),
         tokio::task::spawn_blocking(move || {
-            Command::new(binary)
-                .args([
-                    "prepare-isolated-legacy-fixture-migration-manifest",
-                    "--root",
-                    process_root.to_str().unwrap(),
-                    "--config",
-                    "/nonexistent/config",
-                    "--database",
-                    "/nonexistent/state.db",
-                    "--unit",
-                    "guigu-codex-test.service",
-                    "--manifest",
-                    "/nonexistent/manifest",
-                    "--evidence",
-                    "/nonexistent/evidence",
-                    "--operation-id",
-                    "00000000-0000-4000-8000-000000000000",
-                    "--commit-timestamp",
-                    "2026-10-04T00:00:00.000000000Z",
-                ])
-                .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "root")
-                .output()
-                .unwrap()
+            let run = || {
+                Command::new(&binary)
+                    .args([
+                        "prepare-isolated-legacy-fixture-migration-manifest",
+                        "--root",
+                        process_root.to_str().unwrap(),
+                        "--config",
+                        "/nonexistent/config",
+                        "--database",
+                        "/nonexistent/state.db",
+                        "--unit",
+                        "guigu-codex-test.service",
+                        "--manifest",
+                        "/nonexistent/manifest",
+                        "--evidence",
+                        "/nonexistent/evidence",
+                        "--operation-id",
+                        "00000000-0000-4000-8000-000000000000",
+                        "--commit-timestamp",
+                        "2026-10-04T00:00:00.000000000Z",
+                    ])
+                    .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+                    .output()
+                    .unwrap()
+            };
+            (run(), run())
         }),
     )
     .await
     .expect("diagnostic process timeout")
     .expect("diagnostic process task failed");
-    assert_eq!(result.status.code(), Some(3));
-    let stdout = String::from_utf8_lossy(&result.stdout);
-    assert!(stdout.contains("stage=root cause=canonical-root counts=bounded"));
+    assert_eq!(result.0.status.code(), Some(3));
+    assert_eq!(result.1.status.code(), Some(3));
+    assert_eq!(result.0.stdout, result.1.stdout);
+    let stdout = String::from_utf8_lossy(&result.0.stdout);
+    assert!(stdout.contains("stage=preflight cause=root-contract counts=failures=1"));
     assert!(!stdout.contains("state.db"));
     assert!(!stdout.contains("fingerprint"));
     std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
+async fn publication_and_sqlite_open_diagnostics_are_fixed_and_invariant() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let publication = Fixture::new().await;
+    std::fs::set_permissions(
+        &publication.manifest,
+        std::fs::Permissions::from_mode(0o644),
+    )
+    .unwrap();
+    let publication_tree = fixture_tree(&publication.root);
+    let output = publication
+        .prepare()
+        .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("stage=publication cause=manifest-target counts=failures=1"));
+    assert!(!stdout.contains(publication.root.to_str().unwrap()));
+    assert_eq!(fixture_tree(&publication.root), publication_tree);
+
+    let sqlite = Fixture::new().await;
+    let wal = PathBuf::from(format!("{}-wal", sqlite.db.to_string_lossy()));
+    std::fs::create_dir(&wal).unwrap();
+    let sqlite_tree = fixture_tree(&sqlite.root);
+    let output = sqlite
+        .prepare()
+        .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("stage=sqlite-open cause=sidecar-auth counts=failures=1"));
+    assert!(!stdout.contains(sqlite.root.to_str().unwrap()));
+    assert_eq!(fixture_tree(&sqlite.root), sqlite_tree);
 }
 
 #[tokio::test]

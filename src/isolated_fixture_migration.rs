@@ -323,32 +323,21 @@ async fn emit_eligibility_diagnostic(c: &mut SqliteConnection) {
     );
 }
 
-/// Synthetic-only probe for classifying the fixed pre-eligibility order.  It is
-/// deliberately driven by a bounded test selector and never runs in release
-/// builds or changes the command's decision path.
-fn emit_preflight_diagnostic() {
+fn emit_prepare_diagnostic(stage: &str, cause: &str, counts: &str) {
     #[cfg(debug_assertions)]
     {
-        let Some(stage) = std::env::var_os("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC")
-            .and_then(|value| value.into_string().ok())
-        else {
+        if std::env::var_os("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC").is_none() {
             return;
-        };
-        let (stage, cause) = match stage.as_str() {
-            "root" => ("root", "canonical-root"),
-            "target" => ("target", "publication-target"),
-            "admission" => ("admission", "runtime-lock"),
-            "unit" => ("unit", "unit-state"),
-            "runtime" => ("runtime", "process-listener"),
-            "sidecar" => ("sidecar", "database-sidecar"),
-            "sqlite" => ("sqlite", "sqlite-open-revalidation"),
-            "eligibility" => ("eligibility", "eligibility"),
-            _ => return,
-        };
+        }
         println!(
-            "prepare-isolated-legacy-fixture-migration-manifest stage={stage} cause={cause} counts=bounded"
+            "prepare-isolated-legacy-fixture-migration-manifest stage={stage} cause={cause} counts={counts}"
         );
     }
+}
+
+fn prepare_rejected(stage: &str, cause: &str, error: Error) -> Error {
+    emit_prepare_diagnostic(stage, cause, "failures=1");
+    error
 }
 
 fn owner_digest(owner: &Owner) -> String {
@@ -651,9 +640,11 @@ fn precommit_pause() -> Result<(), Error> {
 }
 
 pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
-    emit_preflight_diagnostic();
     use std::os::unix::fs::MetadataExt;
-    let root = args.root.canonicalize().map_err(|_| Error::Rejected)?;
+    let root = args
+        .root
+        .canonicalize()
+        .map_err(|_| prepare_rejected("preflight", "root-path", Error::Rejected))?;
     if root != args.root
         || std::fs::symlink_metadata(&root)
             .map_err(|_| Error::Rejected)?
@@ -665,24 +656,43 @@ pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
         || args.manifest.parent() != Some(root.as_path())
         || args.evidence.parent() != Some(root.as_path())
     {
-        return Err(Error::Rejected);
+        return Err(prepare_rejected(
+            "preflight",
+            "root-contract",
+            Error::Rejected,
+        ));
     }
-    let config = args.config.canonicalize().map_err(|_| Error::Rejected)?;
-    let database = args.database.canonicalize().map_err(|_| Error::Rejected)?;
+    let config = args
+        .config
+        .canonicalize()
+        .map_err(|_| prepare_rejected("preflight", "config-path", Error::Rejected))?;
+    let database = args
+        .database
+        .canonicalize()
+        .map_err(|_| prepare_rejected("preflight", "database-path", Error::Rejected))?;
     let binary = std::env::current_exe()
         .map_err(|_| Error::Rejected)?
         .canonicalize()
         .map_err(|_| Error::Rejected)?;
     if config != args.config || database != args.database {
-        return Err(Error::Rejected);
+        return Err(prepare_rejected(
+            "preflight",
+            "path-identity",
+            Error::Rejected,
+        ));
     }
-    preflight_publication(&args.manifest)?;
-    preflight_publication(&args.evidence)?;
+    preflight_publication(&args.manifest)
+        .map_err(|error| prepare_rejected("publication", "manifest-target", error))?;
+    preflight_publication(&args.evidence)
+        .map_err(|error| prepare_rejected("publication", "evidence-target", error))?;
     let admission = crate::runtime_admission::Guard::acquire(&database, &config, "reconcile")
-        .map_err(|_| Error::Rejected)?;
-    preflight_unit(&args.unit)?;
-    preflight_runtime_absence(&binary, &config, Some(std::process::id()))?;
-    let sidecars = Sidecars::capture(&database)?;
+        .map_err(|_| prepare_rejected("preflight", "admission-lock", Error::Rejected))?;
+    preflight_unit(&args.unit)
+        .map_err(|error| prepare_rejected("preflight", "unit-state", error))?;
+    preflight_runtime_absence(&binary, &config, Some(std::process::id()))
+        .map_err(|error| prepare_rejected("preflight", "runtime-absence", error))?;
+    let sidecars = Sidecars::capture(&database)
+        .map_err(|error| prepare_rejected("sqlite-open", "sidecar-auth", error))?;
     let mut c = SqliteConnection::connect_with(
         &SqliteConnectOptions::new()
             .filename(&database)
@@ -690,15 +700,18 @@ pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
             .foreign_keys(true),
     )
     .await
-    .map_err(|_| Error::Database)?;
-    sidecars.revalidate(&database)?;
+    .map_err(|_| prepare_rejected("sqlite-open", "connect", Error::Database))?;
+    sidecars
+        .revalidate(&database)
+        .map_err(|error| prepare_rejected("sqlite-open", "sidecar-revalidation", error))?;
     sqlx::query("BEGIN IMMEDIATE")
         .execute(&mut c)
         .await
-        .map_err(|_| Error::Database)?;
+        .map_err(|_| prepare_rejected("sqlite-open", "begin", Error::Database))?;
     let facts = match eligible(&mut c).await {
         Ok(facts) => facts,
         Err(error) => {
+            emit_prepare_diagnostic("eligibility", "durable-facts", "failures=1");
             emit_eligibility_diagnostic(&mut c).await;
             let _ = sqlx::query("ROLLBACK").execute(&mut c).await;
             return Err(error);
