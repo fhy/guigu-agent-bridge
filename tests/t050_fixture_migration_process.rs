@@ -508,7 +508,8 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
         SocketIo,
         SocketParse,
         ProcfsPermission,
-        ProcessExecutablePermission,
+        ProcessExecutableLinkPermission,
+        ProcessExecutableMetadataPermission,
         CmdlineParse,
         CmdlinePermission,
         FdIo,
@@ -519,8 +520,12 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
         (Setup::SocketParse, "runtime-unknown-socket-parse"),
         (Setup::ProcfsPermission, "runtime-unknown-procfs-permission"),
         (
-            Setup::ProcessExecutablePermission,
-            "runtime-unknown-process-executable-permission",
+            Setup::ProcessExecutableLinkPermission,
+            "runtime-unknown-process-executable-link-permission",
+        ),
+        (
+            Setup::ProcessExecutableMetadataPermission,
+            "runtime-unknown-process-executable-metadata-permission",
         ),
         (Setup::CmdlineParse, "runtime-unknown-cmdline-parse"),
         (
@@ -543,7 +548,12 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
                 )
                 .unwrap();
             }
-            Setup::ProcessExecutablePermission => {
+            Setup::ProcessExecutableLinkPermission => {
+                let process = fixture.proc_root.join("424242");
+                std::fs::create_dir(&process).unwrap();
+                std::fs::write(process.join(".t050-test-exe-link-permission"), b"1").unwrap();
+            }
+            Setup::ProcessExecutableMetadataPermission => {
                 let process = fixture.proc_root.join("424242");
                 let denied = fixture.proc_root.join("denied-executable");
                 std::fs::create_dir(&process).unwrap();
@@ -617,7 +627,7 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
         if matches!(setup, Setup::ProcfsPermission) {
             std::fs::set_permissions(&fixture.proc_root, std::fs::Permissions::from_mode(0o700))
                 .unwrap();
-        } else if matches!(setup, Setup::ProcessExecutablePermission) {
+        } else if matches!(setup, Setup::ProcessExecutableMetadataPermission) {
             std::fs::set_permissions(
                 fixture.proc_root.join("denied-executable"),
                 std::fs::Permissions::from_mode(0o700),
