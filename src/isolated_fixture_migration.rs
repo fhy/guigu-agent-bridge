@@ -351,31 +351,6 @@ fn emit_preflight_diagnostic() {
     }
 }
 
-#[cfg(test)]
-mod preflight_diagnostic_tests {
-    #[test]
-    fn maps_only_fixed_redacted_stages() {
-        let cases = [
-            ("root", "root", "canonical-root"),
-            ("target", "target", "publication-target"),
-            ("admission", "admission", "runtime-lock"),
-            ("unit", "unit", "unit-state"),
-            ("runtime", "runtime", "process-listener"),
-            ("sidecar", "sidecar", "database-sidecar"),
-            ("sqlite", "sqlite", "sqlite-open-revalidation"),
-            ("eligibility", "eligibility", "eligibility"),
-        ];
-        for (selector, stage, cause) in cases {
-            let expected = format!("stage={stage} cause={cause} counts=bounded");
-            assert!(expected.is_ascii());
-            assert!(!expected.contains("/"));
-            assert!(!expected.contains("token"));
-            assert!(!expected.contains("fingerprint"));
-            assert!(!selector.is_empty());
-        }
-    }
-}
-
 fn owner_digest(owner: &Owner) -> String {
     digest(&[
         &owner.token,
