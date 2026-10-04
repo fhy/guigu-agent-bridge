@@ -509,7 +509,9 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
         SocketParse,
         ProcfsPermission,
         ProcessExecutableLinkDeploymentOwnerPermission,
-        ProcessExecutableLinkPrivilegedOtherOwnerPermission,
+        ProcessExecutableLinkPrivilegedKernelOwnerPermission,
+        ProcessExecutableLinkPrivilegedUserspaceOwnerPermission,
+        ProcessExecutableLinkPrivilegedOwnerClassificationParse,
         ProcessExecutableLinkUnprivilegedOtherOwnerPermission,
         ProcessExecutableMetadataPermission,
         CmdlineParse,
@@ -526,8 +528,16 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
             "runtime-unknown-process-executable-link-deployment-owner-permission",
         ),
         (
-            Setup::ProcessExecutableLinkPrivilegedOtherOwnerPermission,
-            "runtime-unknown-process-executable-link-privileged-other-owner-permission",
+            Setup::ProcessExecutableLinkPrivilegedKernelOwnerPermission,
+            "runtime-unknown-process-executable-link-privileged-kernel-owner-permission",
+        ),
+        (
+            Setup::ProcessExecutableLinkPrivilegedUserspaceOwnerPermission,
+            "runtime-unknown-process-executable-link-privileged-userspace-owner-permission",
+        ),
+        (
+            Setup::ProcessExecutableLinkPrivilegedOwnerClassificationParse,
+            "runtime-unknown-process-executable-link-privileged-owner-classification-parse",
         ),
         (
             Setup::ProcessExecutableLinkUnprivilegedOtherOwnerPermission,
@@ -559,18 +569,37 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
                 .unwrap();
             }
             Setup::ProcessExecutableLinkDeploymentOwnerPermission
-            | Setup::ProcessExecutableLinkPrivilegedOtherOwnerPermission
+            | Setup::ProcessExecutableLinkPrivilegedKernelOwnerPermission
+            | Setup::ProcessExecutableLinkPrivilegedUserspaceOwnerPermission
+            | Setup::ProcessExecutableLinkPrivilegedOwnerClassificationParse
             | Setup::ProcessExecutableLinkUnprivilegedOtherOwnerPermission => {
                 let process = fixture.proc_root.join("424242");
                 std::fs::create_dir(&process).unwrap();
                 std::fs::write(process.join(".t050-test-exe-link-permission"), b"1").unwrap();
                 let owner = match setup {
-                    Setup::ProcessExecutableLinkPrivilegedOtherOwnerPermission => Some(0),
+                    Setup::ProcessExecutableLinkPrivilegedKernelOwnerPermission
+                    | Setup::ProcessExecutableLinkPrivilegedUserspaceOwnerPermission
+                    | Setup::ProcessExecutableLinkPrivilegedOwnerClassificationParse => Some(0),
                     Setup::ProcessExecutableLinkUnprivilegedOtherOwnerPermission => Some(u32::MAX),
                     _ => None,
                 };
                 if let Some(owner) = owner {
                     std::fs::write(process.join(".t050-test-uid"), owner.to_string()).unwrap();
+                }
+                let status = match setup {
+                    Setup::ProcessExecutableLinkPrivilegedKernelOwnerPermission => {
+                        Some("Kthread:\t1\n")
+                    }
+                    Setup::ProcessExecutableLinkPrivilegedUserspaceOwnerPermission => {
+                        Some("Kthread:\t0\n")
+                    }
+                    Setup::ProcessExecutableLinkPrivilegedOwnerClassificationParse => {
+                        Some("Kthread:\tunknown\n")
+                    }
+                    _ => None,
+                };
+                if let Some(status) = status {
+                    std::fs::write(process.join("status"), status).unwrap();
                 }
             }
             Setup::ProcessExecutableMetadataPermission => {

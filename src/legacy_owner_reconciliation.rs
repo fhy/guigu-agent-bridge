@@ -626,7 +626,9 @@ enum RuntimeUnknownArea {
     Identity,
     DeploymentMetadata,
     ProcessExecutableLinkDeploymentOwner,
-    ProcessExecutableLinkPrivilegedOtherOwner,
+    ProcessExecutableLinkPrivilegedKernelOwner,
+    ProcessExecutableLinkPrivilegedUserspaceOwner,
+    ProcessExecutableLinkPrivilegedOwnerClassification,
     ProcessExecutableLinkUnprivilegedOtherOwner,
     ProcessExecutableMetadata,
     Cmdline,
@@ -706,17 +708,43 @@ impl RuntimeAbsenceUnknown {
                 RuntimeUnknownReason::Parse,
             ) => "runtime-unknown-process-executable-link-deployment-owner-parse",
             (
-                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedOtherOwner,
+                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedKernelOwner,
                 RuntimeUnknownReason::Permission,
-            ) => "runtime-unknown-process-executable-link-privileged-other-owner-permission",
+            ) => "runtime-unknown-process-executable-link-privileged-kernel-owner-permission",
             (
-                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedOtherOwner,
+                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedKernelOwner,
                 RuntimeUnknownReason::Io,
-            ) => "runtime-unknown-process-executable-link-privileged-other-owner-io",
+            ) => "runtime-unknown-process-executable-link-privileged-kernel-owner-io",
             (
-                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedOtherOwner,
+                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedKernelOwner,
                 RuntimeUnknownReason::Parse,
-            ) => "runtime-unknown-process-executable-link-privileged-other-owner-parse",
+            ) => "runtime-unknown-process-executable-link-privileged-kernel-owner-parse",
+            (
+                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedUserspaceOwner,
+                RuntimeUnknownReason::Permission,
+            ) => "runtime-unknown-process-executable-link-privileged-userspace-owner-permission",
+            (
+                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedUserspaceOwner,
+                RuntimeUnknownReason::Io,
+            ) => "runtime-unknown-process-executable-link-privileged-userspace-owner-io",
+            (
+                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedUserspaceOwner,
+                RuntimeUnknownReason::Parse,
+            ) => "runtime-unknown-process-executable-link-privileged-userspace-owner-parse",
+            (
+                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedOwnerClassification,
+                RuntimeUnknownReason::Permission,
+            ) => {
+                "runtime-unknown-process-executable-link-privileged-owner-classification-permission"
+            }
+            (
+                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedOwnerClassification,
+                RuntimeUnknownReason::Io,
+            ) => "runtime-unknown-process-executable-link-privileged-owner-classification-io",
+            (
+                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedOwnerClassification,
+                RuntimeUnknownReason::Parse,
+            ) => "runtime-unknown-process-executable-link-privileged-owner-classification-parse",
             (
                 RuntimeUnknownArea::ProcessExecutableLinkUnprivilegedOtherOwner,
                 RuntimeUnknownReason::Permission,
@@ -763,28 +791,66 @@ impl RuntimeAbsenceUnknown {
     }
 }
 
+fn privileged_link_area(process: &Path) -> Result<RuntimeUnknownArea, RuntimeAbsenceUnknown> {
+    let status = std::fs::read_to_string(process.join("status")).map_err(|error| {
+        RuntimeAbsenceUnknown::io(
+            RuntimeUnknownArea::ProcessExecutableLinkPrivilegedOwnerClassification,
+            &error,
+        )
+    })?;
+    let mut kernel = None;
+    for line in status.lines() {
+        let Some(value) = line.strip_prefix("Kthread:") else {
+            continue;
+        };
+        if kernel.is_some() {
+            return Err(RuntimeAbsenceUnknown::parse(
+                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedOwnerClassification,
+            ));
+        }
+        kernel = match value.trim() {
+            "0" => Some(false),
+            "1" => Some(true),
+            _ => {
+                return Err(RuntimeAbsenceUnknown::parse(
+                    RuntimeUnknownArea::ProcessExecutableLinkPrivilegedOwnerClassification,
+                ));
+            }
+        };
+    }
+    match kernel {
+        Some(true) => Ok(RuntimeUnknownArea::ProcessExecutableLinkPrivilegedKernelOwner),
+        Some(false) => Ok(RuntimeUnknownArea::ProcessExecutableLinkPrivilegedUserspaceOwner),
+        None => Err(RuntimeAbsenceUnknown::parse(
+            RuntimeUnknownArea::ProcessExecutableLinkPrivilegedOwnerClassification,
+        )),
+    }
+}
+
 fn process_executable_metadata(
     process: &Path,
     process_uid: u32,
     config_uid: u32,
 ) -> Result<Option<std::fs::Metadata>, RuntimeAbsenceUnknown> {
     let executable = process.join("exe");
-    let link_area = if process_uid == config_uid {
-        RuntimeUnknownArea::ProcessExecutableLinkDeploymentOwner
-    } else if process_uid == 0 {
-        RuntimeUnknownArea::ProcessExecutableLinkPrivilegedOtherOwner
-    } else {
-        RuntimeUnknownArea::ProcessExecutableLinkUnprivilegedOtherOwner
+    let link_area = || {
+        if process_uid == config_uid {
+            Ok(RuntimeUnknownArea::ProcessExecutableLinkDeploymentOwner)
+        } else if process_uid == 0 {
+            privileged_link_area(process)
+        } else {
+            Ok(RuntimeUnknownArea::ProcessExecutableLinkUnprivilegedOtherOwner)
+        }
     };
     #[cfg(debug_assertions)]
     if process.join(".t050-test-exe-link-permission").exists() {
         let error = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
-        return Err(RuntimeAbsenceUnknown::io(link_area, &error));
+        return Err(RuntimeAbsenceUnknown::io(link_area()?, &error));
     }
     match std::fs::read_link(&executable) {
         Ok(_) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
-        Err(error) => return Err(RuntimeAbsenceUnknown::io(link_area, &error)),
+        Err(error) => return Err(RuntimeAbsenceUnknown::io(link_area()?, &error)),
     }
     match std::fs::metadata(executable) {
         Ok(metadata) => Ok(Some(metadata)),
@@ -1453,11 +1519,19 @@ mod tests {
         );
         assert_eq!(
             RuntimeAbsenceUnknown::io(
-                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedOtherOwner,
+                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedKernelOwner,
                 &permission,
             )
             .cause(),
-            "runtime-unknown-process-executable-link-privileged-other-owner-permission"
+            "runtime-unknown-process-executable-link-privileged-kernel-owner-permission"
+        );
+        assert_eq!(
+            RuntimeAbsenceUnknown::io(
+                RuntimeUnknownArea::ProcessExecutableLinkPrivilegedUserspaceOwner,
+                &permission,
+            )
+            .cause(),
+            "runtime-unknown-process-executable-link-privileged-userspace-owner-permission"
         );
         assert_eq!(
             RuntimeAbsenceUnknown::io(
