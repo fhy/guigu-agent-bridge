@@ -4,6 +4,7 @@ use std::os::unix::fs::OpenOptionsExt;
 #[cfg(test)]
 thread_local! {
     static FSYNC_EVENTS: std::cell::RefCell<Vec<&'static str>> = const { std::cell::RefCell::new(Vec::new()) };
+    static CONSTRUCTION_FAULT: std::cell::RefCell<Option<String>> = const { std::cell::RefCell::new(None) };
 }
 
 const DIRECTORY_MODE: u32 = 0o755;
@@ -34,6 +35,8 @@ struct CreatedDirectory {
     identity: Identity,
 }
 
+include!("bootstrap_pending.rs");
+
 pub(super) struct ProvisionLayout {
     artifact_dir: File,
     lock: File,
@@ -55,26 +58,45 @@ impl ProvisionLayout {
         let etc = trusted_root(etc_root, expected_uid)?;
         let libexec = trusted_root(libexec_root, expected_uid)?;
         let mut created = Vec::new();
-        let directories = (|| {
-            let bridge_etc = directory(&etc, "guigu-agent-bridge", expected_uid, &mut created)?;
-            let artifact_dir =
-                directory(&bridge_etc, "t050-proc-proof", expected_uid, &mut created)?;
-            directory(&libexec, "guigu-agent-bridge", expected_uid, &mut created)?;
+        let directories: Result<File, ConstructionFailure> = (|| {
+            let bridge_etc = directory(
+                &etc,
+                "guigu-agent-bridge",
+                "etc/guigu-agent-bridge",
+                expected_uid,
+                &mut created,
+            )?;
+            let artifact_dir = directory(
+                &bridge_etc,
+                "t050-proc-proof",
+                "etc/guigu-agent-bridge/t050-proc-proof",
+                expected_uid,
+                &mut created,
+            )?;
+            directory(
+                &libexec,
+                "guigu-agent-bridge",
+                "libexec/guigu-agent-bridge",
+                expected_uid,
+                &mut created,
+            )?;
             Ok(artifact_dir)
         })();
         let artifact_dir = match directories {
             Ok(directory) => directory,
-            Err(()) => {
+            Err(ConstructionFailure::Clean) => {
                 cleanup_directories(&mut created)?;
                 return Err(());
             }
+            Err(ConstructionFailure::Ambiguous) => return Err(()),
         };
         let (lock, lock_identity) = match create_lock(&artifact_dir, expected_uid) {
             Ok(lock) => lock,
-            Err(()) => {
+            Err(ConstructionFailure::Clean) => {
                 cleanup_directories(&mut created)?;
                 return Err(());
             }
+            Err(ConstructionFailure::Ambiguous) => return Err(()),
         };
         Ok(Self {
             artifact_dir,
@@ -162,54 +184,83 @@ fn open_directory(parent: &File, name: &CString) -> Result<File, ()> {
 fn directory(
     parent: &File,
     name: &str,
+    fault_label: &str,
     expected_uid: u32,
     created: &mut Vec<CreatedDirectory>,
-) -> Result<File, ()> {
-    let name = CString::new(name).map_err(|_| ())?;
-    let mut invocation_created = false;
+) -> Result<File, ConstructionFailure> {
+    let name = CString::new(name).map_err(|_| ConstructionFailure::Clean)?;
     let directory = match open_directory(parent, &name) {
         Ok(directory) => directory,
         Err(()) => {
             if unsafe { libc::mkdirat(parent.as_raw_fd(), name.as_ptr(), DIRECTORY_MODE) } != 0 {
-                return Err(());
+                return Err(ConstructionFailure::Clean);
             }
-            invocation_created = true;
-            match open_directory(parent, &name) {
+            let mut pending = PendingDirectory {
+                parent,
+                name,
+                identity: None,
+                armed: true,
+            };
+            if construction_fault(&format!("{fault_label}:after-mkdir")).is_err() {
+                return Err(pending.fail());
+            }
+            let directory = match open_directory(parent, &pending.name) {
                 Ok(directory) => directory,
-                Err(()) => return Err(()),
+                Err(()) => return Err(pending.fail()),
+            };
+            if construction_fault(&format!("{fault_label}:after-reopen")).is_err() {
+                return Err(pending.fail());
             }
+            let metadata = match directory.metadata() {
+                Ok(metadata) => metadata,
+                Err(_) => return Err(pending.fail()),
+            };
+            pending.identity = Some(Identity::from(&metadata));
+            if construction_fault(&format!("{fault_label}:after-metadata")).is_err() {
+                return Err(pending.fail());
+            }
+            let retained_parent = match parent.try_clone() {
+                Ok(parent) => parent,
+                Err(_) => return Err(pending.fail()),
+            };
+            if construction_fault(&format!("{fault_label}:after-clone")).is_err() {
+                return Err(pending.fail());
+            }
+            if !metadata.is_dir()
+                || metadata.uid() != expected_uid
+                || metadata.gid() != expected_uid
+                || metadata.mode() & 0o7777 != DIRECTORY_MODE
+            {
+                return Err(pending.fail());
+            }
+            created.push(CreatedDirectory {
+                parent: retained_parent,
+                name: pending.name.clone(),
+                identity: pending.identity.expect("pending identity is set"),
+            });
+            pending.armed = false;
+            if sync_parent(parent, "mkdir").is_err()
+                || construction_fault(&format!("{fault_label}:after-fsync")).is_err()
+            {
+                return Err(ConstructionFailure::Clean);
+            }
+            return Ok(directory);
         }
     };
-    let metadata = directory.metadata().map_err(|_| ())?;
-    let identity = Identity::from(&metadata);
-    if invocation_created {
-        let retained_parent = match parent.try_clone() {
-            Ok(parent) => parent,
-            Err(_) => {
-                let _ = remove_created_directory(parent, &name, identity);
-                return Err(());
-            }
-        };
-        created.push(CreatedDirectory {
-            parent: retained_parent,
-            name,
-            identity,
-        });
-    }
+    let metadata = directory
+        .metadata()
+        .map_err(|_| ConstructionFailure::Clean)?;
     if !metadata.is_dir()
         || metadata.uid() != expected_uid
         || metadata.gid() != expected_uid
         || metadata.mode() & 0o7777 != DIRECTORY_MODE
     {
-        return Err(());
-    }
-    if invocation_created {
-        sync_parent(parent, "mkdir")?;
+        return Err(ConstructionFailure::Clean);
     }
     Ok(directory)
 }
 
-fn create_lock(parent: &File, expected_uid: u32) -> Result<(File, Identity), ()> {
+fn create_lock(parent: &File, expected_uid: u32) -> Result<(File, Identity), ConstructionFailure> {
     let name = c".provision.lock";
     let fd = unsafe {
         libc::openat(
@@ -220,111 +271,50 @@ fn create_lock(parent: &File, expected_uid: u32) -> Result<(File, Identity), ()>
         )
     };
     if fd < 0 {
-        return Err(());
+        return Err(ConstructionFailure::Clean);
     }
-    let file = unsafe { File::from_raw_fd(fd) };
-    let validated = (|| {
-        let metadata = file.metadata().map_err(|_| ())?;
-        if !metadata.is_file()
-            || metadata.uid() != expected_uid
-            || metadata.gid() != expected_uid
-            || metadata.mode() & 0o7777 != LOCK_MODE
-            || metadata.nlink() != 1
-            || unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
-        {
-            return Err(());
-        }
-        sync_parent(parent, "lock-create")?;
-        Ok(Identity::from(&metadata))
-    })();
-    let identity = match validated {
-        Ok(identity) => identity,
-        Err(()) => {
-            let _ = remove_created_lock(parent, &file);
-            return Err(());
-        }
+    let mut pending = PendingLock {
+        parent,
+        file: Some(unsafe { File::from_raw_fd(fd) }),
+        identity: None,
+        armed: true,
     };
-    Ok((file, identity))
-}
-
-fn remove_created_lock(parent: &File, lock: &File) -> Result<(), ()> {
-    let retained = Identity::from(&lock.metadata().map_err(|_| ())?);
-    let current = current_identity(parent, c".provision.lock")?;
-    if current.device != retained.device || current.inode != retained.inode {
-        return Err(());
+    if construction_fault("lock:after-open").is_err() {
+        return Err(pending.fail());
     }
-    if unsafe { libc::unlinkat(parent.as_raw_fd(), c".provision.lock".as_ptr(), 0) } != 0 {
-        return Err(());
-    }
-    sync_parent(parent, "lock-create-rollback")
-}
-
-fn current_identity(parent: &File, name: &std::ffi::CStr) -> Result<Identity, ()> {
-    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
-    if unsafe {
-        libc::fstatat(
-            parent.as_raw_fd(),
-            name.as_ptr(),
-            metadata.as_mut_ptr(),
-            libc::AT_SYMLINK_NOFOLLOW,
-        )
-    } != 0
+    let metadata = match pending
+        .file
+        .as_ref()
+        .expect("pending lock exists")
+        .metadata()
     {
-        return Err(());
+        Ok(metadata) => metadata,
+        Err(_) => return Err(pending.fail()),
+    };
+    pending.identity = Some(Identity::from(&metadata));
+    if construction_fault("lock:after-metadata").is_err() {
+        return Err(pending.fail());
     }
-    let metadata = unsafe { metadata.assume_init() };
-    Ok(Identity {
-        device: metadata.st_dev,
-        inode: metadata.st_ino,
-    })
-}
-
-fn cleanup_lock(parent: &File, lock: &File, expected: Identity) -> Result<(), ()> {
-    let retained = lock.metadata().map_err(|_| ())?;
-    let current = current_identity(parent, c".provision.lock")?;
-    if !expected.matches(&retained)
-        || current.device != expected.device
-        || current.inode != expected.inode
+    let file = pending.file.as_ref().expect("pending lock exists");
+    if !metadata.is_file()
+        || metadata.uid() != expected_uid
+        || metadata.gid() != expected_uid
+        || metadata.mode() & 0o7777 != LOCK_MODE
+        || metadata.nlink() != 1
+        || unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0
     {
-        return Err(());
+        return Err(pending.fail());
     }
-    if unsafe { libc::unlinkat(parent.as_raw_fd(), c".provision.lock".as_ptr(), 0) } != 0 {
-        return Err(());
+    if construction_fault("lock:after-flock").is_err() {
+        return Err(pending.fail());
     }
-    sync_parent(parent, "lock-unlink")
+    if sync_parent(parent, "lock-create").is_err() {
+        return Err(pending.fail());
+    }
+    if construction_fault("lock:after-fsync").is_err() {
+        return Err(pending.fail());
+    }
+    Ok(pending.promote())
 }
 
-fn cleanup_directories(created: &mut Vec<CreatedDirectory>) -> Result<(), ()> {
-    while let Some(directory) = created.pop() {
-        remove_created_directory(&directory.parent, &directory.name, directory.identity)?;
-    }
-    Ok(())
-}
-
-fn remove_created_directory(
-    parent: &File,
-    name: &std::ffi::CStr,
-    identity: Identity,
-) -> Result<(), ()> {
-    let current = current_identity(parent, name)?;
-    if current.device != identity.device || current.inode != identity.inode {
-        return Err(());
-    }
-    if unsafe { libc::unlinkat(parent.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-        return Err(());
-    }
-    sync_parent(parent, "directory-unlink")
-}
-
-fn sync_parent(parent: &File, event: &'static str) -> Result<(), ()> {
-    parent.sync_all().map_err(|_| ())?;
-    #[cfg(test)]
-    FSYNC_EVENTS.with(|events| events.borrow_mut().push(event));
-    let _ = event;
-    Ok(())
-}
-
-#[cfg(test)]
-pub(super) fn take_fsync_events() -> Vec<&'static str> {
-    FSYNC_EVENTS.with(|events| std::mem::take(&mut *events.borrow_mut()))
-}
+include!("bootstrap_cleanup.rs");

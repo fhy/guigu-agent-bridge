@@ -1,4 +1,4 @@
-use super::bootstrap::{ProvisionLayout, take_fsync_events};
+use super::bootstrap::{ProvisionLayout, set_construction_fault, take_fsync_events};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 
@@ -47,6 +47,13 @@ fn mode(path: &Path) -> u32 {
         .permissions()
         .mode()
         & 0o7777
+}
+
+fn acquire_with_fault(roots: &Roots, stage: &str) -> Result<ProvisionLayout, ()> {
+    set_construction_fault(Some(stage));
+    let result = roots.acquire();
+    set_construction_fault(None);
+    result
 }
 
 #[test]
@@ -190,4 +197,81 @@ fn directory_replacement_is_preserved_after_owned_lock_cleanup() {
     );
     assert!(displaced.is_dir());
     assert!(!displaced.join(".provision.lock").exists());
+}
+
+#[test]
+fn every_directory_construction_boundary_cleans_the_owned_tree() {
+    for component in [
+        "etc/guigu-agent-bridge",
+        "etc/guigu-agent-bridge/t050-proc-proof",
+        "libexec/guigu-agent-bridge",
+    ] {
+        for boundary in [
+            "after-mkdir",
+            "after-reopen",
+            "after-metadata",
+            "after-clone",
+            "after-fsync",
+        ] {
+            let roots = Roots::new();
+            let stage = format!("{component}:{boundary}");
+            assert!(acquire_with_fault(&roots, &stage).is_err(), "{stage}");
+            assert!(!roots.etc.join("guigu-agent-bridge").exists(), "{stage}");
+            assert!(!roots.helper_dir().exists(), "{stage}");
+        }
+    }
+}
+
+#[test]
+fn every_lock_construction_boundary_cleans_lock_and_owned_tree() {
+    for stage in [
+        "lock:after-open",
+        "lock:after-metadata",
+        "lock:after-flock",
+        "lock:after-fsync",
+    ] {
+        let roots = Roots::new();
+        assert!(acquire_with_fault(&roots, stage).is_err(), "{stage}");
+        assert!(!roots.artifact_dir().join(".provision.lock").exists());
+        assert!(!roots.etc.join("guigu-agent-bridge").exists());
+        assert!(!roots.helper_dir().exists());
+    }
+}
+
+#[test]
+fn pending_cleanup_ambiguity_stops_without_touching_contents() {
+    for stage in ["directory-cleanup-inspect", "directory-cleanup-unlink"] {
+        let roots = Roots::new();
+        let faults = format!("etc/guigu-agent-bridge:after-mkdir,{stage}");
+        set_construction_fault(Some(&faults));
+        assert!(roots.acquire().is_err(), "{stage}");
+        set_construction_fault(None);
+        assert!(roots.etc.join("guigu-agent-bridge").is_dir(), "{stage}");
+        assert!(!roots.helper_dir().exists(), "{stage}");
+    }
+
+    let roots = Roots::new();
+    set_construction_fault(Some("lock:after-open,lock-cleanup-unlink"));
+    assert!(roots.acquire().is_err());
+    set_construction_fault(None);
+    assert!(roots.artifact_dir().join(".provision.lock").is_file());
+    assert!(roots.helper_dir().is_dir());
+
+    let roots = Roots::new();
+    set_construction_fault(Some(
+        "etc/guigu-agent-bridge/t050-proc-proof:after-mkdir,directory-cleanup-fsync",
+    ));
+    assert!(roots.acquire().is_err());
+    set_construction_fault(None);
+    assert!(roots.etc.join("guigu-agent-bridge").is_dir());
+    assert!(!roots.artifact_dir().exists());
+    assert!(!roots.helper_dir().exists());
+
+    let roots = Roots::new();
+    set_construction_fault(Some("lock:after-open,lock-cleanup-fsync"));
+    assert!(roots.acquire().is_err());
+    set_construction_fault(None);
+    assert!(!roots.artifact_dir().join(".provision.lock").exists());
+    assert!(roots.artifact_dir().is_dir());
+    assert!(roots.helper_dir().is_dir());
 }
