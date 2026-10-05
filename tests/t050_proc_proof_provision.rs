@@ -1,4 +1,11 @@
-use std::{os::unix::fs::PermissionsExt, path::Path, process::Command};
+use std::{
+    os::{
+        fd::AsRawFd,
+        unix::{fs::PermissionsExt, process::CommandExt},
+    },
+    path::Path,
+    process::Command,
+};
 
 fn file(path: &Path, bytes: &[u8], mode: u32) {
     std::fs::write(path, bytes).unwrap();
@@ -165,4 +172,52 @@ fn hostile_preexisting_leaves_are_untouched() {
     );
     assert!(manifest.is_symlink());
     assert_eq!(std::fs::read(&target).unwrap(), b"outside");
+}
+
+#[test]
+fn policy_staging_emits_only_canonical_bytes_and_is_repeatable() {
+    let (temp, args) = fixture();
+    let input = temp.path().join("input");
+    let output1 = temp.path().join("policy-1");
+    let output2 = temp.path().join("policy-2");
+    let parent = input.join("parent");
+    let helper = input.join("helper");
+    let config = input.join("config.toml");
+    let database = input.join("database");
+    let stage = [
+        "stage-policy",
+        "--parent",
+        parent.to_str().unwrap(),
+        "--helper",
+        helper.to_str().unwrap(),
+        "--config",
+        config.to_str().unwrap(),
+        "--database-root",
+        database.to_str().unwrap(),
+    ];
+    for output in [&output1, &output2] {
+        let file = std::fs::File::create(output).unwrap();
+        let fd = file.as_raw_fd();
+        let mut command = Command::new(binary());
+        command.args(stage);
+        unsafe {
+            command.pre_exec(move || {
+                if libc::dup2(fd, 3) < 0 {
+                    Err(std::io::Error::last_os_error())
+                } else {
+                    libc::fcntl(3, libc::F_SETFD, 0);
+                    Ok(())
+                }
+            });
+        }
+        let status = command.status().unwrap();
+        assert!(status.success());
+    }
+    assert_eq!(
+        std::fs::read(&output1).unwrap(),
+        std::fs::read(&output2).unwrap()
+    );
+    assert_eq!(&std::fs::read(&output1).unwrap()[..8], b"GGPFP001");
+    assert!(!temp.path().join("fixture-root").exists());
+    drop(args);
 }
