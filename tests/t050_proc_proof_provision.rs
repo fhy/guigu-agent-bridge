@@ -121,3 +121,31 @@ fn failure_points_roll_back_and_system_roots_are_refused() {
     );
     drop(temp);
 }
+
+#[test]
+fn production_mode_has_fixed_interface_and_refuses_overrides() {
+    assert_eq!(
+        Command::new(binary())
+            .args(["production-provision", "--root", "/tmp/override"])
+            .status()
+            .unwrap()
+            .code(),
+        Some(3)
+    );
+    assert_eq!(
+        Command::new(binary())
+            .args(["production-provision", "--parent-sha", "00"])
+            .status()
+            .unwrap()
+            .code(),
+        Some(3)
+    );
+    assert_eq!(
+        Command::new(binary())
+            .args(["production-teardown", "--root", "/tmp/override"])
+            .status()
+            .unwrap()
+            .code(),
+        Some(3)
+    );
+}

@@ -24,6 +24,42 @@ fn value(args: &mut impl Iterator<Item = String>, flag: &str) -> PathBuf {
 fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
+        Some("production-provision") => {
+            let parent = match (args.next(), args.next()) {
+                (Some(flag), value) if flag == "--parent-sha" => value,
+                _ => None,
+            };
+            let helper = match (args.next(), args.next()) {
+                (Some(flag), value) if flag == "--helper-sha" => value,
+                _ => None,
+            };
+            let policy = match (args.next(), args.next()) {
+                (Some(flag), value) if flag == "--policy-sha" => value,
+                _ => None,
+            };
+            if args.next().is_some() {
+                std::process::exit(3);
+            }
+            let (Some(parent), Some(helper), Some(policy)) = (parent, helper, policy) else {
+                std::process::exit(3)
+            };
+            if guigu_agent_bridge::privileged_proc_proof::provision_production(
+                &parent, &helper, &policy, 3,
+            )
+            .is_err()
+            {
+                std::process::exit(3);
+            }
+            println!("production provisioning complete");
+        }
+        Some("production-teardown") => {
+            if args.next().is_some()
+                || guigu_agent_bridge::privileged_proc_proof::teardown_production().is_err()
+            {
+                std::process::exit(3);
+            }
+            println!("production teardown complete");
+        }
         Some("provision") => {
             let mut root = None;
             let mut parent = None;
