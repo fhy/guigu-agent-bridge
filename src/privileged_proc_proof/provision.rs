@@ -1,8 +1,5 @@
-// SPLIT_PROVISION
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
-
-const PROVISION_LOCK_PATH: &str = "/etc/guigu-agent-bridge/t050-proc-proof/.provision.lock";
 
 fn fixture_path(root: &Path, suffix: &str) -> Result<PathBuf, ()> {
     if !root.is_absolute() || root == Path::new("/") || suffix.contains("..") {
@@ -79,7 +76,11 @@ fn read_policy_fd(fd: RawFd, expected: [u8; 32]) -> Result<(Policy, Vec<u8>), ()
 
 #[allow(clippy::result_unit_err)]
 pub fn provision_production(parent_hash: &str, helper_hash: &str, policy_hash: &str, policy_fd: RawFd) -> Result<(), ()> {
-    provision_production_inner(parent_hash, helper_hash, policy_hash, policy_fd)
+    if unsafe { libc::geteuid() } != 0 || policy_fd < 0 { return Err(()); }
+    let layout = bootstrap::ProvisionLayout::production()?;
+    let result = provision_production_inner(parent_hash, helper_hash, policy_hash, policy_fd);
+    let cleanup = layout.finish(result.is_ok());
+    result.and(cleanup)
 }
 
 fn leaf_absent(path: &Path) -> Result<(), ()> {
@@ -124,16 +125,6 @@ fn replacement_hook(stage: &str) -> Result<(), ()> {
     if std::env::var("T050_PRODUCTION_REPLACE_AT").ok().as_deref() == Some(stage) { Err(()) } else { Ok(()) }
 }
 
-fn acquire_provision_lock() -> Result<File, ()> {
-    let parent = Path::new(PROVISION_LOCK_PATH).parent().ok_or(())?;
-    let meta = std::fs::symlink_metadata(parent).map_err(|_| ())?;
-    use std::os::unix::fs::MetadataExt;
-    if !meta.is_dir() || meta.uid() != 0 || meta.mode() & 0o022 != 0 { return Err(()); }
-    let lock = OpenOptions::new().read(true).write(true).create(true).truncate(false).mode(0o600).open(PROVISION_LOCK_PATH).map_err(|_| ())?;
-    if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 { return Err(()); }
-    Ok(lock)
-}
-
 fn rename_noreplace(dir: &File, from: &str, to: &str) -> Result<(), ()> {
     let from = std::ffi::CString::new(from).map_err(|_| ())?;
     let to = std::ffi::CString::new(to).map_err(|_| ())?;
@@ -147,8 +138,6 @@ fn unlinkat_leaf(dir: &File, name: &str) -> Result<(), ()> {
 fn fsync_dir(dir: &File) -> Result<(), ()> { dir.sync_all().map_err(|_| ()) }
 
 fn provision_production_inner(parent_hash: &str, helper_hash: &str, policy_hash: &str, policy_fd: RawFd) -> Result<(), ()> {
-    if unsafe { libc::geteuid() } != 0 || policy_fd < 0 { return Err(()); }
-    let _lock = acquire_provision_lock()?;
     let expected_parent = parse_hash(parent_hash)?;
     let expected_helper = parse_hash(helper_hash)?;
     let expected_policy = parse_hash(policy_hash)?;
@@ -166,7 +155,6 @@ fn provision_production_inner(parent_hash: &str, helper_hash: &str, policy_hash:
     validate_system_path(Path::new(HELPER_PATH))?;
     validate_system_path(Path::new(POLICY_PATH))?;
     let helper_bytes = std::fs::read(helper_source).map_err(|_| ())?;
-    std::fs::create_dir_all(artifact_root).map_err(|_| ())?;
     write_exclusive(Path::new(POLICY_PATH), &policy_bytes, 0o644)?;
     let policy_identity = metadata_identity(Path::new(POLICY_PATH))?;
     let mut helper = OpenOptions::new().write(true).create_new(true).mode(0o750).open(HELPER_PATH).map_err(|_| ())?;
@@ -193,7 +181,13 @@ fn provision_production_inner(parent_hash: &str, helper_hash: &str, policy_hash:
 #[allow(clippy::result_unit_err)]
 pub fn teardown_production(parent_hash: &str, helper_hash: &str, policy_hash: &str, generation: u64) -> Result<(), ()> {
     if unsafe { libc::geteuid() } != 0 { return Err(()); }
-    let _lock = acquire_provision_lock()?;
+    let layout = bootstrap::ProvisionLayout::production()?;
+    let result = teardown_production_inner(parent_hash, helper_hash, policy_hash, generation);
+    let cleanup = layout.finish(result.is_ok());
+    result.and(cleanup)
+}
+
+fn teardown_production_inner(parent_hash: &str, helper_hash: &str, policy_hash: &str, generation: u64) -> Result<(), ()> {
     let parent_hash = parse_hash(parent_hash)?;
     let helper_hash = parse_hash(helper_hash)?;
     let policy_hash = parse_hash(policy_hash)?;
@@ -272,124 +266,4 @@ fn write_exclusive(path: &Path, bytes: &[u8], mode: u32) -> Result<(), ()> {
         .map_err(|_| ())?;
     file.write_all(bytes).map_err(|_| ())?;
     file.sync_all().map_err(|_| ())
-}
-
-#[allow(clippy::result_unit_err)]
-pub fn provision_temp_fixture(paths: &FixturePaths, generation: u64) -> Result<(), ()> {
-    let artifact_root = fixture_path(&paths.root, "etc/guigu-agent-bridge/t050-proc-proof")?;
-    let targets = [
-        artifact_root.join("artifacts.v1"),
-        artifact_root.join("policy.v1"),
-        fixture_path(&paths.root, "usr/libexec/guigu-agent-bridge/t050-proc-proof")?,
-    ];
-    if targets.iter().any(|path| std::fs::symlink_metadata(path).is_ok()) { return Err(()); }
-    let result = provision_temp_fixture_inner(paths, generation);
-    if result.is_err() {
-        let _ = teardown_temp_fixture(&paths.root);
-    }
-    result
-}
-
-fn provision_temp_fixture_inner(paths: &FixturePaths, generation: u64) -> Result<(), ()> {
-    if generation == 0 || paths.root.starts_with("/etc") || paths.root.starts_with("/usr") {
-        return Err(());
-    }
-    let artifact_root = fixture_path(&paths.root, "etc/guigu-agent-bridge/t050-proc-proof")?;
-    let helper_target = fixture_path(&paths.root, "usr/libexec/guigu-agent-bridge/t050-proc-proof")?;
-    let manifest_target = artifact_root.join("artifacts.v1");
-    let policy_target = artifact_root.join("policy.v1");
-    if manifest_target.exists() || policy_target.exists() || helper_target.exists() {
-        return Err(());
-    }
-    std::fs::create_dir_all(&artifact_root).map_err(|_| ())?;
-    std::fs::create_dir_all(helper_target.parent().ok_or(())?).map_err(|_| ())?;
-    let parent = metadata_identity(&paths.parent)?;
-    let config = metadata_identity(&paths.config)?;
-    let database_root = metadata_identity(&paths.database_root)?;
-    let helper_source = metadata_identity(&paths.helper)?;
-    let operator_uid = parent.uid;
-    let operator_gid = parent.gid;
-    if parent.mode != 0o755 || helper_source.mode != 0o755 || database_root.file_type != libc::S_IFDIR {
-        return Err(());
-    }
-    let policy = Policy {
-        operator_uid,
-        operator_gid,
-        binary: FileIdentity { path: parent.path.clone(), ..parent.clone() },
-        config: FileIdentity { path: config.path.clone(), ..config.clone() },
-        database_root: FileIdentity { path: database_root.path.clone(), ..database_root.clone() },
-        admission_lock: b".runtime-admission.lock".to_vec(),
-        unit: b"guigu-codex-test.service".to_vec(),
-        ports: [9291, 9292],
-    };
-    let policy_bytes = policy.encode();
-    let helper_hash = hash_file(&paths.helper)?;
-    let policy_hash: [u8; 32] = Sha256::digest(&policy_bytes).into();
-    let manifest = ArtifactManifest {
-        source_commit: SOURCE_COMMIT,
-        build_identity: BUILD_IDENTITY,
-        parent_hash: hash_file(&paths.parent)?,
-        helper_hash,
-        policy_hash,
-        parent_uid: parent.uid,
-        parent_gid: parent.gid,
-        parent_mode: parent.mode,
-        helper_uid: 0,
-        helper_gid: operator_gid,
-        helper_mode: 0o750,
-        capability_permitted: 1 << 19,
-        capability_inheritable: 0,
-        capability_flags: 1,
-        policy_uid: 0,
-        policy_gid: 0,
-        policy_mode: 0o644,
-        generation,
-    };
-    let helper_bytes = std::fs::read(&paths.helper).map_err(|_| ())?;
-    write_exclusive(&policy_target, &policy_bytes, 0o644)?;
-    failpoint("after-policy")?;
-    write_exclusive(&helper_target, &helper_bytes, 0o750)?;
-    std::fs::set_permissions(&helper_target, std::os::unix::fs::PermissionsExt::from_mode(0o750)).map_err(|_| ())?;
-    failpoint("after-helper")?;
-    let directory = OpenOptions::new().read(true).open(&artifact_root).map_err(|_| ())?;
-    directory.sync_all().map_err(|_| ())?;
-    failpoint("before-manifest")?;
-    write_exclusive(&manifest_target, &manifest.encode(), 0o644)?;
-    directory.sync_all().map_err(|_| ())?;
-    failpoint("after-manifest")
-}
-
-fn failpoint(stage: &str) -> Result<(), ()> {
-    #[cfg(debug_assertions)]
-    if std::env::var("T050_PROVISION_TEST_FAIL").ok().as_deref() == Some(stage) { return Err(()); }
-    let _ = stage;
-    Ok(())
-}
-
-#[allow(clippy::result_unit_err)]
-pub fn teardown_temp_fixture(root: &Path) -> Result<(), ()> {
-    let artifact_root = fixture_path(root, "etc/guigu-agent-bridge/t050-proc-proof")?;
-    let helper = fixture_path(root, "usr/libexec/guigu-agent-bridge/t050-proc-proof")?;
-    let manifest = artifact_root.join("artifacts.v1");
-    let policy = artifact_root.join("policy.v1");
-    if manifest.exists() { std::fs::rename(&manifest, artifact_root.join("artifacts.v1.quarantine")).map_err(|_| ())?; }
-    if artifact_root.exists() { OpenOptions::new().read(true).open(&artifact_root).map_err(|_| ())?.sync_all().map_err(|_| ())?; }
-    if policy.exists() { std::fs::remove_file(&policy).map_err(|_| ())?; }
-    if helper.exists() {
-        let file = OpenOptions::new().read(true).write(true).open(&helper).map_err(|_| ())?;
-        let name = c"security.capability";
-        let size = unsafe { libc::fgetxattr(file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
-        if size >= 0 {
-            if unsafe { libc::fremovexattr(file.as_raw_fd(), name.as_ptr()) } != 0 { return Err(()); }
-        } else if std::io::Error::last_os_error().raw_os_error() != Some(libc::ENODATA) {
-            return Err(())
-        }
-        file.sync_all().map_err(|_| ())?;
-        drop(file);
-        std::fs::remove_file(&helper).map_err(|_| ())?;
-    }
-    if artifact_root.join("artifacts.v1.quarantine").exists() { std::fs::remove_file(artifact_root.join("artifacts.v1.quarantine")).map_err(|_| ())?; }
-    if manifest.exists() || policy.exists() || helper.exists() { return Err(()); }
-    if artifact_root.exists() { OpenOptions::new().read(true).open(&artifact_root).map_err(|_| ())?.sync_all().map_err(|_| ())?; }
-    Ok(())
 }

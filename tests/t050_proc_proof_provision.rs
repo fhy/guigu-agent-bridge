@@ -48,6 +48,14 @@ fn binary() -> &'static str {
     env!("CARGO_BIN_EXE_provision-isolated-proc-proof-fixture")
 }
 
+fn assert_lock_absent(root: &Path) {
+    assert!(
+        !root
+            .join("etc/guigu-agent-bridge/t050-proc-proof/.provision.lock")
+            .exists()
+    );
+}
+
 #[test]
 fn manifest_last_repeat_refusal_and_manifest_first_teardown_are_bounded() {
     let (temp, args) = fixture();
@@ -70,10 +78,12 @@ fn manifest_last_repeat_refusal_and_manifest_first_teardown_are_bounded() {
         std::fs::metadata(&helper).unwrap().permissions().mode() & 0o777,
         0o750
     );
+    assert_lock_absent(&root);
     assert_eq!(
         Command::new(binary()).args(&args).status().unwrap().code(),
         Some(3)
     );
+    assert_lock_absent(&root);
     assert!(
         Command::new(binary())
             .args(["teardown", "--root", root.to_str().unwrap()])
@@ -82,6 +92,11 @@ fn manifest_last_repeat_refusal_and_manifest_first_teardown_are_bounded() {
             .success()
     );
     assert!(!manifest.exists() && !policy.exists() && !helper.exists());
+    assert_lock_absent(&root);
+    assert_eq!(
+        std::fs::metadata(&artifacts).unwrap().permissions().mode() & 0o777,
+        0o755
+    );
 }
 
 #[test]
@@ -108,6 +123,9 @@ fn failure_points_roll_back_and_system_roots_are_refused() {
                 .join("etc/guigu-agent-bridge/t050-proc-proof/artifacts.v1")
                 .exists()
         );
+        assert_lock_absent(&root);
+        assert!(!root.join("etc/guigu-agent-bridge").exists());
+        assert!(!root.join("usr/libexec/guigu-agent-bridge").exists());
         assert!(
             !root
                 .join("etc/guigu-agent-bridge/t050-proc-proof/policy.v1")
@@ -172,6 +190,7 @@ fn hostile_preexisting_leaves_are_untouched() {
     );
     assert!(manifest.is_symlink());
     assert_eq!(std::fs::read(&target).unwrap(), b"outside");
+    assert_lock_absent(&root);
 }
 
 #[test]

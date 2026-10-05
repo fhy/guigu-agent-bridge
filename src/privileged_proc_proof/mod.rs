@@ -90,11 +90,15 @@ pub struct Policy {
 }
 
 include!("codec.rs");
+mod bootstrap;
+#[cfg(test)]
+mod bootstrap_tests;
 mod stage;
 pub use stage::{
     FixturePaths, PRODUCTION_HELPER_SOURCE, PRODUCTION_PARENT_SOURCE, StageCause, stage_policy,
 };
 include!("provision.rs");
+include!("provision_temp.rs");
 include!("protocol.rs");
 include!("proc_lookup.rs");
 include!("scan.rs");
