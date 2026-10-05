@@ -105,6 +105,31 @@ fn remove_owned(path: &Path, expected: &FileIdentity) -> Result<(), ()> {
     std::fs::remove_file(path).map_err(|_| ())
 }
 
+fn open_leaf_fd(parent: &File, name: &str, write: bool) -> Result<File, ()> {
+    let name = std::ffi::CString::new(name).map_err(|_| ())?;
+    #[repr(C)] struct T050OpenHow { flags: u64, mode: u64, resolve: u64 }
+    let how = T050OpenHow { flags: (if write { libc::O_RDWR } else { libc::O_RDONLY } | libc::O_CLOEXEC) as u64, mode: 0, resolve: 0x08 | 0x04 | 0x02 };
+    let fd = unsafe { libc::syscall(libc::SYS_openat2, parent.as_raw_fd(), name.as_ptr(), &how, std::mem::size_of::<OpenHow>()) };
+    if fd < 0 { return Err(()); }
+    Ok(unsafe { File::from_raw_fd(fd as RawFd) })
+}
+
+fn fd_bytes(file: &mut File, max: usize) -> Result<Vec<u8>, ()> {
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0)).map_err(|_| ())?;
+    let before = file.metadata().map_err(|_| ())?;
+    if !before.is_file() || before.len() > max as u64 { return Err(()); }
+    let mut bytes = Vec::new();
+    file.take((max + 1) as u64).read_to_end(&mut bytes).map_err(|_| ())?;
+    let after = file.metadata().map_err(|_| ())?;
+    if bytes.len() as u64 != before.len() || before.dev() != after.dev() || before.ino() != after.ino() { return Err(()); }
+    Ok(bytes)
+}
+
+fn replacement_hook(stage: &str) -> Result<(), ()> {
+    if std::env::var("T050_PRODUCTION_REPLACE_AT").ok().as_deref() == Some(stage) { Err(()) } else { Ok(()) }
+}
+
 fn provision_production_inner(parent_hash: &str, helper_hash: &str, policy_hash: &str, policy_fd: RawFd) -> Result<(), ()> {
     if unsafe { libc::geteuid() } != 0 || policy_fd < 0 { return Err(()); }
     let expected_parent = parse_hash(parent_hash)?;
@@ -154,33 +179,40 @@ pub fn teardown_production(parent_hash: &str, helper_hash: &str, policy_hash: &s
     let parent_hash = parse_hash(parent_hash)?;
     let helper_hash = parse_hash(helper_hash)?;
     let policy_hash = parse_hash(policy_hash)?;
-    let manifest_bytes = std::fs::read(MANIFEST_PATH).map_err(|_| ())?;
+    let artifact_root = OpenOptions::new().read(true).open("/etc/guigu-agent-bridge/t050-proc-proof").map_err(|_| ())?;
+    let helper_root = OpenOptions::new().read(true).open("/usr/libexec/guigu-agent-bridge").map_err(|_| ())?;
+    let mut manifest_file = open_leaf_fd(&artifact_root, "artifacts.v1", false)?;
+    let mut policy_file = open_leaf_fd(&artifact_root, "policy.v1", false)?;
+    let mut helper_file = open_leaf_fd(&helper_root, "t050-proc-proof", true)?;
+    replacement_hook("pre-hash")?;
+    let manifest_bytes = fd_bytes(&mut manifest_file, 4096)?;
     let manifest = ArtifactManifest::decode(&manifest_bytes)?;
     if manifest.parent_hash != parent_hash || manifest.helper_hash != helper_hash || manifest.policy_hash != policy_hash || manifest.generation != generation { return Err(()); }
+    let policy_bytes = fd_bytes(&mut policy_file, MAX_POLICY_SIZE)?;
+    if <[u8; 32]>::from(Sha256::digest(&policy_bytes)) != policy_hash { return Err(()); }
+    let helper_bytes = fd_bytes(&mut helper_file, 64 * 1024 * 1024)?;
+    if <[u8; 32]>::from(Sha256::digest(&helper_bytes)) != helper_hash { return Err(()); }
+    let quarantine = Path::new("/etc/guigu-agent-bridge/t050-proc-proof/artifacts.v1.quarantine");
+    leaf_absent(quarantine)?;
     let manifest_identity = metadata_identity(Path::new(MANIFEST_PATH))?;
     let policy_identity = metadata_identity(Path::new(POLICY_PATH))?;
     let helper_identity = metadata_identity(Path::new(HELPER_PATH))?;
-    if hash_file(Path::new(POLICY_PATH))? != policy_hash || hash_file(Path::new(HELPER_PATH))? != helper_hash { return Err(()); }
-    if !Path::new(HELPER_PATH).is_file() || !Path::new(POLICY_PATH).is_file() { return Err(()); }
-    let artifact_root = Path::new(POLICY_PATH).parent().ok_or(())?;
-    let quarantine = artifact_root.join("artifacts.v1.quarantine");
-    leaf_absent(&quarantine)?;
     same_leaf(Path::new(MANIFEST_PATH), &manifest_identity)?;
-    std::fs::rename(MANIFEST_PATH, &quarantine).map_err(|_| ())?;
-    if same_leaf(&quarantine, &manifest_identity).is_err() { return Err(()); }
+    replacement_hook("pre-rename")?;
+    std::fs::rename(MANIFEST_PATH, quarantine).map_err(|_| ())?;
+    if same_leaf(quarantine, &manifest_identity).is_err() { return Err(()); }
     remove_owned(Path::new(POLICY_PATH), &policy_identity)?;
-    if Path::new(HELPER_PATH).exists() {
-        let helper = OpenOptions::new().read(true).write(true).open(HELPER_PATH).map_err(|_| ())?;
-        let name = c"security.capability";
-        let size = unsafe { libc::fgetxattr(helper.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
-        if size >= 0 && unsafe { libc::fremovexattr(helper.as_raw_fd(), name.as_ptr()) } != 0 { return Err(()); }
-        if capability_tuple(&helper)? != (0, 0, 0) { return Err(()); }
-        helper.sync_all().map_err(|_| ())?;
-        drop(helper);
-        remove_owned(Path::new(HELPER_PATH), &helper_identity)?;
-    }
-    remove_owned(&quarantine, &manifest_identity)?;
-    OpenOptions::new().read(true).open(artifact_root).map_err(|_| ())?.sync_all().map_err(|_| ())?;
+    replacement_hook("pre-capability-removal")?;
+    let name = c"security.capability";
+    let size = unsafe { libc::fgetxattr(helper_file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
+    if size >= 0 && unsafe { libc::fremovexattr(helper_file.as_raw_fd(), name.as_ptr()) } != 0 { return Err(()); }
+    if capability_tuple(&helper_file)? != (0, 0, 0) { return Err(()); }
+    helper_file.sync_all().map_err(|_| ())?;
+    drop(helper_file);
+    replacement_hook("pre-unlink")?;
+    remove_owned(Path::new(HELPER_PATH), &helper_identity)?;
+    remove_owned(quarantine, &manifest_identity)?;
+    OpenOptions::new().read(true).open(Path::new("/etc/guigu-agent-bridge/t050-proc-proof")).map_err(|_| ())?.sync_all().map_err(|_| ())?;
     if let Some(parent) = Path::new(HELPER_PATH).parent() {
         OpenOptions::new().read(true).open(parent).map_err(|_| ())?.sync_all().map_err(|_| ())?;
     }
