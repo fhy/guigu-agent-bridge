@@ -96,6 +96,8 @@ mod bootstrap;
 #[cfg(test)]
 mod bootstrap_tests;
 mod publication;
+#[cfg(test)]
+mod publication_tests;
 mod stage;
 pub use stage::{
     FixturePaths, PRODUCTION_HELPER_SOURCE, PRODUCTION_PARENT_SOURCE, StageCause, stage_policy,
