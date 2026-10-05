@@ -149,3 +149,20 @@ fn production_mode_has_fixed_interface_and_refuses_overrides() {
         Some(3)
     );
 }
+
+#[test]
+fn hostile_preexisting_leaves_are_untouched() {
+    let (temp, args) = fixture();
+    let root = temp.path().join("fixture-root");
+    let manifest = root.join("etc/guigu-agent-bridge/t050-proc-proof/artifacts.v1");
+    std::fs::create_dir_all(manifest.parent().unwrap()).unwrap();
+    let target = temp.path().join("outside");
+    std::fs::write(&target, b"outside").unwrap();
+    std::os::unix::fs::symlink(&target, &manifest).unwrap();
+    assert_eq!(
+        Command::new(binary()).args(&args).status().unwrap().code(),
+        Some(3)
+    );
+    assert!(manifest.is_symlink());
+    assert_eq!(std::fs::read(&target).unwrap(), b"outside");
+}

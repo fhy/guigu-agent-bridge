@@ -85,9 +85,24 @@ fn read_policy_fd(fd: RawFd, expected: [u8; 32]) -> Result<(Policy, Vec<u8>), ()
 
 #[allow(clippy::result_unit_err)]
 pub fn provision_production(parent_hash: &str, helper_hash: &str, policy_hash: &str, policy_fd: RawFd) -> Result<(), ()> {
-    let result = provision_production_inner(parent_hash, helper_hash, policy_hash, policy_fd);
-    if result.is_err() { let _ = teardown_production(); }
-    result
+    provision_production_inner(parent_hash, helper_hash, policy_hash, policy_fd)
+}
+
+fn leaf_absent(path: &Path) -> Result<(), ()> {
+    match std::fs::symlink_metadata(path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        _ => Err(()),
+    }
+}
+
+fn same_leaf(path: &Path, expected: &FileIdentity) -> Result<(), ()> {
+    let actual = metadata_identity(path)?;
+    if actual.device == expected.device && actual.inode == expected.inode && actual.file_type == libc::S_IFREG { Ok(()) } else { Err(()) }
+}
+
+fn remove_owned(path: &Path, expected: &FileIdentity) -> Result<(), ()> {
+    same_leaf(path, expected)?;
+    std::fs::remove_file(path).map_err(|_| ())
 }
 
 fn provision_production_inner(parent_hash: &str, helper_hash: &str, policy_hash: &str, policy_fd: RawFd) -> Result<(), ()> {
@@ -103,30 +118,57 @@ fn provision_production_inner(parent_hash: &str, helper_hash: &str, policy_hash:
     let (policy, policy_bytes) = read_policy_fd(policy_fd, expected_policy)?;
     if policy.binary.path != parent_identity.path { return Err(()); }
     let artifact_root = Path::new(POLICY_PATH).parent().ok_or(())?;
-    if Path::new(HELPER_PATH).exists() || Path::new(POLICY_PATH).exists() || Path::new(MANIFEST_PATH).exists() { return Err(()); }
+    leaf_absent(Path::new(HELPER_PATH))?;
+    leaf_absent(Path::new(POLICY_PATH))?;
+    leaf_absent(Path::new(MANIFEST_PATH))?;
     validate_system_path(Path::new(HELPER_PATH))?;
     validate_system_path(Path::new(POLICY_PATH))?;
     let helper_bytes = std::fs::read(helper_source).map_err(|_| ())?;
     std::fs::create_dir_all(artifact_root).map_err(|_| ())?;
     write_exclusive(Path::new(POLICY_PATH), &policy_bytes, 0o644)?;
+    let policy_identity = metadata_identity(Path::new(POLICY_PATH))?;
     let mut helper = OpenOptions::new().write(true).create_new(true).mode(0o750).open(HELPER_PATH).map_err(|_| ())?;
-    helper.write_all(&helper_bytes).map_err(|_| ())?;
-    helper.sync_all().map_err(|_| ())?;
-    std::fs::set_permissions(HELPER_PATH, std::os::unix::fs::PermissionsExt::from_mode(0o750)).map_err(|_| ())?;
-    set_capability(&helper)?;
+    let helper_identity = metadata_identity(Path::new(HELPER_PATH))?;
+    let rollback = || {
+        let _ = remove_owned(Path::new(HELPER_PATH), &helper_identity);
+        let _ = remove_owned(Path::new(POLICY_PATH), &policy_identity);
+    };
+    if helper.write_all(&helper_bytes).is_err() || helper.sync_all().is_err() { rollback(); return Err(()); }
+    if std::fs::set_permissions(HELPER_PATH, std::os::unix::fs::PermissionsExt::from_mode(0o750)).is_err() { rollback(); return Err(()); }
+    if set_capability(&helper).is_err() { rollback(); return Err(()); }
     OpenOptions::new().read(true).open(artifact_root).map_err(|_| ())?.sync_all().map_err(|_| ())?;
     let manifest = ArtifactManifest { source_commit: SOURCE_COMMIT, build_identity: BUILD_IDENTITY, parent_hash: expected_parent, helper_hash: expected_helper, policy_hash: expected_policy, parent_uid: parent_identity.uid, parent_gid: parent_identity.gid, parent_mode: 0o755, helper_uid: 0, helper_gid: policy.operator_gid, helper_mode: 0o750, capability_permitted: 1 << 19, capability_inheritable: 0, capability_flags: 1, policy_uid: 0, policy_gid: 0, policy_mode: 0o644, generation: 1 };
-    write_exclusive(Path::new(MANIFEST_PATH), &manifest.encode(), 0o644)?;
-    OpenOptions::new().read(true).open(artifact_root).map_err(|_| ())?.sync_all().map_err(|_| ())
+    if write_exclusive(Path::new(MANIFEST_PATH), &manifest.encode(), 0o644).is_err() { rollback(); return Err(()); }
+    let manifest_identity = metadata_identity(Path::new(MANIFEST_PATH))?;
+    if OpenOptions::new().read(true).open(artifact_root).map_err(|_| ()).and_then(|f| f.sync_all().map_err(|_| ())).is_err() {
+        let _ = remove_owned(Path::new(MANIFEST_PATH), &manifest_identity);
+        rollback();
+        return Err(());
+    }
+    Ok(())
 }
 
 #[allow(clippy::result_unit_err)]
-pub fn teardown_production() -> Result<(), ()> {
+pub fn teardown_production(parent_hash: &str, helper_hash: &str, policy_hash: &str, generation: u64) -> Result<(), ()> {
     if unsafe { libc::geteuid() } != 0 { return Err(()); }
+    let parent_hash = parse_hash(parent_hash)?;
+    let helper_hash = parse_hash(helper_hash)?;
+    let policy_hash = parse_hash(policy_hash)?;
+    let manifest_bytes = std::fs::read(MANIFEST_PATH).map_err(|_| ())?;
+    let manifest = ArtifactManifest::decode(&manifest_bytes)?;
+    if manifest.parent_hash != parent_hash || manifest.helper_hash != helper_hash || manifest.policy_hash != policy_hash || manifest.generation != generation { return Err(()); }
+    let manifest_identity = metadata_identity(Path::new(MANIFEST_PATH))?;
+    let policy_identity = metadata_identity(Path::new(POLICY_PATH))?;
+    let helper_identity = metadata_identity(Path::new(HELPER_PATH))?;
+    if hash_file(Path::new(POLICY_PATH))? != policy_hash || hash_file(Path::new(HELPER_PATH))? != helper_hash { return Err(()); }
+    if !Path::new(HELPER_PATH).is_file() || !Path::new(POLICY_PATH).is_file() { return Err(()); }
     let artifact_root = Path::new(POLICY_PATH).parent().ok_or(())?;
     let quarantine = artifact_root.join("artifacts.v1.quarantine");
-    if Path::new(MANIFEST_PATH).exists() { std::fs::rename(MANIFEST_PATH, &quarantine).map_err(|_| ())?; }
-    if Path::new(POLICY_PATH).exists() { std::fs::remove_file(POLICY_PATH).map_err(|_| ())?; }
+    leaf_absent(&quarantine)?;
+    same_leaf(Path::new(MANIFEST_PATH), &manifest_identity)?;
+    std::fs::rename(MANIFEST_PATH, &quarantine).map_err(|_| ())?;
+    if same_leaf(&quarantine, &manifest_identity).is_err() { return Err(()); }
+    remove_owned(Path::new(POLICY_PATH), &policy_identity)?;
     if Path::new(HELPER_PATH).exists() {
         let helper = OpenOptions::new().read(true).write(true).open(HELPER_PATH).map_err(|_| ())?;
         let name = c"security.capability";
@@ -135,9 +177,9 @@ pub fn teardown_production() -> Result<(), ()> {
         if capability_tuple(&helper)? != (0, 0, 0) { return Err(()); }
         helper.sync_all().map_err(|_| ())?;
         drop(helper);
-        std::fs::remove_file(HELPER_PATH).map_err(|_| ())?;
+        remove_owned(Path::new(HELPER_PATH), &helper_identity)?;
     }
-    if quarantine.exists() { std::fs::remove_file(quarantine).map_err(|_| ())?; }
+    remove_owned(&quarantine, &manifest_identity)?;
     OpenOptions::new().read(true).open(artifact_root).map_err(|_| ())?.sync_all().map_err(|_| ())?;
     if let Some(parent) = Path::new(HELPER_PATH).parent() {
         OpenOptions::new().read(true).open(parent).map_err(|_| ())?.sync_all().map_err(|_| ())?;
@@ -160,6 +202,13 @@ fn write_exclusive(path: &Path, bytes: &[u8], mode: u32) -> Result<(), ()> {
 
 #[allow(clippy::result_unit_err)]
 pub fn provision_temp_fixture(paths: &FixturePaths, generation: u64) -> Result<(), ()> {
+    let artifact_root = fixture_path(&paths.root, "etc/guigu-agent-bridge/t050-proc-proof")?;
+    let targets = [
+        artifact_root.join("artifacts.v1"),
+        artifact_root.join("policy.v1"),
+        fixture_path(&paths.root, "usr/libexec/guigu-agent-bridge/t050-proc-proof")?,
+    ];
+    if targets.iter().any(|path| std::fs::symlink_metadata(path).is_ok()) { return Err(()); }
     let result = provision_temp_fixture_inner(paths, generation);
     if result.is_err() {
         let _ = teardown_temp_fixture(&paths.root);

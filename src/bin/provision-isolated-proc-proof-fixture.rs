@@ -53,8 +53,34 @@ fn main() {
             println!("production provisioning complete");
         }
         Some("production-teardown") => {
+            let parent = match (args.next(), args.next()) {
+                (Some(flag), value) if flag == "--parent-sha" => value,
+                _ => None,
+            };
+            let helper = match (args.next(), args.next()) {
+                (Some(flag), value) if flag == "--helper-sha" => value,
+                _ => None,
+            };
+            let policy = match (args.next(), args.next()) {
+                (Some(flag), value) if flag == "--policy-sha" => value,
+                _ => None,
+            };
+            let generation = match (args.next(), args.next()) {
+                (Some(flag), value) if flag == "--generation" => value.and_then(|v| v.parse().ok()),
+                _ => None,
+            };
             if args.next().is_some()
-                || guigu_agent_bridge::privileged_proc_proof::teardown_production().is_err()
+                || parent.is_none()
+                || helper.is_none()
+                || policy.is_none()
+                || generation.is_none()
+                || guigu_agent_bridge::privileged_proc_proof::teardown_production(
+                    &parent.unwrap(),
+                    &helper.unwrap(),
+                    &policy.unwrap(),
+                    generation.unwrap(),
+                )
+                .is_err()
             {
                 std::process::exit(3);
             }
