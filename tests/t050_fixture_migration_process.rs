@@ -513,6 +513,7 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
         ProcessExecutableLinkPrivilegedUserspaceOwnerPermission,
         ProcessExecutableLinkPrivilegedOwnerClassificationParse,
         ProcessExecutableLinkUnprivilegedOtherOwnerPermission,
+        PrivilegedUserspaceUnrelatedBeforeCmdlineParse,
         ProcessExecutableMetadataPermission,
         CmdlineParse,
         CmdlinePermission,
@@ -542,6 +543,10 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
         (
             Setup::ProcessExecutableLinkUnprivilegedOtherOwnerPermission,
             "runtime-unknown-process-executable-link-unprivileged-other-owner-permission",
+        ),
+        (
+            Setup::PrivilegedUserspaceUnrelatedBeforeCmdlineParse,
+            "runtime-unknown-cmdline-parse",
         ),
         (
             Setup::ProcessExecutableMetadataPermission,
@@ -576,6 +581,11 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
                 let process = fixture.proc_root.join("424242");
                 std::fs::create_dir(&process).unwrap();
                 std::fs::write(process.join(".t050-test-exe-link-permission"), b"1").unwrap();
+                let mut cmdline = b"candidate\0".to_vec();
+                cmdline.extend_from_slice(fixture.config.as_os_str().as_encoded_bytes());
+                cmdline.push(0);
+                std::fs::write(process.join("cmdline"), cmdline).unwrap();
+                std::fs::create_dir(process.join("fd")).unwrap();
                 let owner = match setup {
                     Setup::ProcessExecutableLinkPrivilegedKernelOwnerPermission
                     | Setup::ProcessExecutableLinkPrivilegedUserspaceOwnerPermission
@@ -602,6 +612,24 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
                     std::fs::write(process.join("status"), status).unwrap();
                 }
             }
+            Setup::PrivilegedUserspaceUnrelatedBeforeCmdlineParse => {
+                let unrelated = fixture.proc_root.join("424241");
+                std::fs::create_dir(&unrelated).unwrap();
+                std::fs::write(unrelated.join(".t050-test-exe-link-permission"), b"1").unwrap();
+                std::fs::write(unrelated.join(".t050-test-uid"), b"0").unwrap();
+                std::fs::write(unrelated.join("status"), b"Kthread:\t0\n").unwrap();
+                std::fs::write(unrelated.join("cmdline"), b"unrelated\0").unwrap();
+                std::fs::create_dir(unrelated.join("fd")).unwrap();
+
+                let ambiguous = fixture.proc_root.join("424242");
+                std::fs::create_dir(&ambiguous).unwrap();
+                std::os::unix::fs::symlink(
+                    env!("CARGO_BIN_EXE_guigu-agent-bridge"),
+                    ambiguous.join("exe"),
+                )
+                .unwrap();
+                std::fs::write(ambiguous.join("cmdline"), b"not-terminated").unwrap();
+            }
             Setup::ProcessExecutableMetadataPermission => {
                 let process = fixture.proc_root.join("424242");
                 let denied = fixture.proc_root.join("denied-executable");
@@ -610,6 +638,11 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
                 std::fs::write(denied.join("binary"), b"fixture").unwrap();
                 std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
                 std::os::unix::fs::symlink(denied.join("binary"), process.join("exe")).unwrap();
+                let mut cmdline = b"candidate\0".to_vec();
+                cmdline.extend_from_slice(fixture.config.as_os_str().as_encoded_bytes());
+                cmdline.push(0);
+                std::fs::write(process.join("cmdline"), cmdline).unwrap();
+                std::fs::create_dir(process.join("fd")).unwrap();
             }
             Setup::CmdlineParse | Setup::CmdlinePermission | Setup::FdIo => {
                 let process = fixture.proc_root.join("424242");

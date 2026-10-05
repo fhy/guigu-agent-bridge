@@ -911,15 +911,6 @@ fn classify_process_or_listener(
             }
         };
         let process_uid = observed_process_uid(&process, &process_meta)?;
-        let executable_meta = match process_executable_metadata(&process, process_uid, config_uid)?
-        {
-            Some(metadata) => metadata,
-            None => continue,
-        };
-        if !same_file(&executable_meta, &binary_meta) {
-            continue;
-        }
-
         let command_line = match std::fs::read(process.join("cmdline")) {
             Ok(bytes) => bytes,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
@@ -967,15 +958,28 @@ fn classify_process_or_listener(
                 }
             }
         }
+        let config_matches = config_argument || config_descriptor;
+        if !config_matches && !listener_descriptor {
+            continue;
+        }
+
+        let executable_meta = match process_executable_metadata(&process, process_uid, config_uid)?
+        {
+            Some(metadata) => metadata,
+            None => continue,
+        };
+        if !same_file(&executable_meta, &binary_meta) {
+            continue;
+        }
         if is_deployment_presence(
             process_uid,
             config_uid,
             true,
-            config_argument || config_descriptor,
+            config_matches,
             listener_descriptor,
         ) {
             return Ok(deployment_presence_kind(
-                config_argument || config_descriptor,
+                config_matches,
                 listener_descriptor,
             ));
         }
