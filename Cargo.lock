@@ -1165,6 +1165,7 @@ dependencies = [
  "axum",
  "chrono",
  "libc",
+ "libsqlite3-sys",
  "matrix-sdk",
  "reqwest",
  "serde",

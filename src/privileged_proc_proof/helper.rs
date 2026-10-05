@@ -101,6 +101,10 @@ fn command_shape(args: &[&[u8]], mode: u8) -> bool {
             && flags_match(&[prepare_flags, &[b"--commit-timestamp"]].concat()),
         2 => args.get(1).copied() == Some(b"migrate-isolated-legacy-fixture")
             && flags_match(&[b"--manifest"]),
+        3 => args.len() == 2 && args.get(1).copied() == Some(b"backup-isolated-t050-state"),
+        4 => args.len() == 2 && args.get(1).copied() == Some(b"verify-isolated-t050-backup"),
+        5 => args.get(1).copied() == Some(b"restore-isolated-t050-state")
+            && flags_match(&[b"--expected-backup-sha256", b"--expected-current-set-sha256"]),
         _ => false,
     }
 }

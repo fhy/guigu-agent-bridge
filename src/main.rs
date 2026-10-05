@@ -9,11 +9,25 @@ async fn main() -> std::process::ExitCode {
                 || failure.command == "prepare-isolated-legacy-owner-manifest"
                 || failure.command == "prepare-isolated-legacy-fixture-migration-manifest"
                 || failure.command == "migrate-isolated-legacy-fixture"
+                || failure.command == "backup-isolated-t050-state"
+                || failure.command == "verify-isolated-t050-backup"
+                || failure.command == "restore-isolated-t050-state"
+                || failure.command == "cleanup-isolated-t050-backup"
             {
-                println!(
-                    "{} result={} status={}",
-                    failure.command, failure.category, failure.status
-                );
+                if failure.command.ends_with("t050-state")
+                    || failure.command == "verify-isolated-t050-backup"
+                    || failure.command == "cleanup-isolated-t050-backup"
+                {
+                    println!(
+                        "{} result=rejected status={} cause={}",
+                        failure.command, failure.status, failure.category
+                    );
+                } else {
+                    println!(
+                        "{} result={} status={}",
+                        failure.command, failure.category, failure.status
+                    );
+                }
                 return std::process::ExitCode::from(failure.status);
             }
             println!("{} result={}", failure.command, failure.category);

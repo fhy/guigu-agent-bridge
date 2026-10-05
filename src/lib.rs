@@ -12,6 +12,7 @@ pub mod config;
 pub mod error;
 pub mod gateway;
 pub mod isolated_fixture_migration;
+pub mod isolated_state_backup;
 pub mod lease_owner_diagnostics;
 pub mod legacy_owner_reconciliation;
 pub mod matrix;
@@ -95,6 +96,21 @@ pub fn init_tracing() {
 /// Production entry point: initialize tracing, then run until an interrupt or
 /// termination signal.
 pub async fn run() -> Result<(), Error> {
+    if let Some(output) = isolated_state_backup::dispatch(std::env::args_os().collect()).await {
+        match output {
+            Ok(line) => {
+                println!("{line}");
+                return Ok(());
+            }
+            Err(failure) => {
+                return Err(Error::Cli(error::CliFailure {
+                    command: failure.command,
+                    category: failure.cause,
+                    status: failure.status,
+                }));
+            }
+        }
+    }
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref().and_then(|v| v.to_str())
         == Some("prepare-isolated-legacy-fixture-migration-manifest")

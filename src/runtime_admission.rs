@@ -136,7 +136,13 @@ fn read_record(path: &Path) -> std::io::Result<Record> {
     if record.version != 1
         || !matches!(
             record.kind.as_str(),
-            "startup" | "reconcile" | "fixture-prepare" | "fixture-migrate"
+            "startup"
+                | "reconcile"
+                | "fixture-prepare"
+                | "fixture-migrate"
+                | "backup"
+                | "backup-verify"
+                | "restore"
         )
         || record.pid == 0
         || record.starttime == 0
@@ -155,6 +161,7 @@ impl Guard {
     pub fn acquire(database: &Path, config: &Path, kind: &str) -> std::io::Result<Self> {
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
 
+        reject_restore_interlock(database, kind)?;
         let database = identity(database)?;
         let config = identity(config)?;
         let executable = identity(&std::env::current_exe()?.canonicalize()?)?;
@@ -271,6 +278,9 @@ impl Guard {
             mode: match record.kind.as_str() {
                 "fixture-prepare" => 1,
                 "fixture-migrate" => 2,
+                "backup" => 3,
+                "backup-verify" => 4,
+                "restore" => 5,
                 "reconcile" => return Err(std::io::Error::other("unsupported proof mode")),
                 _ => return Err(std::io::Error::other("invalid admission mode")),
             },
@@ -291,6 +301,36 @@ impl Guard {
     }
 }
 
+fn reject_restore_interlock(database: &Path, kind: &str) -> std::io::Result<()> {
+    if matches!(kind, "backup" | "backup-verify" | "restore") {
+        return Ok(());
+    }
+    let root = database
+        .parent()
+        .ok_or_else(|| std::io::Error::other("database has no parent"))?;
+    let namespace = root.join(".t050-backup-v1");
+    let markers = [
+        "restore.journal.v1",
+        "restore.journal.next",
+        "restore.journal.prev",
+        "cleanup.restore.journal.v1",
+        "cleanup.restore.journal.next",
+        "cleanup.restore.journal.prev",
+        "restore.new.sqlite3",
+        "pre-restore.main",
+        "pre-restore.wal",
+        "pre-restore.shm",
+    ];
+    for marker in markers {
+        match std::fs::symlink_metadata(namespace.join(marker)) {
+            Ok(_) => return Err(std::io::Error::other("restore interlock is active")),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => return Err(std::io::Error::other("restore interlock is ambiguous")),
+        }
+    }
+    Ok(())
+}
+
 pub fn verify_proof_binding(path: &Path, expected: ProofBinding) -> std::io::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -301,6 +341,9 @@ pub fn verify_proof_binding(path: &Path, expected: ProofBinding) -> std::io::Res
     let mode = match record.kind.as_str() {
         "fixture-prepare" => 1,
         "fixture-migrate" => 2,
+        "backup" => 3,
+        "backup-verify" => 4,
+        "restore" => 5,
         "reconcile" => return Err(std::io::Error::other("unsupported proof mode")),
         _ => return Err(std::io::Error::other("invalid admission mode")),
     };
