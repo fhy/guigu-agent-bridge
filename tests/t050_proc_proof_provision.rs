@@ -180,17 +180,10 @@ fn policy_staging_emits_only_canonical_bytes_and_is_repeatable() {
     let input = temp.path().join("input");
     let output1 = temp.path().join("policy-1");
     let output2 = temp.path().join("policy-2");
-    let parent = input.join("parent");
-    let helper = input.join("helper");
-    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o775)).unwrap();
     let config = input.join("config.toml");
     let database = input.join("database");
     let stage = [
         "stage-policy",
-        "--parent",
-        parent.to_str().unwrap(),
-        "--helper",
-        helper.to_str().unwrap(),
         "--config",
         config.to_str().unwrap(),
         "--database-root",
@@ -225,20 +218,12 @@ fn policy_staging_emits_only_canonical_bytes_and_is_repeatable() {
 
 #[test]
 fn policy_staging_refusals_are_fixed_empty_and_invariant() {
-    for cause in ["parent", "helper", "config", "database", "output"] {
+    for cause in ["config", "database", "output"] {
         let (temp, _) = fixture();
         let input = temp.path().join("input");
-        let parent = input.join("parent");
-        let helper = input.join("helper");
         let config = input.join("config.toml");
         let database = input.join("database");
         match cause {
-            "parent" => {
-                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap()
-            }
-            "helper" => {
-                std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o644)).unwrap()
-            }
             "config" => {
                 std::fs::remove_file(&config).unwrap();
                 std::fs::create_dir(&config).unwrap();
@@ -261,10 +246,6 @@ fn policy_staging_refusals_are_fixed_empty_and_invariant() {
         let mut command = Command::new(binary());
         command.args([
             "stage-policy",
-            "--parent",
-            parent.to_str().unwrap(),
-            "--helper",
-            helper.to_str().unwrap(),
             "--config",
             config.to_str().unwrap(),
             "--database-root",

@@ -90,6 +90,10 @@ pub struct Policy {
 }
 
 include!("codec.rs");
+mod stage;
+pub use stage::{
+    FixturePaths, PRODUCTION_HELPER_SOURCE, PRODUCTION_PARENT_SOURCE, StageCause, stage_policy,
+};
 include!("provision.rs");
 include!("protocol.rs");
 include!("proc_lookup.rs");

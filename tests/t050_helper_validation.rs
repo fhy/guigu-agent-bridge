@@ -1,8 +1,5 @@
 use std::{
-    os::{
-        fd::AsRawFd,
-        unix::{fs::PermissionsExt, process::CommandExt},
-    },
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
     process::{Command, Output},
 };
@@ -50,34 +47,6 @@ impl Fixture {
         }
     }
 
-    fn stage(&self, output: &Path) -> Output {
-        let output_file = std::fs::File::create(output).unwrap();
-        let fd = output_file.as_raw_fd();
-        let mut command = Command::new(binary());
-        command.args([
-            "stage-policy",
-            "--parent",
-            self.parent.to_str().unwrap(),
-            "--helper",
-            self.helper.to_str().unwrap(),
-            "--config",
-            self.config.to_str().unwrap(),
-            "--database-root",
-            self.database.to_str().unwrap(),
-        ]);
-        unsafe {
-            command.pre_exec(move || {
-                if libc::dup2(fd, 3) < 0 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    libc::fcntl(3, libc::F_SETFD, 0);
-                    Ok(())
-                }
-            });
-        }
-        command.output().unwrap()
-    }
-
     fn provision(&self) -> Output {
         Command::new(binary())
             .args([
@@ -108,76 +77,28 @@ fn mode(path: &Path) -> u32 {
         & 0o7777
 }
 
-fn assert_common_sources_unchanged(fixture: &Fixture) {
-    assert_eq!(std::fs::read(&fixture.parent).unwrap(), b"parent");
-    assert_eq!(mode(&fixture.parent), 0o755);
-    assert_eq!(std::fs::read(&fixture.config).unwrap(), b"not-read");
-    assert_eq!(mode(&fixture.config), 0o600);
-    assert!(fixture.database.is_dir());
-    assert_eq!(mode(&fixture.database), 0o700);
-    assert!(!fixture.root.exists());
-}
-
 #[test]
-fn helper_source_rejections_are_fixed_empty_and_invariant() {
-    for case in ["symlink", "nonregular", "non-executable"] {
-        let fixture = Fixture::new();
-        let outside = fixture._temp.path().join("outside-helper");
-        match case {
-            "symlink" => {
-                std::fs::remove_file(&fixture.helper).unwrap();
-                write_file(&outside, b"outside", 0o775);
-                std::os::unix::fs::symlink(&outside, &fixture.helper).unwrap();
-            }
-            "nonregular" => {
-                std::fs::remove_file(&fixture.helper).unwrap();
-                std::fs::create_dir(&fixture.helper).unwrap();
-                std::fs::set_permissions(&fixture.helper, std::fs::Permissions::from_mode(0o755))
-                    .unwrap();
-            }
-            "non-executable" => {
-                std::fs::set_permissions(&fixture.helper, std::fs::Permissions::from_mode(0o644))
-                    .unwrap();
-            }
-            _ => unreachable!(),
-        }
-
-        let output_path = fixture._temp.path().join("policy-output");
-        let result = fixture.stage(&output_path);
-        assert_eq!(result.status.code(), Some(3), "case={case}");
-        assert!(result.stdout.is_empty(), "case={case}");
-        assert_eq!(
-            result.stderr, b"stage-policy status=3 cause=helper\n",
-            "case={case}"
-        );
-        assert!(
-            std::fs::read(&output_path).unwrap().is_empty(),
-            "case={case}"
-        );
-        assert_common_sources_unchanged(&fixture);
-
-        match case {
-            "symlink" => {
-                assert!(
-                    std::fs::symlink_metadata(&fixture.helper)
-                        .unwrap()
-                        .file_type()
-                        .is_symlink()
-                );
-                assert_eq!(std::fs::read_link(&fixture.helper).unwrap(), outside);
-                assert_eq!(std::fs::read(&outside).unwrap(), b"outside");
-                assert_eq!(mode(&outside), 0o775);
-            }
-            "nonregular" => {
-                assert!(fixture.helper.is_dir());
-                assert_eq!(mode(&fixture.helper), 0o755);
-            }
-            "non-executable" => {
-                assert_eq!(std::fs::read(&fixture.helper).unwrap(), b"helper");
-                assert_eq!(mode(&fixture.helper), 0o644);
-            }
-            _ => unreachable!(),
-        }
+fn production_stage_policy_refuses_source_path_overrides() {
+    let fixture = Fixture::new();
+    for flag in ["--parent", "--helper"] {
+        let result = Command::new(binary())
+            .args([
+                "stage-policy",
+                flag,
+                fixture.helper.to_str().unwrap(),
+                "--config",
+                fixture.config.to_str().unwrap(),
+                "--database-root",
+                fixture.database.to_str().unwrap(),
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(result.status.code(), Some(2), "flag={flag}");
+        assert!(result.stdout.is_empty(), "flag={flag}");
+        assert!(String::from_utf8_lossy(&result.stderr).starts_with("usage:"));
+        assert!(!fixture.root.exists());
+        assert_eq!(std::fs::read(&fixture.helper).unwrap(), b"helper");
+        assert_eq!(mode(&fixture.helper), 0o775);
     }
 }
 

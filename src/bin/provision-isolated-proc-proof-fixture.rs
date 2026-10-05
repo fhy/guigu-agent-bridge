@@ -25,32 +25,19 @@ fn main() {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("stage-policy") => {
-            let mut parent = None;
-            let mut helper = None;
             let mut config = None;
             let mut database_root = None;
             while let Some(flag) = args.next() {
                 match flag.as_str() {
-                    "--parent" => parent = Some(value(&mut args, "--parent")),
-                    "--helper" => helper = Some(value(&mut args, "--helper")),
                     "--config" => config = Some(value(&mut args, "--config")),
                     "--database-root" => database_root = Some(value(&mut args, "--database-root")),
                     _ => usage(),
                 }
             }
-            let (Some(parent), Some(helper), Some(config), Some(database_root)) =
-                (parent, helper, config, database_root)
-            else {
+            let (Some(config), Some(database_root)) = (config, database_root) else {
                 usage()
             };
-            let paths = FixturePaths {
-                root: PathBuf::new(),
-                parent,
-                helper,
-                config,
-                database_root,
-            };
-            match stage_policy(&paths, 3) {
+            match stage_policy(&config, &database_root, 3) {
                 Ok(_) => eprintln!("stage-policy status=0 cause=none"),
                 Err(cause) => {
                     eprintln!("stage-policy status=3 cause={}", cause.code());

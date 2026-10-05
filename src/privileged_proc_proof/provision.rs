@@ -2,43 +2,7 @@
 use std::io::Write;
 use std::os::unix::fs::OpenOptionsExt;
 
-pub const PRODUCTION_PARENT_SOURCE: &str = "/home/fhy/.local/lib/guigu-codex-test/guigu-agent-bridge";
-pub const PRODUCTION_HELPER_SOURCE: &str = "/home/fhy/.cache/cargo-target/guigu-agent-bridge/debug/guigu-t050-proc-proof";
 const PROVISION_LOCK_PATH: &str = "/etc/guigu-agent-bridge/t050-proc-proof/.provision.lock";
-
-#[derive(Debug, Clone)]
-pub struct FixturePaths {
-    pub root: PathBuf,
-    pub parent: PathBuf,
-    pub helper: PathBuf,
-    pub config: PathBuf,
-    pub database_root: PathBuf,
-}
-
-#[derive(Debug, Clone, Copy)]
-pub enum StageCause { Parent, Helper, Config, Database, Output }
-
-impl StageCause {
-    pub fn code(self) -> &'static str { match self { Self::Parent => "parent", Self::Helper => "helper", Self::Config => "config", Self::Database => "database", Self::Output => "output" } }
-}
-
-pub fn stage_policy(paths: &FixturePaths, output_fd: RawFd) -> Result<[u8; 32], StageCause> {
-    let parent = metadata_identity(&paths.parent).map_err(|_| StageCause::Parent)?;
-    let helper = source_helper_identity(&paths.helper).map_err(|_| StageCause::Helper)?;
-    let config = metadata_identity(&paths.config).map_err(|_| StageCause::Config)?;
-    let database = metadata_identity(&paths.database_root).map_err(|_| StageCause::Database)?;
-    if parent.file_type != libc::S_IFREG || parent.mode != 0o755 { return Err(StageCause::Parent); }
-    if helper.file_type != libc::S_IFREG || helper.mode & 0o111 == 0 { return Err(StageCause::Helper); }
-    if config.file_type != libc::S_IFREG { return Err(StageCause::Config); }
-    if database.file_type != libc::S_IFDIR { return Err(StageCause::Database); }
-    let policy = Policy { operator_uid: parent.uid, operator_gid: parent.gid, binary: parent, config, database_root: database, admission_lock: b".runtime-admission.lock".to_vec(), unit: b"guigu-codex-test.service".to_vec(), ports: [9291, 9292] };
-    let bytes = policy.encode();
-    let duplicate = unsafe { libc::dup(output_fd) };
-    if duplicate < 0 { return Err(StageCause::Output); }
-    let mut output = unsafe { File::from_raw_fd(duplicate) };
-    output.write_all(&bytes).and_then(|_| output.sync_all()).map_err(|_| StageCause::Output)?;
-    Ok(Sha256::digest(&bytes).into())
-}
 
 fn fixture_path(root: &Path, suffix: &str) -> Result<PathBuf, ()> {
     if !root.is_absolute() || root == Path::new("/") || suffix.contains("..") {
@@ -47,19 +11,13 @@ fn fixture_path(root: &Path, suffix: &str) -> Result<PathBuf, ()> {
     Ok(root.join(suffix))
 }
 
-fn metadata_identity(path: &Path) -> Result<FileIdentity, ()> {
+pub(super) fn metadata_identity(path: &Path) -> Result<FileIdentity, ()> {
     let identity = raw_identity(path)?;
     if identity.mode & 0o022 != 0 { return Err(()); }
     Ok(identity)
 }
 
-fn source_helper_identity(path: &Path) -> Result<FileIdentity, ()> {
-    let identity = raw_identity(path)?;
-    if identity.file_type != libc::S_IFREG || identity.mode & 0o111 == 0 { return Err(()); }
-    Ok(identity)
-}
-
-fn raw_identity(path: &Path) -> Result<FileIdentity, ()> {
+pub(super) fn raw_identity(path: &Path) -> Result<FileIdentity, ()> {
     use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::symlink_metadata(path).map_err(|_| ())?;
     if metadata.is_file() && metadata.nlink() != 1 { return Err(()); }
