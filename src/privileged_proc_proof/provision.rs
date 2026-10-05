@@ -24,7 +24,7 @@ impl StageCause {
 
 pub fn stage_policy(paths: &FixturePaths, output_fd: RawFd) -> Result<[u8; 32], StageCause> {
     let parent = metadata_identity(&paths.parent).map_err(|_| StageCause::Parent)?;
-    let helper = metadata_identity(&paths.helper).map_err(|_| StageCause::Helper)?;
+    let helper = source_helper_identity(&paths.helper).map_err(|_| StageCause::Helper)?;
     let config = metadata_identity(&paths.config).map_err(|_| StageCause::Config)?;
     let database = metadata_identity(&paths.database_root).map_err(|_| StageCause::Database)?;
     if parent.file_type != libc::S_IFREG || parent.mode != 0o755 { return Err(StageCause::Parent); }
@@ -48,11 +48,21 @@ fn fixture_path(root: &Path, suffix: &str) -> Result<PathBuf, ()> {
 }
 
 fn metadata_identity(path: &Path) -> Result<FileIdentity, ()> {
+    let identity = raw_identity(path)?;
+    if identity.mode & 0o022 != 0 { return Err(()); }
+    Ok(identity)
+}
+
+fn source_helper_identity(path: &Path) -> Result<FileIdentity, ()> {
+    let identity = raw_identity(path)?;
+    if identity.file_type != libc::S_IFREG || identity.mode & 0o111 == 0 { return Err(()); }
+    Ok(identity)
+}
+
+fn raw_identity(path: &Path) -> Result<FileIdentity, ()> {
     use std::os::unix::fs::MetadataExt;
     let metadata = std::fs::symlink_metadata(path).map_err(|_| ())?;
-    if (metadata.is_file() && metadata.nlink() != 1) || metadata.mode() & 0o022 != 0 {
-        return Err(());
-    }
+    if metadata.is_file() && metadata.nlink() != 1 { return Err(()); }
     Ok(FileIdentity {
         path: path.as_os_str().as_bytes().to_vec(),
         device: metadata.dev(),

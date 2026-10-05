@@ -182,6 +182,7 @@ fn policy_staging_emits_only_canonical_bytes_and_is_repeatable() {
     let output2 = temp.path().join("policy-2");
     let parent = input.join("parent");
     let helper = input.join("helper");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o775)).unwrap();
     let config = input.join("config.toml");
     let database = input.join("database");
     let stage = [
