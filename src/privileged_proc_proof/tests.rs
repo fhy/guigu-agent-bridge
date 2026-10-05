@@ -232,7 +232,9 @@ mod tests {
     }
 
     #[test]
-    fn fixed_production_paths_exclude_forbidden_proc_objects() {
+    fn proc_lookup_audit_enforces_grammar_and_magic_link_sites() {
+        use std::os::unix::fs::symlink;
+
         for value in [HELPER_PATH, MANIFEST_PATH, POLICY_PATH] {
             assert!(
                 ![
@@ -248,13 +250,83 @@ mod tests {
                 .any(|part| value.contains(part))
             );
         }
-        let process = Path::new("/proc/1");
-        for allowed in ["stat", "status", "cmdline", "exe", "fd"] {
-            assert!(proc_literal(process, allowed).is_ok());
+        let root = std::env::temp_dir().join(format!("t050-proc-{}", uuid::Uuid::now_v7()));
+        let self_pid = std::process::id();
+        let process_root = root.join(self_pid.to_string());
+        std::fs::create_dir_all(process_root.join("fd")).unwrap();
+        std::fs::create_dir(process_root.join("net")).unwrap();
+        std::fs::write(
+            process_root.join("stat"),
+            format!("{self_pid} (x) S{} 10\n", " 0".repeat(18)),
+        )
+        .unwrap();
+        let uid = unsafe { libc::getuid() };
+        std::fs::write(
+            process_root.join("status"),
+            format!("Uid:\t{uid}\t{uid}\t{uid}\t{uid}\n"),
+        )
+        .unwrap();
+        std::fs::write(process_root.join("cmdline"), b"binary\0").unwrap();
+        std::fs::write(root.join("target"), b"target").unwrap();
+        symlink(root.join("target"), process_root.join("exe")).unwrap();
+        symlink(root.join("target"), process_root.join("fd/5")).unwrap();
+        std::fs::write(process_root.join("net/tcp"), b"local_address st\n").unwrap();
+        std::fs::write(process_root.join("net/tcp6"), b"local_address st\n").unwrap();
+
+        let proc = ProcDir::open_root(&root).unwrap();
+        let (process, _) = proc.process(self_pid).unwrap();
+        for allowed in [b"stat".as_slice(), b"status", b"cmdline", b"fd"] {
+            assert!(proc.open_child(&process, allowed, libc::O_RDONLY, self_pid).is_ok());
         }
-        for forbidden in ["environ", "mem", "maps", "stack", "cwd", "root", "map_files"] {
-            assert!(proc_literal(process, forbidden).is_err());
+        for forbidden in [b"environ".as_slice(), b"mem", b"maps", b"cwd", b"root"] {
+            assert!(proc.open_child(&process, forbidden, libc::O_RDONLY, self_pid).is_err());
         }
+        let global = global_snapshot(&proc).unwrap();
+        assert_eq!(global.generations.len(), 1);
+        let snapshot = process_snapshot(&proc, &global.generations[0], b"/unmatched").unwrap();
+        assert_eq!(snapshot.generation.pid, self_pid);
+        assert!(!snapshot.config_argument);
+        std::fs::rename(process_root.join("stat"), process_root.join("stat.original")).unwrap();
+        symlink(process_root.join("stat.original"), process_root.join("stat")).unwrap();
+        assert!(proc.open_child(&process, b"stat", libc::O_RDONLY, self_pid).is_err());
+        assert!(proc.executable_metadata(&process, self_pid).is_ok());
+        let (descriptors, numbers) = proc.descriptors(&process, self_pid).unwrap();
+        assert_eq!(numbers, vec![5]);
+        assert!(proc.descriptor_metadata(&descriptors, self_pid, 5).is_ok());
+        assert!(proc.table(b"tcp", 1024).is_ok());
+        assert!(proc.table(b"tcp6", 1024).is_ok());
+        assert!(proc.table(b"udp", 1024).is_err());
+        let audit = proc.audit();
+        assert!(audit.contains(&ProcAudit::FollowExecutable(self_pid)));
+        assert!(audit.contains(&ProcAudit::FollowDescriptor(self_pid, 5)));
+        assert!(!audit.iter().any(|entry| match entry {
+            ProcAudit::Open(path) | ProcAudit::Read(path) | ProcAudit::ReadDir(path) =>
+                [b"environ".as_slice(), b"mem", b"maps", b"stack", b"cwd", b"root", b"map_files"]
+                    .iter().any(|part| path.split(|byte| *byte == b'/').any(|value| value == *part)),
+            _ => false,
+        }));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn unprivileged_real_proc_lookup_uses_retained_dirfd_boundary() {
+        let held = File::open("/dev/null").unwrap();
+        let held_number = u32::try_from(held.as_raw_fd()).unwrap();
+        let proc = ProcDir::open_fixed().unwrap();
+        let pid = std::process::id();
+        let (process, metadata) = proc.process(pid).unwrap();
+        assert!(process_starttime(&proc, &process, pid).unwrap() > 0);
+        assert_eq!(process_uid(&proc, &process, pid).unwrap(), metadata.uid);
+        assert_eq!(file_type(proc.executable_metadata(&process, pid).unwrap().mode), libc::S_IFREG);
+        let (directory, numbers) = proc.descriptors(&process, pid).unwrap();
+        assert!(numbers.contains(&held_number));
+        proc.descriptor_metadata(&directory, pid, held_number).unwrap();
+        assert!(proc.table(b"tcp", 4 * 1024 * 1024).is_ok());
+        assert!(proc.table(b"tcp6", 4 * 1024 * 1024).is_ok());
+        assert!(proc.root_pids().unwrap().contains(&pid));
+        let audit = proc.audit();
+        assert_eq!(audit.iter().filter(|entry| matches!(entry, ProcAudit::FollowExecutable(value) if *value == pid)).count(), 1);
+        assert_eq!(audit.iter().filter(|entry| matches!(entry, ProcAudit::FollowDescriptor(value, number) if *value == pid && *number == held_number)).count(), 1);
     }
 
     #[test]

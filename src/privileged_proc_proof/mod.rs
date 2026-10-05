@@ -91,6 +91,7 @@ pub struct Policy {
 
 include!("codec.rs");
 include!("protocol.rs");
+include!("proc_lookup.rs");
 include!("scan.rs");
 include!("artifact.rs");
 include!("client.rs");

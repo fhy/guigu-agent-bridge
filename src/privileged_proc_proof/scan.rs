@@ -44,24 +44,9 @@ fn file_type(mode: u32) -> u32 {
     mode & libc::S_IFMT
 }
 
-fn proc_literal(parent: &Path, name: &str) -> Result<PathBuf, ()> {
-    if matches!(name, "stat" | "status" | "cmdline" | "exe" | "fd") {
-        Ok(parent.join(name))
-    } else {
-        Err(())
-    }
-}
-
-fn proc_table(root: &Path, name: &str) -> Result<PathBuf, ()> {
-    if matches!(name, "tcp" | "tcp6") {
-        Ok(root.join("net").join(name))
-    } else {
-        Err(())
-    }
-}
-
-fn process_starttime(path: &Path) -> Result<u64, ()> {
-    let text = std::fs::read_to_string(proc_literal(path, "stat")?).map_err(|_| ())?;
+fn process_starttime(proc: &ProcDir, process: &OwnedFd, pid: u32) -> Result<u64, ()> {
+    let bytes = proc.read_child(process, b"stat", pid, 4096)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| ())?;
     let close = text.rfind(')').ok_or(())?;
     text[close + 1..]
         .split_whitespace()
@@ -71,8 +56,9 @@ fn process_starttime(path: &Path) -> Result<u64, ()> {
         .map_err(|_| ())
 }
 
-fn process_uid(path: &Path) -> Result<u32, ()> {
-    let text = std::fs::read_to_string(proc_literal(path, "status")?).map_err(|_| ())?;
+fn process_uid(proc: &ProcDir, process: &OwnedFd, pid: u32) -> Result<u32, ()> {
+    let bytes = proc.read_child(process, b"status", pid, 64 * 1024)?;
+    let text = std::str::from_utf8(&bytes).map_err(|_| ())?;
     let lines = text.lines().filter_map(|line| line.strip_prefix("Uid:")).collect::<Vec<_>>();
     let [line] = lines.as_slice() else { return Err(()); };
     let values = line.split_whitespace().map(str::parse::<u32>).collect::<Result<Vec<_>, _>>().map_err(|_| ())?;
@@ -80,10 +66,11 @@ fn process_uid(path: &Path) -> Result<u32, ()> {
     Ok(values[1])
 }
 
-fn listeners(root: &Path) -> Result<BTreeSet<Listener>, ()> {
+fn listeners(proc: &ProcDir) -> Result<BTreeSet<Listener>, ()> {
     let mut answer = BTreeSet::new();
     for (family, name) in [(4, "tcp"), (6, "tcp6")] {
-        let text = std::fs::read_to_string(proc_table(root, name)?).map_err(|_| ())?;
+        let bytes = proc.table(name.as_bytes(), 4 * 1024 * 1024)?;
+        let text = std::str::from_utf8(&bytes).map_err(|_| ())?;
         let mut lines = text.lines();
         let header = lines.next().ok_or(())?;
         if !header.split_whitespace().any(|field| field == "local_address")
@@ -115,55 +102,41 @@ fn listeners(root: &Path) -> Result<BTreeSet<Listener>, ()> {
     Ok(answer)
 }
 
-fn global_snapshot(root: &Path) -> Result<GlobalSnapshot, ()> {
+fn global_snapshot(proc: &ProcDir) -> Result<GlobalSnapshot, ()> {
     let mut generations = Vec::new();
-    for entry in std::fs::read_dir(root).map_err(|_| ())? {
-        let entry = entry.map_err(|_| ())?;
-        let Some(pid) = entry
-            .file_name()
-            .to_str()
-            .and_then(|s| s.parse::<u32>().ok())
-        else {
-            continue;
-        };
-        let metadata = entry.metadata().map_err(|_| ())?;
+    for pid in proc.root_pids()? {
+        let (process, metadata) = proc.process(pid)?;
         generations.push(Generation {
             pid,
-            starttime: process_starttime(&entry.path())?,
-            device: metadata.dev(),
-            inode: metadata.ino(),
+            starttime: process_starttime(proc, &process, pid)?,
+            device: metadata.device,
+            inode: metadata.inode,
         });
     }
     generations.sort();
     Ok(GlobalSnapshot {
         generations,
-        listeners: listeners(root)?,
+        listeners: listeners(proc)?,
     })
 }
 
 fn process_snapshot(
-    root: &Path,
+    proc: &ProcDir,
     generation: &Generation,
     config: &[u8],
 ) -> Result<ProcessSnapshot, ()> {
-    let process = root.join(generation.pid.to_string());
-    let metadata = std::fs::metadata(&process).map_err(|_| ())?;
-    if metadata.dev() != generation.device
-        || metadata.ino() != generation.inode
-        || process_starttime(&process)? != generation.starttime
+    let (process, metadata) = proc.process(generation.pid)?;
+    if metadata.device != generation.device
+        || metadata.inode != generation.inode
+        || process_starttime(proc, &process, generation.pid)? != generation.starttime
     {
         return Err(());
     }
-    let uid = process_uid(&process)?;
-    if metadata.uid() != uid {
+    let uid = process_uid(proc, &process, generation.pid)?;
+    if metadata.uid != uid {
         return Err(());
     }
-    let mut cmdline = Vec::new();
-    File::open(proc_literal(&process, "cmdline")?)
-        .map_err(|_| ())?
-        .take((MAX_CMDLINE + 1) as u64)
-        .read_to_end(&mut cmdline)
-        .map_err(|_| ())?;
+    let mut cmdline = proc.read_child(&process, b"cmdline", generation.pid, MAX_CMDLINE)?;
     if cmdline.is_empty() || cmdline.len() > MAX_CMDLINE || cmdline.last() != Some(&0) {
         return Err(());
     }
@@ -171,22 +144,16 @@ fn process_snapshot(
     let cmdline_hash = Sha256::digest(&cmdline).into();
     let config_argument = cmdline.split(|byte| *byte == 0).any(|part| part == config);
     cmdline.fill(0);
-    let executable = std::fs::metadata(proc_literal(&process, "exe")?).map_err(|_| ())?;
+    let executable = proc.executable_metadata(&process, generation.pid)?;
     let mut descriptors = Vec::new();
-    for entry in std::fs::read_dir(proc_literal(&process, "fd")?).map_err(|_| ())? {
-        let entry = entry.map_err(|_| ())?;
-        let number = entry
-            .file_name()
-            .to_str()
-            .ok_or(())?
-            .parse()
-            .map_err(|_| ())?;
-        let target = std::fs::metadata(entry.path()).map_err(|_| ())?;
+    let (directory, numbers) = proc.descriptors(&process, generation.pid)?;
+    for number in numbers {
+        let target = proc.descriptor_metadata(&directory, generation.pid, number)?;
         descriptors.push(Descriptor {
             number,
-            device: target.dev(),
-            inode: target.ino(),
-            file_type: file_type(target.mode()),
+            device: target.device,
+            inode: target.inode,
+            file_type: file_type(target.mode),
         });
         if descriptors.len() > MAX_FDS {
             return Err(());
@@ -206,9 +173,9 @@ fn process_snapshot(
         cmdline_len,
         config_argument,
         executable: (
-            executable.dev(),
-            executable.ino(),
-            file_type(executable.mode()),
+            executable.device,
+            executable.inode,
+            file_type(executable.mode),
         ),
         descriptors,
     })
@@ -231,12 +198,12 @@ fn pidfd_live(fd: &OwnedFd) -> bool {
     (unsafe { libc::poll(&mut poll, 1, 0) }) == 0 && poll.revents == 0
 }
 
-fn stable_scan(root: &Path, policy: &Policy, ignored_pid: u32, deadline: Instant) -> ProofResult {
+fn stable_scan(proc: &ProcDir, policy: &Policy, ignored_pid: u32, deadline: Instant) -> ProofResult {
     for _ in 0..3 {
         if Instant::now() >= deadline {
             return ProofResult::Unknown;
         }
-        let Ok(g0) = global_snapshot(root) else {
+        let Ok(g0) = global_snapshot(proc) else {
             continue;
         };
         let mut observations = Vec::new();
@@ -253,8 +220,8 @@ fn stable_scan(root: &Path, policy: &Policy, ignored_pid: u32, deadline: Instant
                 break;
             }
             let (Ok(p0), Ok(p1)) = (
-                process_snapshot(root, generation, &policy.config.path),
-                process_snapshot(root, generation, &policy.config.path),
+                process_snapshot(proc, generation, &policy.config.path),
+                process_snapshot(proc, generation, &policy.config.path),
             ) else {
                 unstable = true;
                 break;
@@ -266,7 +233,7 @@ fn stable_scan(root: &Path, policy: &Policy, ignored_pid: u32, deadline: Instant
             observations.push((p0, p1));
             pidfds.push(pidfd);
         }
-        let Ok(g1) = global_snapshot(root) else {
+        let Ok(g1) = global_snapshot(proc) else {
             continue;
         };
         if unstable || pidfds.iter().any(|fd| !pidfd_live(fd)) {
@@ -318,20 +285,6 @@ fn evaluate_stable(
     } else {
         ProofResult::Clean
     })
-}
-
-fn read_bounded(path: &Path, max: usize) -> Result<Vec<u8>, ()> {
-    let mut bytes = Vec::new();
-    File::open(path)
-        .map_err(|_| ())?
-        .take((max + 1) as u64)
-        .read_to_end(&mut bytes)
-        .map_err(|_| ())?;
-    if bytes.len() > max {
-        Err(())
-    } else {
-        Ok(bytes)
-    }
 }
 
 fn helper_deadline(milliseconds: u32) -> Instant {

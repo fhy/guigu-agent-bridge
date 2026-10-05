@@ -12,8 +12,11 @@ struct CapData {
     inheritable: u32,
 }
 
-fn status_capabilities_zero() -> Result<bool, ()> {
-    let status = std::fs::read_to_string("/proc/self/status").map_err(|_| ())?;
+fn status_capabilities_zero(proc: &ProcDir) -> Result<bool, ()> {
+    let pid = std::process::id();
+    let (process, _) = proc.process(pid)?;
+    let bytes = proc.read_child(&process, b"status", pid, 64 * 1024)?;
+    let status = std::str::from_utf8(&bytes).map_err(|_| ())?;
     let mut seen = 0u8;
     for line in status.lines() {
         if let Some((name, value)) = line.split_once(':')
@@ -44,9 +47,12 @@ fn capability_sets() -> Result<[CapData; 2], ()> {
     Ok(data)
 }
 
-fn verify_initial_capability() -> Result<(), ()> {
+fn verify_initial_capability(proc: &ProcDir) -> Result<(), ()> {
     let data = capability_sets()?;
-    let status = std::fs::read_to_string("/proc/self/status").map_err(|_| ())?;
+    let pid = std::process::id();
+    let (process, _) = proc.process(pid)?;
+    let bytes = proc.read_child(&process, b"status", pid, 64 * 1024)?;
+    let status = std::str::from_utf8(&bytes).map_err(|_| ())?;
     let ambient_zero = status
         .lines()
         .find_map(|line| line.strip_prefix("CapAmb:"))
@@ -66,7 +72,7 @@ fn verify_initial_capability() -> Result<(), ()> {
     }
 }
 
-fn drop_capabilities() -> Result<(), ()> {
+fn drop_capabilities(proc: &ProcDir) -> Result<(), ()> {
     let mut header = CapHeader {
         version: 0x2008_0522,
         pid: 0,
@@ -92,7 +98,7 @@ fn drop_capabilities() -> Result<(), ()> {
         return Err(());
     }
     let current = capability_sets()?;
-    if !status_capabilities_zero()?
+    if !status_capabilities_zero(proc)?
         || current
             .iter()
             .any(|set| set.effective != 0 || set.permitted != 0 || set.inheritable != 0)

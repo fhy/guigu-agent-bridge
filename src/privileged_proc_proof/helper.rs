@@ -30,6 +30,7 @@ fn verify_helper_artifacts(
     artifacts: &Artifacts,
     request: &Request,
     parent_pid: u32,
+    proc: &ProcDir,
 ) -> Result<(), ()> {
     if artifacts.manifest_bytes != request.manifest
         || artifacts.policy_bytes != request.policy
@@ -41,8 +42,9 @@ fn verify_helper_artifacts(
     }
     let mut own = secure_open(Path::new(HELPER_PATH), libc::O_RDONLY)?;
     let own_meta = own.metadata().map_err(|_| ())?;
-    let live_own_meta = std::fs::metadata("/proc/self/exe").map_err(|_| ())?;
-    if !same_metadata(&own_meta, &live_own_meta)
+    let (self_process, _) = proc.process(std::process::id())?;
+    let live_own_meta = proc.executable_metadata(&self_process, std::process::id())?;
+    if own_meta.dev() != live_own_meta.device || own_meta.ino() != live_own_meta.inode
         || fd_hash(&mut own, 64 * 1024 * 1024)? != artifacts.manifest.helper_hash
         || capability_tuple(&own)?
             != (
@@ -57,13 +59,14 @@ fn verify_helper_artifacts(
         Path::new(std::str::from_utf8(&artifacts.policy.binary.path).map_err(|_| ())?);
     let mut parent = secure_open(parent_path, libc::O_RDONLY)?;
     let parent_meta = parent.metadata().map_err(|_| ())?;
-    let live_parent_meta = std::fs::metadata(format!("/proc/{parent_pid}/exe")).map_err(|_| ())?;
+    let (parent_process, _) = proc.process(parent_pid)?;
+    let live_parent_meta = proc.executable_metadata(&parent_process, parent_pid)?;
     if !exact_metadata(
         &parent_meta,
         artifacts.manifest.parent_uid,
         artifacts.manifest.parent_gid,
         artifacts.manifest.parent_mode,
-    ) || !same_metadata(&parent_meta, &live_parent_meta)
+    ) || parent_meta.dev() != live_parent_meta.device || parent_meta.ino() != live_parent_meta.inode
         || fd_hash(&mut parent, 128 * 1024 * 1024)? != artifacts.manifest.parent_hash
     {
         return Err(());
@@ -74,8 +77,9 @@ fn verify_helper_artifacts(
     Ok(())
 }
 
-fn verify_parent_command(pid: u32, mode: u8) -> Result<(), ()> {
-    let bytes = read_bounded(&PathBuf::from(format!("/proc/{pid}/cmdline")), MAX_CMDLINE)?;
+fn verify_parent_command(proc: &ProcDir, pid: u32, mode: u8) -> Result<(), ()> {
+    let (process, _) = proc.process(pid)?;
+    let bytes = proc.read_child(&process, b"cmdline", pid, MAX_CMDLINE)?;
     if bytes.is_empty() || bytes.last() != Some(&0) {
         return Err(());
     }
@@ -108,21 +112,19 @@ struct ParentGeneration {
     starttime: u64,
 }
 
-fn authenticate_parent_generation(pid: u32, starttime: u64) -> Result<ParentGeneration, ()> {
-    let process = PathBuf::from(format!("/proc/{pid}"));
-    let metadata = std::fs::metadata(&process).map_err(|_| ())?;
+fn authenticate_parent_generation(proc: &ProcDir, pid: u32, starttime: u64) -> Result<ParentGeneration, ()> {
+    let (process, metadata) = proc.process(pid)?;
     let pidfd = pidfd_open(pid)?;
-    if !pidfd_live(&pidfd) || process_starttime(&process)? != starttime {
+    if !pidfd_live(&pidfd) || process_starttime(proc, &process, pid)? != starttime {
         return Err(());
     }
-    Ok(ParentGeneration { pidfd, device:metadata.dev(), inode:metadata.ino(), starttime })
+    Ok(ParentGeneration { pidfd, device:metadata.device, inode:metadata.inode, starttime })
 }
 
-fn revalidate_parent_generation(pid: u32, generation: &ParentGeneration) -> Result<(), ()> {
-    let process = PathBuf::from(format!("/proc/{pid}"));
-    let metadata = std::fs::metadata(&process).map_err(|_| ())?;
-    if !pidfd_live(&generation.pidfd) || metadata.dev() != generation.device
-        || metadata.ino() != generation.inode || process_starttime(&process)? != generation.starttime
+fn revalidate_parent_generation(proc: &ProcDir, pid: u32, generation: &ParentGeneration) -> Result<(), ()> {
+    let (process, metadata) = proc.process(pid)?;
+    if !pidfd_live(&generation.pidfd) || metadata.device != generation.device
+        || metadata.inode != generation.inode || process_starttime(proc, &process, pid)? != generation.starttime
     { Err(()) } else { Ok(()) }
 }
 
@@ -137,7 +139,8 @@ fn helper_main_inner() -> Result<(), ()> {
     {
         return Err(());
     }
-    verify_initial_capability()?;
+    let proc = ProcDir::open_fixed()?;
+    verify_initial_capability(&proc)?;
     set_resource_limits()?;
     let parent_pid = u32::try_from(unsafe { libc::getppid() }).map_err(|_| ())?;
     let (request_bytes, peer) = recv_packet(3)?;
@@ -161,9 +164,9 @@ fn helper_main_inner() -> Result<(), ()> {
     if peer.uid != artifacts.policy.operator_uid || peer.gid != artifacts.policy.operator_gid {
         return Err(());
     }
-    let parent_generation = authenticate_parent_generation(parent_pid, request.parent_starttime)?;
-    verify_helper_artifacts(&artifacts, &request, parent_pid)?;
-    verify_parent_command(parent_pid, request.mode)?;
+    let parent_generation = authenticate_parent_generation(&proc, parent_pid, request.parent_starttime)?;
+    verify_helper_artifacts(&artifacts, &request, parent_pid, &proc)?;
+    verify_parent_command(&proc, parent_pid, request.mode)?;
     let lock =
         PathBuf::from(std::str::from_utf8(&artifacts.policy.database_root.path).map_err(|_| ())?)
             .join(".runtime-admission.lock");
@@ -184,7 +187,7 @@ fn helper_main_inner() -> Result<(), ()> {
     )
     .map_err(|_| ())?;
     install_deny_seccomp()?;
-    finish_helper(&artifacts, &request, parent_pid, &parent_generation, &lock, binding)
+    finish_helper(&artifacts, &request, parent_pid, &parent_generation, &lock, binding, &proc)
 }
 
 fn finish_helper(
@@ -194,15 +197,16 @@ fn finish_helper(
     parent_generation: &ParentGeneration,
     lock: &Path,
     binding: crate::runtime_admission::ProofBinding,
+    proc: &ProcDir,
 ) -> Result<(), ()> {
     let result = stable_scan(
-        Path::new("/proc"),
+        proc,
         &artifacts.policy,
         parent_pid,
         helper_deadline(request.deadline_ms),
     );
-    revalidate_parent_generation(parent_pid, parent_generation)?;
-    verify_helper_artifacts(artifacts, request, parent_pid)?;
+    revalidate_parent_generation(proc, parent_pid, parent_generation)?;
+    verify_helper_artifacts(artifacts, request, parent_pid, proc)?;
     crate::runtime_admission::verify_proof_binding(lock, binding).map_err(|_| ())?;
     reopen_matches(
         Path::new(MANIFEST_PATH),
@@ -218,7 +222,7 @@ fn finish_helper(
         MAX_POLICY_SIZE,
         artifacts.manifest.policy_hash,
     )?;
-    drop_capabilities()?;
+    drop_capabilities(proc)?;
     install_output_seccomp()?;
     let sent = send_packet(
         3,
