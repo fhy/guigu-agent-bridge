@@ -9,9 +9,9 @@ use sha2::{Digest, Sha256};
 use sqlx::{Connection, Row, SqliteConnection, sqlite::SqliteConnectOptions};
 
 use crate::legacy_owner_reconciliation::{
-    Error, RuntimeAbsence, Sidecars, classify_runtime_absence, digest, ensure_marker,
-    path_identity, preflight_publication, preflight_runtime_absence, preflight_unit, publish,
-    publish_new,
+    Error, RuntimeAbsence, Sidecars, classify_runtime_absence_authenticated, digest, ensure_marker,
+    path_identity, preflight_publication, preflight_runtime_absence_authenticated, preflight_unit,
+    publish, publish_new,
 };
 
 const O_NOFOLLOW: i32 = 0o400000;
@@ -686,11 +686,16 @@ pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
         .map_err(|error| prepare_rejected("publication", "manifest-target", error))?;
     preflight_publication(&args.evidence)
         .map_err(|error| prepare_rejected("publication", "evidence-target", error))?;
-    let admission = crate::runtime_admission::Guard::acquire(&database, &config, "reconcile")
+    let admission = crate::runtime_admission::Guard::acquire(&database, &config, "fixture-prepare")
         .map_err(|_| prepare_rejected("preflight", "admission-lock", Error::Rejected))?;
     preflight_unit(&args.unit)
         .map_err(|error| prepare_rejected("preflight", "unit-state", error))?;
-    match classify_runtime_absence(&binary, &config, Some(std::process::id())) {
+    match classify_runtime_absence_authenticated(
+        &binary,
+        &config,
+        Some(std::process::id()),
+        &admission,
+    ) {
         Ok(RuntimeAbsence::Clean) => {}
         Ok(RuntimeAbsence::Process) => {
             return Err(prepare_rejected(
@@ -751,7 +756,12 @@ pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
     sidecars.revalidate(&database)?;
     admission.revalidate().map_err(|_| Error::Rejected)?;
     preflight_unit(&args.unit)?;
-    preflight_runtime_absence(&binary, &config, Some(std::process::id()))?;
+    preflight_runtime_absence_authenticated(
+        &binary,
+        &config,
+        Some(std::process::id()),
+        &admission,
+    )?;
     let mut m = Manifest {
         operation_id: args.operation_id,
         isolated_root: root.to_string_lossy().into_owned(),
@@ -802,11 +812,11 @@ pub async fn migrate(path: impl AsRef<Path>) -> Result<Outcome, Error> {
     let admission = crate::runtime_admission::Guard::acquire(
         Path::new(&m.database),
         Path::new(&m.config),
-        "reconcile",
+        "fixture-migrate",
     )
     .map_err(|_| Error::Rejected)?;
     preflight_unit(&m.unit)?;
-    preflight_runtime_absence(&binary, Path::new(&m.config), None)?;
+    preflight_runtime_absence_authenticated(&binary, Path::new(&m.config), None, &admission)?;
     preflight_publication(Path::new(&m.evidence))?;
     let sidecars = Sidecars::capture(Path::new(&m.database))?;
     let mut c = SqliteConnection::connect_with(
@@ -831,7 +841,12 @@ pub async fn migrate(path: impl AsRef<Path>) -> Result<Outcome, Error> {
         Ok(outcome) => {
             admission.revalidate().map_err(|_| Error::Rejected)?;
             preflight_unit(&m.unit)?;
-            preflight_runtime_absence(&binary, Path::new(&m.config), None)?;
+            preflight_runtime_absence_authenticated(
+                &binary,
+                Path::new(&m.config),
+                None,
+                &admission,
+            )?;
             sqlx::query("COMMIT")
                 .execute(&mut c)
                 .await

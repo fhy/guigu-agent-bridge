@@ -21,6 +21,7 @@ pub mod offline_delivery;
 pub mod offline_preacceptance;
 pub mod offline_recovery;
 pub mod orphaned_preacceptance;
+pub mod privileged_proc_proof;
 pub mod readonly_tuple;
 pub mod readonly_tuple_diagnostics;
 pub mod runtime;

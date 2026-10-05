@@ -1090,6 +1090,42 @@ pub(crate) fn preflight_runtime_absence(
     }
 }
 
+pub(crate) fn preflight_runtime_absence_authenticated(
+    binary: &Path,
+    config: &Path,
+    ignored_pid: Option<u32>,
+    admission: &crate::runtime_admission::Guard,
+) -> Result<(), Error> {
+    match classify_runtime_absence_authenticated(binary, config, ignored_pid, admission)
+        .map_err(|_| Error::Rejected)?
+    {
+        RuntimeAbsence::Clean => Ok(()),
+        RuntimeAbsence::Process | RuntimeAbsence::Listener => Err(Error::Rejected),
+    }
+}
+
+pub(crate) fn classify_runtime_absence_authenticated(
+    binary: &Path,
+    config: &Path,
+    ignored_pid: Option<u32>,
+    admission: &crate::runtime_admission::Guard,
+) -> Result<RuntimeAbsence, RuntimeAbsenceUnknown> {
+    #[cfg(debug_assertions)]
+    if std::env::var_os("T050_RECONCILE_TEST_PROC_ROOT").is_some() {
+        return classify_runtime_absence(binary, config, ignored_pid);
+    }
+    match crate::privileged_proc_proof::prove_runtime_absence(admission)
+        .map_err(|_| RuntimeAbsenceUnknown::parse(RuntimeUnknownArea::Procfs))?
+    {
+        crate::privileged_proc_proof::ProofResult::Clean => Ok(RuntimeAbsence::Clean),
+        crate::privileged_proc_proof::ProofResult::Process => Ok(RuntimeAbsence::Process),
+        crate::privileged_proc_proof::ProofResult::Listener => Ok(RuntimeAbsence::Listener),
+        crate::privileged_proc_proof::ProofResult::Unknown => {
+            Err(RuntimeAbsenceUnknown::parse(RuntimeUnknownArea::Procfs))
+        }
+    }
+}
+
 pub(crate) fn classify_runtime_absence(
     binary: &Path,
     config: &Path,
