@@ -514,6 +514,11 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
         ProcessExecutableLinkPrivilegedOwnerClassificationParse,
         ProcessExecutableLinkUnprivilegedOtherOwnerPermission,
         PrivilegedUserspaceUnrelatedBeforeCmdlineParse,
+        MissingCmdline,
+        MissingDescriptorDirectory,
+        MissingDescriptorEntry,
+        ProcessDisappearsBeforeCmdline,
+        MissingExecutable,
         ProcessExecutableMetadataPermission,
         CmdlineParse,
         CmdlinePermission,
@@ -547,6 +552,17 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
         (
             Setup::PrivilegedUserspaceUnrelatedBeforeCmdlineParse,
             "runtime-unknown-cmdline-parse",
+        ),
+        (Setup::MissingCmdline, "runtime-unknown-cmdline-io"),
+        (Setup::MissingDescriptorDirectory, "runtime-unknown-fd-io"),
+        (Setup::MissingDescriptorEntry, "runtime-unknown-fd-io"),
+        (
+            Setup::ProcessDisappearsBeforeCmdline,
+            "runtime-unknown-cmdline-parse",
+        ),
+        (
+            Setup::MissingExecutable,
+            "runtime-unknown-process-executable-metadata-io",
         ),
         (
             Setup::ProcessExecutableMetadataPermission,
@@ -630,6 +646,43 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
                 .unwrap();
                 std::fs::write(ambiguous.join("cmdline"), b"not-terminated").unwrap();
             }
+            Setup::MissingCmdline => {
+                std::fs::create_dir(fixture.proc_root.join("424242")).unwrap();
+            }
+            Setup::MissingDescriptorDirectory => {
+                let process = fixture.proc_root.join("424242");
+                std::fs::create_dir(&process).unwrap();
+                std::fs::write(process.join("cmdline"), b"unrelated\0").unwrap();
+            }
+            Setup::MissingDescriptorEntry => {
+                let process = fixture.proc_root.join("424242");
+                std::fs::create_dir(&process).unwrap();
+                std::fs::write(process.join("cmdline"), b"unrelated\0").unwrap();
+                std::fs::create_dir(process.join("fd")).unwrap();
+                std::os::unix::fs::symlink("missing", process.join("fd/1")).unwrap();
+            }
+            Setup::ProcessDisappearsBeforeCmdline => {
+                let disappearing = fixture.proc_root.join("424241");
+                std::fs::create_dir(&disappearing).unwrap();
+                std::fs::write(
+                    disappearing.join(".t050-test-disappear-on-child-not-found"),
+                    b"1",
+                )
+                .unwrap();
+
+                let ambiguous = fixture.proc_root.join("424242");
+                std::fs::create_dir(&ambiguous).unwrap();
+                std::fs::write(ambiguous.join("cmdline"), b"not-terminated").unwrap();
+            }
+            Setup::MissingExecutable => {
+                let process = fixture.proc_root.join("424242");
+                std::fs::create_dir(&process).unwrap();
+                let mut cmdline = b"candidate\0".to_vec();
+                cmdline.extend_from_slice(fixture.config.as_os_str().as_encoded_bytes());
+                cmdline.push(0);
+                std::fs::write(process.join("cmdline"), cmdline).unwrap();
+                std::fs::create_dir(process.join("fd")).unwrap();
+            }
             Setup::ProcessExecutableMetadataPermission => {
                 let process = fixture.proc_root.join("424242");
                 let denied = fixture.proc_root.join("denied-executable");
@@ -694,6 +747,7 @@ async fn runtime_unknown_diagnostic_is_bounded_redacted_repeatable_and_invariant
         for forbidden in [
             fixture.root.to_string_lossy().as_ref(),
             "424242",
+            "424241",
             "4294967295",
             "inode",
             "fingerprint",

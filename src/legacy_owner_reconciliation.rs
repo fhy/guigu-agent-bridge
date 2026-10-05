@@ -565,6 +565,31 @@ fn same_file(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
     left.dev() == right.dev() && left.ino() == right.ino()
 }
 
+fn process_gone_after_child_not_found(
+    process: &Path,
+    authenticated: &std::fs::Metadata,
+    area: RuntimeUnknownArea,
+) -> Result<(), RuntimeAbsenceUnknown> {
+    #[cfg(debug_assertions)]
+    {
+        let disappear = process.join(".t050-test-disappear-on-child-not-found");
+        if disappear.exists() {
+            std::fs::remove_file(disappear)
+                .and_then(|()| std::fs::remove_dir(process))
+                .map_err(|error| RuntimeAbsenceUnknown::io(area, &error))?;
+        }
+    }
+    match std::fs::metadata(process) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(RuntimeAbsenceUnknown::io(area, &error)),
+        Ok(current) if same_file(&current, authenticated) => Err(RuntimeAbsenceUnknown::io(
+            area,
+            &std::io::Error::from(std::io::ErrorKind::NotFound),
+        )),
+        Ok(_) => Err(RuntimeAbsenceUnknown::parse(area)),
+    }
+}
+
 fn observed_process_uid(
     process: &Path,
     metadata: &std::fs::Metadata,
@@ -880,7 +905,7 @@ fn classify_process_or_listener(
     let config_uid = config_meta.uid();
     let entries = std::fs::read_dir(&root)
         .map_err(|error| RuntimeAbsenceUnknown::io(RuntimeUnknownArea::Procfs, &error))?;
-    for entry in entries {
+    'processes: for entry in entries {
         let entry =
             entry.map_err(|error| RuntimeAbsenceUnknown::io(RuntimeUnknownArea::Procfs, &error))?;
         if entry
@@ -913,7 +938,14 @@ fn classify_process_or_listener(
         let process_uid = observed_process_uid(&process, &process_meta)?;
         let command_line = match std::fs::read(process.join("cmdline")) {
             Ok(bytes) => bytes,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                process_gone_after_child_not_found(
+                    &process,
+                    &process_meta,
+                    RuntimeUnknownArea::Cmdline,
+                )?;
+                continue;
+            }
             Err(error) => {
                 return Err(RuntimeAbsenceUnknown::io(
                     RuntimeUnknownArea::Cmdline,
@@ -930,7 +962,14 @@ fn classify_process_or_listener(
 
         let descriptors = match std::fs::read_dir(process.join("fd")) {
             Ok(entries) => entries,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                process_gone_after_child_not_found(
+                    &process,
+                    &process_meta,
+                    RuntimeUnknownArea::Descriptor,
+                )?;
+                continue;
+            }
             Err(error) => {
                 return Err(RuntimeAbsenceUnknown::io(
                     RuntimeUnknownArea::Descriptor,
@@ -949,7 +988,14 @@ fn classify_process_or_listener(
                     config_descriptor |= same_file(&metadata, &config_meta);
                     listener_descriptor |= listener_inodes.contains(&metadata.ino());
                 }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    process_gone_after_child_not_found(
+                        &process,
+                        &process_meta,
+                        RuntimeUnknownArea::Descriptor,
+                    )?;
+                    continue 'processes;
+                }
                 Err(error) => {
                     return Err(RuntimeAbsenceUnknown::io(
                         RuntimeUnknownArea::Descriptor,
@@ -966,7 +1012,14 @@ fn classify_process_or_listener(
         let executable_meta = match process_executable_metadata(&process, process_uid, config_uid)?
         {
             Some(metadata) => metadata,
-            None => continue,
+            None => {
+                process_gone_after_child_not_found(
+                    &process,
+                    &process_meta,
+                    RuntimeUnknownArea::ProcessExecutableMetadata,
+                )?;
+                continue;
+            }
         };
         if !same_file(&executable_meta, &binary_meta) {
             continue;
