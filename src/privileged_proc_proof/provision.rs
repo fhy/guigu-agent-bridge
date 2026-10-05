@@ -151,6 +151,7 @@ fn unlinkat_leaf(dir: &File, name: &str) -> Result<(), ()> {
     let name = std::ffi::CString::new(name).map_err(|_| ())?;
     if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } == 0 { Ok(()) } else { Err(()) }
 }
+fn fsync_dir(dir: &File) -> Result<(), ()> { dir.sync_all().map_err(|_| ()) }
 
 fn provision_production_inner(parent_hash: &str, helper_hash: &str, policy_hash: &str, policy_fd: RawFd) -> Result<(), ()> {
     if unsafe { libc::geteuid() } != 0 || policy_fd < 0 { return Err(()); }
@@ -226,11 +227,13 @@ pub fn teardown_production(parent_hash: &str, helper_hash: &str, policy_hash: &s
     let artifact_dir = OpenOptions::new().read(true).open("/etc/guigu-agent-bridge/t050-proc-proof").map_err(|_| ())?;
     let quarantine_name = format!("artifacts.v1.quarantine.{}", std::process::id());
     rename_noreplace(&artifact_dir, "artifacts.v1", &quarantine_name)?;
+    fsync_dir(&artifact_dir)?;
     let quarantine = Path::new("/etc/guigu-agent-bridge/t050-proc-proof").join(&quarantine_name);
     if same_leaf(&quarantine, &manifest_identity).is_err() { return Err(()); }
     replacement_hook("pre-helper-rename")?;
     same_leaf(Path::new(HELPER_PATH), &helper_identity)?;
     rename_noreplace(&helper_root, "t050-proc-proof", &format!("t050-proc-proof.quarantine.{}", std::process::id()))?;
+    fsync_dir(&helper_root)?;
     replacement_hook("pre-capability-removal")?;
     let name = c"security.capability";
     let size = unsafe { libc::fgetxattr(helper_file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
@@ -241,6 +244,7 @@ pub fn teardown_production(parent_hash: &str, helper_hash: &str, policy_hash: &s
     replacement_hook("pre-policy-rename")?;
     same_leaf(Path::new(POLICY_PATH), &policy_identity)?;
     rename_noreplace(&artifact_dir, "policy.v1", &format!("policy.v1.quarantine.{}", std::process::id()))?;
+    fsync_dir(&artifact_dir)?;
     let policy_quarantine = Path::new("/etc/guigu-agent-bridge/t050-proc-proof").join(format!("policy.v1.quarantine.{}", std::process::id()));
     let helper_quarantine = Path::new("/usr/libexec/guigu-agent-bridge").join(format!("t050-proc-proof.quarantine.{}", std::process::id()));
     let _policy_qfd = open_leaf_fd(&artifact_dir, &format!("policy.v1.quarantine.{}", std::process::id()), false)?;
@@ -252,8 +256,11 @@ pub fn teardown_production(parent_hash: &str, helper_hash: &str, policy_hash: &s
     same_leaf(&helper_quarantine, &helper_identity)?;
     same_leaf(&quarantine, &manifest_identity)?;
     unlinkat_leaf(&artifact_dir, &format!("policy.v1.quarantine.{}", std::process::id()))?;
+    fsync_dir(&artifact_dir)?;
     unlinkat_leaf(&helper_root, &format!("t050-proc-proof.quarantine.{}", std::process::id()))?;
+    fsync_dir(&helper_root)?;
     unlinkat_leaf(&artifact_dir, &quarantine_name)?;
+    fsync_dir(&artifact_dir)?;
     OpenOptions::new().read(true).open(Path::new("/etc/guigu-agent-bridge/t050-proc-proof")).map_err(|_| ())?.sync_all().map_err(|_| ())?;
     if let Some(parent) = Path::new(HELPER_PATH).parent() {
         OpenOptions::new().read(true).open(parent).map_err(|_| ())?.sync_all().map_err(|_| ())?;
