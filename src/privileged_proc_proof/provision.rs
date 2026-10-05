@@ -29,7 +29,8 @@ pub fn stage_policy(paths: &FixturePaths, output_fd: RawFd) -> Result<[u8; 32], 
     let database = metadata_identity(&paths.database_root).map_err(|_| StageCause::Database)?;
     if parent.file_type != libc::S_IFREG || parent.mode != 0o755 { return Err(StageCause::Parent); }
     if helper.file_type != libc::S_IFREG || helper.mode & 0o111 == 0 { return Err(StageCause::Helper); }
-    if config.file_type != libc::S_IFREG || database.file_type != libc::S_IFDIR { return Err(StageCause::Config); }
+    if config.file_type != libc::S_IFREG { return Err(StageCause::Config); }
+    if database.file_type != libc::S_IFDIR { return Err(StageCause::Database); }
     let policy = Policy { operator_uid: parent.uid, operator_gid: parent.gid, binary: parent, config, database_root: database, admission_lock: b".runtime-admission.lock".to_vec(), unit: b"guigu-codex-test.service".to_vec(), ports: [9291, 9292] };
     let bytes = policy.encode();
     let duplicate = unsafe { libc::dup(output_fd) };

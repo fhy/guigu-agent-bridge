@@ -221,3 +221,76 @@ fn policy_staging_emits_only_canonical_bytes_and_is_repeatable() {
     assert!(!temp.path().join("fixture-root").exists());
     drop(args);
 }
+
+#[test]
+fn policy_staging_refusals_are_fixed_empty_and_invariant() {
+    for cause in ["parent", "helper", "config", "database", "output"] {
+        let (temp, _) = fixture();
+        let input = temp.path().join("input");
+        let parent = input.join("parent");
+        let helper = input.join("helper");
+        let config = input.join("config.toml");
+        let database = input.join("database");
+        match cause {
+            "parent" => {
+                std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o700)).unwrap()
+            }
+            "helper" => {
+                std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o644)).unwrap()
+            }
+            "config" => {
+                std::fs::remove_file(&config).unwrap();
+                std::fs::create_dir(&config).unwrap();
+            }
+            "database" => {
+                std::fs::remove_dir(&database).unwrap();
+                std::fs::write(&database, b"not-a-directory").unwrap();
+            }
+            "output" => {}
+            _ => unreachable!(),
+        }
+        let config_before = if config.is_file() {
+            Some(std::fs::read(&config).unwrap())
+        } else {
+            None
+        };
+        let output = temp.path().join("policy-output");
+        let file = std::fs::File::create(&output).unwrap();
+        let fd = file.as_raw_fd();
+        let mut command = Command::new(binary());
+        command.args([
+            "stage-policy",
+            "--parent",
+            parent.to_str().unwrap(),
+            "--helper",
+            helper.to_str().unwrap(),
+            "--config",
+            config.to_str().unwrap(),
+            "--database-root",
+            database.to_str().unwrap(),
+        ]);
+        if cause != "output" {
+            unsafe {
+                command.pre_exec(move || {
+                    if libc::dup2(fd, 3) < 0 {
+                        Err(std::io::Error::last_os_error())
+                    } else {
+                        libc::fcntl(3, libc::F_SETFD, 0);
+                        Ok(())
+                    }
+                });
+            }
+        }
+        let result = command.output().unwrap();
+        assert_eq!(result.status.code(), Some(3));
+        assert_eq!(
+            result.stderr,
+            format!("stage-policy status=3 cause={cause}\n").as_bytes()
+        );
+        assert!(std::fs::read(&output).unwrap().is_empty());
+        assert!(!temp.path().join("fixture-root").exists());
+        if let Some(before) = config_before {
+            assert_eq!(std::fs::read(&config).unwrap(), before);
+        }
+    }
+}
