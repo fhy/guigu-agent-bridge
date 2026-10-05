@@ -136,7 +136,6 @@ impl ArtifactManifest {
         Ok(value)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn encode(&self) -> [u8; 256] {
         let mut out = Vec::with_capacity(256);
         out.extend_from_slice(MANIFEST_MAGIC);
@@ -206,14 +205,12 @@ fn canonical_absolute_path(path: &[u8]) -> bool {
             .all(|part| !part.is_empty() && part != b"." && part != b"..")
 }
 
-#[cfg(any(test, feature = "test-support"))]
 fn push_tlv(out: &mut Vec<u8>, tag: u16, value: &[u8]) {
     out.extend_from_slice(&tag.to_be_bytes());
     out.extend_from_slice(&(value.len() as u16).to_be_bytes());
     out.extend_from_slice(value);
 }
 
-#[cfg(any(test, feature = "test-support"))]
 fn encode_identity(value: &FileIdentity) -> Vec<u8> {
     let mut out = Vec::new();
     out.extend_from_slice(&(value.path.len() as u16).to_be_bytes());
@@ -283,7 +280,6 @@ impl Policy {
         Ok(value)
     }
 
-    #[cfg(any(test, feature = "test-support"))]
     pub fn encode(&self) -> Vec<u8> {
         let mut body = Vec::new();
         push_tlv(&mut body, 1, &self.operator_uid.to_be_bytes());
