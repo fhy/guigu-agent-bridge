@@ -1,4 +1,4 @@
-use std::io::Write;
+use std::io::{Seek, SeekFrom, Write};
 use std::os::unix::fs::OpenOptionsExt;
 
 fn fixture_path(root: &Path, suffix: &str) -> Result<PathBuf, ()> {
@@ -30,9 +30,13 @@ pub(super) fn raw_identity(path: &Path) -> Result<FileIdentity, ()> {
 }
 
 fn hash_file(path: &Path) -> Result<[u8; 32], ()> {
-    let bytes = std::fs::read(path).map_err(|_| ())?;
-    Ok(Sha256::digest(bytes).into())
+    let mut file = secure_open(path, libc::O_RDONLY)?;
+    fd_hash(&mut file, MAX_HELPER_SIZE)
 }
+
+const R4_PARENT_HASH: &str = "e1acaf12d51f67cf5f0c4767aefa4a287d6680b042d72bd1728cdcb52a26d6a9";
+const R4_HELPER_HASH: &str = "213f14f32754f8f16714daf0aeeb89faf95c27223978cd46492d6e4531ce778f";
+const R4_POLICY_HASH: &str = "340f5896eb2e99e7cbcc056ed9634894b639dddc71ed766119b6e77bec52ecd1";
 
 fn parse_hash(value: &str) -> Result<[u8; 32], ()> {
     if value.len() != 64 { return Err(()); }
@@ -121,6 +125,112 @@ fn fd_bytes(file: &mut File, max: usize) -> Result<Vec<u8>, ()> {
     Ok(bytes)
 }
 
+fn stream_copy_retained(
+    source: &mut File,
+    target: &mut File,
+    max: u64,
+    mut observed: impl FnMut(u64, usize),
+) -> Result<[u8; 32], ()> {
+    source.seek(SeekFrom::Start(0)).map_err(|_| ())?;
+    let before = source.metadata().map_err(|_| ())?;
+    if !before.is_file() || before.len() > max {
+        return Err(());
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; HASH_BUFFER_SIZE];
+    let mut total = 0u64;
+    loop {
+        let count = source.read(&mut buffer).map_err(|_| ())?;
+        if count == 0 {
+            break;
+        }
+        total = total.checked_add(count as u64).ok_or(())?;
+        if total > max || total > before.len() {
+            return Err(());
+        }
+        target.write_all(&buffer[..count]).map_err(|_| ())?;
+        digest.update(&buffer[..count]);
+        observed(total, count);
+    }
+    let after = source.metadata().map_err(|_| ())?;
+    let target_metadata = target.metadata().map_err(|_| ())?;
+    if total != before.len()
+        || !same_metadata(&before, &after)
+        || !target_metadata.is_file()
+        || target_metadata.len() != total
+    {
+        return Err(());
+    }
+    Ok(digest.finalize().into())
+}
+
+fn set_helper_identity(file: &File, gid: u32) -> Result<(), ()> {
+    if unsafe { libc::fchown(file.as_raw_fd(), 0, gid) } != 0
+        || unsafe { libc::fchmod(file.as_raw_fd(), 0o750) } != 0
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn r4_teardown_manifest(manifest: &ArtifactManifest) -> Result<bool, ()> {
+    Ok(manifest.generation == 1
+        && manifest.parent_hash == parse_hash(R4_PARENT_HASH)?
+        && manifest.helper_hash == parse_hash(R4_HELPER_HASH)?
+        && manifest.policy_hash == parse_hash(R4_POLICY_HASH)?)
+}
+
+fn teardown_helper_metadata_allowed(
+    manifest: &ArtifactManifest,
+    metadata: &std::fs::Metadata,
+) -> Result<bool, ()> {
+    teardown_helper_shape_allowed(
+        manifest,
+        metadata.is_file(),
+        metadata.nlink(),
+        metadata.uid(),
+        metadata.gid(),
+        metadata.mode() & 0o7777,
+    )
+}
+
+fn teardown_helper_shape_allowed(
+    manifest: &ArtifactManifest,
+    is_file: bool,
+    nlink: u64,
+    uid: u32,
+    gid: u32,
+    mode: u32,
+) -> Result<bool, ()> {
+    let exact = is_file
+        && nlink == 1
+        && uid == manifest.helper_uid
+        && gid == manifest.helper_gid
+        && mode == manifest.helper_mode;
+    let r4 = is_file
+        && nlink == 1
+        && uid == 0
+        && gid == 0
+        && mode == 0o750
+        && r4_teardown_manifest(manifest)?;
+    Ok(exact || r4)
+}
+
+fn verify_published_helper(
+    helper: &mut File,
+    operator_gid: u32,
+    expected_hash: [u8; 32],
+) -> Result<(), ()> {
+    let metadata = helper.metadata().map_err(|_| ())?;
+    if !exact_metadata(&metadata, 0, operator_gid, 0o750)
+        || fd_hash(helper, MAX_HELPER_SIZE)? != expected_hash
+        || capability_tuple(helper)? != (1 << 19, 0, 1)
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
 fn replacement_hook(stage: &str) -> Result<(), ()> {
     if std::env::var("T050_PRODUCTION_REPLACE_AT").ok().as_deref() == Some(stage) { Err(()) } else { Ok(()) }
 }
@@ -143,7 +253,9 @@ fn provision_production_inner(parent_hash: &str, helper_hash: &str, policy_hash:
     let expected_policy = parse_hash(policy_hash)?;
     let parent = Path::new(PRODUCTION_PARENT_SOURCE);
     let helper_source = Path::new(PRODUCTION_HELPER_SOURCE);
-    if hash_file(parent)? != expected_parent || hash_file(helper_source)? != expected_helper { return Err(()); }
+    if hash_file(parent)? != expected_parent { return Err(()); }
+    let mut helper_source_file = secure_open(helper_source, libc::O_RDONLY)?;
+    if fd_hash(&mut helper_source_file, MAX_HELPER_SIZE)? != expected_helper { return Err(()); }
     let parent_identity = metadata_identity(parent)?;
     if parent_identity.uid == 0 || parent_identity.mode != 0o755 { return Err(()); }
     let (policy, policy_bytes) = read_policy_fd(policy_fd, expected_policy)?;
@@ -154,18 +266,32 @@ fn provision_production_inner(parent_hash: &str, helper_hash: &str, policy_hash:
     leaf_absent(Path::new(MANIFEST_PATH))?;
     validate_system_path(Path::new(HELPER_PATH))?;
     validate_system_path(Path::new(POLICY_PATH))?;
-    let helper_bytes = std::fs::read(helper_source).map_err(|_| ())?;
     write_exclusive(Path::new(POLICY_PATH), &policy_bytes, 0o644)?;
     let policy_identity = metadata_identity(Path::new(POLICY_PATH))?;
-    let mut helper = OpenOptions::new().write(true).create_new(true).mode(0o750).open(HELPER_PATH).map_err(|_| ())?;
+    let mut helper = OpenOptions::new().read(true).write(true).create_new(true).mode(0o750).open(HELPER_PATH).map_err(|_| ())?;
     let helper_identity = metadata_identity(Path::new(HELPER_PATH))?;
     let rollback = || {
         let _ = remove_owned(Path::new(HELPER_PATH), &helper_identity);
         let _ = remove_owned(Path::new(POLICY_PATH), &policy_identity);
     };
-    if helper.write_all(&helper_bytes).is_err() || helper.sync_all().is_err() { rollback(); return Err(()); }
-    if std::fs::set_permissions(HELPER_PATH, std::os::unix::fs::PermissionsExt::from_mode(0o750)).is_err() { rollback(); return Err(()); }
-    if set_capability(&helper).is_err() { rollback(); return Err(()); }
+    let copied_hash = stream_copy_retained(
+        &mut helper_source_file,
+        &mut helper,
+        MAX_HELPER_SIZE,
+        |_, _| {},
+    );
+    if copied_hash != Ok(expected_helper)
+        || set_helper_identity(&helper, policy.operator_gid).is_err()
+        || set_capability(&helper).is_err()
+        || helper.sync_all().is_err()
+    {
+        rollback();
+        return Err(());
+    }
+    if verify_published_helper(&mut helper, policy.operator_gid, expected_helper).is_err() {
+        rollback();
+        return Err(());
+    }
     OpenOptions::new().read(true).open(artifact_root).map_err(|_| ())?.sync_all().map_err(|_| ())?;
     let manifest = ArtifactManifest { source_commit: SOURCE_COMMIT, build_identity: BUILD_IDENTITY, parent_hash: expected_parent, helper_hash: expected_helper, policy_hash: expected_policy, parent_uid: parent_identity.uid, parent_gid: parent_identity.gid, parent_mode: 0o755, helper_uid: 0, helper_gid: policy.operator_gid, helper_mode: 0o750, capability_permitted: 1 << 19, capability_inheritable: 0, capability_flags: 1, policy_uid: 0, policy_gid: 0, policy_mode: 0o644, generation: 1 };
     if write_exclusive(Path::new(MANIFEST_PATH), &manifest.encode(), 0o644).is_err() { rollback(); return Err(()); }
@@ -202,8 +328,22 @@ fn teardown_production_inner(parent_hash: &str, helper_hash: &str, policy_hash: 
     if manifest.parent_hash != parent_hash || manifest.helper_hash != helper_hash || manifest.policy_hash != policy_hash || manifest.generation != generation { return Err(()); }
     let policy_bytes = fd_bytes(&mut policy_file, MAX_POLICY_SIZE)?;
     if <[u8; 32]>::from(Sha256::digest(&policy_bytes)) != policy_hash { return Err(()); }
-    let helper_bytes = fd_bytes(&mut helper_file, 64 * 1024 * 1024)?;
-    if <[u8; 32]>::from(Sha256::digest(&helper_bytes)) != helper_hash { return Err(()); }
+    if fd_hash(&mut helper_file, MAX_HELPER_SIZE)? != helper_hash { return Err(()); }
+    let manifest_metadata = manifest_file.metadata().map_err(|_| ())?;
+    let policy_metadata = policy_file.metadata().map_err(|_| ())?;
+    let helper_metadata = helper_file.metadata().map_err(|_| ())?;
+    if !exact_metadata(&manifest_metadata, 0, 0, 0o644)
+        || !exact_metadata(&policy_metadata, 0, 0, 0o644)
+        || !teardown_helper_metadata_allowed(&manifest, &helper_metadata)?
+        || capability_tuple(&helper_file)?
+            != (
+                manifest.capability_permitted,
+                manifest.capability_inheritable,
+                manifest.capability_flags,
+            )
+    {
+        return Err(());
+    }
     let quarantine = Path::new("/etc/guigu-agent-bridge/t050-proc-proof/artifacts.v1.quarantine");
     leaf_absent(quarantine)?;
     let manifest_identity = metadata_identity(Path::new(MANIFEST_PATH))?;
@@ -225,7 +365,7 @@ fn teardown_production_inner(parent_hash: &str, helper_hash: &str, policy_hash: 
     let name = c"security.capability";
     let size = unsafe { libc::fgetxattr(helper_file.as_raw_fd(), name.as_ptr(), std::ptr::null_mut(), 0) };
     if size >= 0 && unsafe { libc::fremovexattr(helper_file.as_raw_fd(), name.as_ptr()) } != 0 { return Err(()); }
-    if capability_tuple(&helper_file)? != (0, 0, 0) { return Err(()); }
+    if !has_no_capability(&helper_file) { return Err(()); }
     helper_file.sync_all().map_err(|_| ())?;
     drop(helper_file);
     replacement_hook("pre-policy-rename")?;

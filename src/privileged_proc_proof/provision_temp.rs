@@ -109,10 +109,25 @@ fn provision_temp_fixture_inner(paths: &FixturePaths, generation: u64) -> Result
         policy_mode: 0o644,
         generation,
     };
-    let helper_bytes = std::fs::read(&paths.helper).map_err(|_| ())?;
     write_exclusive(&policy_target, &policy_bytes, 0o644)?;
     failpoint("after-policy")?;
-    write_exclusive(&helper_target, &helper_bytes, 0o750)?;
+    let mut helper_source = secure_open(&paths.helper, libc::O_RDONLY)?;
+    let mut helper_target_file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o750)
+        .open(&helper_target)
+        .map_err(|_| ())?;
+    if stream_copy_retained(
+        &mut helper_source,
+        &mut helper_target_file,
+        MAX_HELPER_SIZE,
+        |_, _| {},
+    )? != helper_hash
+    {
+        return Err(());
+    }
+    helper_target_file.sync_all().map_err(|_| ())?;
     std::fs::set_permissions(
         &helper_target,
         std::os::unix::fs::PermissionsExt::from_mode(0o750),

@@ -91,11 +91,41 @@ fn same_metadata(left: &std::fs::Metadata, right: &std::fs::Metadata) -> bool {
         && left.len() == right.len()
 }
 
-fn fd_hash(file: &mut File, max: usize) -> Result<[u8; 32], ()> {
+fn fd_hash(file: &mut File, max: u64) -> Result<[u8; 32], ()> {
+    fd_hash_observed(file, max, |_, _| {})
+}
+
+fn fd_hash_observed(
+    file: &mut File,
+    max: u64,
+    mut observed: impl FnMut(u64, usize),
+) -> Result<[u8; 32], ()> {
     use std::io::{Seek, SeekFrom};
     file.seek(SeekFrom::Start(0)).map_err(|_| ())?;
-    let (bytes, _) = stable_file_bytes(file, max)?;
-    Ok(Sha256::digest(bytes).into())
+    let before = file.metadata().map_err(|_| ())?;
+    if !before.is_file() || before.len() > max {
+        return Err(());
+    }
+    let mut digest = Sha256::new();
+    let mut buffer = [0u8; HASH_BUFFER_SIZE];
+    let mut total = 0u64;
+    loop {
+        let count = file.read(&mut buffer).map_err(|_| ())?;
+        if count == 0 {
+            break;
+        }
+        total = total.checked_add(count as u64).ok_or(())?;
+        if total > max || total > before.len() {
+            return Err(());
+        }
+        digest.update(&buffer[..count]);
+        observed(total, count);
+    }
+    let after = file.metadata().map_err(|_| ())?;
+    if total != before.len() || !same_metadata(&before, &after) {
+        return Err(());
+    }
+    Ok(digest.finalize().into())
 }
 
 fn capability_tuple(file: &File) -> Result<(u64, u64, u32), ()> {
@@ -195,7 +225,7 @@ fn reopen_matches(
     path: &Path,
     retained: &File,
     expected: &std::fs::Metadata,
-    max: usize,
+    max: u64,
     hash: [u8; 32],
 ) -> Result<(), ()> {
     let current_retained = retained.metadata().map_err(|_| ())?;
@@ -220,7 +250,7 @@ fn verify_parent_artifacts(artifacts: &Artifacts) -> Result<(), ()> {
         artifacts.manifest.parent_gid,
         artifacts.manifest.parent_mode,
     ) || !has_no_capability(&parent)
-        || fd_hash(&mut parent, 128 * 1024 * 1024)? != artifacts.manifest.parent_hash
+        || fd_hash(&mut parent, MAX_HELPER_SIZE)? != artifacts.manifest.parent_hash
     {
         return Err(());
     }
@@ -232,7 +262,7 @@ fn verify_parent_artifacts(artifacts: &Artifacts) -> Result<(), ()> {
         artifacts.manifest.helper_uid,
         artifacts.manifest.helper_gid,
         artifacts.manifest.helper_mode,
-    ) || fd_hash(&mut helper, 64 * 1024 * 1024)? != artifacts.manifest.helper_hash
+    ) || fd_hash(&mut helper, MAX_HELPER_SIZE)? != artifacts.manifest.helper_hash
         || capability_tuple(&helper)?
             != (
                 artifacts.manifest.capability_permitted,

@@ -45,7 +45,7 @@ fn verify_helper_artifacts(
     let (self_process, _) = proc.process(std::process::id())?;
     let live_own_meta = proc.executable_metadata(&self_process, std::process::id())?;
     if own_meta.dev() != live_own_meta.device || own_meta.ino() != live_own_meta.inode
-        || fd_hash(&mut own, 64 * 1024 * 1024)? != artifacts.manifest.helper_hash
+        || fd_hash(&mut own, MAX_HELPER_SIZE)? != artifacts.manifest.helper_hash
         || capability_tuple(&own)?
             != (
                 artifacts.manifest.capability_permitted,
@@ -67,7 +67,7 @@ fn verify_helper_artifacts(
         artifacts.manifest.parent_gid,
         artifacts.manifest.parent_mode,
     ) || parent_meta.dev() != live_parent_meta.device || parent_meta.ino() != live_parent_meta.inode
-        || fd_hash(&mut parent, 128 * 1024 * 1024)? != artifacts.manifest.parent_hash
+        || fd_hash(&mut parent, MAX_HELPER_SIZE)? != artifacts.manifest.parent_hash
     {
         return Err(());
     }
@@ -219,7 +219,7 @@ fn finish_helper(
         Path::new(POLICY_PATH),
         &artifacts.policy_file,
         &artifacts.policy_metadata,
-        MAX_POLICY_SIZE,
+        MAX_POLICY_SIZE as u64,
         artifacts.manifest.policy_hash,
     )?;
     drop_capabilities(proc)?;

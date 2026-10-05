@@ -350,6 +350,109 @@ mod tests {
     }
 
     #[test]
+    fn retained_fd_hash_streams_reviewed_helper_size_with_bounded_buffer() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let file = tempfile::tempfile().unwrap();
+        file.set_len(409_078_248).unwrap();
+        let mut writer = file.try_clone().unwrap();
+        writer.seek(SeekFrom::End(-1)).unwrap();
+        writer.write_all(&[0xa5]).unwrap();
+        writer.sync_all().unwrap();
+
+        let mut first = file.try_clone().unwrap();
+        let mut chunks = 0usize;
+        let digest = fd_hash_observed(&mut first, MAX_HELPER_SIZE, |_, count| {
+            assert!(count <= HASH_BUFFER_SIZE);
+            chunks += 1;
+        })
+        .unwrap();
+        assert!(chunks > 64 * 1024 * 1024 / HASH_BUFFER_SIZE);
+        let mut second = file.try_clone().unwrap();
+        assert_eq!(fd_hash(&mut second, MAX_HELPER_SIZE).unwrap(), digest);
+    }
+
+    #[test]
+    fn retained_fd_hash_rejects_sparse_limit_and_size_churn() {
+        let oversized = tempfile::tempfile().unwrap();
+        oversized.set_len(MAX_HELPER_SIZE + 1).unwrap();
+        let mut oversized_reader = oversized.try_clone().unwrap();
+        assert!(fd_hash(&mut oversized_reader, MAX_HELPER_SIZE).is_err());
+
+        let changing = tempfile::tempfile().unwrap();
+        changing.set_len((HASH_BUFFER_SIZE * 3) as u64).unwrap();
+        let mut reader = changing.try_clone().unwrap();
+        let mut changed = false;
+        assert!(
+            fd_hash_observed(&mut reader, MAX_HELPER_SIZE, |_, _| {
+                if !changed {
+                    changing.set_len(HASH_BUFFER_SIZE as u64).unwrap();
+                    changed = true;
+                }
+            })
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn streaming_copy_crosses_old_limit_and_rejects_source_churn() {
+        let source = tempfile::tempfile().unwrap();
+        source.set_len(64 * 1024 * 1024 + 1).unwrap();
+        let mut source_reader = source.try_clone().unwrap();
+        let mut target = tempfile::tempfile().unwrap();
+        let mut largest = 0usize;
+        let digest = stream_copy_retained(
+            &mut source_reader,
+            &mut target,
+            MAX_HELPER_SIZE,
+            |_, count| largest = largest.max(count),
+        )
+        .unwrap();
+        assert_eq!(largest, HASH_BUFFER_SIZE);
+        let mut target_reader = target.try_clone().unwrap();
+        assert_eq!(fd_hash(&mut target_reader, MAX_HELPER_SIZE).unwrap(), digest);
+
+        let changing = tempfile::tempfile().unwrap();
+        changing.set_len((HASH_BUFFER_SIZE * 3) as u64).unwrap();
+        let mut changing_reader = changing.try_clone().unwrap();
+        let mut changing_target = tempfile::tempfile().unwrap();
+        let mut changed = false;
+        assert!(
+            stream_copy_retained(
+                &mut changing_reader,
+                &mut changing_target,
+                MAX_HELPER_SIZE,
+                |_, _| {
+                    if !changed {
+                        changing.set_len(HASH_BUFFER_SIZE as u64).unwrap();
+                        changed = true;
+                    }
+                },
+            )
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn r4_teardown_compatibility_is_exact_and_runtime_shape_stays_strict() {
+        let mut r4 = manifest();
+        r4.parent_hash = parse_hash(R4_PARENT_HASH).unwrap();
+        r4.helper_hash = parse_hash(R4_HELPER_HASH).unwrap();
+        r4.policy_hash = parse_hash(R4_POLICY_HASH).unwrap();
+        r4.generation = 1;
+        assert!(r4_teardown_manifest(&r4).unwrap());
+        assert!(teardown_helper_shape_allowed(&r4, true, 1, 0, 0, 0o750).unwrap());
+        assert_ne!(r4.helper_gid, 0, "runtime exact metadata still rejects the R4 gid");
+
+        let mut changed = r4.clone();
+        changed.helper_hash[0] ^= 1;
+        assert!(!r4_teardown_manifest(&changed).unwrap());
+        assert!(!teardown_helper_shape_allowed(&changed, true, 1, 0, 0, 0o750).unwrap());
+        assert!(!teardown_helper_shape_allowed(&r4, true, 1, 0, 0, 0o755).unwrap());
+        assert!(!teardown_helper_shape_allowed(&r4, true, 2, 0, 0, 0o750).unwrap());
+    }
+
+    #[test]
     fn syscall_profiles_include_frozen_denials_and_output_minimum() {
         for syscall in [libc::SYS_ptrace, libc::SYS_process_vm_readv, libc::SYS_pidfd_getfd,
             libc::SYS_socket, libc::SYS_mount, libc::SYS_execve, libc::SYS_kill,

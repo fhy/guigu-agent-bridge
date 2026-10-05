@@ -102,6 +102,6 @@ fn revalidate_parent(
     reopen_matches(Path::new(MANIFEST_PATH), &artifacts.manifest_file,
         &artifacts.manifest_metadata, 512, Sha256::digest(artifacts.manifest_bytes).into())?;
     reopen_matches(Path::new(POLICY_PATH), &artifacts.policy_file,
-        &artifacts.policy_metadata, MAX_POLICY_SIZE, artifacts.manifest.policy_hash)?;
+        &artifacts.policy_metadata, MAX_POLICY_SIZE as u64, artifacts.manifest.policy_hash)?;
     verify_parent_artifacts(artifacts)
 }
