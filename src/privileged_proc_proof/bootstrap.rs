@@ -39,6 +39,7 @@ include!("bootstrap_pending.rs");
 
 pub(super) struct ProvisionLayout {
     artifact_dir: File,
+    helper_dir: File,
     lock: File,
     lock_identity: Identity,
     created: Vec<CreatedDirectory>,
@@ -58,7 +59,7 @@ impl ProvisionLayout {
         let etc = trusted_root(etc_root, expected_uid)?;
         let libexec = trusted_root(libexec_root, expected_uid)?;
         let mut created = Vec::new();
-        let directories: Result<File, ConstructionFailure> = (|| {
+        let directories: Result<(File, File), ConstructionFailure> = (|| {
             let bridge_etc = directory(
                 &etc,
                 "guigu-agent-bridge",
@@ -73,17 +74,17 @@ impl ProvisionLayout {
                 expected_uid,
                 &mut created,
             )?;
-            directory(
+            let helper_dir = directory(
                 &libexec,
                 "guigu-agent-bridge",
                 "libexec/guigu-agent-bridge",
                 expected_uid,
                 &mut created,
             )?;
-            Ok(artifact_dir)
+            Ok((artifact_dir, helper_dir))
         })();
-        let artifact_dir = match directories {
-            Ok(directory) => directory,
+        let (artifact_dir, helper_dir) = match directories {
+            Ok(directories) => directories,
             Err(ConstructionFailure::Clean) => {
                 cleanup_directories(&mut created)?;
                 return Err(());
@@ -100,11 +101,20 @@ impl ProvisionLayout {
         };
         Ok(Self {
             artifact_dir,
+            helper_dir,
             lock,
             lock_identity,
             created,
             finished: false,
         })
+    }
+
+    pub(super) fn artifact_dir(&self) -> &File {
+        &self.artifact_dir
+    }
+
+    pub(super) fn helper_dir(&self) -> &File {
+        &self.helper_dir
     }
 
     pub(super) fn finish(mut self, retain_directories: bool) -> Result<(), ()> {

@@ -95,6 +95,7 @@ include!("codec.rs");
 mod bootstrap;
 #[cfg(test)]
 mod bootstrap_tests;
+mod publication;
 mod stage;
 pub use stage::{
     FixturePaths, PRODUCTION_HELPER_SOURCE, PRODUCTION_PARENT_SOURCE, StageCause, stage_policy,

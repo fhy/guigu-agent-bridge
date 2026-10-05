@@ -82,8 +82,17 @@ fn read_policy_fd(fd: RawFd, expected: [u8; 32]) -> Result<(Policy, Vec<u8>), ()
 pub fn provision_production(parent_hash: &str, helper_hash: &str, policy_hash: &str, policy_fd: RawFd) -> Result<(), ()> {
     if unsafe { libc::geteuid() } != 0 || policy_fd < 0 { return Err(()); }
     let layout = bootstrap::ProvisionLayout::production()?;
-    let result = provision_production_inner(parent_hash, helper_hash, policy_hash, policy_fd);
-    let cleanup = layout.finish(result.is_ok());
+    let mut cleanup_ambiguous = false;
+    let result = provision_production_inner(
+        parent_hash,
+        helper_hash,
+        policy_hash,
+        policy_fd,
+        layout.artifact_dir(),
+        layout.helper_dir(),
+        &mut cleanup_ambiguous,
+    );
+    let cleanup = layout.finish(result.is_ok() || cleanup_ambiguous);
     result.and(cleanup)
 }
 
@@ -97,11 +106,6 @@ fn leaf_absent(path: &Path) -> Result<(), ()> {
 fn same_leaf(path: &Path, expected: &FileIdentity) -> Result<(), ()> {
     let actual = metadata_identity(path)?;
     if actual.device == expected.device && actual.inode == expected.inode && actual.file_type == libc::S_IFREG { Ok(()) } else { Err(()) }
-}
-
-fn remove_owned(path: &Path, expected: &FileIdentity) -> Result<(), ()> {
-    same_leaf(path, expected)?;
-    std::fs::remove_file(path).map_err(|_| ())
 }
 
 fn open_leaf_fd(parent: &File, name: &str, write: bool) -> Result<File, ()> {
@@ -162,15 +166,6 @@ fn stream_copy_retained(
         return Err(());
     }
     Ok(digest.finalize().into())
-}
-
-fn set_helper_identity(file: &File, gid: u32) -> Result<(), ()> {
-    if unsafe { libc::fchown(file.as_raw_fd(), 0, gid) } != 0
-        || unsafe { libc::fchmod(file.as_raw_fd(), 0o750) } != 0
-    {
-        return Err(());
-    }
-    Ok(())
 }
 
 fn r4_teardown_manifest(manifest: &ArtifactManifest) -> Result<bool, ()> {
@@ -247,7 +242,15 @@ fn unlinkat_leaf(dir: &File, name: &str) -> Result<(), ()> {
 }
 fn fsync_dir(dir: &File) -> Result<(), ()> { dir.sync_all().map_err(|_| ()) }
 
-fn provision_production_inner(parent_hash: &str, helper_hash: &str, policy_hash: &str, policy_fd: RawFd) -> Result<(), ()> {
+fn provision_production_inner(
+    parent_hash: &str,
+    helper_hash: &str,
+    policy_hash: &str,
+    policy_fd: RawFd,
+    artifact_dir: &File,
+    helper_dir: &File,
+    cleanup_ambiguous: &mut bool,
+) -> Result<(), ()> {
     let expected_parent = parse_hash(parent_hash)?;
     let expected_helper = parse_hash(helper_hash)?;
     let expected_policy = parse_hash(policy_hash)?;
@@ -260,48 +263,73 @@ fn provision_production_inner(parent_hash: &str, helper_hash: &str, policy_hash:
     if parent_identity.uid == 0 || parent_identity.mode != 0o755 { return Err(()); }
     let (policy, policy_bytes) = read_policy_fd(policy_fd, expected_policy)?;
     if policy.binary.path != parent_identity.path { return Err(()); }
-    let artifact_root = Path::new(POLICY_PATH).parent().ok_or(())?;
     leaf_absent(Path::new(HELPER_PATH))?;
     leaf_absent(Path::new(POLICY_PATH))?;
     leaf_absent(Path::new(MANIFEST_PATH))?;
     validate_system_path(Path::new(HELPER_PATH))?;
     validate_system_path(Path::new(POLICY_PATH))?;
-    write_exclusive(Path::new(POLICY_PATH), &policy_bytes, 0o644)?;
-    let policy_identity = metadata_identity(Path::new(POLICY_PATH))?;
-    let mut helper = OpenOptions::new().read(true).write(true).create_new(true).mode(0o750).open(HELPER_PATH).map_err(|_| ())?;
-    let helper_identity = metadata_identity(Path::new(HELPER_PATH))?;
-    let rollback = || {
-        let _ = remove_owned(Path::new(HELPER_PATH), &helper_identity);
-        let _ = remove_owned(Path::new(POLICY_PATH), &policy_identity);
-    };
-    let copied_hash = stream_copy_retained(
-        &mut helper_source_file,
-        &mut helper,
-        MAX_HELPER_SIZE,
-        |_, _| {},
-    );
-    if copied_hash != Ok(expected_helper)
-        || set_helper_identity(&helper, policy.operator_gid).is_err()
-        || set_capability(&helper).is_err()
-        || helper.sync_all().is_err()
-    {
-        rollback();
-        return Err(());
+    use publication::{LeafKind, PublicationTransaction};
+    let mut publication = PublicationTransaction::new(artifact_dir, helper_dir);
+    let result = (|| {
+        let policy_leaf = publication.create(LeafKind::Policy, 0o644)?;
+        publication.file_mut(policy_leaf)?.write_all(&policy_bytes).map_err(|_| ())?;
+        publication.boundary("policy:after-write")?;
+        publication.sync_file(policy_leaf, "policy:after-file-fsync")?;
+        publication.promote(policy_leaf, 0, 0, 0o644)?;
+
+        let helper_leaf = publication.create(LeafKind::Helper, 0o750)?;
+        let copied_hash = stream_copy_retained(
+            &mut helper_source_file,
+            publication.file_mut(helper_leaf)?,
+            MAX_HELPER_SIZE,
+            |_, _| {},
+        )?;
+        if copied_hash != expected_helper {
+            return Err(());
+        }
+        publication.boundary("helper:after-copy")?;
+        if unsafe {
+            libc::fchown(
+                publication.file_mut(helper_leaf)?.as_raw_fd(),
+                0,
+                policy.operator_gid,
+            )
+        } != 0
+        {
+            return Err(());
+        }
+        publication.boundary("helper:after-fchown")?;
+        if unsafe { libc::fchmod(publication.file_mut(helper_leaf)?.as_raw_fd(), 0o750) } != 0 {
+            return Err(());
+        }
+        publication.boundary("helper:after-fchmod")?;
+        set_capability(publication.file_mut(helper_leaf)?)?;
+        publication.boundary("helper:after-capability")?;
+        publication.sync_file(helper_leaf, "helper:after-file-fsync")?;
+        publication.promote(helper_leaf, 0, policy.operator_gid, 0o750)?;
+        verify_published_helper(
+            publication.file_mut(helper_leaf)?,
+            policy.operator_gid,
+            expected_helper,
+        )?;
+        publication.boundary("helper:after-revalidation")?;
+        publication.sync_parent(LeafKind::Helper, "helper:after-parent-fsync")?;
+        publication.sync_parent(LeafKind::Policy, "artifacts:before-manifest-fsync")?;
+
+        let manifest = ArtifactManifest { source_commit: SOURCE_COMMIT, build_identity: BUILD_IDENTITY, parent_hash: expected_parent, helper_hash: expected_helper, policy_hash: expected_policy, parent_uid: parent_identity.uid, parent_gid: parent_identity.gid, parent_mode: 0o755, helper_uid: 0, helper_gid: policy.operator_gid, helper_mode: 0o750, capability_permitted: 1 << 19, capability_inheritable: 0, capability_flags: 1, policy_uid: 0, policy_gid: 0, policy_mode: 0o644, generation: 1 };
+        let manifest_leaf = publication.create(LeafKind::Manifest, 0o644)?;
+        publication.file_mut(manifest_leaf)?.write_all(&manifest.encode()).map_err(|_| ())?;
+        publication.boundary("manifest:after-write")?;
+        publication.sync_file(manifest_leaf, "manifest:after-file-fsync")?;
+        publication.promote(manifest_leaf, 0, 0, 0o644)?;
+        publication.sync_parent(LeafKind::Manifest, "manifest:after-parent-fsync")?;
+        publication.commit(manifest_leaf)
+    })();
+    let cleanup = publication.finish(result.is_ok());
+    if cleanup.is_err() {
+        *cleanup_ambiguous = true;
     }
-    if verify_published_helper(&mut helper, policy.operator_gid, expected_helper).is_err() {
-        rollback();
-        return Err(());
-    }
-    OpenOptions::new().read(true).open(artifact_root).map_err(|_| ())?.sync_all().map_err(|_| ())?;
-    let manifest = ArtifactManifest { source_commit: SOURCE_COMMIT, build_identity: BUILD_IDENTITY, parent_hash: expected_parent, helper_hash: expected_helper, policy_hash: expected_policy, parent_uid: parent_identity.uid, parent_gid: parent_identity.gid, parent_mode: 0o755, helper_uid: 0, helper_gid: policy.operator_gid, helper_mode: 0o750, capability_permitted: 1 << 19, capability_inheritable: 0, capability_flags: 1, policy_uid: 0, policy_gid: 0, policy_mode: 0o644, generation: 1 };
-    if write_exclusive(Path::new(MANIFEST_PATH), &manifest.encode(), 0o644).is_err() { rollback(); return Err(()); }
-    let manifest_identity = metadata_identity(Path::new(MANIFEST_PATH))?;
-    if OpenOptions::new().read(true).open(artifact_root).map_err(|_| ()).and_then(|f| f.sync_all().map_err(|_| ())).is_err() {
-        let _ = remove_owned(Path::new(MANIFEST_PATH), &manifest_identity);
-        rollback();
-        return Err(());
-    }
-    Ok(())
+    result.and(cleanup)
 }
 
 #[allow(clippy::result_unit_err)]
