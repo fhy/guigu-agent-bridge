@@ -1,4 +1,6 @@
 // SPLIT_CLIENT
+const HELPER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+
 pub fn prove_runtime_absence(
     guard: &crate::runtime_admission::Guard,
 ) -> Result<ProofResult, ProofError> {
@@ -75,7 +77,12 @@ fn receive_helper_result(
     child_pidfd: &OwnedFd,
     binding: crate::runtime_admission::ProofBinding,
 ) -> Result<Response, ()> {
-    let timeout = libc::timeval { tv_sec:3, tv_usec:0 };
+    // The helper streams and revalidates binaries up to MAX_HELPER_SIZE before its
+    // bounded scan. Keep this total response budget separate from the scan deadline.
+    let timeout = libc::timeval {
+        tv_sec: HELPER_RESPONSE_TIMEOUT.as_secs() as libc::time_t,
+        tv_usec: 0,
+    };
     if unsafe { libc::setsockopt(socket.as_raw_fd(), libc::SOL_SOCKET, libc::SO_RCVTIMEO, (&timeout as *const libc::timeval).cast(), std::mem::size_of_val(&timeout) as libc::socklen_t) } != 0 {
         stop_and_reap(child);
         return Err(());

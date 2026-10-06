@@ -117,7 +117,14 @@ fn fixed_line(output: &std::process::Output) -> &str {
         .unwrap()
         .lines()
         .find(|line| line.starts_with("production-capability-evidence "))
-        .unwrap()
+        .unwrap_or_else(|| {
+            panic!(
+                "child emitted no fixed record: exit={:?} stdout_bytes={} stderr_bytes={}",
+                output.status.code(),
+                output.stdout.len(),
+                output.stderr.len()
+            )
+        })
 }
 
 fn roots() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf) {

@@ -119,7 +119,14 @@ fn fixed_line(output: &std::process::Output) -> &str {
             line.starts_with("backup-isolated-t050-state ")
                 || line.starts_with("cleanup-isolated-t050-backup ")
         })
-        .unwrap()
+        .unwrap_or_else(|| {
+            panic!(
+                "child emitted no fixed record: exit={:?} stdout_bytes={} stderr_bytes={}",
+                output.status.code(),
+                output.stdout.len(),
+                output.stderr.len()
+            )
+        })
 }
 
 #[test]
