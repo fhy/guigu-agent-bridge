@@ -25,49 +25,164 @@ impl CapabilityEvidence {
     }
 }
 
-fn leaf_absent_for_evidence(path: &str) -> bool {
-    std::fs::symlink_metadata(path)
-        .map(|_| false)
-        .unwrap_or_else(|error| error.kind() == std::io::ErrorKind::NotFound)
+enum ParentState {
+    Missing,
+    Present(File),
 }
 
-fn directory_has_no_quarantine(path: &str, prefixes: &[&[u8]]) -> bool {
-    let entries = match std::fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return true,
-        Err(_) => return false,
+fn evidence_trusted_root(path: &Path, expected_uid: u32) -> Result<File, ()> {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC)
+        .open(path)
+        .map_err(|_| ())?;
+    validate_evidence_directory(&file, expected_uid)?;
+    Ok(file)
+}
+
+fn validate_evidence_directory(file: &File, expected_uid: u32) -> Result<(), ()> {
+    let metadata = file.metadata().map_err(|_| ())?;
+    if !metadata.is_dir()
+        || metadata.uid() != expected_uid
+        || metadata.gid() != expected_uid
+        || metadata.mode() & 0o7777 != 0o755
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+fn open_directory_optional(parent: &File, name: &std::ffi::CStr) -> Result<ParentState, ()> {
+    let how = OpenHow {
+        flags: (libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC) as u64,
+        mode: 0,
+        resolve: RESOLVE_BENEATH | RESOLVE_NO_SYMLINKS | RESOLVE_NO_MAGICLINKS,
     };
-    for entry in entries {
-        let Ok(entry) = entry else {
-            return false;
-        };
-        if prefixes
-            .iter()
-            .any(|prefix| entry.file_name().as_bytes().starts_with(prefix))
-        {
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_openat2,
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            &how,
+            std::mem::size_of::<OpenHow>(),
+        )
+    };
+    if fd >= 0 {
+        return Ok(ParentState::Present(unsafe {
+            File::from_raw_fd(fd as RawFd)
+        }));
+    }
+    if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT) {
+        Ok(ParentState::Missing)
+    } else {
+        Err(())
+    }
+}
+
+fn retained_parent(
+    root: &Path,
+    components: &[&str],
+    expected_uid: u32,
+) -> Result<ParentState, ()> {
+    let mut current = evidence_trusted_root(root, expected_uid)?;
+    for component in components {
+        let name = CString::new(*component).map_err(|_| ())?;
+        match open_directory_optional(&current, &name)? {
+            ParentState::Missing => return Ok(ParentState::Missing),
+            ParentState::Present(next) => {
+                validate_evidence_directory(&next, expected_uid)?;
+                current = next;
+            }
+        }
+    }
+    Ok(ParentState::Present(current))
+}
+
+fn leaf_absent_at(parent: &File, name: &str) -> bool {
+    let Ok(name) = CString::new(name) else {
+        return false;
+    };
+    let mut metadata = std::mem::MaybeUninit::<libc::stat>::uninit();
+    let result = unsafe {
+        libc::fstatat(
+            parent.as_raw_fd(),
+            name.as_ptr(),
+            metadata.as_mut_ptr(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    result < 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ENOENT)
+}
+
+fn directory_has_no_prefixes(parent: &File, prefixes: &[&[u8]]) -> bool {
+    let duplicate = unsafe { libc::dup(parent.as_raw_fd()) };
+    if duplicate < 0 {
+        return false;
+    }
+    let directory = unsafe { libc::fdopendir(duplicate) };
+    if directory.is_null() {
+        unsafe { libc::close(duplicate) };
+        return false;
+    }
+    loop {
+        unsafe { *libc::__errno_location() = 0 };
+        let entry = unsafe { libc::readdir(directory) };
+        if entry.is_null() {
+            let clean = unsafe { *libc::__errno_location() == 0 };
+            unsafe { libc::closedir(directory) };
+            return clean;
+        }
+        let name = unsafe { std::ffi::CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if prefixes.iter().any(|prefix| name.starts_with(prefix)) {
+            unsafe { libc::closedir(directory) };
             return false;
         }
     }
-    true
+}
+
+fn clean_no_generation_at(etc_root: &Path, libexec_root: &Path, expected_uid: u32) -> bool {
+    #[cfg(test)]
+    if std::env::var_os("T050_CAPABILITY_EVIDENCE_INSPECTION_FAILURE").is_some() {
+        return false;
+    }
+    let artifact = match retained_parent(
+        etc_root,
+        &["guigu-agent-bridge", "t050-proc-proof"],
+        expected_uid,
+    ) {
+        Ok(parent) => parent,
+        Err(()) => return false,
+    };
+    let helper = match retained_parent(libexec_root, &["guigu-agent-bridge"], expected_uid) {
+        Ok(parent) => parent,
+        Err(()) => return false,
+    };
+    let artifact_clean = match artifact {
+        ParentState::Missing => true,
+        ParentState::Present(parent) => {
+            ["artifacts.v1", "policy.v1", ".provision.lock"]
+                .iter()
+                .all(|name| leaf_absent_at(&parent, name))
+                && directory_has_no_prefixes(
+                    &parent,
+                    &[b"artifacts.v1.quarantine", b"policy.v1.quarantine."],
+                )
+        }
+    };
+    let helper_clean = match helper {
+        ParentState::Missing => true,
+        ParentState::Present(parent) => {
+            leaf_absent_at(&parent, "t050-proc-proof")
+                && directory_has_no_prefixes(&parent, &[b"t050-proc-proof.quarantine."])
+        }
+    };
+    artifact_clean && helper_clean
 }
 
 fn clean_no_generation() -> bool {
-    [
-        MANIFEST_PATH,
-        POLICY_PATH,
-        HELPER_PATH,
-        "/etc/guigu-agent-bridge/t050-proc-proof/.provision.lock",
-    ]
-    .iter()
-    .all(|path| leaf_absent_for_evidence(path))
-        && directory_has_no_quarantine(
-            "/etc/guigu-agent-bridge/t050-proc-proof",
-            &[b"artifacts.v1.quarantine", b"policy.v1.quarantine."],
-        )
-        && directory_has_no_quarantine(
-            "/usr/libexec/guigu-agent-bridge",
-            &[b"t050-proc-proof.quarantine."],
-        )
+    clean_no_generation_at(Path::new("/etc"), Path::new("/usr/libexec"), 0)
 }
 
 fn authenticate_capability_generation() -> Result<u64, ()> {
@@ -134,169 +249,5 @@ pub fn production_capability_evidence() -> CapabilityEvidence {
 }
 
 #[cfg(test)]
-mod capability_evidence_tests {
-    use super::*;
-    use std::{
-        os::{
-            fd::AsRawFd,
-            unix::fs::{MetadataExt, PermissionsExt},
-        },
-        process::Command,
-    };
-
-    const CHILD: &str =
-        "privileged_proc_proof::capability_evidence_tests::capability_evidence_fixture_child";
-    const PLANTED: &str = "planted-secret-capability-path";
-
-    fn capability_bytes() -> [u8; 20] {
-        let mut value = [0u8; 20];
-        value[0..4].copy_from_slice(&0x0200_0001u32.to_le_bytes());
-        value[4..8].copy_from_slice(&(1u32 << 19).to_le_bytes());
-        value
-    }
-
-    fn test_evidence(path: &Path) -> CapabilityEvidence {
-        let mut file = match secure_open(path, libc::O_RDONLY) {
-            Ok(file) => file,
-            Err(()) if std::fs::symlink_metadata(path).is_err_and(|error| {
-                error.kind() == std::io::ErrorKind::NotFound
-            }) => return CapabilityEvidence::NoGeneration,
-            Err(()) => return CapabilityEvidence::Refused,
-        };
-        let metadata = match file.metadata() {
-            Ok(metadata) => metadata,
-            Err(_) => return CapabilityEvidence::Refused,
-        };
-        let expected_hash = Sha256::digest(b"reviewed-helper");
-        let valid = metadata.is_file()
-            && metadata.mode() & 0o7777 == 0o750
-            && metadata.nlink() == 1
-            && fd_hash(&mut file, 4096) == Ok(expected_hash.into())
-            && capability_tuple_named(&file, c"user.t050-capability") == Ok((1 << 19, 0, 1));
-        if valid {
-            CapabilityEvidence::Present { generation: 1 }
-        } else {
-            CapabilityEvidence::Refused
-        }
-    }
-
-    #[test]
-    #[ignore]
-    fn capability_evidence_fixture_child() {
-        let Some(path) = std::env::var_os("T050_CAPABILITY_EVIDENCE_FIXTURE") else {
-            return;
-        };
-        let evidence = test_evidence(Path::new(&path));
-        println!("{}", evidence.line());
-        std::process::exit(if evidence.is_success() { 0 } else { 3 });
-    }
-
-    fn run(path: &Path) -> std::process::Output {
-        Command::new(std::env::current_exe().unwrap())
-            .args(["--ignored", "--exact", CHILD, "--nocapture"])
-            .env("T050_CAPABILITY_EVIDENCE_FIXTURE", path)
-            .output()
-            .unwrap()
-    }
-
-    fn helper(path: &Path) {
-        std::fs::write(path, b"reviewed-helper").unwrap();
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o750)).unwrap();
-        let file = File::open(path).unwrap();
-        let value = capability_bytes();
-        assert_eq!(
-            unsafe {
-                libc::fsetxattr(
-                    file.as_raw_fd(),
-                    c"user.t050-capability".as_ptr(),
-                    value.as_ptr().cast(),
-                    value.len(),
-                    0,
-                )
-            },
-            0
-        );
-    }
-
-    fn fixed_line(output: &std::process::Output) -> &str {
-        std::str::from_utf8(&output.stdout)
-            .unwrap()
-            .lines()
-            .find(|line| line.starts_with("production-capability-evidence "))
-            .unwrap()
-    }
-
-    #[test]
-    fn process_capability_success_is_fixed() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("helper");
-        helper(&path);
-        let output = run(&path);
-        assert_eq!(output.status.code(), Some(0));
-        assert_eq!(
-            fixed_line(&output),
-            CapabilityEvidence::Present { generation: 1 }.line()
-        );
-    }
-
-    #[test]
-    fn process_capability_refusal_is_fixed() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("helper");
-        std::fs::write(&path, b"reviewed-helper").unwrap();
-        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o750)).unwrap();
-        let output = run(&path);
-        assert_eq!(output.status.code(), Some(3));
-        assert_eq!(fixed_line(&output), CapabilityEvidence::Refused.line());
-    }
-
-    #[test]
-    fn process_no_generation_is_distinct() {
-        let temp = tempfile::tempdir().unwrap();
-        let output = run(&temp.path().join("absent-helper"));
-        assert_eq!(output.status.code(), Some(3));
-        assert_eq!(fixed_line(&output), CapabilityEvidence::NoGeneration.line());
-    }
-
-    #[test]
-    fn process_cleanup_returns_to_no_generation() {
-        let temp = tempfile::tempdir().unwrap();
-        let path = temp.path().join("helper");
-        helper(&path);
-        std::fs::remove_file(&path).unwrap();
-        let output = run(&path);
-        assert_eq!(fixed_line(&output), CapabilityEvidence::NoGeneration.line());
-        assert!(std::fs::read_dir(temp.path()).unwrap().next().is_none());
-    }
-
-    #[test]
-    fn process_refusal_never_reflects_path_or_content() {
-        let temp = tempfile::Builder::new().prefix(PLANTED).tempdir().unwrap();
-        let outside = temp.path().join(PLANTED);
-        let path = temp.path().join("helper");
-        std::fs::write(&outside, PLANTED).unwrap();
-        std::os::unix::fs::symlink(&outside, &path).unwrap();
-        let output = run(&path);
-        let line = fixed_line(&output);
-        assert_eq!(line, CapabilityEvidence::Refused.line());
-        assert!(!line.contains(PLANTED));
-        assert_eq!(std::fs::read_to_string(outside).unwrap(), PLANTED);
-    }
-
-    #[test]
-    fn production_lines_are_fixed_and_redacted() {
-        assert_eq!(
-            CapabilityEvidence::Present { generation: 7 }.line(),
-            "production-capability-evidence status=0 cause=none generation=7 capability=cap_sys_ptrace_ep"
-        );
-        assert_eq!(
-            CapabilityEvidence::NoGeneration.line(),
-            "production-capability-evidence status=3 cause=no-generation generation=none capability=none"
-        );
-        assert_eq!(
-            CapabilityEvidence::Refused.line(),
-            "production-capability-evidence status=3 cause=artifact generation=unknown capability=unknown"
-        );
-    }
-
-}
+#[path = "capability_evidence_tests.rs"]
+mod capability_evidence_tests;
