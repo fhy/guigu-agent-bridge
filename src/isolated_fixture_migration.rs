@@ -341,6 +341,25 @@ fn prepare_rejected(stage: &str, cause: &str, error: Error) -> Error {
     error
 }
 
+fn prepare_test_fault(label: &str) -> bool {
+    #[cfg(debug_assertions)]
+    {
+        std::env::var("T050_FIXTURE_MIGRATION_TEST_PREPARE_FAULT").as_deref() == Ok(label)
+    }
+    #[cfg(not(debug_assertions))]
+    {
+        let _ = label;
+        false
+    }
+}
+
+fn postflight_identity(path: &Path, executable: bool, cause: &str) -> Result<String, Error> {
+    if prepare_test_fault(cause) {
+        return Err(prepare_rejected("postflight", cause, Error::Rejected));
+    }
+    path_identity(path, executable).map_err(|error| prepare_rejected("postflight", cause, error))
+}
+
 fn owner_digest(owner: &Owner) -> String {
     digest(&[
         &owner.token,
@@ -788,11 +807,11 @@ pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
             .to_string_lossy()
             .into_owned(),
         config: config.to_string_lossy().into_owned(),
-        config_identity: path_identity(&config, true)?,
+        config_identity: postflight_identity(&config, true, "config-identity")?,
         database: database.to_string_lossy().into_owned(),
-        database_identity: path_identity(&database, false)?,
+        database_identity: postflight_identity(&database, false, "database-identity")?,
         binary: binary.to_string_lossy().into_owned(),
-        binary_identity: path_identity(&binary, true)?,
+        binary_identity: postflight_identity(&binary, true, "binary-identity")?,
         unit: args.unit,
         evidence: args.evidence.to_string_lossy().into_owned(),
         pre_state_digest: pre,
@@ -807,17 +826,20 @@ pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
     };
     m.manifest_digest = manifest_digest(&m);
     m.receipt_digest = receipt_digest(&m);
+    let manifest = if prepare_test_fault("manifest-serialization") {
+        Err(Error::Rejected)
+    } else {
+        serde_json::to_vec(&m).map_err(|_| Error::Rejected)
+    }
+    .map_err(|error| prepare_rejected("publication", "manifest-serialization", error))?;
     let marker = format!(
         "t050-fixture-migration-v1\noperation_id={}\nunit={}\n",
         m.operation_id, m.unit
     );
     ensure_marker(Path::new(&m.marker), marker.as_bytes())
         .map_err(|error| prepare_rejected("publication", "marker", error))?;
-    publish_new(
-        &args.manifest,
-        &serde_json::to_vec(&m).map_err(|_| Error::Rejected)?,
-    )
-    .map_err(|error| prepare_rejected("publication", "manifest", error))?;
+    publish_new(&args.manifest, &manifest)
+        .map_err(|error| prepare_rejected("publication", "manifest", error))?;
     Ok(())
 }
 
