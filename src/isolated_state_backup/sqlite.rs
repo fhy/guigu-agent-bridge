@@ -23,9 +23,15 @@ pub(crate) struct SqliteFacts {
 pub(crate) async fn online_backup(
     paths: &Paths,
     s0: &SourceSet,
+    source_main: &std::fs::File,
     destination: &std::fs::File,
 ) -> Result<(SqliteFacts, SourceSet), ()> {
-    let options = SqliteConnectOptions::from_str(paths.database.to_str().ok_or(())?)
+    let retained = fs::identity(&source_main.metadata().map_err(|_| ())?)?;
+    if !fs::same(retained, s0.main) {
+        return Err(());
+    }
+    let source_path = format!("/proc/self/fd/{}", source_main.as_raw_fd());
+    let options = SqliteConnectOptions::from_str(&source_path)
         .map_err(|_| ())?
         .read_only(true)
         .create_if_missing(false)
@@ -33,12 +39,20 @@ pub(crate) async fn online_backup(
     let mut source = SqliteConnection::connect_with(&options)
         .await
         .map_err(|_| ())?;
+    super::fault::hit("sqlite-s1-open")?;
     validate_main(paths, s0.main)?;
+    if !fs::same(
+        retained,
+        fs::identity(&source_main.metadata().map_err(|_| ())?)?,
+    ) {
+        return Err(());
+    }
     sqlx::query("BEGIN")
         .execute(&mut source)
         .await
         .map_err(|_| ())?;
     let facts = facts(&mut source).await?;
+    super::fault::hit("sqlite-s3-transaction")?;
     let s3 = super::backup::source_set(paths)?;
     validate_observation(s0, &s3, None)?;
     let mut handle = source.lock_handle().await.map_err(|_| ())?;
@@ -64,12 +78,14 @@ pub(crate) async fn online_backup(
     }
     let copied =
         backup_raw(raw_source, raw_destination).and_then(|()| journal_delete(raw_destination));
+    super::fault::hit("sqlite-s5-copy")?;
     let s5 = super::backup::source_set(paths)?;
     validate_observation(s0, &s5, Some(&s3))?;
     let closed = unsafe { ffi::sqlite3_close(raw_destination) };
     drop(handle);
     let rolled_back = sqlx::query("ROLLBACK").execute(&mut source).await;
     source.close().await.map_err(|_| ())?;
+    super::fault::hit("sqlite-s7-close")?;
     if copied.is_err() || closed != ffi::SQLITE_OK || rolled_back.is_err() {
         return Err(());
     }

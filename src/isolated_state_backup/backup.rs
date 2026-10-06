@@ -38,13 +38,20 @@ async fn create(paths: Paths) -> Result<String, Failure> {
     let gid = unsafe { libc::getegid() };
     let namespace = fs::create_namespace(&root, NAMESPACE, uid, gid)
         .map_err(|_| Failure::rejected(COMMAND, "target"))?;
+    let namespace_identity = fs::dir_identity(
+        &namespace
+            .metadata()
+            .map_err(|_| Failure::rejected(COMMAND, "target"))?,
+    )
+    .map_err(|_| Failure::rejected(COMMAND, "target"))?;
     let mut publication = Publication::default();
     let outcome = create_in_namespace(&paths, &root, &namespace, uid, gid, &mut publication).await;
     if outcome.is_err() {
         publication
             .rollback(&namespace)
             .map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
-        fs::remove_dir(&root, NAMESPACE).map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
+        fs::remove_dir_exact(&root, NAMESPACE, namespace_identity)
+            .map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
         root.sync_all()
             .map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
     }
@@ -85,14 +92,15 @@ async fn create_locked(
     gid: u32,
     publication: &mut Publication,
 ) -> Result<String, Failure> {
-    let before = source_set(paths).map_err(|_| Failure::rejected(COMMAND, "identity"))?;
+    let (before, source_main) =
+        source_set_retained(paths).map_err(|_| Failure::rejected(COMMAND, "identity"))?;
     let temporary = format!("snapshot.tmp.{}", uuid::Uuid::now_v7().simple());
     let destination = fs::create_leaf(namespace, &temporary, 0o600)
         .map_err(|_| Failure::rejected(COMMAND, "publication"))?;
     publication
-        .arm(&temporary, &destination)
+        .arm(namespace, &temporary, &destination)
         .map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
-    let (facts, after) = sqlite::online_backup(paths, &before, &destination)
+    let (facts, after) = sqlite::online_backup(paths, &before, &source_main, &destination)
         .await
         .map_err(|_| Failure::rejected(COMMAND, "sqlite"))?;
     destination
@@ -151,7 +159,7 @@ async fn create_locked(
     let mut manifest_file = fs::create_leaf(namespace, &manifest_temp, 0o600)
         .map_err(|_| Failure::rejected(COMMAND, "publication"))?;
     publication
-        .arm(&manifest_temp, &manifest_file)
+        .arm(namespace, &manifest_temp, &manifest_file)
         .map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
     fs::write_sync(&mut manifest_file, &manifest.encode())
         .map_err(|_| Failure::rejected(COMMAND, "publication"))?;
@@ -230,8 +238,13 @@ pub(crate) fn load_manifest(namespace: &File) -> Result<Manifest, ()> {
 }
 
 pub(crate) fn source_set(paths: &Paths) -> Result<SourceSet, ()> {
+    source_set_retained(paths).map(|(set, _)| set)
+}
+
+pub(crate) fn source_set_retained(paths: &Paths) -> Result<(SourceSet, File), ()> {
     let root = fs::open_dir(&paths.root)?;
-    let (main, main_hash) = source_leaf(&root, "state.db")?;
+    let mut main_file = fs::open_leaf(&root, "state.db", false)?;
+    let (main_hash, main) = fs::hash(&mut main_file)?;
     let (wal, wal_hash) = optional_source(&root, "state.db-wal")?;
     let (shm, _) = optional_source(&root, "state.db-shm")?;
     for sidecar in [wal, shm].into_iter().flatten() {
@@ -258,15 +271,18 @@ pub(crate) fn source_set(paths: &Paths) -> Result<SourceSet, ()> {
     if bytes > 2 * super::MAX_FILE {
         return Err(());
     }
-    Ok(SourceSet {
-        main,
-        wal,
-        shm,
-        hash: digest.finalize().into(),
-        bytes,
-        main_hash,
-        wal_hash,
-    })
+    Ok((
+        SourceSet {
+            main,
+            wal,
+            shm,
+            hash: digest.finalize().into(),
+            bytes,
+            main_hash,
+            wal_hash,
+        },
+        main_file,
+    ))
 }
 
 fn source_leaf(dir: &File, name: &str) -> Result<(super::codec::Identity, [u8; 32]), ()> {
@@ -299,14 +315,20 @@ fn encode_component(
 }
 #[derive(Default)]
 struct Publication {
-    leaves: Vec<(String, Option<super::codec::Identity>)>,
+    leaves: Vec<(String, super::codec::Identity)>,
 }
 
 impl Publication {
-    fn arm(&mut self, name: &str, file: &File) -> Result<(), ()> {
-        self.leaves.push((name.to_owned(), None));
+    fn arm(&mut self, namespace: &File, name: &str, file: &File) -> Result<(), ()> {
+        super::fault::hit("before-publication-metadata")?;
         let identity = fs::identity(&file.metadata().map_err(|_| ())?)?;
-        self.leaves.last_mut().ok_or(())?.1 = Some(identity);
+        self.leaves.push((name.to_owned(), identity));
+        let current = fs::open_leaf(namespace, name, false)?;
+        let observed = fs::identity(&current.metadata().map_err(|_| ())?)?;
+        if !fs::same(identity, observed) {
+            return Err(());
+        }
+        super::fault::hit("after-publication-create")?;
         Ok(())
     }
 
@@ -317,13 +339,10 @@ impl Publication {
             .find(|(candidate, _)| candidate == name)
             .ok_or(())?;
         let observed = fs::identity(&file.metadata().map_err(|_| ())?)?;
-        if entry
-            .1
-            .is_none_or(|expected| !fs::same_object(expected, observed))
-        {
+        if !fs::same_object(entry.1, observed) {
             return Err(());
         }
-        entry.1 = Some(observed);
+        entry.1 = observed;
         Ok(())
     }
 
@@ -341,7 +360,7 @@ impl Publication {
         while let Some((name, expected)) = self.leaves.pop() {
             let file = fs::open_leaf(namespace, &name, false)?;
             let observed = fs::identity(&file.metadata().map_err(|_| ())?)?;
-            if expected.is_some_and(|value| !fs::same(value, observed)) {
+            if !fs::same(expected, observed) {
                 return Err(());
             }
             fs::unlink(namespace, &name)?;

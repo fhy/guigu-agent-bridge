@@ -39,6 +39,13 @@ fn cleanup(paths: &Paths, expected: [u8; 32]) -> Result<String, &'static str> {
     } else {
         fs::OperationLock::acquire(&namespace).map_err(|_| "cleanup")?
     };
+    if existing
+        .as_ref()
+        .is_some_and(|record| !fs::same(record.operation_lock, operation.identity()))
+    {
+        operation.preserve();
+        return Err("cleanup");
+    }
     let mut record = match existing {
         Some(record) => {
             if record.expected_snapshot != expected {
@@ -47,7 +54,9 @@ fn cleanup(paths: &Paths, expected: [u8; 32]) -> Result<String, &'static str> {
             }
             record
         }
-        None => create_record(&namespace, expected).map_err(|_| "manifest")?,
+        None => {
+            create_record(&namespace, expected, operation.identity()).map_err(|_| "manifest")?
+        }
     };
     let result = drive(&namespace, &mut record);
     if result.is_err() {
@@ -59,7 +68,11 @@ fn cleanup(paths: &Paths, expected: [u8; 32]) -> Result<String, &'static str> {
     Ok(success(count))
 }
 
-fn create_record(namespace: &File, expected: [u8; 32]) -> Result<Record, ()> {
+fn create_record(
+    namespace: &File,
+    expected: [u8; 32],
+    operation_lock: super::codec::Identity,
+) -> Result<Record, ()> {
     let manifest = backup::load_manifest(namespace)?;
     if manifest.snapshot_hash != expected {
         return Err(());
@@ -72,19 +85,26 @@ fn create_record(namespace: &File, expected: [u8; 32]) -> Result<Record, ()> {
     if hash != expected || !fs::same(snapshot_identity, manifest.snapshot) {
         return Err(());
     }
-    let restore = journal::adopt(namespace)?;
-    let (kind, old_main, old_wal, old_shm) = match restore {
-        None => (Kind::Backup, None, None, None),
-        Some(record) if record.phase == RestorePhase::Committed && record.snapshot == expected => (
-            Kind::Restore,
-            (record.bitmap & MAIN != 0).then_some(record.original_main),
-            (record.bitmap & WAL != 0)
-                .then_some(record.original_wal)
-                .flatten(),
-            (record.bitmap & SHM != 0)
-                .then_some(record.original_shm)
-                .flatten(),
-        ),
+    let restore = journal::adopt_bound(namespace)?;
+    let (kind, old_main, old_wal, old_shm, restore_journal, restore_journal_digest) = match restore
+    {
+        None => (Kind::Backup, None, None, None, None, None),
+        Some((record, identity, digest))
+            if record.phase == RestorePhase::Committed && record.snapshot == expected =>
+        {
+            (
+                Kind::Restore,
+                (record.bitmap & MAIN != 0).then_some(record.original_main),
+                (record.bitmap & WAL != 0)
+                    .then_some(record.original_wal)
+                    .flatten(),
+                (record.bitmap & SHM != 0)
+                    .then_some(record.original_shm)
+                    .flatten(),
+                Some(identity),
+                Some(digest),
+            )
+        }
         Some(_) => return Err(()),
     };
     let record = Record {
@@ -98,6 +118,9 @@ fn create_record(namespace: &File, expected: [u8; 32]) -> Result<Record, ()> {
         namespace: fs::dir_identity(&namespace.metadata().map_err(|_| ())?)?,
         snapshot: snapshot_identity,
         manifest: manifest_identity,
+        restore_journal,
+        restore_journal_digest,
+        operation_lock,
         old_main,
         old_wal,
         old_shm,
@@ -173,15 +196,25 @@ fn drive(namespace: &File, record: &mut Record) -> Result<u32, &'static str> {
     }
     if record.phase == Phase::IntentRestoreJournal {
         if !fs::leaf_absent(namespace, RESTORE_JOURNAL).map_err(|_| "journal")? {
-            let restore = journal::adopt(namespace)
-                .map_err(|_| "journal")?
-                .ok_or("journal")?;
+            super::fault::hit("cleanup-before-restore-journal-delete").map_err(|_| "cleanup")?;
+            let mut journal_file =
+                fs::open_leaf(namespace, RESTORE_JOURNAL, false).map_err(|_| "journal")?;
+            let journal_identity = fs::identity(&journal_file.metadata().map_err(|_| "journal")?)
+                .map_err(|_| "journal")?;
+            let journal_bytes = fs::read_small(&mut journal_file).map_err(|_| "journal")?;
+            let restore =
+                super::codec::RestoreRecord::decode(&journal_bytes).map_err(|_| "journal")?;
             if restore.phase != RestorePhase::Committed
                 || restore.snapshot != record.expected_snapshot
+                || record
+                    .restore_journal
+                    .is_none_or(|v| !fs::same(v, journal_identity))
+                || record.restore_journal_digest != Some(Sha256::digest(&journal_bytes).into())
             {
                 return Err("journal");
             }
-            remove_exact(namespace, RESTORE_JOURNAL, None).map_err(|_| "cleanup")?;
+            remove_exact(namespace, RESTORE_JOURNAL, record.restore_journal)
+                .map_err(|_| "cleanup")?;
             count += 1;
         }
         namespace.sync_all().map_err(|_| "cleanup")?;
@@ -262,11 +295,14 @@ fn remove_exact(
     name: &str,
     expected: Option<super::codec::Identity>,
 ) -> Result<(), ()> {
+    super::fault::hit("cleanup-before-leaf-delete")?;
     match observed(dir, name)? {
         None => dir.sync_all().map_err(|_| ()),
         Some(value) if expected.is_none_or(|e| fs::same(e, value)) => {
             fs::unlink(dir, name)?;
-            dir.sync_all().map_err(|_| ())
+            super::fault::hit("cleanup-after-leaf-unlink")?;
+            dir.sync_all().map_err(|_| ())?;
+            super::fault::hit("cleanup-after-leaf-fsync")
         }
         Some(_) => Err(()),
     }

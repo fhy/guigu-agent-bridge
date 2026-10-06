@@ -186,7 +186,9 @@ fn restore_one(
         (false, Some(value), None) if fs::same(value, expected) => Ok(()),
         (true, None, Some(value)) if fs::same(value, expected) => {
             fs::rename_noreplace(namespace, quarantine, root, fixed)?;
-            root.sync_all().map_err(|_| ())
+            super::fault::hit("rollback-after-restore-rename")?;
+            root.sync_all().map_err(|_| ())?;
+            super::fault::hit("rollback-after-restore-fsync")
         }
         (true, Some(value), None) if fs::same(value, expected) => root.sync_all().map_err(|_| ()),
         _ => Err(()),
@@ -220,7 +222,9 @@ fn adopt_remove_new(namespace: &File, expected: Option<Identity>) -> Result<(), 
         None => namespace.sync_all().map_err(|_| ()),
         Some(observed) if expected.is_some_and(|value| fs::same(value, observed)) => {
             fs::unlink(namespace, "restore.new.sqlite3")?;
-            namespace.sync_all().map_err(|_| ())
+            super::fault::hit("rollback-after-new-unlink")?;
+            namespace.sync_all().map_err(|_| ())?;
+            super::fault::hit("rollback-after-new-fsync")
         }
         Some(_) => Err(()),
     }

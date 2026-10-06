@@ -1,5 +1,7 @@
 use std::fs::File;
 
+use sha2::Digest;
+
 use super::{codec::RestoreRecord, fs};
 
 const CURRENT: &str = "restore.journal.v1";
@@ -69,6 +71,21 @@ pub(crate) fn adopt(dir: &File) -> Result<Option<RestoreRecord>, ()> {
         }
         _ => Err(()),
     }
+}
+
+pub(crate) fn adopt_bound(
+    dir: &File,
+) -> Result<Option<(RestoreRecord, super::codec::Identity, [u8; 32])>, ()> {
+    let Some(record) = adopt(dir)? else {
+        return Ok(None);
+    };
+    let mut file = fs::open_leaf(dir, CURRENT, false)?;
+    let identity = fs::identity(&file.metadata().map_err(|_| ())?)?;
+    let bytes = fs::read_small(&mut file)?;
+    if RestoreRecord::decode(&bytes)? != record {
+        return Err(());
+    }
+    Ok(Some((record, identity, sha2::Sha256::digest(bytes).into())))
 }
 
 pub(crate) fn initial(dir: &File, record: &RestoreRecord) -> Result<(), ()> {

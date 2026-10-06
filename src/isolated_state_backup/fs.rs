@@ -13,6 +13,8 @@ use sha2::{Digest, Sha256};
 
 use super::{MAX_FILE, codec::Identity};
 
+pub(crate) use super::lock::OperationLock;
+
 const RESOLVE: u64 = 0x08 | 0x04 | 0x02;
 
 #[repr(C)]
@@ -65,6 +67,10 @@ pub(crate) fn same_object(left: Identity, right: Identity) -> bool {
         && left.uid == right.uid
         && left.gid == right.gid
         && left.mode == right.mode
+}
+
+pub(crate) fn same_inode(left: Identity, right: Identity) -> bool {
+    left.device == right.device && left.inode == right.inode
 }
 
 pub(crate) fn open_dir(path: &Path) -> Result<File, ()> {
@@ -172,7 +178,9 @@ pub(crate) fn read_small(file: &mut File) -> Result<Vec<u8>, ()> {
 
 pub(crate) fn write_sync(file: &mut File, bytes: &[u8]) -> Result<Identity, ()> {
     file.write_all(bytes).map_err(|_| ())?;
+    super::fault::hit("after-leaf-write")?;
     file.sync_data().map_err(|_| ())?;
+    super::fault::hit("after-leaf-fsync")?;
     identity(&file.metadata().map_err(|_| ())?)
 }
 
@@ -200,6 +208,7 @@ pub(crate) fn rename_noreplace(
 pub(crate) fn unlink(dir: &File, name: &str) -> Result<(), ()> {
     let name = CString::new(name).map_err(|_| ())?;
     if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), 0) } == 0 {
+        super::fault::hit("after-leaf-unlink")?;
         Ok(())
     } else {
         Err(())
@@ -244,32 +253,43 @@ pub(crate) fn create_namespace(root: &File, name: &str, uid: u32, gid: u32) -> R
     if unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
         return Err(());
     }
+    super::fault::hit("after-namespace-mkdir")?;
+    let dir = openat_dir(root, name.as_c_str())?;
+    super::fault::hit("after-namespace-reopen")?;
+    super::fault::hit("before-namespace-metadata")?;
+    let retained = dir_identity(&dir.metadata().map_err(|_| ())?)?;
+    super::fault::hit("after-namespace-metadata")?;
     let outcome = (|| {
-        let dir = openat_dir(root, name.as_c_str())?;
-        let created = dir.metadata().map_err(|_| ())?;
-        if !created.is_dir() {
-            return Err(());
-        }
         if unsafe { libc::fchown(dir.as_raw_fd(), uid, gid) } != 0
             || unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) } != 0
         {
             return Err(());
         }
         dir.sync_all().map_err(|_| ())?;
+        super::fault::hit("after-namespace-fsync")?;
         root.sync_all().map_err(|_| ())?;
-        Ok(dir)
-    })();
-    if outcome.is_err() {
-        let pending = openat_dir(root, name.as_c_str())?;
-        let metadata = pending.metadata().map_err(|_| ())?;
-        if !metadata.is_dir() {
+        let current = open_child_dir(root, name.to_str().map_err(|_| ())?)?;
+        let observed = dir_identity(&current.metadata().map_err(|_| ())?)?;
+        if !same_inode(retained, observed) {
             return Err(());
         }
-        drop(pending);
-        remove_dir(root, name.to_str().map_err(|_| ())?)?;
+        Ok(())
+    })();
+    if outcome.is_err() {
+        remove_dir_exact(root, name.to_str().map_err(|_| ())?, retained)?;
         root.sync_all().map_err(|_| ())?;
     }
-    outcome
+    outcome.map(|()| dir)
+}
+
+pub(crate) fn remove_dir_exact(root: &File, name: &str, expected: Identity) -> Result<(), ()> {
+    let current = open_child_dir(root, name)?;
+    let observed = dir_identity(&current.metadata().map_err(|_| ())?)?;
+    if !same_inode(expected, observed) {
+        return Err(());
+    }
+    drop(current);
+    remove_dir(root, name)
 }
 
 fn openat_dir(parent: &File, name: &std::ffi::CStr) -> Result<File, ()> {
@@ -299,86 +319,4 @@ pub(crate) fn open_child_dir(parent: &File, name: &str) -> Result<File, ()> {
     let file = openat_dir(parent, name.as_c_str())?;
     dir_identity(&file.metadata().map_err(|_| ())?)?;
     Ok(file)
-}
-
-pub(crate) struct OperationLock {
-    _file: File,
-    dir: File,
-    identity: Identity,
-    armed: bool,
-}
-impl OperationLock {
-    pub(crate) fn acquire(dir: &File) -> Result<Self, ()> {
-        let file = create_leaf(dir, super::codec::LOCK, 0o600)?;
-        let pending = identity(&file.metadata().map_err(|_| ())?);
-        let outcome = pending.and_then(|identity| {
-            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-                return Err(());
-            }
-            dir.sync_all().map_err(|_| ())?;
-            Ok(identity)
-        });
-        let identity = match outcome {
-            Ok(identity) => identity,
-            Err(()) => {
-                let observed = identity(&file.metadata().map_err(|_| ())?)?;
-                let current = open_leaf(dir, super::codec::LOCK, false)?;
-                let current_identity = identity(&current.metadata().map_err(|_| ())?)?;
-                if !same_object(observed, current_identity) {
-                    return Err(());
-                }
-                unlink(dir, super::codec::LOCK)?;
-                dir.sync_all().map_err(|_| ())?;
-                return Err(());
-            }
-        };
-        Ok(Self {
-            _file: file,
-            dir: dir.try_clone().map_err(|_| ())?,
-            identity,
-            armed: true,
-        })
-    }
-    pub(crate) fn acquire_resume(dir: &File) -> Result<Self, ()> {
-        let file = open_leaf(dir, super::codec::LOCK, true)?;
-        let identity = identity(&file.metadata().map_err(|_| ())?)?;
-        let uid = unsafe { libc::geteuid() };
-        let gid = unsafe { libc::getegid() };
-        if identity.uid != uid || identity.gid != gid || identity.mode != 0o600 {
-            return Err(());
-        }
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(());
-        }
-        Ok(Self {
-            _file: file,
-            dir: dir.try_clone().map_err(|_| ())?,
-            identity,
-            armed: true,
-        })
-    }
-    pub(crate) fn preserve(mut self) {
-        self.armed = false;
-    }
-    pub(crate) fn finish(mut self) -> Result<(), ()> {
-        self.remove()?;
-        self.armed = false;
-        Ok(())
-    }
-    fn remove(&self) -> Result<(), ()> {
-        let mut current = open_leaf(&self.dir, super::codec::LOCK, false)?;
-        let (_, observed) = hash(&mut current)?;
-        if !same(self.identity, observed) {
-            return Err(());
-        }
-        unlink(&self.dir, super::codec::LOCK)?;
-        self.dir.sync_all().map_err(|_| ())
-    }
-}
-impl Drop for OperationLock {
-    fn drop(&mut self) {
-        if self.armed {
-            let _ = self.remove();
-        }
-    }
 }

@@ -57,7 +57,13 @@ pub(crate) fn resume(root: &File, expected: [u8; 32]) -> Result<bool, ()> {
     if phase == 4 {
         let namespace = fs::open_child_dir(root, NAMESPACE)?;
         if !fs::leaf_absent(&namespace, LOCK)? {
-            fs::OperationLock::acquire_resume(&namespace)?.finish()?
+            super::fault::hit("cleanup-before-lock-delete")?;
+            let operation = fs::OperationLock::acquire_resume(&namespace)?;
+            if !fs::same(record.operation_lock, operation.identity()) {
+                operation.preserve();
+                return Err(());
+            }
+            operation.finish()?
         }
         transition(root, &record, 5)?;
         phase = 5
@@ -222,6 +228,9 @@ mod tests {
             namespace: id(),
             snapshot: id(),
             manifest: id(),
+            restore_journal: None,
+            restore_journal_digest: None,
+            operation_lock: id(),
             old_main: None,
             old_wal: None,
             old_shm: None,

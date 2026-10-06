@@ -4,8 +4,10 @@ mod cleanup_codec;
 mod cleanup_journal;
 mod cleanup_witness;
 mod codec;
+mod fault;
 mod fs;
 mod journal;
+mod lock;
 mod restore;
 mod restore_io;
 mod rollback;
@@ -112,6 +114,8 @@ fn command_name(value: &str) -> &'static str {
     }
 }
 
+#[cfg(test)]
+mod fault_tests;
 #[cfg(test)]
 mod journal_tests;
 #[cfg(test)]

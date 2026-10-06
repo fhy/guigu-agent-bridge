@@ -42,6 +42,9 @@ pub(crate) struct Record {
     pub namespace: Identity,
     pub snapshot: Identity,
     pub manifest: Identity,
+    pub restore_journal: Option<Identity>,
+    pub restore_journal_digest: Option<[u8; 32]>,
+    pub operation_lock: Identity,
     pub old_main: Option<Identity>,
     pub old_wal: Option<Identity>,
     pub old_shm: Option<Identity>,
@@ -65,6 +68,9 @@ impl Record {
         put_identity(&mut out, self.namespace);
         put_identity(&mut out, self.snapshot);
         put_identity(&mut out, self.manifest);
+        put_optional(&mut out, self.restore_journal);
+        put_optional_array(&mut out, self.restore_journal_digest);
+        put_identity(&mut out, self.operation_lock);
         put_optional(&mut out, self.old_main);
         put_optional(&mut out, self.old_wal);
         put_optional(&mut out, self.old_shm);
@@ -124,6 +130,9 @@ impl Record {
             namespace: r.identity()?,
             snapshot: r.identity()?,
             manifest: r.identity()?,
+            restore_journal: r.optional()?,
+            restore_journal_digest: r.optional_array()?,
+            operation_lock: r.identity()?,
             old_main: r.optional()?,
             old_wal: r.optional()?,
             old_shm: r.optional()?,
@@ -150,6 +159,12 @@ fn put_optional(out: &mut Vec<u8>, v: Option<Identity>) {
     out.push(u8::from(v.is_some()));
     if let Some(v) = v {
         put_identity(out, v)
+    }
+}
+fn put_optional_array(out: &mut Vec<u8>, v: Option<[u8; 32]>) {
+    out.push(u8::from(v.is_some()));
+    if let Some(v) = v {
+        out.extend_from_slice(&v);
     }
 }
 struct Reader<'a> {
@@ -192,6 +207,13 @@ impl<'a> Reader<'a> {
         match self.byte()? {
             0 => Ok(None),
             1 => Ok(Some(self.identity()?)),
+            _ => Err(()),
+        }
+    }
+    fn optional_array(&mut self) -> Result<Option<[u8; 32]>, ()> {
+        match self.byte()? {
+            0 => Ok(None),
+            1 => Ok(Some(self.array()?)),
             _ => Err(()),
         }
     }

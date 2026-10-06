@@ -36,6 +36,9 @@ fn follows(a: &Record, b: &Record) -> bool {
         && b.namespace == a.namespace
         && b.snapshot == a.snapshot
         && b.manifest == a.manifest
+        && b.restore_journal == a.restore_journal
+        && b.restore_journal_digest == a.restore_journal_digest
+        && b.operation_lock == a.operation_lock
         && b.old_main == a.old_main
         && b.old_wal == a.old_wal
         && b.old_shm == a.old_shm
@@ -148,6 +151,9 @@ mod tests {
             namespace: id(),
             snapshot: id(),
             manifest: id(),
+            restore_journal: None,
+            restore_journal_digest: None,
+            operation_lock: id(),
             old_main: None,
             old_wal: None,
             old_shm: None,

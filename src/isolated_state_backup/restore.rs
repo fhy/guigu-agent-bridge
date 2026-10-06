@@ -316,8 +316,10 @@ fn quarantine(
         (Some(observed), None) if fs::same(observed, expected) => {
             fs::rename_noreplace(&root, step.fixed, namespace, step.quarantine)
                 .map_err(|_| "publication")?;
+            super::fault::hit("restore-after-quarantine-rename").map_err(|_| "publication")?;
             root.sync_all().map_err(|_| "publication")?;
             namespace.sync_all().map_err(|_| "publication")?;
+            super::fault::hit("restore-after-quarantine-fsync").map_err(|_| "publication")?;
         }
         (None, Some(observed)) if fs::same(observed, expected) => {
             root.sync_all().map_err(|_| "publication")?;
@@ -325,6 +327,7 @@ fn quarantine(
         }
         _ => return Err("identity"),
     }
+    super::fault::hit("restore-before-quarantine-ack").map_err(|_| "journal")?;
     next(namespace, record, step.phase, record.bitmap | step.bit).map_err(|_| "journal")
 }
 
