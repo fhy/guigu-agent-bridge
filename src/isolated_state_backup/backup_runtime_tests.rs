@@ -105,6 +105,7 @@ async fn backup_runtime_fixture_child() {
 fn run(root: &Path, mode: &str) -> std::process::Output {
     Command::new(std::env::current_exe().unwrap())
         .args(["--ignored", "--exact", CHILD, "--nocapture"])
+        .env_remove("RUST_TEST_THREADS")
         .env("T050_BACKUP_RUNTIME_ROOT", root)
         .env("T050_BACKUP_RUNTIME_MODE", mode)
         .output()

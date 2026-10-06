@@ -73,7 +73,9 @@ fn capability_evidence_fixture_child() {
 
 fn child() -> Command {
     let mut command = Command::new(std::env::current_exe().unwrap());
-    command.args(["--ignored", "--exact", CHILD, "--nocapture"]);
+    command
+        .args(["--ignored", "--exact", CHILD, "--nocapture"])
+        .env_remove("RUST_TEST_THREADS");
     command
 }
 
