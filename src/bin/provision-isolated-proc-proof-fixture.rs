@@ -2,6 +2,8 @@ use std::{fmt::Write as _, io::Write as _, path::PathBuf};
 
 #[path = "provision-isolated-proc-proof-fixture/orchestration.rs"]
 mod orchestration;
+#[path = "provision-isolated-proc-proof-fixture/prepare_boundary.rs"]
+mod prepare_boundary;
 
 use guigu_agent_bridge::privileged_proc_proof::{
     FixturePaths, StageCause, provision_temp_fixture, stage_policy, teardown_temp_fixture,
@@ -246,6 +248,11 @@ fn main() {
             let evidence = capability_evidence();
             println!("{}", evidence.line());
             if std::io::stdout().flush().is_err() || !evidence.is_success() {
+                std::process::exit(3);
+            }
+        }
+        Some("production-prepare-boundary") => {
+            if prepare_boundary::run_cli(args).is_err() {
                 std::process::exit(3);
             }
         }

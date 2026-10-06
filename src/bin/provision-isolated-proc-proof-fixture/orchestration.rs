@@ -54,7 +54,7 @@ fn encode_hash(hash: [u8; 32]) -> String {
     encoded
 }
 
-fn production_identity() -> Result<(), ()> {
+pub(super) fn production_identity() -> Result<(), ()> {
     let current = std::env::current_exe()
         .and_then(std::fs::canonicalize)
         .map_err(|_| ())?;
