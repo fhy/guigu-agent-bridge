@@ -745,23 +745,41 @@ pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
             return Err(error);
         }
     };
-    let pre = snapshot(&mut c, None).await?;
-    let post = snapshot(&mut c, Some((&facts, &args.commit_timestamp))).await?;
-    let siblings = sibling_digest(&mut c, &args.operation_id).await?;
+    let pre = snapshot(&mut c, None)
+        .await
+        .map_err(|error| prepare_rejected("sqlite-read", "pre-snapshot", error))?;
+    let post = snapshot(&mut c, Some((&facts, &args.commit_timestamp)))
+        .await
+        .map_err(|error| prepare_rejected("sqlite-read", "post-snapshot", error))?;
+    let siblings = sibling_digest(&mut c, &args.operation_id)
+        .await
+        .map_err(|error| prepare_rejected("sqlite-read", "sibling-receipts", error))?;
     sqlx::query("ROLLBACK")
         .execute(&mut c)
         .await
-        .map_err(|_| Error::Database)?;
-    c.close().await.map_err(|_| Error::Database)?;
-    sidecars.revalidate(&database)?;
-    admission.revalidate().map_err(|_| Error::Rejected)?;
-    preflight_unit(&args.unit)?;
-    preflight_runtime_absence_authenticated(
-        &binary,
-        &config,
-        Some(std::process::id()),
-        &admission,
-    )?;
+        .map_err(|_| prepare_rejected("sqlite-close", "rollback", Error::Database))?;
+    c.close()
+        .await
+        .map_err(|_| prepare_rejected("sqlite-close", "connection", Error::Database))?;
+    #[cfg(debug_assertions)]
+    if std::env::var_os("T050_FIXTURE_MIGRATION_TEST_REPLACE_SIDECAR_AFTER_CLOSE").is_some() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let wal = PathBuf::from(format!("{}-wal", database.to_string_lossy()));
+        std::fs::write(&wal, b"replacement").map_err(|_| Error::Rejected)?;
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o600))
+            .map_err(|_| Error::Rejected)?;
+    }
+    sidecars
+        .revalidate(&database)
+        .map_err(|error| prepare_rejected("sqlite-close", "sidecar-revalidation", error))?;
+    admission
+        .revalidate()
+        .map_err(|_| prepare_rejected("postflight", "admission-lock", Error::Rejected))?;
+    preflight_unit(&args.unit)
+        .map_err(|error| prepare_rejected("postflight", "unit-state", error))?;
+    preflight_runtime_absence_authenticated(&binary, &config, Some(std::process::id()), &admission)
+        .map_err(|_| prepare_rejected("postflight", "runtime-absence", Error::Rejected))?;
     let mut m = Manifest {
         operation_id: args.operation_id,
         isolated_root: root.to_string_lossy().into_owned(),
@@ -793,11 +811,13 @@ pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
         "t050-fixture-migration-v1\noperation_id={}\nunit={}\n",
         m.operation_id, m.unit
     );
-    ensure_marker(Path::new(&m.marker), marker.as_bytes())?;
+    ensure_marker(Path::new(&m.marker), marker.as_bytes())
+        .map_err(|error| prepare_rejected("publication", "marker", error))?;
     publish_new(
         &args.manifest,
         &serde_json::to_vec(&m).map_err(|_| Error::Rejected)?,
-    )?;
+    )
+    .map_err(|error| prepare_rejected("publication", "manifest", error))?;
     Ok(())
 }
 

@@ -134,6 +134,19 @@ struct Fixture {
 
 impl Fixture {
     async fn new() -> Self {
+        let fixture = Self::new_unprepared().await;
+        let output = fixture.prepare().output().unwrap();
+        assert_eq!(
+            output.status.code(),
+            Some(0),
+            "stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        fixture
+    }
+
+    async fn new_unprepared() -> Self {
         use std::os::unix::fs::PermissionsExt;
         let root =
             std::env::temp_dir().join(format!("t050-fixture-migration-{}", uuid::Uuid::now_v7()));
@@ -172,7 +185,7 @@ impl Fixture {
         )
         .unwrap();
         std::fs::set_permissions(&systemctl, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let fixture = Self {
+        Self {
             manifest: root.join("manifest.json"),
             evidence: root.join("evidence.txt"),
             proc_root: proc_view(),
@@ -180,16 +193,7 @@ impl Fixture {
             db,
             config,
             systemctl,
-        };
-        let output = fixture.prepare().output().unwrap();
-        assert_eq!(
-            output.status.code(),
-            Some(0),
-            "stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        fixture
+        }
     }
     fn base(&self) -> Command {
         let mut c = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"));
@@ -225,6 +229,42 @@ impl Fixture {
         c.args(["migrate-isolated-legacy-fixture", "--manifest"])
             .arg(&self.manifest);
         c
+    }
+
+    async fn restore_closed_wal_sidecars(&self) -> (PathBuf, PathBuf) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut connection = SqliteConnection::connect_with(
+            &SqliteConnectOptions::new()
+                .filename(&self.db)
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+        sqlx::query("PRAGMA journal_mode=WAL")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query("PRAGMA wal_autocheckpoint=0")
+            .execute(&mut connection)
+            .await
+            .unwrap();
+        sqlx::query(
+            "UPDATE runtime_instances SET heartbeat_at=heartbeat_at WHERE instance_token='owner-a'",
+        )
+        .execute(&mut connection)
+        .await
+        .unwrap();
+        let wal = PathBuf::from(format!("{}-wal", self.db.to_string_lossy()));
+        let shm = PathBuf::from(format!("{}-shm", self.db.to_string_lossy()));
+        let wal_bytes = std::fs::read(&wal).unwrap();
+        let shm_bytes = std::fs::read(&shm).unwrap();
+        connection.close().await.unwrap();
+        std::fs::write(&wal, wal_bytes).unwrap();
+        std::fs::write(&shm, shm_bytes).unwrap();
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&shm, std::fs::Permissions::from_mode(0o600)).unwrap();
+        (wal, shm)
     }
 }
 
@@ -461,6 +501,58 @@ async fn publication_and_sqlite_open_diagnostics_are_fixed_and_invariant() {
     assert!(stdout.contains("stage=sqlite-open cause=sidecar-auth counts=failures=1"));
     assert!(!stdout.contains(sqlite.root.to_str().unwrap()));
     assert_eq!(fixture_tree(&sqlite.root), sqlite_tree);
+}
+
+#[tokio::test]
+async fn prepare_accepts_a_closed_database_with_retained_wal_sidecars() {
+    let fixture = Fixture::new_unprepared().await;
+    let (wal, shm) = fixture.restore_closed_wal_sidecars().await;
+
+    let output = fixture
+        .prepare()
+        .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert_eq!(
+        stdout.trim(),
+        "prepare-isolated-legacy-fixture-migration-manifest result=prepared status=0"
+    );
+    assert!(!wal.exists());
+    assert!(!shm.exists());
+    assert!(fixture.manifest.exists());
+    assert!(!fixture.evidence.exists());
+}
+
+#[tokio::test]
+async fn post_close_sidecar_replacement_is_fixed_redacted_and_fail_closed() {
+    let fixture = Fixture::new_unprepared().await;
+    let (wal, shm) = fixture.restore_closed_wal_sidecars().await;
+    let output = fixture
+        .prepare()
+        .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+        .env(
+            "T050_FIXTURE_MIGRATION_TEST_REPLACE_SIDECAR_AFTER_CLOSE",
+            "1",
+        )
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("stage=sqlite-close cause=sidecar-revalidation counts=failures=1"));
+    assert!(
+        stdout.contains(
+            "prepare-isolated-legacy-fixture-migration-manifest result=rejected status=3"
+        )
+    );
+    assert!(!stdout.contains(fixture.root.to_str().unwrap()));
+    assert!(wal.exists());
+    assert!(!shm.exists());
+    assert!(!fixture.manifest.exists());
+    assert!(!fixture.evidence.exists());
+    assert!(!fixture.root.join(".runtime-admission.lock").exists());
 }
 
 #[tokio::test]

@@ -73,16 +73,32 @@ impl Sidecars {
         if self.parent_device != after.parent_device || self.database_uid != after.database_uid {
             return Err(Error::Rejected);
         }
-        for (before, after) in [(&self.wal, &after.wal), (&self.shm, &after.shm)] {
-            if !matches!(
-                (before, after),
-                (Sidecar::Absent, Sidecar::Absent | Sidecar::Present { .. })
-            ) && before != after
+        match (&self.wal, &self.shm, &after.wal, &after.shm) {
+            (before_wal, before_shm, after_wal, after_shm)
+                if before_wal == after_wal && before_shm == after_shm =>
             {
-                return Err(Error::Rejected);
+                Ok(())
             }
+            (
+                Sidecar::Absent,
+                Sidecar::Absent,
+                Sidecar::Present { .. },
+                Sidecar::Present { .. },
+            )
+            | (
+                Sidecar::Present { .. },
+                Sidecar::Present { .. },
+                Sidecar::Absent,
+                Sidecar::Absent,
+            ) => Ok(()),
+            (
+                before_wal @ Sidecar::Present { .. },
+                Sidecar::Absent,
+                after_wal,
+                Sidecar::Present { .. },
+            ) if before_wal == after_wal => Ok(()),
+            _ => Err(Error::Rejected),
         }
-        Ok(())
     }
 }
 
@@ -1578,6 +1594,45 @@ mod tests {
     use super::*;
     use crate::storage::{connect, migrate};
     use serde_json::json;
+
+    fn sidecar_fixture() -> (tempfile::TempDir, PathBuf, PathBuf, PathBuf, Sidecars) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        let wal = root.path().join("state.db-wal");
+        let shm = root.path().join("state.db-shm");
+        for path in [&database, &wal, &shm] {
+            std::fs::write(path, b"fixture").unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        let sidecars = Sidecars::capture(&database).unwrap();
+        (root, database, wal, shm, sidecars)
+    }
+
+    #[test]
+    fn retained_sidecar_lifecycle_accepts_only_paired_sqlite_close() {
+        let (_root, database, wal, shm, sidecars) = sidecar_fixture();
+        std::fs::remove_file(&wal).unwrap();
+        std::fs::remove_file(&shm).unwrap();
+        assert!(sidecars.revalidate(&database).is_ok());
+
+        let (_root, database, wal, _shm, sidecars) = sidecar_fixture();
+        std::fs::remove_file(wal).unwrap();
+        assert!(sidecars.revalidate(&database).is_err());
+
+        let (_root, database, _wal, shm, sidecars) = sidecar_fixture();
+        std::fs::remove_file(&shm).unwrap();
+        std::fs::write(&shm, b"replacement").unwrap();
+        assert!(sidecars.revalidate(&database).is_err());
+
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        std::fs::write(&database, b"fixture").unwrap();
+        let sidecars = Sidecars::capture(&database).unwrap();
+        std::fs::write(root.path().join("state.db-wal"), b"partial").unwrap();
+        assert!(sidecars.revalidate(&database).is_err());
+    }
 
     #[test]
     fn deployment_identity_is_not_filtered_by_uid() {
