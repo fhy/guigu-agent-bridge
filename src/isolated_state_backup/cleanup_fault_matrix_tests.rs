@@ -2,7 +2,7 @@ use std::os::unix::fs::PermissionsExt;
 
 use sqlx::Connection;
 
-use super::{Paths, backup, cleanup, fault, fs, restore};
+use super::{Paths, backup, cleanup, fault, fs, journal, restore};
 
 async fn fixture(restored: bool) -> (tempfile::TempDir, Paths, [u8; 32]) {
     let temp = tempfile::tempdir().unwrap();
@@ -41,15 +41,39 @@ async fn fixture(restored: bool) -> (tempfile::TempDir, Paths, [u8; 32]) {
         .await
         .unwrap();
     backup::create_fixture(paths.clone()).await.unwrap();
+    let sidecars = restored.then(|| {
+        (
+            std::fs::read(paths.root.join("state.db-wal")).unwrap(),
+            std::fs::read(paths.root.join("state.db-shm")).unwrap(),
+        )
+    });
     connection.close().await.unwrap();
     let namespace = fs::open_dir(&paths.namespace()).unwrap();
     let snapshot = backup::load_manifest(&namespace).unwrap().snapshot_hash;
     drop(namespace);
     if restored {
+        let (wal, shm) = sidecars.unwrap();
+        let mode = std::fs::metadata(&paths.database)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        for (name, bytes) in [("state.db-wal", wal), ("state.db-shm", shm)] {
+            let path = paths.root.join(name);
+            std::fs::write(&path, bytes).unwrap();
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)).unwrap();
+        }
         let current = backup::source_set(&paths).unwrap().hash;
         restore::restore_fixture(&paths, snapshot, current)
             .await
             .unwrap();
+        let namespace = fs::open_dir(&paths.namespace()).unwrap();
+        let (record, _, _) = journal::adopt_bound(&namespace).unwrap().unwrap();
+        assert!(record.original_wal.is_some() && record.original_shm.is_some());
+        assert_eq!(
+            record.bitmap & (restore::MAIN | restore::WAL | restore::SHM),
+            7
+        );
     }
     (temp, paths, snapshot)
 }
@@ -81,7 +105,7 @@ async fn both_cleanup_kinds_cover_manifest_quarantine_durability_and_ack() {
 
 #[tokio::test]
 async fn every_applicable_leaf_covers_unlink_parent_fsync_and_ack() {
-    for (restored, leaves) in [(false, 2usize), (true, 3usize)] {
+    for (restored, leaves) in [(false, 2usize), (true, 6usize)] {
         for point in [
             "cleanup-after-artifact-unlink",
             "cleanup-after-leaf-fsync",

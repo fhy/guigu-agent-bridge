@@ -219,6 +219,7 @@ fn drive(namespace: &File, record: &mut Record) -> Result<u32, &'static str> {
             count += 1;
         }
         namespace.sync_all().map_err(|_| "cleanup")?;
+        super::fault::hit("cleanup-before-leaf-ack").map_err(|_| "cleanup")?;
         transition(namespace, record, Phase::RestoreJournalRemoved)?;
     }
     if record.phase == Phase::RestoreJournalRemoved {
