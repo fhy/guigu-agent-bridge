@@ -56,6 +56,8 @@ struct Classification {
     stdout: StreamShape,
     stderr: &'static str,
     reap: &'static str,
+    prepare_stage: &'static str,
+    prepare_cause: &'static str,
 }
 
 fn binding(args: &[String]) -> String {
@@ -204,6 +206,11 @@ fn classify(result: &ChildResult) -> Classification {
         .map(|text| text.lines().collect::<Vec<_>>())
         .unwrap_or_default();
     let last = lines.last().copied();
+    let retained_diagnostic = if stdout == StreamShape::Valid && lines.len() > 1 {
+        diagnostic::last(&lines[..lines.len() - 1])
+    } else {
+        None
+    };
     let (child, terminal_matches) = match result.status {
         Some(status) if status.success() => (
             "exit-0",
@@ -249,6 +256,15 @@ fn classify(result: &ChildResult) -> Classification {
     } else {
         (3, "child")
     };
+    let (prepare_stage, prepare_cause) = if child == "exit-3" {
+        retained_diagnostic
+            .map(|value| (value.stage, value.cause))
+            .unwrap_or(("none", "none"))
+    } else if stdout == StreamShape::Valid {
+        ("none", "none")
+    } else {
+        ("unknown", "unknown")
+    };
     Classification {
         status,
         cause,
@@ -256,18 +272,22 @@ fn classify(result: &ChildResult) -> Classification {
         stdout,
         stderr,
         reap: result.reap,
+        prepare_stage,
+        prepare_cause,
     }
 }
 
 fn result_line(binding: &str, classification: &Classification) -> String {
     format!(
-        "production-prepare-boundary phase=result status={} cause={} child={} stdout={} stderr={} reap={} binding_sha256={binding}",
+        "production-prepare-boundary phase=result status={} cause={} child={} stdout={} stderr={} reap={} prepare_stage={} prepare_cause={} binding_sha256={binding}",
         classification.status,
         classification.cause,
         classification.child,
         classification.stdout.code(),
         classification.stderr,
         classification.reap,
+        classification.prepare_stage,
+        classification.prepare_cause,
     )
 }
 
@@ -291,6 +311,8 @@ fn run_command(mut command: Command, args: &[String], deadline: Duration) -> Res
                 stdout: StreamShape::Missing,
                 stderr: "missing",
                 reap: "not-applicable",
+                prepare_stage: "unknown",
+                prepare_cause: "unknown",
             };
             emit_result(&binding, &classification)?;
             return Err(());
@@ -323,6 +345,8 @@ pub(super) fn run_cli(args: impl Iterator<Item = String>) -> Result<(), ()> {
             stdout: StreamShape::Missing,
             stderr: "missing",
             reap: "not-applicable",
+            prepare_stage: "unknown",
+            prepare_cause: "unknown",
         };
         emit_result(&binding, &classification)?;
         return Err(());

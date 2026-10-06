@@ -24,6 +24,8 @@ fn success_is_framed_reaped_and_authenticated() {
     assert_eq!(child.reap, "complete");
     assert_eq!(classify(&child).status, 0);
     assert_eq!(classify(&child).cause, "none");
+    assert_eq!(classify(&child).prepare_stage, "none");
+    assert_eq!(classify(&child).prepare_cause, "none");
 }
 
 #[test]
@@ -105,6 +107,8 @@ fn synthetic_cleanup_and_diagnostics_leave_no_residue() {
     let classification = classify(&result(&script));
     assert_eq!(classification.cause, "prepare");
     assert_eq!(classification.stdout, StreamShape::Valid);
+    assert_eq!(classification.prepare_stage, "eligibility");
+    assert_eq!(classification.prepare_cause, "durable-facts");
     assert!(!marker.exists());
 }
 
@@ -115,6 +119,8 @@ fn fixed_generic_and_eligibility_aggregate_diagnostics_are_valid() {
     )));
     assert_eq!(generic.stdout, StreamShape::Valid);
     assert_eq!(generic.cause, "prepare");
+    assert_eq!(generic.prepare_stage, "sqlite-open");
+    assert_eq!(generic.prepare_cause, "sidecar-auth");
 
     for diagnostic in [
         "stage=eligibility cause=open-sessions counts=owners=2,continuations=1,sessions=1,children=0,leases=1,admissions=1,work=0",
@@ -126,7 +132,30 @@ fn fixed_generic_and_eligibility_aggregate_diagnostics_are_valid() {
         )));
         assert_eq!(child.stdout, StreamShape::Valid, "{diagnostic}");
         assert_eq!(child.cause, "prepare", "{diagnostic}");
+        assert_eq!(child.prepare_stage, "eligibility", "{diagnostic}");
+        assert_eq!(
+            child.prepare_cause,
+            diagnostic
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .strip_prefix("cause=")
+                .unwrap(),
+            "{diagnostic}"
+        );
     }
+}
+
+#[test]
+fn eligibility_retains_the_last_authenticated_specific_cause() {
+    let child = classify(&result(&format!(
+        "printf 'prepare-isolated-legacy-fixture-migration-manifest stage=eligibility cause=durable-facts counts=failures=1\\n'; printf 'prepare-isolated-legacy-fixture-migration-manifest stage=eligibility cause=open-sessions counts=owners=2,continuations=1,sessions=1,children=0,leases=1,admissions=1,work=0\\n'; printf '%s' '{TERMINAL_REFUSED}'; exit 3"
+    )));
+    assert_eq!(child.status, 3);
+    assert_eq!(child.cause, "prepare");
+    assert_eq!(child.stdout, StreamShape::Valid);
+    assert_eq!(child.prepare_stage, "eligibility");
+    assert_eq!(child.prepare_cause, "open-sessions");
 }
 
 #[test]
@@ -154,6 +183,14 @@ fn hostile_diagnostic_grammar_is_malformed_and_fail_closed() {
         assert_eq!(child.status, 3, "{diagnostic}");
         assert_eq!(child.cause, "result", "{diagnostic}");
         assert_eq!(child.stdout, StreamShape::Malformed, "{diagnostic}");
+        assert_eq!(child.prepare_stage, "unknown", "{diagnostic}");
+        assert_eq!(child.prepare_cause, "unknown", "{diagnostic}");
+        let line = result_line("00", &child);
+        assert!(
+            line.contains("prepare_stage=unknown prepare_cause=unknown"),
+            "{diagnostic}"
+        );
+        assert!(!line.contains(diagnostic), "{diagnostic}");
     }
 
     let valid_but_impossible_success = classify(&result(&format!(
@@ -179,9 +216,13 @@ fn invalid_program_is_spawn_failure_and_binding_is_redacted() {
         stdout: StreamShape::Malformed,
         stderr: "empty",
         reap: "complete",
+        prepare_stage: "unknown",
+        prepare_cause: "unknown",
     };
     let line = result_line(&digest, &classification);
-    assert!(line.contains("cause=result child=exit-3 stdout=malformed"));
+    assert!(line.contains(
+        "cause=result child=exit-3 stdout=malformed stderr=empty reap=complete prepare_stage=unknown prepare_cause=unknown"
+    ));
     assert!(!line.contains("planted-secret-body"));
 }
 

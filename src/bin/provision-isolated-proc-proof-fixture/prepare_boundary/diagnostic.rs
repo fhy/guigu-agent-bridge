@@ -1,26 +1,112 @@
 const PREFIX: &str = "prepare-isolated-legacy-fixture-migration-manifest stage=";
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct Diagnostic {
+    pub(super) stage: &'static str,
+    pub(super) cause: &'static str,
+}
+
+fn canonical(value: &str, values: &'static [&'static str]) -> Option<&'static str> {
+    values.iter().copied().find(|candidate| *candidate == value)
+}
+
+fn canonical_stage(value: &str) -> Option<&'static str> {
+    canonical(
+        value,
+        &[
+            "preflight",
+            "publication",
+            "sqlite-open",
+            "eligibility",
+            "sqlite-read",
+            "sqlite-close",
+            "postflight",
+        ],
+    )
+}
+
+fn canonical_cause(value: &str) -> Option<&'static str> {
+    canonical(
+        value,
+        &[
+            "root-path",
+            "root-contract",
+            "config-path",
+            "database-path",
+            "path-identity",
+            "admission-lock",
+            "unit-state",
+            "runtime-process",
+            "runtime-listener",
+            "manifest-target",
+            "evidence-target",
+            "manifest-serialization",
+            "marker",
+            "manifest",
+            "sidecar-auth",
+            "connect",
+            "sidecar-revalidation",
+            "begin",
+            "durable-facts",
+            "pre-snapshot",
+            "post-snapshot",
+            "sibling-receipts",
+            "rollback",
+            "connection",
+            "runtime-absence",
+            "config-identity",
+            "database-identity",
+            "binary-identity",
+            "database-facts",
+            "owner-topology",
+            "continuation-topology",
+            "open-sessions",
+            "child-reap",
+            "lease-admission",
+            "work-queue",
+            "witness-or-binding",
+            "runtime-unknown-procfs-permission",
+            "runtime-unknown-procfs-io",
+            "runtime-unknown-procfs-parse",
+            "runtime-unknown-identity-permission",
+            "runtime-unknown-identity-io",
+            "runtime-unknown-identity-parse",
+            "runtime-unknown-deployment-metadata-permission",
+            "runtime-unknown-deployment-metadata-io",
+            "runtime-unknown-deployment-metadata-parse",
+            "runtime-unknown-process-executable-link-deployment-owner-permission",
+            "runtime-unknown-process-executable-link-deployment-owner-io",
+            "runtime-unknown-process-executable-link-deployment-owner-parse",
+            "runtime-unknown-process-executable-link-privileged-kernel-owner-permission",
+            "runtime-unknown-process-executable-link-privileged-kernel-owner-io",
+            "runtime-unknown-process-executable-link-privileged-kernel-owner-parse",
+            "runtime-unknown-process-executable-link-privileged-userspace-owner-permission",
+            "runtime-unknown-process-executable-link-privileged-userspace-owner-io",
+            "runtime-unknown-process-executable-link-privileged-userspace-owner-parse",
+            "runtime-unknown-process-executable-link-privileged-owner-classification-permission",
+            "runtime-unknown-process-executable-link-privileged-owner-classification-io",
+            "runtime-unknown-process-executable-link-privileged-owner-classification-parse",
+            "runtime-unknown-process-executable-link-unprivileged-other-owner-permission",
+            "runtime-unknown-process-executable-link-unprivileged-other-owner-io",
+            "runtime-unknown-process-executable-link-unprivileged-other-owner-parse",
+            "runtime-unknown-process-executable-metadata-permission",
+            "runtime-unknown-process-executable-metadata-io",
+            "runtime-unknown-process-executable-metadata-parse",
+            "runtime-unknown-cmdline-permission",
+            "runtime-unknown-cmdline-io",
+            "runtime-unknown-cmdline-parse",
+            "runtime-unknown-fd-permission",
+            "runtime-unknown-fd-io",
+            "runtime-unknown-fd-parse",
+            "runtime-unknown-socket-permission",
+            "runtime-unknown-socket-io",
+            "runtime-unknown-socket-parse",
+        ],
+    )
+}
+
 fn runtime_unknown(cause: &str) -> bool {
-    const AREAS: &[&str] = &[
-        "procfs",
-        "identity",
-        "deployment-metadata",
-        "process-executable-link-deployment-owner",
-        "process-executable-link-privileged-kernel-owner",
-        "process-executable-link-privileged-userspace-owner",
-        "process-executable-link-privileged-owner-classification",
-        "process-executable-link-unprivileged-other-owner",
-        "process-executable-metadata",
-        "cmdline",
-        "fd",
-        "socket",
-    ];
-    const REASONS: &[&str] = &["permission", "io", "parse"];
-    AREAS.iter().any(|area| {
-        REASONS
-            .iter()
-            .any(|reason| cause == format!("runtime-unknown-{area}-{reason}"))
-    })
+    cause.starts_with("runtime-unknown-") && canonical_cause(cause).is_some()
 }
 
 fn generic(stage: &str, cause: &str) -> bool {
@@ -119,22 +205,35 @@ fn aggregate(cause: &str, counts: &str) -> bool {
     cause == expected
 }
 
-pub(super) fn valid(line: &str) -> bool {
-    let Some(body) = line.strip_prefix(PREFIX) else {
-        return false;
-    };
-    let Some((stage, tail)) = body.split_once(" cause=") else {
-        return false;
-    };
-    let Some((cause, counts)) = tail.split_once(" counts=") else {
-        return false;
-    };
+pub(super) fn parse(line: &str) -> Option<Diagnostic> {
+    let body = line.strip_prefix(PREFIX)?;
+    let (stage, tail) = body.split_once(" cause=")?;
+    let (cause, counts) = tail.split_once(" counts=")?;
     if stage.is_empty() || cause.is_empty() || counts.is_empty() {
-        return false;
+        return None;
     }
-    if counts == "failures=1" {
+    let valid = if counts == "failures=1" {
         generic(stage, cause)
     } else {
         stage == "eligibility" && aggregate(cause, counts)
+    };
+    if !valid {
+        return None;
     }
+    Some(Diagnostic {
+        stage: canonical_stage(stage)?,
+        cause: canonical_cause(cause)?,
+    })
+}
+
+pub(super) fn valid(line: &str) -> bool {
+    parse(line).is_some()
+}
+
+pub(super) fn last(lines: &[&str]) -> Option<Diagnostic> {
+    let mut last = None;
+    for line in lines {
+        last = Some(parse(line)?);
+    }
+    last
 }
