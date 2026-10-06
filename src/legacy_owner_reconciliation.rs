@@ -243,19 +243,10 @@ pub(crate) fn path_identity(path: &Path, include_content: bool) -> Result<String
         return Err(Error::Rejected);
     }
     let content = if include_content {
-        if before.len() > MAX_IDENTITY_CONTENT_SIZE {
-            return Err(Error::Rejected);
-        }
-        let mut hash = Sha256::new();
-        let mut buffer = [0u8; IDENTITY_HASH_BUFFER_SIZE];
-        loop {
-            let read = file.read(&mut buffer).map_err(|_| Error::Rejected)?;
-            if read == 0 {
-                break;
-            }
-            hash.update(&buffer[..read]);
-        }
-        format!("{:x}", hash.finalize())
+        format!(
+            "{:x}",
+            identity_content_hash_observed(&mut file, before.len(), |_, _| {})?
+        )
     } else {
         "identity-only".to_owned()
     };
@@ -274,6 +265,36 @@ pub(crate) fn path_identity(path: &Path, include_content: bool) -> Result<String
         &before.mode().to_string(),
         &content,
     ]))
+}
+
+fn identity_content_hash_observed(
+    file: &mut std::fs::File,
+    initial_size: u64,
+    mut observed: impl FnMut(u64, usize),
+) -> Result<sha2::digest::Output<Sha256>, Error> {
+    if initial_size > MAX_IDENTITY_CONTENT_SIZE {
+        return Err(Error::Rejected);
+    }
+    let mut hash = Sha256::new();
+    let mut buffer = [0u8; IDENTITY_HASH_BUFFER_SIZE];
+    let mut total = 0u64;
+    loop {
+        let count = file.read(&mut buffer).map_err(|_| Error::Rejected)?;
+        if count == 0 {
+            observed(total, count);
+            break;
+        }
+        total = total.checked_add(count as u64).ok_or(Error::Rejected)?;
+        if total > initial_size || total > MAX_IDENTITY_CONTENT_SIZE {
+            return Err(Error::Rejected);
+        }
+        hash.update(&buffer[..count]);
+        observed(total, count);
+    }
+    if total != initial_size {
+        return Err(Error::Rejected);
+    }
+    Ok(hash.finalize())
 }
 async fn logical_digest_projected(
     c: &mut SqliteConnection,
@@ -1673,6 +1694,61 @@ mod tests {
             .set_len(MAX_IDENTITY_CONTENT_SIZE + 1)
             .unwrap();
         assert!(path_identity(&oversized, true).is_err());
+        let mut oversized_reader = std::fs::File::open(&oversized).unwrap();
+        let mut observed = false;
+        assert!(
+            identity_content_hash_observed(
+                &mut oversized_reader,
+                MAX_IDENTITY_CONTENT_SIZE + 1,
+                |_, _| observed = true,
+            )
+            .is_err()
+        );
+        assert!(!observed);
+    }
+
+    #[test]
+    fn content_identity_rejects_growth_and_short_eof_with_restored_metadata() {
+        use std::io::{Seek, SeekFrom, Write};
+
+        let growing = tempfile::tempfile().unwrap();
+        let initial_size = (IDENTITY_HASH_BUFFER_SIZE * 2) as u64;
+        growing.set_len(initial_size).unwrap();
+        let mut growing_reader = growing.try_clone().unwrap();
+        let mut grew = false;
+        assert!(
+            identity_content_hash_observed(&mut growing_reader, initial_size, |_, count| {
+                if count != 0 && !grew {
+                    let mut writer = growing.try_clone().unwrap();
+                    writer.seek(SeekFrom::End(0)).unwrap();
+                    writer
+                        .write_all(&vec![0xa5; IDENTITY_HASH_BUFFER_SIZE])
+                        .unwrap();
+                    grew = true;
+                }
+            })
+            .is_err()
+        );
+
+        let short = tempfile::tempfile().unwrap();
+        short.set_len(initial_size).unwrap();
+        let mut short_reader = short.try_clone().unwrap();
+        let mut shortened = false;
+        let mut restored = false;
+        assert!(
+            identity_content_hash_observed(&mut short_reader, initial_size, |_, count| {
+                if count != 0 && !shortened {
+                    short.set_len(IDENTITY_HASH_BUFFER_SIZE as u64).unwrap();
+                    shortened = true;
+                } else if count == 0 {
+                    short.set_len(initial_size).unwrap();
+                    restored = true;
+                }
+            })
+            .is_err()
+        );
+        assert!(restored);
+        assert_eq!(short.metadata().unwrap().len(), initial_size);
     }
 
     #[test]
