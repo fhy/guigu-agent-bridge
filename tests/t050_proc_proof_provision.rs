@@ -181,6 +181,18 @@ fn production_mode_has_fixed_interface_and_refuses_overrides() {
             .code(),
         Some(3)
     );
+    assert_eq!(
+        Command::new(binary())
+            .args([
+                "production-stage-provision-boundary",
+                "--config",
+                "/tmp/override"
+            ])
+            .status()
+            .unwrap()
+            .code(),
+        Some(3)
+    );
 }
 
 #[test]

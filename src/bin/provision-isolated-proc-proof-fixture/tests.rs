@@ -1,4 +1,5 @@
 use super::*;
+use std::process::Command;
 
 const BINDING: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
 const PLANTED: &str = "planted-secret-path-and-body";

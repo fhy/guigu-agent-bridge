@@ -1,14 +1,10 @@
-use std::{
-    fmt::Write as _,
-    fs::File,
-    io::Write as _,
-    os::fd::FromRawFd,
-    path::PathBuf,
-    process::{Command, Stdio},
-};
+use std::{fmt::Write as _, io::Write as _, path::PathBuf};
+
+#[path = "provision-isolated-proc-proof-fixture/orchestration.rs"]
+mod orchestration;
 
 use guigu_agent_bridge::privileged_proc_proof::{
-    FixturePaths, provision_temp_fixture, stage_policy, teardown_temp_fixture,
+    FixturePaths, StageCause, provision_temp_fixture, stage_policy, teardown_temp_fixture,
 };
 use sha2::{Digest, Sha256};
 
@@ -136,54 +132,6 @@ fn capability_evidence() -> guigu_agent_bridge::privileged_proc_proof::Capabilit
     guigu_agent_bridge::privileged_proc_proof::production_capability_evidence()
 }
 
-fn production_boundary(parent: &str, helper: &str, policy: &str) -> Result<(), ()> {
-    let binding = provision_binding(parent, helper, policy);
-    println!(
-        "production-provision-boundary phase=start status=attempting binding_sha256={binding}"
-    );
-    std::io::stdout().flush().map_err(|_| ())?;
-    let current = std::env::current_exe()
-        .and_then(std::fs::canonicalize)
-        .map_err(|_| ())?;
-    let expected = std::fs::canonicalize(PRODUCTION_PROVISIONER).map_err(|_| ())?;
-    if current != expected {
-        emit_boundary_result(&binding, 3, "identity")?;
-        return Err(());
-    }
-    let policy_fd = unsafe { libc::dup(3) };
-    if policy_fd < 0 {
-        emit_boundary_result(&binding, 3, "policy")?;
-        return Err(());
-    }
-    let policy_input = unsafe { File::from_raw_fd(policy_fd) };
-    let output = Command::new("/usr/bin/sudo")
-        .args(["-n", "/bin/sh", "-c"])
-        .arg("exec 3<&0; exec \"$1\" production-provision --parent-sha \"$2\" --helper-sha \"$3\" --policy-sha \"$4\"")
-        .arg("sh")
-        .arg(PRODUCTION_PROVISIONER)
-        .arg(parent)
-        .arg(helper)
-        .arg(policy)
-        .stdin(Stdio::from(policy_input))
-        .output()
-        .map_err(|_| ())?;
-    match classify_child(&output, &binding) {
-        ChildOutcome::Success => emit_boundary_result(&binding, 0, "none"),
-        ChildOutcome::ProvisionRefusal => {
-            emit_boundary_result(&binding, 3, "provision")?;
-            Err(())
-        }
-        ChildOutcome::ChildFailure => {
-            emit_boundary_result(&binding, 3, "child")?;
-            Err(())
-        }
-        ChildOutcome::InvalidResult => {
-            emit_boundary_result(&binding, 3, "result")?;
-            Err(())
-        }
-    }
-}
-
 fn usage() -> ! {
     eprintln!(
         "usage: provision-isolated-proc-proof-fixture provision --root ROOT --parent P --helper H --config C --database-root D [--generation N] | teardown --root ROOT"
@@ -282,7 +230,12 @@ fn main() {
             let (Some(parent), Some(helper), Some(policy)) = (parent, helper, policy) else {
                 std::process::exit(3)
             };
-            if production_boundary(&parent, &helper, &policy).is_err() {
+            if orchestration::run_boundary_fd3(&parent, &helper, &policy).is_err() {
+                std::process::exit(3);
+            }
+        }
+        Some("production-stage-provision-boundary") => {
+            if orchestration::run_cli(args).is_err() {
                 std::process::exit(3);
             }
         }
