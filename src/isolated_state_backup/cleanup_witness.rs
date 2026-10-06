@@ -28,7 +28,7 @@ pub(crate) fn finish(
     remove_namespace(root, record.namespace)?;
     transition(root, record, 7)?;
     transition(root, record, 8)?;
-    remove(root, CURRENT)
+    retire(root)
 }
 
 pub(crate) fn resume(root: &File, expected: [u8; 32]) -> Result<bool, ()> {
@@ -82,7 +82,7 @@ pub(crate) fn resume(root: &File, expected: [u8; 32]) -> Result<bool, ()> {
     if phase == 7 {
         transition(root, &record, 8)?
     }
-    remove(root, CURRENT)?;
+    retire(root)?;
     Ok(true)
 }
 
@@ -124,14 +124,27 @@ fn write(root: &File, record: &Record, phase: u8) -> Result<(), ()> {
     root.sync_all().map_err(|_| ())
 }
 fn transition(root: &File, record: &Record, phase: u8) -> Result<(), ()> {
+    super::fault::hit("witness-before-transition")?;
     let mut f = fs::create_leaf(root, NEXT, 0o600)?;
     fs::write_sync(&mut f, &bytes(record, phase))?;
     root.sync_all().map_err(|_| ())?;
+    super::fault::hit("witness-after-intent-fsync")?;
     fs::rename_noreplace(root, CURRENT, root, PREV)?;
+    super::fault::hit("witness-after-current-quarantine")?;
     root.sync_all().map_err(|_| ())?;
+    super::fault::hit("witness-after-current-fsync")?;
     fs::rename_noreplace(root, NEXT, root, CURRENT)?;
+    super::fault::hit("witness-after-next-publish")?;
     root.sync_all().map_err(|_| ())?;
+    super::fault::hit("witness-after-next-fsync")?;
+    super::fault::hit("witness-after-transition-fsync")?;
+    super::fault::hit("witness-before-previous-retire")?;
     remove(root, PREV)
+}
+fn retire(root: &File) -> Result<(), ()> {
+    super::fault::hit("witness-before-final-retire")?;
+    remove(root, CURRENT)?;
+    super::fault::hit("witness-after-final-retire")
 }
 fn remove(root: &File, name: &str) -> Result<(), ()> {
     if fs::leaf_absent(root, name)? {
@@ -159,7 +172,9 @@ fn remove_namespace(root: &File, expected: Identity) -> Result<(), ()> {
     if unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
         return Err(());
     }
-    root.sync_all().map_err(|_| ())
+    super::fault::hit("witness-after-namespace-unlink")?;
+    root.sync_all().map_err(|_| ())?;
+    super::fault::hit("witness-after-namespace-fsync")
 }
 fn read(root: &File, name: &str) -> Result<Option<(Vec<u8>, Identity)>, ()> {
     if fs::leaf_absent(root, name)? {
@@ -289,5 +304,31 @@ mod tests {
         let before = std::fs::read_dir(t.path()).unwrap().count();
         assert!(adopt(&d).is_err());
         assert_eq!(std::fs::read_dir(t.path()).unwrap().count(), before)
+    }
+
+    #[test]
+    fn every_witness_transition_fault_shape_is_adoptable() {
+        let points = [
+            "witness-after-intent-fsync",
+            "witness-after-current-quarantine",
+            "witness-after-current-fsync",
+            "witness-after-next-publish",
+            "witness-after-next-fsync",
+            "witness-before-previous-retire",
+        ];
+        for phase in 2..=8 {
+            for point in points {
+                let (_t, d) = dir();
+                let r = record();
+                put(&d, CURRENT, &bytes(&r, phase - 1));
+                crate::isolated_state_backup::fault::once(point);
+                assert!(transition(&d, &r, phase).is_err(), "phase={phase} {point}");
+                assert_eq!(
+                    adopt(&d).unwrap(),
+                    Some(bytes(&r, phase)),
+                    "phase={phase} {point}"
+                );
+            }
+        }
     }
 }

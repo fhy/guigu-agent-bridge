@@ -136,6 +136,7 @@ fn drive(namespace: &File, record: &mut Record) -> Result<u32, &'static str> {
     }
     if record.phase == Phase::IntentManifest {
         adopt_manifest_disable(namespace, record.manifest).map_err(|_| "cleanup")?;
+        super::fault::hit("cleanup-before-manifest-ack").map_err(|_| "cleanup")?;
         transition(namespace, record, Phase::ManifestDisabled)?;
     }
     if record.kind == Kind::Restore {
@@ -249,6 +250,7 @@ fn remove_step(
                 }
             }
         }
+        super::fault::hit("cleanup-before-leaf-ack").map_err(|_| "cleanup")?;
         transition(namespace, record, acknowledged)?;
         return Ok(u32::from(identity.is_some()));
     }
@@ -276,7 +278,9 @@ fn adopt_manifest_disable(namespace: &File, expected: super::codec::Identity) ->
     match (original, quarantine) {
         (Some(value), None) if fs::same(value, expected) => {
             fs::rename_noreplace(namespace, MANIFEST, namespace, MANIFEST_Q)?;
-            namespace.sync_all().map_err(|_| ())
+            super::fault::hit("cleanup-after-manifest-quarantine")?;
+            namespace.sync_all().map_err(|_| ())?;
+            super::fault::hit("cleanup-after-manifest-fsync")
         }
         (None, Some(value)) if fs::same(value, expected) => namespace.sync_all().map_err(|_| ()),
         _ => Err(()),
@@ -300,6 +304,7 @@ fn remove_exact(
         None => dir.sync_all().map_err(|_| ()),
         Some(value) if expected.is_none_or(|e| fs::same(e, value)) => {
             fs::unlink(dir, name)?;
+            super::fault::hit("cleanup-after-artifact-unlink")?;
             super::fault::hit("cleanup-after-leaf-unlink")?;
             dir.sync_all().map_err(|_| ())?;
             super::fault::hit("cleanup-after-leaf-fsync")

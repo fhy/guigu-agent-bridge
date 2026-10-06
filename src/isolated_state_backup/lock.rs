@@ -1,6 +1,6 @@
 use std::{fs::File, os::fd::AsRawFd};
 
-use super::{codec::Identity, fs};
+use super::{codec::Identity, fs, fs::OwnershipFailure};
 
 pub(crate) struct OperationLock {
     _file: File,
@@ -10,36 +10,49 @@ pub(crate) struct OperationLock {
 }
 
 impl OperationLock {
-    pub(crate) fn acquire(dir: &File) -> Result<Self, ()> {
-        let file = fs::create_leaf(dir, super::codec::LOCK, 0o600)?;
-        let pending = fs::identity(&file.metadata().map_err(|_| ())?);
+    pub(crate) fn acquire(dir: &File) -> Result<Self, OwnershipFailure> {
+        let file =
+            fs::create_leaf(dir, super::codec::LOCK, 0o600).map_err(|_| OwnershipFailure::Clean)?;
+        super::fault::hit("before-lock-metadata").map_err(|_| OwnershipFailure::Ambiguous)?;
+        let pending = fs::identity(&file.metadata().map_err(|_| OwnershipFailure::Ambiguous)?);
         let outcome = pending.and_then(|identity| {
             super::fault::hit("after-lock-create")?;
             if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
                 return Err(());
             }
             super::fault::hit("after-lock-flock")?;
+            file.sync_all().map_err(|_| ())?;
+            super::fault::hit("after-lock-file-fsync")?;
             dir.sync_all().map_err(|_| ())?;
-            super::fault::hit("after-lock-fsync")?;
+            super::fault::hit("after-lock-parent-fsync")?;
             Ok(identity)
         });
         let identity = match outcome {
             Ok(identity) => identity,
             Err(()) => {
-                let observed = fs::identity(&file.metadata().map_err(|_| ())?)?;
-                let current = fs::open_leaf(dir, super::codec::LOCK, false)?;
-                let current_identity = fs::identity(&current.metadata().map_err(|_| ())?)?;
+                let observed =
+                    fs::identity(&file.metadata().map_err(|_| OwnershipFailure::Ambiguous)?)
+                        .map_err(|_| OwnershipFailure::Ambiguous)?;
+                let current = fs::open_leaf(dir, super::codec::LOCK, false)
+                    .map_err(|_| OwnershipFailure::Ambiguous)?;
+                let current_identity = fs::identity(
+                    &current
+                        .metadata()
+                        .map_err(|_| OwnershipFailure::Ambiguous)?,
+                )
+                .map_err(|_| OwnershipFailure::Ambiguous)?;
                 if !fs::same_object(observed, current_identity) {
-                    return Err(());
+                    return Err(OwnershipFailure::Ambiguous);
                 }
-                fs::unlink(dir, super::codec::LOCK)?;
-                dir.sync_all().map_err(|_| ())?;
-                return Err(());
+                fs::unlink(dir, super::codec::LOCK)
+                    .and_then(|()| dir.sync_all().map_err(|_| ()))
+                    .map_err(|_| OwnershipFailure::Ambiguous)?;
+                return Err(OwnershipFailure::Clean);
             }
         };
         Ok(Self {
             _file: file,
-            dir: dir.try_clone().map_err(|_| ())?,
+            dir: dir.try_clone().map_err(|_| OwnershipFailure::Ambiguous)?,
             identity,
             armed: true,
         })

@@ -1,6 +1,6 @@
 #[cfg(test)]
 thread_local! {
-    static POINT: std::cell::RefCell<Option<&'static str>> = const { std::cell::RefCell::new(None) };
+    static POINT: std::cell::RefCell<Option<(&'static str, usize)>> = const { std::cell::RefCell::new(None) };
     static ACTION: std::cell::RefCell<Option<(&'static str, Box<dyn FnOnce()>)>> = const { std::cell::RefCell::new(None) };
 }
 
@@ -9,6 +9,9 @@ pub(crate) fn hit(point: &'static str) -> Result<(), ()> {
     {
         if std::env::var("T050_BACKUP_CRASH_POINT").as_deref() == Ok(point) {
             unsafe { libc::_exit(86) }
+        }
+        if std::env::var("T050_BACKUP_FAIL_POINT").as_deref() == Ok(point) {
+            return Err(());
         }
         let action = ACTION.with(|slot| {
             let matches = slot
@@ -21,11 +24,17 @@ pub(crate) fn hit(point: &'static str) -> Result<(), ()> {
             action();
         }
         return POINT.with(|slot| {
-            if *slot.borrow() == Some(point) {
-                slot.replace(None);
-                Err(())
-            } else {
-                Ok(())
+            let current = *slot.borrow();
+            match current {
+                Some((name, 1)) if name == point => {
+                    slot.replace(None);
+                    Err(())
+                }
+                Some((name, remaining)) if name == point => {
+                    slot.replace(Some((name, remaining - 1)));
+                    Ok(())
+                }
+                _ => Ok(()),
             }
         });
     }
@@ -38,7 +47,13 @@ pub(crate) fn hit(point: &'static str) -> Result<(), ()> {
 
 #[cfg(test)]
 pub(crate) fn once(point: &'static str) {
-    POINT.with(|slot| slot.replace(Some(point)));
+    nth(point, 1);
+}
+
+#[cfg(test)]
+pub(crate) fn nth(point: &'static str, occurrence: usize) {
+    assert!(occurrence > 0);
+    POINT.with(|slot| slot.replace(Some((point, occurrence))));
 }
 
 #[cfg(test)]

@@ -197,7 +197,9 @@ async fn forward(
                 let mut replacement = fs::create_leaf(namespace, "restore.new.sqlite3", 0o600)
                     .map_err(|_| "publication")?;
                 super::restore_io::copy(snapshot, &mut replacement).map_err(|_| "publication")?;
+                super::fault::hit("restore-after-new-write").map_err(|_| "publication")?;
                 replacement.sync_all().map_err(|_| "publication")?;
+                super::fault::hit("restore-after-new-fsync").map_err(|_| "publication")?;
                 replacement
             } else {
                 fs::open_leaf(namespace, "restore.new.sqlite3", false).map_err(|_| "publication")?
@@ -240,9 +242,12 @@ async fn forward(
         let fixed_present = !fs::leaf_absent(&root, "state.db").map_err(|_| "publication")?;
         match (new_present, fixed_present) {
             (true, false) => {
+                super::fault::hit("restore-before-publish-rename").map_err(|_| "publication")?;
                 fs::rename_noreplace(namespace, "restore.new.sqlite3", &root, "state.db")
                     .map_err(|_| "publication")?;
+                super::fault::hit("restore-after-publish-rename").map_err(|_| "publication")?;
                 root.sync_all().map_err(|_| "publication")?;
+                super::fault::hit("restore-after-publish-fsync").map_err(|_| "publication")?;
             }
             (false, true) => {
                 let file = fs::open_leaf(&root, "state.db", false).map_err(|_| "publication")?;
@@ -254,6 +259,7 @@ async fn forward(
             }
             _ => return Err("publication"),
         }
+        super::fault::hit("restore-before-publish-ack").map_err(|_| "journal")?;
         next(
             namespace,
             record,

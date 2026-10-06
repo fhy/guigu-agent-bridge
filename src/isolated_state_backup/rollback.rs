@@ -26,6 +26,7 @@ pub(crate) fn run(paths: &Paths, namespace: &File, record: &mut RestoreRecord) -
     }
     if record.phase == RestorePhase::RollbackIntentRemoveNew {
         adopt_remove_new(namespace, record.replacement)?;
+        super::fault::hit("rollback-before-new-ack")?;
         next(
             namespace,
             record,
@@ -237,7 +238,7 @@ pub(crate) fn restore_shape_fixture(
     moved: bool,
     expected: Identity,
 ) -> Result<(), ()> {
-    restore_one(
+    restore_shape_named_fixture(
         root,
         namespace,
         "state.db",
@@ -245,4 +246,16 @@ pub(crate) fn restore_shape_fixture(
         moved,
         expected,
     )
+}
+
+#[cfg(test)]
+pub(crate) fn restore_shape_named_fixture(
+    root: &File,
+    namespace: &File,
+    fixed: &str,
+    quarantine: &str,
+    moved: bool,
+    expected: Identity,
+) -> Result<(), ()> {
+    restore_one(root, namespace, fixed, quarantine, moved, expected)
 }

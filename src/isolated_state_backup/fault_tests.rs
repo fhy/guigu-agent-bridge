@@ -88,10 +88,10 @@ async fn namespace_lock_and_publication_faults_have_checked_outcomes() {
         "after-namespace-mkdir",
         "after-namespace-reopen",
         "after-namespace-metadata",
-        "after-namespace-fsync",
+        "after-namespace-file-fsync",
         "after-lock-create",
         "after-lock-flock",
-        "after-lock-fsync",
+        "after-lock-parent-fsync",
         "after-publication-create",
         "after-leaf-write",
         "after-leaf-fsync",
@@ -233,56 +233,115 @@ fn restore_record(identity: Identity) -> RestoreRecord {
 
 #[test]
 fn real_rename_and_fsync_faults_are_adopted_forward_and_reverse() {
-    for point in [
-        "restore-after-quarantine-rename",
-        "restore-after-quarantine-fsync",
-        "restore-before-quarantine-ack",
-    ] {
-        let temp = tempfile::tempdir().unwrap();
-        let paths = fixture_paths(&temp);
-        std::fs::write(&paths.database, b"original").unwrap();
-        let namespace_path = paths.root.join("ns");
-        std::fs::create_dir(&namespace_path).unwrap();
-        std::fs::set_permissions(&namespace_path, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let root = fs::open_dir(&paths.root).unwrap();
-        let namespace = fs::open_dir(&namespace_path).unwrap();
-        let mut main = fs::open_leaf(&root, "state.db", false).unwrap();
-        let (_, identity) = fs::hash(&mut main).unwrap();
-        let mut record = restore_record(identity);
-        super::journal::initial(&namespace, &record).unwrap();
-        fault::once(point);
-        assert!(
-            restore::quarantine_fixture(
-                &paths,
-                &namespace,
-                &mut record,
-                "state.db",
-                "pre-restore.main",
-                RestorePhase::IntentMain,
-                restore::MAIN,
-                identity,
-            )
-            .is_err()
-        );
-        restore::quarantine_fixture(
-            &paths,
-            &namespace,
-            &mut record,
+    let components = [
+        (
+            "state.db-shm",
+            "pre-restore.shm",
+            RestorePhase::IntentShm,
+            restore::SHM,
+        ),
+        (
+            "state.db-wal",
+            "pre-restore.wal",
+            RestorePhase::IntentWal,
+            restore::WAL,
+        ),
+        (
             "state.db",
             "pre-restore.main",
             RestorePhase::IntentMain,
             restore::MAIN,
-            identity,
-        )
-        .unwrap();
-        fault::once(if point.ends_with("rename") {
-            "rollback-after-restore-rename"
-        } else {
-            "rollback-after-restore-fsync"
-        });
-        assert!(rollback::restore_shape_fixture(&root, &namespace, true, identity).is_err());
-        rollback::restore_shape_fixture(&root, &namespace, true, identity).unwrap();
-        assert_eq!(std::fs::read(&paths.database).unwrap(), b"original");
+        ),
+    ];
+    for (fixed, quarantine, phase, bit) in components {
+        for point in [
+            "restore-after-quarantine-rename",
+            "restore-after-quarantine-fsync",
+            "restore-before-quarantine-ack",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = fixture_paths(&temp);
+            std::fs::write(paths.root.join(fixed), b"original").unwrap();
+            std::fs::set_permissions(
+                paths.root.join(fixed),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            let namespace_path = paths.root.join("ns");
+            std::fs::create_dir(&namespace_path).unwrap();
+            std::fs::set_permissions(&namespace_path, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            let root = fs::open_dir(&paths.root).unwrap();
+            let namespace = fs::open_dir(&namespace_path).unwrap();
+            let mut main = fs::open_leaf(&root, fixed, false).unwrap();
+            let (_, identity) = fs::hash(&mut main).unwrap();
+            let mut record = restore_record(identity);
+            super::journal::initial(&namespace, &record).unwrap();
+            fault::once(point);
+            assert!(
+                restore::quarantine_fixture(
+                    &paths,
+                    &namespace,
+                    &mut record,
+                    fixed,
+                    quarantine,
+                    phase,
+                    bit,
+                    identity,
+                )
+                .is_err()
+            );
+            restore::quarantine_fixture(
+                &paths,
+                &namespace,
+                &mut record,
+                fixed,
+                quarantine,
+                phase,
+                bit,
+                identity,
+            )
+            .unwrap();
+            assert_eq!(
+                std::fs::read(namespace_path.join(quarantine)).unwrap(),
+                b"original"
+            );
+        }
+    }
+    for (fixed, quarantine, _, _) in components {
+        for point in [
+            "rollback-after-restore-rename",
+            "rollback-after-restore-fsync",
+        ] {
+            let temp = tempfile::tempdir().unwrap();
+            let paths = fixture_paths(&temp);
+            let namespace_path = paths.root.join("ns");
+            std::fs::create_dir(&namespace_path).unwrap();
+            std::fs::set_permissions(&namespace_path, std::fs::Permissions::from_mode(0o700))
+                .unwrap();
+            std::fs::write(namespace_path.join(quarantine), b"original").unwrap();
+            std::fs::set_permissions(
+                namespace_path.join(quarantine),
+                std::fs::Permissions::from_mode(0o600),
+            )
+            .unwrap();
+            let root = fs::open_dir(&paths.root).unwrap();
+            let namespace = fs::open_dir(&namespace_path).unwrap();
+            let mut leaf = fs::open_leaf(&namespace, quarantine, false).unwrap();
+            let (_, identity) = fs::hash(&mut leaf).unwrap();
+            fault::once(point);
+            assert!(
+                rollback::restore_shape_named_fixture(
+                    &root, &namespace, fixed, quarantine, true, identity
+                )
+                .is_err()
+            );
+            rollback::restore_shape_named_fixture(
+                &root, &namespace, fixed, quarantine, true, identity,
+            )
+            .unwrap();
+            assert_eq!(std::fs::read(paths.root.join(fixed)).unwrap(), b"original");
+        }
     }
 }
 
@@ -326,60 +385,4 @@ async fn committed_restore_cleanup_rejects_journal_and_lock_replacements() {
             b"foreign-restore-replacement"
         );
     }
-}
-
-#[tokio::test]
-async fn crash_restore_worker() {
-    let Ok(root) = std::env::var("T050_BACKUP_CRASH_ROOT") else {
-        return;
-    };
-    let decode = |name: &str| {
-        let value = std::env::var(name).unwrap();
-        let mut bytes = [0u8; 32];
-        for (index, byte) in bytes.iter_mut().enumerate() {
-            *byte = u8::from_str_radix(&value[index * 2..index * 2 + 2], 16).unwrap();
-        }
-        bytes
-    };
-    let paths = Paths {
-        database: std::path::Path::new(&root).join("state.db"),
-        root: root.into(),
-        config: std::path::PathBuf::from("unused"),
-    };
-    let _ = restore::restore_fixture(
-        &paths,
-        decode("T050_BACKUP_CRASH_SNAPSHOT"),
-        decode("T050_BACKUP_CRASH_CURRENT"),
-    )
-    .await;
-}
-
-#[tokio::test]
-async fn process_crash_after_quarantine_rename_is_resumed() {
-    let temp = tempfile::tempdir().unwrap();
-    let paths = fixture_paths(&temp);
-    let connection = wal_database(&paths).await;
-    backup::create_fixture(paths.clone()).await.unwrap();
-    connection.close().await.unwrap();
-    let namespace = fs::open_dir(&paths.namespace()).unwrap();
-    let snapshot = backup::load_manifest(&namespace).unwrap().snapshot_hash;
-    drop(namespace);
-    let current = backup::source_set(&paths).unwrap().hash;
-    let output = std::process::Command::new(std::env::current_exe().unwrap())
-        .args([
-            "--exact",
-            "isolated_state_backup::fault_tests::crash_restore_worker",
-            "--nocapture",
-        ])
-        .env("T050_BACKUP_CRASH_ROOT", &paths.root)
-        .env("T050_BACKUP_CRASH_SNAPSHOT", backup::hex(snapshot))
-        .env("T050_BACKUP_CRASH_CURRENT", backup::hex(current))
-        .env("T050_BACKUP_CRASH_POINT", "restore-after-quarantine-rename")
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(86));
-    let result = restore::restore_fixture(&paths, snapshot, current)
-        .await
-        .unwrap();
-    assert!(result.contains("result=committed"));
 }

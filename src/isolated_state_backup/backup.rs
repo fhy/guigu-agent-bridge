@@ -36,26 +36,47 @@ async fn create(paths: Paths) -> Result<String, Failure> {
     let root = fs::open_dir(&paths.root).map_err(|_| Failure::rejected(COMMAND, "identity"))?;
     let uid = unsafe { libc::geteuid() };
     let gid = unsafe { libc::getegid() };
-    let namespace = fs::create_namespace(&root, NAMESPACE, uid, gid)
-        .map_err(|_| Failure::rejected(COMMAND, "target"))?;
-    let namespace_identity = fs::dir_identity(
-        &namespace
-            .metadata()
-            .map_err(|_| Failure::rejected(COMMAND, "target"))?,
-    )
-    .map_err(|_| Failure::rejected(COMMAND, "target"))?;
+    let (namespace, namespace_identity) = match fs::create_namespace(&root, NAMESPACE, uid, gid) {
+        Ok(owned) => owned,
+        Err(fs::OwnershipFailure::Clean) => return Err(Failure::rejected(COMMAND, "target")),
+        Err(fs::OwnershipFailure::Ambiguous) => {
+            return Err(Failure::rejected(COMMAND, "cleanup"));
+        }
+    };
     let mut publication = Publication::default();
-    let outcome = create_in_namespace(&paths, &root, &namespace, uid, gid, &mut publication).await;
-    if outcome.is_err() {
-        publication
-            .rollback(&namespace)
-            .map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
-        fs::remove_dir_exact(&root, NAMESPACE, namespace_identity)
-            .map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
-        root.sync_all()
-            .map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
+    let operation = match fs::OperationLock::acquire(&namespace) {
+        Ok(operation) => operation,
+        Err(fs::OwnershipFailure::Ambiguous) => {
+            return Err(Failure::rejected(COMMAND, "cleanup"));
+        }
+        Err(fs::OwnershipFailure::Clean) => {
+            remove_namespace(&root, namespace_identity)?;
+            return Err(Failure::rejected(COMMAND, "target"));
+        }
+    };
+    let outcome = create_locked(&paths, &namespace, uid, gid, &mut publication).await;
+    if outcome.is_ok() {
+        return if operation.finish().is_ok() {
+            outcome
+        } else {
+            Err(Failure::rejected(COMMAND, "cleanup"))
+        };
     }
+    publication
+        .rollback(&namespace)
+        .map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
+    operation
+        .finish()
+        .map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
+    remove_namespace(&root, namespace_identity)?;
     outcome
+}
+
+fn remove_namespace(root: &File, identity: super::codec::Identity) -> Result<(), Failure> {
+    fs::remove_dir_exact(root, NAMESPACE, identity)
+        .map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
+    root.sync_all()
+        .map_err(|_| Failure::rejected(COMMAND, "cleanup"))
 }
 
 #[cfg(test)]
@@ -66,23 +87,6 @@ pub(crate) async fn create_fixture(paths: Paths) -> Result<String, Failure> {
 #[cfg(test)]
 pub(crate) async fn verify_fixture(paths: &Paths) -> Result<String, &'static str> {
     verify_inner(paths).await
-}
-
-async fn create_in_namespace(
-    paths: &Paths,
-    _root: &File,
-    namespace: &File,
-    uid: u32,
-    gid: u32,
-    publication: &mut Publication,
-) -> Result<String, Failure> {
-    let operation =
-        fs::OperationLock::acquire(namespace).map_err(|_| Failure::rejected(COMMAND, "target"))?;
-    let outcome = create_locked(paths, namespace, uid, gid, publication).await;
-    if operation.finish().is_err() {
-        return Err(Failure::rejected(COMMAND, "cleanup"));
-    }
-    outcome
 }
 
 async fn create_locked(
@@ -103,8 +107,12 @@ async fn create_locked(
     let (facts, after) = sqlite::online_backup(paths, &before, &source_main, &destination)
         .await
         .map_err(|_| Failure::rejected(COMMAND, "sqlite"))?;
+    super::fault::hit("after-snapshot-write")
+        .map_err(|_| Failure::rejected(COMMAND, "publication"))?;
     destination
         .sync_all()
+        .map_err(|_| Failure::rejected(COMMAND, "publication"))?;
+    super::fault::hit("after-snapshot-file-fsync")
         .map_err(|_| Failure::rejected(COMMAND, "publication"))?;
     let verified = sqlite::verify_retained(&destination)
         .await
@@ -123,8 +131,12 @@ async fn create_locked(
     fs::rename_noreplace(namespace, &temporary, namespace, SNAPSHOT)
         .map_err(|_| Failure::rejected(COMMAND, "publication"))?;
     publication.rename(&temporary, SNAPSHOT);
+    super::fault::hit("after-publication-rename")
+        .map_err(|_| Failure::rejected(COMMAND, "publication"))?;
     namespace
         .sync_all()
+        .map_err(|_| Failure::rejected(COMMAND, "publication"))?;
+    super::fault::hit("after-publication-parent-fsync")
         .map_err(|_| Failure::rejected(COMMAND, "publication"))?;
     let snapshot = fs::open_leaf(namespace, SNAPSHOT, false)
         .and_then(|file| fs::identity(&file.metadata().map_err(|_| ())?))
@@ -169,8 +181,12 @@ async fn create_locked(
     fs::rename_noreplace(namespace, &manifest_temp, namespace, MANIFEST)
         .map_err(|_| Failure::rejected(COMMAND, "publication"))?;
     publication.rename(&manifest_temp, MANIFEST);
+    super::fault::hit("after-publication-rename")
+        .map_err(|_| Failure::rejected(COMMAND, "publication"))?;
     namespace
         .sync_all()
+        .map_err(|_| Failure::rejected(COMMAND, "publication"))?;
+    super::fault::hit("after-publication-parent-fsync")
         .map_err(|_| Failure::rejected(COMMAND, "publication"))?;
     publication.disarm();
     Ok(format!(
@@ -363,8 +379,11 @@ impl Publication {
             if !fs::same(expected, observed) {
                 return Err(());
             }
+            super::fault::hit("before-publication-rollback-unlink")?;
             fs::unlink(namespace, &name)?;
+            super::fault::hit("after-publication-rollback-unlink")?;
             namespace.sync_all().map_err(|_| ())?;
+            super::fault::hit("after-publication-rollback-fsync")?;
         }
         Ok(())
     }

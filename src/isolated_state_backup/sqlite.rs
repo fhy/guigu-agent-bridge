@@ -30,6 +30,7 @@ pub(crate) async fn online_backup(
     if !fs::same(retained, s0.main) {
         return Err(());
     }
+    super::fault::hit("sqlite-s0-retained")?;
     let source_path = format!("/proc/self/fd/{}", source_main.as_raw_fd());
     let options = SqliteConnectOptions::from_str(&source_path)
         .map_err(|_| ())?

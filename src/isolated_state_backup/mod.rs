@@ -1,6 +1,8 @@
 mod backup;
 mod cleanup;
 mod cleanup_codec;
+#[cfg(test)]
+mod cleanup_fault_matrix_tests;
 mod cleanup_journal;
 mod cleanup_witness;
 mod codec;
@@ -119,6 +121,14 @@ mod fault_tests;
 #[cfg(test)]
 mod journal_tests;
 #[cfg(test)]
+mod ownership_fault_tests;
+#[cfg(test)]
+mod process_death_tests;
+#[cfg(test)]
+mod publication_fault_tests;
+#[cfg(test)]
 mod recovery_tests;
+#[cfg(test)]
+mod sqlite_fault_tests;
 #[cfg(test)]
 mod tests;

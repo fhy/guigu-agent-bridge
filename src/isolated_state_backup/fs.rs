@@ -15,6 +15,12 @@ use super::{MAX_FILE, codec::Identity};
 
 pub(crate) use super::lock::OperationLock;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum OwnershipFailure {
+    Clean,
+    Ambiguous,
+}
+
 const RESOLVE: u64 = 0x08 | 0x04 | 0x02;
 
 #[repr(C)]
@@ -245,41 +251,64 @@ pub(crate) fn leaf_absent(dir: &File, name: &str) -> Result<bool, ()> {
     }
 }
 
-pub(crate) fn create_namespace(root: &File, name: &str, uid: u32, gid: u32) -> Result<File, ()> {
-    if !leaf_absent(root, name)? {
-        return Err(());
+pub(crate) fn create_namespace(
+    root: &File,
+    name: &str,
+    uid: u32,
+    gid: u32,
+) -> Result<(File, Identity), OwnershipFailure> {
+    if !leaf_absent(root, name).map_err(|_| OwnershipFailure::Clean)? {
+        return Err(OwnershipFailure::Clean);
     }
-    let name = CString::new(name).map_err(|_| ())?;
+    let name = CString::new(name).map_err(|_| OwnershipFailure::Clean)?;
     if unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
-        return Err(());
+        return Err(OwnershipFailure::Clean);
     }
-    super::fault::hit("after-namespace-mkdir")?;
-    let dir = openat_dir(root, name.as_c_str())?;
-    super::fault::hit("after-namespace-reopen")?;
-    super::fault::hit("before-namespace-metadata")?;
-    let retained = dir_identity(&dir.metadata().map_err(|_| ())?)?;
-    super::fault::hit("after-namespace-metadata")?;
+    super::fault::hit("after-namespace-mkdir").map_err(|_| OwnershipFailure::Ambiguous)?;
+    let dir = openat_dir(root, name.as_c_str()).map_err(|_| OwnershipFailure::Ambiguous)?;
+    super::fault::hit("after-namespace-reopen").map_err(|_| OwnershipFailure::Ambiguous)?;
+    super::fault::hit("before-namespace-metadata").map_err(|_| OwnershipFailure::Ambiguous)?;
+    let retained = dir_identity(&dir.metadata().map_err(|_| OwnershipFailure::Ambiguous)?)
+        .map_err(|_| OwnershipFailure::Ambiguous)?;
     let outcome = (|| {
+        super::fault::hit("after-namespace-metadata")?;
         if unsafe { libc::fchown(dir.as_raw_fd(), uid, gid) } != 0
             || unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) } != 0
         {
             return Err(());
         }
+        super::fault::hit("after-namespace-ownership")?;
         dir.sync_all().map_err(|_| ())?;
-        super::fault::hit("after-namespace-fsync")?;
+        super::fault::hit("after-namespace-file-fsync")?;
         root.sync_all().map_err(|_| ())?;
+        super::fault::hit("after-namespace-parent-fsync")?;
         let current = open_child_dir(root, name.to_str().map_err(|_| ())?)?;
         let observed = dir_identity(&current.metadata().map_err(|_| ())?)?;
         if !same_inode(retained, observed) {
             return Err(());
         }
-        Ok(())
+        dir_identity(&dir.metadata().map_err(|_| ())?)
     })();
     if outcome.is_err() {
-        remove_dir_exact(root, name.to_str().map_err(|_| ())?, retained)?;
-        root.sync_all().map_err(|_| ())?;
+        let leaf = name.to_str().map_err(|_| OwnershipFailure::Ambiguous)?;
+        return match remove_dir_exact(root, leaf, retained)
+            .and_then(|()| root.sync_all().map_err(|_| ()))
+        {
+            Ok(()) => Err(OwnershipFailure::Clean),
+            Err(()) => Err(OwnershipFailure::Ambiguous),
+        };
     }
-    outcome.map(|()| dir)
+    Ok((dir, outcome.expect("checked success")))
+}
+
+#[cfg(test)]
+pub(crate) fn create_namespace_fixture(
+    root: &File,
+    name: &str,
+) -> Result<(File, Identity), OwnershipFailure> {
+    create_namespace(root, name, unsafe { libc::geteuid() }, unsafe {
+        libc::getegid()
+    })
 }
 
 pub(crate) fn remove_dir_exact(root: &File, name: &str, expected: Identity) -> Result<(), ()> {
