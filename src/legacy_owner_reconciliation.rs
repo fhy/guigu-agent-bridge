@@ -1709,18 +1709,20 @@ mod tests {
 
     #[test]
     fn content_identity_rejects_growth_and_short_eof_with_restored_metadata() {
-        use std::io::{Seek, SeekFrom, Write};
+        use std::io::{Seek, Write};
 
-        let growing = tempfile::tempfile().unwrap();
+        let growing = tempfile::NamedTempFile::new().unwrap();
         let initial_size = (IDENTITY_HASH_BUFFER_SIZE * 2) as u64;
-        growing.set_len(initial_size).unwrap();
-        let mut growing_reader = growing.try_clone().unwrap();
+        growing.as_file().set_len(initial_size).unwrap();
+        let mut growing_reader = growing.reopen().unwrap();
         let mut grew = false;
         assert!(
             identity_content_hash_observed(&mut growing_reader, initial_size, |_, count| {
                 if count != 0 && !grew {
-                    let mut writer = growing.try_clone().unwrap();
-                    writer.seek(SeekFrom::End(0)).unwrap();
+                    let mut writer = std::fs::OpenOptions::new()
+                        .append(true)
+                        .open(growing.path())
+                        .unwrap();
                     writer
                         .write_all(&vec![0xa5; IDENTITY_HASH_BUFFER_SIZE])
                         .unwrap();
@@ -1728,6 +1730,15 @@ mod tests {
                 }
             })
             .is_err()
+        );
+        assert!(grew);
+        assert_eq!(
+            growing_reader.stream_position().unwrap(),
+            initial_size + IDENTITY_HASH_BUFFER_SIZE as u64
+        );
+        assert_eq!(
+            growing.as_file().metadata().unwrap().len(),
+            initial_size + IDENTITY_HASH_BUFFER_SIZE as u64
         );
 
         let short = tempfile::tempfile().unwrap();
