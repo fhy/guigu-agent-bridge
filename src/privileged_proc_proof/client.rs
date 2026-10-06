@@ -1,5 +1,6 @@
 // SPLIT_CLIENT
 const HELPER_RESPONSE_TIMEOUT: Duration = Duration::from_secs(120);
+const HELPER_SCAN_DEADLINE_MS: u32 = 5000;
 
 pub fn prove_runtime_absence(
     guard: &crate::runtime_admission::Guard,
@@ -67,7 +68,7 @@ fn parent_request(
         parent_starttime: binding.starttime,
         admission_device: binding.device,
         admission_inode: binding.inode,
-        deadline_ms: 2000,
+        deadline_ms: HELPER_SCAN_DEADLINE_MS,
     }.encode()
 }
 

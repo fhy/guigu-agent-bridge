@@ -85,8 +85,14 @@ async fn backup_runtime_fixture_child() {
                 }
             }
         }
-        "runtime" => {
-            let result = backup::run_with_proof_fixture(paths, Ok(ProofResult::Process)).await;
+        "process" | "listener" | "unknown" => {
+            let proof = match mode.as_str() {
+                "process" => ProofResult::Process,
+                "listener" => ProofResult::Listener,
+                "unknown" => ProofResult::Unknown,
+                _ => unreachable!(),
+            };
+            let result = backup::run_with_proof_fixture(paths, Ok(proof)).await;
             connection.close().await.unwrap();
             result
         }
@@ -162,7 +168,7 @@ fn process_backup_success_and_cleanup_are_real_and_fixed() {
 
 #[test]
 fn process_runtime_and_no_generation_refuse_without_residue() {
-    for mode in ["runtime", "no-generation"] {
+    for mode in ["process", "listener", "unknown", "no-generation"] {
         let temp = tempfile::tempdir().unwrap();
         let root = temp.path().join("state");
         let output = run(&root, mode);
@@ -180,7 +186,7 @@ fn process_runtime_and_no_generation_refuse_without_residue() {
 #[test]
 fn process_backup_refusal_is_redacted() {
     let temp = tempfile::Builder::new().prefix(PLANTED).tempdir().unwrap();
-    let output = run(&temp.path().join(PLANTED), "runtime");
+    let output = run(&temp.path().join(PLANTED), "unknown");
     assert_eq!(output.status.code(), Some(3));
     assert_eq!(
         fixed_line(&output),

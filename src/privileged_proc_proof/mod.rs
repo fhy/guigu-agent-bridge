@@ -113,3 +113,5 @@ include!("client.rs");
 include!("sandbox.rs");
 include!("helper.rs");
 include!("tests.rs");
+#[cfg(test)]
+mod resource_tests;

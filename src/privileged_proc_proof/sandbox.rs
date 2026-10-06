@@ -109,12 +109,17 @@ fn drop_capabilities(proc: &ProcDir) -> Result<(), ()> {
     }
 }
 
+const HELPER_CPU_SECONDS: libc::rlim_t = 60;
+
 fn set_resource_limits() -> Result<(), ()> {
     for (resource, value) in [
         (libc::RLIMIT_NOFILE, 65_536),
         (libc::RLIMIT_AS, 512 * 1024 * 1024),
         (libc::RLIMIT_FSIZE, 0),
-        (libc::RLIMIT_CPU, 5),
+        // Authentication streams the parent and helper before and after the scan.
+        // The reviewed artifacts may each be as large as MAX_HELPER_SIZE, so five
+        // seconds can terminate a healthy helper before it emits its proof record.
+        (libc::RLIMIT_CPU, HELPER_CPU_SECONDS),
     ] {
         let limit = libc::rlimit {
             rlim_cur: value,
