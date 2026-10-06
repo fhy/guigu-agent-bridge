@@ -271,7 +271,6 @@ async fn eligible(c: &mut SqliteConnection) -> Result<Facts, Error> {
 }
 
 async fn emit_eligibility_diagnostic(c: &mut SqliteConnection) {
-    #[cfg(debug_assertions)]
     if std::env::var_os("T050_FIXTURE_MIGRATION_DIAGNOSTIC").is_none() {
         return;
     }
@@ -325,15 +324,12 @@ async fn emit_eligibility_diagnostic(c: &mut SqliteConnection) {
 }
 
 fn emit_prepare_diagnostic(stage: &str, cause: &str, counts: &str) {
-    #[cfg(debug_assertions)]
-    {
-        if std::env::var_os("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC").is_none() {
-            return;
-        }
-        println!(
-            "prepare-isolated-legacy-fixture-migration-manifest stage={stage} cause={cause} counts={counts}"
-        );
+    if std::env::var_os("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC").is_none() {
+        return;
     }
+    println!(
+        "prepare-isolated-legacy-fixture-migration-manifest stage={stage} cause={cause} counts={counts}"
+    );
 }
 
 fn prepare_rejected(stage: &str, cause: &str, error: Error) -> Error {

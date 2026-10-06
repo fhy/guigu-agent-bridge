@@ -136,7 +136,12 @@ struct Fixture {
 impl Fixture {
     async fn new() -> Self {
         let fixture = Self::new_unprepared().await;
-        let output = fixture.prepare().output().unwrap();
+        let output = fixture
+            .prepare()
+            .env("T050_FIXTURE_MIGRATION_DIAGNOSTIC", "1")
+            .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+            .output()
+            .unwrap();
         assert_eq!(
             output.status.code(),
             Some(0),
@@ -431,6 +436,44 @@ async fn eligibility_diagnostic_is_fixed_and_redacted() {
     assert!(stdout.contains("counts=owners=2,continuations=1,sessions=1"));
     assert!(!stdout.contains("owner-a"));
     assert!(!stdout.contains("closed-session"));
+}
+
+#[cfg(not(debug_assertions))]
+#[tokio::test]
+async fn optimized_prepare_child_exposes_only_opt_in_fixed_internal_classification() {
+    let fixture = Fixture::new_unprepared().await;
+    let tree = fixture_tree(&fixture.root);
+
+    let public = fixture.prepare().output().unwrap();
+    assert_eq!(public.status.code(), Some(3));
+    assert!(public.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8_lossy(&public.stdout).trim(),
+        "prepare-isolated-legacy-fixture-migration-manifest result=rejected status=3"
+    );
+    assert_eq!(fixture_tree(&fixture.root), tree);
+
+    let classified = fixture
+        .prepare()
+        .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+        .output()
+        .unwrap();
+    assert_eq!(classified.status.code(), Some(3));
+    assert!(classified.stderr.is_empty());
+    let stdout = String::from_utf8_lossy(&classified.stdout);
+    assert!(
+        stdout.contains("stage=preflight cause=runtime-unknown-procfs-parse counts=failures=1")
+    );
+    assert!(
+        stdout.contains(
+            "prepare-isolated-legacy-fixture-migration-manifest result=rejected status=3"
+        )
+    );
+    assert!(!stdout.contains(fixture.root.to_str().unwrap()));
+    assert_eq!(fixture_tree(&fixture.root), tree);
+    assert!(!fixture.manifest.exists());
+    assert!(!fixture.evidence.exists());
+    assert!(!fixture.root.join(".runtime-admission.lock").exists());
 }
 
 #[tokio::test]
