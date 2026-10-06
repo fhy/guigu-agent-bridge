@@ -347,26 +347,31 @@ fn retained_identity(dir: &File, name: &str) -> Result<Option<super::codec::Iden
 }
 
 #[cfg(test)]
+pub(crate) struct QuarantineFixture {
+    pub fixed: &'static str,
+    pub quarantine: &'static str,
+    pub phase: RestorePhase,
+    pub bit: u16,
+    pub expected: super::codec::Identity,
+}
+
+#[cfg(test)]
 pub(crate) fn quarantine_fixture(
     paths: &Paths,
     namespace: &File,
     record: &mut RestoreRecord,
-    fixed: &'static str,
-    quarantine_name: &'static str,
-    phase: RestorePhase,
-    bit: u16,
-    expected: super::codec::Identity,
+    fixture: QuarantineFixture,
 ) -> Result<(), &'static str> {
     quarantine(
         paths,
         namespace,
         record,
         Quarantine {
-            fixed,
-            quarantine: quarantine_name,
-            phase,
-            bit,
-            expected: Some(expected),
+            fixed: fixture.fixed,
+            quarantine: fixture.quarantine,
+            phase: fixture.phase,
+            bit: fixture.bit,
+            expected: Some(fixture.expected),
         },
     )
 }

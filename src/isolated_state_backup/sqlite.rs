@@ -224,6 +224,42 @@ fn validate_observation(
     }
 }
 
+async fn facts(connection: &mut SqliteConnection) -> Result<SqliteFacts, ()> {
+    let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|_| ())?;
+    let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|_| ())?;
+    let user_version: i64 = sqlx::query_scalar("PRAGMA user_version")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|_| ())?;
+    if page_size <= 0 || page_count < 0 || user_version < 0 {
+        return Err(());
+    }
+    let rows = sqlx::query("SELECT type,name,tbl_name,coalesce(sql,'') FROM sqlite_schema ORDER BY type,name,tbl_name,sql")
+        .fetch_all(&mut *connection).await.map_err(|_| ())?;
+    let mut schema = Sha256::new();
+    for row in rows {
+        for index in 0..4 {
+            let value: String = row.try_get(index).map_err(|_| ())?;
+            let length = u32::try_from(value.len()).map_err(|_| ())?;
+            schema.update(length.to_be_bytes());
+            schema.update(value.as_bytes());
+        }
+    }
+    Ok(SqliteFacts {
+        version: unsafe { ffi::sqlite3_libversion_number() as u32 },
+        page_size: u32::try_from(page_size).map_err(|_| ())?,
+        page_count: u32::try_from(page_count).map_err(|_| ())?,
+        user_version: u32::try_from(user_version).map_err(|_| ())?,
+        schema_hash: schema.finalize().into(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -269,40 +305,4 @@ mod tests {
         wal_drift.wal_hash = Some([9; 32]);
         assert!(validate_observation(&existing, &wal_drift, Some(&existing)).is_err());
     }
-}
-
-async fn facts(connection: &mut SqliteConnection) -> Result<SqliteFacts, ()> {
-    let page_size: i64 = sqlx::query_scalar("PRAGMA page_size")
-        .fetch_one(&mut *connection)
-        .await
-        .map_err(|_| ())?;
-    let page_count: i64 = sqlx::query_scalar("PRAGMA page_count")
-        .fetch_one(&mut *connection)
-        .await
-        .map_err(|_| ())?;
-    let user_version: i64 = sqlx::query_scalar("PRAGMA user_version")
-        .fetch_one(&mut *connection)
-        .await
-        .map_err(|_| ())?;
-    if page_size <= 0 || page_count < 0 || user_version < 0 {
-        return Err(());
-    }
-    let rows = sqlx::query("SELECT type,name,tbl_name,coalesce(sql,'') FROM sqlite_schema ORDER BY type,name,tbl_name,sql")
-        .fetch_all(&mut *connection).await.map_err(|_| ())?;
-    let mut schema = Sha256::new();
-    for row in rows {
-        for index in 0..4 {
-            let value: String = row.try_get(index).map_err(|_| ())?;
-            let length = u32::try_from(value.len()).map_err(|_| ())?;
-            schema.update(length.to_be_bytes());
-            schema.update(value.as_bytes());
-        }
-    }
-    Ok(SqliteFacts {
-        version: unsafe { ffi::sqlite3_libversion_number() as u32 },
-        page_size: u32::try_from(page_size).map_err(|_| ())?,
-        page_count: u32::try_from(page_count).map_err(|_| ())?,
-        user_version: u32::try_from(user_version).map_err(|_| ())?,
-        schema_hash: schema.finalize().into(),
-    })
 }

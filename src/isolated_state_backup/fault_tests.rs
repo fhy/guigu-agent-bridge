@@ -283,11 +283,13 @@ fn real_rename_and_fsync_faults_are_adopted_forward_and_reverse() {
                     &paths,
                     &namespace,
                     &mut record,
-                    fixed,
-                    quarantine,
-                    phase,
-                    bit,
-                    identity,
+                    restore::QuarantineFixture {
+                        fixed,
+                        quarantine,
+                        phase,
+                        bit,
+                        expected: identity,
+                    },
                 )
                 .is_err()
             );
@@ -295,11 +297,13 @@ fn real_rename_and_fsync_faults_are_adopted_forward_and_reverse() {
                 &paths,
                 &namespace,
                 &mut record,
-                fixed,
-                quarantine,
-                phase,
-                bit,
-                identity,
+                restore::QuarantineFixture {
+                    fixed,
+                    quarantine,
+                    phase,
+                    bit,
+                    expected: identity,
+                },
             )
             .unwrap();
             assert_eq!(

@@ -83,11 +83,13 @@ fn forward_quarantine_adopts_before_and_after_shapes_and_rejects_ambiguity() {
             &paths,
             &namespace,
             &mut record,
-            "state.db",
-            "pre-restore.main",
-            RestorePhase::IntentMain,
-            restore::MAIN,
-            id,
+            restore::QuarantineFixture {
+                fixed: "state.db",
+                quarantine: "pre-restore.main",
+                phase: RestorePhase::IntentMain,
+                bit: restore::MAIN,
+                expected: id,
+            },
         )
         .unwrap();
         assert_eq!(record.bitmap & restore::MAIN, restore::MAIN);
@@ -110,11 +112,13 @@ fn forward_quarantine_adopts_before_and_after_shapes_and_rejects_ambiguity() {
             &paths,
             &namespace,
             &mut record,
-            "state.db",
-            "pre-restore.main",
-            RestorePhase::IntentMain,
-            restore::MAIN,
-            id
+            restore::QuarantineFixture {
+                fixed: "state.db",
+                quarantine: "pre-restore.main",
+                phase: RestorePhase::IntentMain,
+                bit: restore::MAIN,
+                expected: id,
+            }
         )
         .is_err()
     );

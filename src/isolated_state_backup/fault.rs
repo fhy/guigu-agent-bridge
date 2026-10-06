@@ -1,7 +1,10 @@
 #[cfg(test)]
+type Action = Option<(&'static str, Box<dyn FnOnce()>)>;
+
+#[cfg(test)]
 thread_local! {
     static POINT: std::cell::RefCell<Option<(&'static str, usize)>> = const { std::cell::RefCell::new(None) };
-    static ACTION: std::cell::RefCell<Option<(&'static str, Box<dyn FnOnce()>)>> = const { std::cell::RefCell::new(None) };
+    static ACTION: std::cell::RefCell<Action> = const { std::cell::RefCell::new(None) };
 }
 
 pub(crate) fn hit(point: &'static str) -> Result<(), ()> {
@@ -23,7 +26,7 @@ pub(crate) fn hit(point: &'static str) -> Result<(), ()> {
         if let Some(action) = action {
             action();
         }
-        return POINT.with(|slot| {
+        POINT.with(|slot| {
             let current = *slot.borrow();
             match current {
                 Some((name, 1)) if name == point => {
@@ -36,7 +39,7 @@ pub(crate) fn hit(point: &'static str) -> Result<(), ()> {
                 }
                 _ => Ok(()),
             }
-        });
+        })
     }
     #[cfg(not(test))]
     {
