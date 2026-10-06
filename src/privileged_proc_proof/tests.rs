@@ -106,6 +106,17 @@ mod tests {
         };
         let bytes = request.encode().unwrap();
         assert_eq!(Request::decode(&bytes).unwrap(), request);
+        for mode in 1..=5 {
+            let mut supported = request.clone();
+            supported.mode = mode;
+            let encoded = supported.encode().unwrap();
+            assert_eq!(Request::decode(&encoded).unwrap(), supported);
+        }
+        for mode in [0, 6] {
+            let mut unsupported = request.clone();
+            unsupported.mode = mode;
+            assert!(unsupported.encode().is_err());
+        }
         let mut extra = bytes;
         extra.push(0);
         assert!(Request::decode(&extra).is_err());

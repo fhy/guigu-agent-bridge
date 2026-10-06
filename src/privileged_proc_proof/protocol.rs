@@ -1,6 +1,6 @@
 impl Request {
     fn encode(&self) -> Result<Vec<u8>, ()> {
-        if self.policy.len() > MAX_POLICY_SIZE || !matches!(self.mode, 1 | 2) {
+        if self.policy.len() > MAX_POLICY_SIZE || !matches!(self.mode, 1..=5) {
             return Err(());
         }
         let mut out = Vec::new();
@@ -62,7 +62,7 @@ impl Request {
             admission_inode: u64_at(bytes, &mut at)?,
             deadline_ms: u32_at(bytes, &mut at)?,
         };
-        if at != bytes.len() || !matches!(value.mode, 1 | 2) || value.deadline_ms > 5000 {
+        if at != bytes.len() || !matches!(value.mode, 1..=5) || value.deadline_ms > 5000 {
             return Err(());
         }
         ArtifactManifest::decode(&value.manifest)?;

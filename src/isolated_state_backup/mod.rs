@@ -117,6 +117,8 @@ fn command_name(value: &str) -> &'static str {
 }
 
 #[cfg(test)]
+mod backup_runtime_tests;
+#[cfg(test)]
 mod fault_tests;
 #[cfg(test)]
 mod journal_tests;
