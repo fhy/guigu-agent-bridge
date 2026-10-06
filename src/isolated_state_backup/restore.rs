@@ -1,8 +1,4 @@
-use std::{
-    fs::File,
-    io::{Read, Seek, SeekFrom, Write},
-    path::Path,
-};
+use std::fs::File;
 
 use super::{
     Failure, Paths, backup,
@@ -92,6 +88,11 @@ async fn restore(
             | RestorePhase::RollbackMain
             | RestorePhase::RollbackWal
             | RestorePhase::RollbackShm
+            | RestorePhase::RollbackIntentRemoveNew
+            | RestorePhase::RollbackIntentMain
+            | RestorePhase::RollbackIntentWal
+            | RestorePhase::RollbackIntentShm
+            | RestorePhase::RollbackVerifying
             | RestorePhase::Restored
     );
     if resuming_rollback {
@@ -187,15 +188,27 @@ async fn forward(
     }
     let manifest = backup::load_manifest(namespace).map_err(|_| "manifest")?;
     if record.bitmap & NEW == 0 {
+        if record.phase != RestorePhase::IntentNew {
+            next(namespace, record, RestorePhase::IntentNew, record.bitmap)
+                .map_err(|_| "journal")?;
+        }
         let mut replacement =
-            fs::create_leaf(namespace, "restore.new.sqlite3", 0o600).map_err(|_| "publication")?;
-        copy(snapshot, &mut replacement).map_err(|_| "publication")?;
-        replacement.sync_all().map_err(|_| "publication")?;
-        let (_, replacement_identity) = fs::hash(&mut replacement).map_err(|_| "publication")?;
-        let replacement_facts = sqlite::verify(&paths.namespace().join("restore.new.sqlite3"))
+            if fs::leaf_absent(namespace, "restore.new.sqlite3").map_err(|_| "publication")? {
+                let mut replacement = fs::create_leaf(namespace, "restore.new.sqlite3", 0o600)
+                    .map_err(|_| "publication")?;
+                super::restore_io::copy(snapshot, &mut replacement).map_err(|_| "publication")?;
+                replacement.sync_all().map_err(|_| "publication")?;
+                replacement
+            } else {
+                fs::open_leaf(namespace, "restore.new.sqlite3", false).map_err(|_| "publication")?
+            };
+        let (replacement_hash, replacement_identity) =
+            fs::hash(&mut replacement).map_err(|_| "publication")?;
+        let replacement_facts = sqlite::verify_retained(&replacement)
             .await
             .map_err(|_| "snapshot")?;
-        if replacement_identity.size != manifest.snapshot.size
+        if replacement_hash != record.snapshot
+            || replacement_identity.size != manifest.snapshot.size
             || replacement_facts.page_size != manifest.page_size
             || replacement_facts.schema_hash != manifest.schema_hash
         {
@@ -249,10 +262,11 @@ async fn forward(
         )
         .map_err(|_| "journal")?;
     }
-    let facts = sqlite::verify(&paths.database)
+    let published_file = fs::open_leaf(&root, "state.db", false).map_err(|_| "verification")?;
+    let facts = sqlite::verify_retained(&published_file)
         .await
         .map_err(|_| "verification")?;
-    let mut published = open_path(&paths.database).map_err(|_| "verification")?;
+    let mut published = published_file.try_clone().map_err(|_| "verification")?;
     let (hash, identity) = fs::hash(&mut published).map_err(|_| "verification")?;
     if hash != record.snapshot
         || record
@@ -291,18 +305,61 @@ fn quarantine(
     if step.expected.is_none() {
         return Ok(());
     }
-    next(namespace, record, step.phase, record.bitmap).map_err(|_| "journal")?;
-    let root = fs::open_dir(&paths.root).map_err(|_| "identity")?;
-    let mut retained = fs::open_leaf(&root, step.fixed, false).map_err(|_| "identity")?;
-    let (_, observed) = fs::hash(&mut retained).map_err(|_| "identity")?;
-    if !fs::same(observed, step.expected.ok_or("identity")?) {
-        return Err("identity");
+    if record.phase != step.phase {
+        next(namespace, record, step.phase, record.bitmap).map_err(|_| "journal")?;
     }
-    fs::rename_noreplace(&root, step.fixed, namespace, step.quarantine)
-        .map_err(|_| "publication")?;
-    root.sync_all().map_err(|_| "publication")?;
-    namespace.sync_all().map_err(|_| "publication")?;
+    let root = fs::open_dir(&paths.root).map_err(|_| "identity")?;
+    let expected = step.expected.ok_or("identity")?;
+    let fixed = retained_identity(&root, step.fixed).map_err(|_| "identity")?;
+    let moved = retained_identity(namespace, step.quarantine).map_err(|_| "identity")?;
+    match (fixed, moved) {
+        (Some(observed), None) if fs::same(observed, expected) => {
+            fs::rename_noreplace(&root, step.fixed, namespace, step.quarantine)
+                .map_err(|_| "publication")?;
+            root.sync_all().map_err(|_| "publication")?;
+            namespace.sync_all().map_err(|_| "publication")?;
+        }
+        (None, Some(observed)) if fs::same(observed, expected) => {
+            root.sync_all().map_err(|_| "publication")?;
+            namespace.sync_all().map_err(|_| "publication")?;
+        }
+        _ => return Err("identity"),
+    }
     next(namespace, record, step.phase, record.bitmap | step.bit).map_err(|_| "journal")
+}
+
+fn retained_identity(dir: &File, name: &str) -> Result<Option<super::codec::Identity>, ()> {
+    if fs::leaf_absent(dir, name)? {
+        return Ok(None);
+    }
+    let mut file = fs::open_leaf(dir, name, false)?;
+    let (_, identity) = fs::hash(&mut file)?;
+    Ok(Some(identity))
+}
+
+#[cfg(test)]
+pub(crate) fn quarantine_fixture(
+    paths: &Paths,
+    namespace: &File,
+    record: &mut RestoreRecord,
+    fixed: &'static str,
+    quarantine_name: &'static str,
+    phase: RestorePhase,
+    bit: u16,
+    expected: super::codec::Identity,
+) -> Result<(), &'static str> {
+    quarantine(
+        paths,
+        namespace,
+        record,
+        Quarantine {
+            fixed,
+            quarantine: quarantine_name,
+            phase,
+            bit,
+            expected: Some(expected),
+        },
+    )
 }
 
 pub(crate) fn next(
@@ -320,30 +377,4 @@ pub(crate) fn next(
     journal::transition(namespace, &mut successor)?;
     *record = successor;
     Ok(())
-}
-
-fn copy(source: &mut File, destination: &mut File) -> Result<(), ()> {
-    source.seek(SeekFrom::Start(0)).map_err(|_| ())?;
-    let mut buffer = [0u8; 64 * 1024];
-    let mut total = 0u64;
-    loop {
-        let count = source.read(&mut buffer).map_err(|_| ())?;
-        if count == 0 {
-            break;
-        }
-        total = total.checked_add(count as u64).ok_or(())?;
-        if total > super::MAX_FILE {
-            return Err(());
-        }
-        destination.write_all(&buffer[..count]).map_err(|_| ())?;
-    }
-    Ok(())
-}
-fn open_path(path: &Path) -> Result<File, ()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|_| ())
 }

@@ -1,18 +1,18 @@
-use std::{ffi::CString, fs::File, os::fd::AsRawFd};
+use std::fs::File;
 
 use sha2::{Digest, Sha256};
 
 use super::{
     Failure, NAMESPACE, Paths, backup,
-    codec::{
-        BACKUP_CLEANUP, MANIFEST, RESTORE_CLEANUP, RESTORE_JOURNAL, RestorePhase, RestoreRecord,
-        SNAPSHOT,
-    },
-    fs,
+    cleanup_codec::{Kind, Phase, Record},
+    cleanup_journal,
+    codec::{MANIFEST, RESTORE_JOURNAL, RestorePhase, SNAPSHOT},
+    fs, journal,
+    restore::{MAIN, SHM, WAL},
 };
 
 const COMMAND: &str = "cleanup-isolated-t050-backup";
-const WITNESS: &str = ".t050-backup-cleanup-owner.v1";
+const MANIFEST_Q: &str = "snapshot.manifest.quarantine";
 
 pub(crate) fn run(paths: Paths, expected: [u8; 32]) -> Result<String, Failure> {
     cleanup(&paths, expected).map_err(|cause| Failure::rejected(COMMAND, cause))
@@ -20,155 +20,263 @@ pub(crate) fn run(paths: Paths, expected: [u8; 32]) -> Result<String, Failure> {
 
 fn cleanup(paths: &Paths, expected: [u8; 32]) -> Result<String, &'static str> {
     let root = fs::open_dir(&paths.root).map_err(|_| "identity")?;
+    if super::cleanup_witness::resume(&root, expected).map_err(|_| "cleanup")? {
+        return Ok(success(0));
+    }
     if fs::leaf_absent(&root, NAMESPACE).map_err(|_| "identity")? {
-        return Ok(
-            "cleanup-isolated-t050-backup result=already-absent status=0 count=0".to_owned(),
-        );
+        return Ok("cleanup-isolated-t050-backup result=already-absent status=0 count=0".into());
     }
     let namespace = fs::open_dir(&paths.namespace()).map_err(|_| "identity")?;
-    let manifest = backup::load_manifest(&namespace).map_err(|_| "manifest")?;
-    if manifest.snapshot_hash != expected {
-        return Err("manifest");
+    let backup_record = cleanup_journal::adopt(&namespace, Kind::Backup).map_err(|_| "journal")?;
+    let restore_record =
+        cleanup_journal::adopt(&namespace, Kind::Restore).map_err(|_| "journal")?;
+    if backup_record.is_some() && restore_record.is_some() {
+        return Err("journal");
     }
-    let mut snapshot = fs::open_leaf(&namespace, SNAPSHOT, false).map_err(|_| "snapshot")?;
-    let (hash, identity) = fs::hash(&mut snapshot).map_err(|_| "snapshot")?;
-    if hash != expected || !fs::same(identity, manifest.snapshot) {
-        return Err("snapshot");
-    }
-    let restore = read_restore(&namespace)?;
-    let operation = fs::OperationLock::acquire(&namespace).map_err(|_| "cleanup")?;
-    let journal_name = if restore.is_some() {
-        RESTORE_CLEANUP
+    let existing = backup_record.or(restore_record);
+    let operation = if existing.is_some() {
+        fs::OperationLock::acquire_resume(&namespace).map_err(|_| "cleanup")?
     } else {
-        BACKUP_CLEANUP
+        fs::OperationLock::acquire(&namespace).map_err(|_| "cleanup")?
     };
-    write_record(&namespace, journal_name, b"GGT50C01", 0).map_err(|_| "cleanup")?;
-    let mut count = 0u32;
-    if let Some(record) = restore {
-        if record.phase != RestorePhase::Committed || record.snapshot != expected {
-            return Err("journal");
+    let mut record = match existing {
+        Some(record) => {
+            if record.expected_snapshot != expected {
+                operation.preserve();
+                return Err("manifest");
+            }
+            record
         }
-        for name in ["pre-restore.shm", "pre-restore.wal", "pre-restore.main"] {
-            count += remove_if_present(&namespace, name).map_err(|_| "cleanup")?;
-        }
-        count += remove_if_present(&namespace, SNAPSHOT).map_err(|_| "cleanup")?;
-        disable_manifest(&namespace).map_err(|_| "cleanup")?;
-        count +=
-            remove_if_present(&namespace, "snapshot.manifest.quarantine").map_err(|_| "cleanup")?;
-        count += remove_if_present(&namespace, RESTORE_JOURNAL).map_err(|_| "cleanup")?;
-    } else {
-        for forbidden in [
-            "pre-restore.main",
-            "pre-restore.wal",
+        None => create_record(&namespace, expected).map_err(|_| "manifest")?,
+    };
+    let result = drive(&namespace, &mut record);
+    if result.is_err() {
+        operation.preserve();
+        return result.map(|_| unreachable!());
+    }
+    let count = result?;
+    super::cleanup_witness::finish(&root, &namespace, &record, operation).map_err(|_| "cleanup")?;
+    Ok(success(count))
+}
+
+fn create_record(namespace: &File, expected: [u8; 32]) -> Result<Record, ()> {
+    let manifest = backup::load_manifest(namespace)?;
+    if manifest.snapshot_hash != expected {
+        return Err(());
+    }
+    let mut manifest_file = fs::open_leaf(namespace, MANIFEST, false)?;
+    let manifest_identity = fs::identity(&manifest_file.metadata().map_err(|_| ())?)?;
+    let manifest_bytes = fs::read_small(&mut manifest_file)?;
+    let mut snapshot = fs::open_leaf(namespace, SNAPSHOT, false)?;
+    let (hash, snapshot_identity) = fs::hash(&mut snapshot)?;
+    if hash != expected || !fs::same(snapshot_identity, manifest.snapshot) {
+        return Err(());
+    }
+    let restore = journal::adopt(namespace)?;
+    let (kind, old_main, old_wal, old_shm) = match restore {
+        None => (Kind::Backup, None, None, None),
+        Some(record) if record.phase == RestorePhase::Committed && record.snapshot == expected => (
+            Kind::Restore,
+            (record.bitmap & MAIN != 0).then_some(record.original_main),
+            (record.bitmap & WAL != 0)
+                .then_some(record.original_wal)
+                .flatten(),
+            (record.bitmap & SHM != 0)
+                .then_some(record.original_shm)
+                .flatten(),
+        ),
+        Some(_) => return Err(()),
+    };
+    let record = Record {
+        sequence: 0,
+        predecessor: [0; 32],
+        kind,
+        phase: Phase::Ready,
+        bitmap: 0,
+        expected_snapshot: expected,
+        manifest_digest: Sha256::digest(manifest_bytes).into(),
+        namespace: fs::dir_identity(&namespace.metadata().map_err(|_| ())?)?,
+        snapshot: snapshot_identity,
+        manifest: manifest_identity,
+        old_main,
+        old_wal,
+        old_shm,
+    };
+    cleanup_journal::initial(namespace, &record)?;
+    Ok(record)
+}
+
+fn drive(namespace: &File, record: &mut Record) -> Result<u32, &'static str> {
+    let mut count = 0;
+    if record.phase == Phase::Ready {
+        transition(namespace, record, Phase::IntentManifest)?;
+    }
+    if record.phase == Phase::IntentManifest {
+        adopt_manifest_disable(namespace, record.manifest).map_err(|_| "cleanup")?;
+        transition(namespace, record, Phase::ManifestDisabled)?;
+    }
+    if record.kind == Kind::Restore {
+        count += remove_step(
+            namespace,
+            record,
             "pre-restore.shm",
-            "restore.new.sqlite3",
-        ] {
-            if !fs::leaf_absent(&namespace, forbidden).map_err(|_| "cleanup")? {
+            record.old_shm,
+            Phase::ManifestDisabled,
+            Phase::IntentShm,
+            Phase::ShmRemoved,
+        )?;
+        count += remove_step(
+            namespace,
+            record,
+            "pre-restore.wal",
+            record.old_wal,
+            Phase::ShmRemoved,
+            Phase::IntentWal,
+            Phase::WalRemoved,
+        )?;
+        count += remove_step(
+            namespace,
+            record,
+            "pre-restore.main",
+            record.old_main,
+            Phase::WalRemoved,
+            Phase::IntentMain,
+            Phase::MainRemoved,
+        )?;
+    } else if record.phase == Phase::ManifestDisabled {
+        transition(namespace, record, Phase::MainRemoved)?;
+    }
+    count += remove_step(
+        namespace,
+        record,
+        SNAPSHOT,
+        Some(record.snapshot),
+        Phase::MainRemoved,
+        Phase::IntentSnapshot,
+        Phase::SnapshotRemoved,
+    )?;
+    count += remove_step(
+        namespace,
+        record,
+        MANIFEST_Q,
+        Some(record.manifest),
+        Phase::SnapshotRemoved,
+        Phase::IntentManifestRemove,
+        Phase::ManifestRemoved,
+    )?;
+    if record.phase == Phase::ManifestRemoved {
+        if record.kind == Kind::Restore {
+            transition(namespace, record, Phase::IntentRestoreJournal)?;
+        } else {
+            transition(namespace, record, Phase::Terminal)?;
+        }
+    }
+    if record.phase == Phase::IntentRestoreJournal {
+        if !fs::leaf_absent(namespace, RESTORE_JOURNAL).map_err(|_| "journal")? {
+            let restore = journal::adopt(namespace)
+                .map_err(|_| "journal")?
+                .ok_or("journal")?;
+            if restore.phase != RestorePhase::Committed
+                || restore.snapshot != record.expected_snapshot
+            {
                 return Err("journal");
             }
+            remove_exact(namespace, RESTORE_JOURNAL, None).map_err(|_| "cleanup")?;
+            count += 1;
         }
-        disable_manifest(&namespace).map_err(|_| "cleanup")?;
-        count += remove_if_present(&namespace, SNAPSHOT).map_err(|_| "cleanup")?;
-        count +=
-            remove_if_present(&namespace, "snapshot.manifest.quarantine").map_err(|_| "cleanup")?;
+        namespace.sync_all().map_err(|_| "cleanup")?;
+        transition(namespace, record, Phase::RestoreJournalRemoved)?;
     }
-    write_witness(&root, expected, 1).map_err(|_| "cleanup")?;
-    count += remove_if_present(&namespace, journal_name).map_err(|_| "cleanup")?;
-    operation.finish().map_err(|_| "cleanup")?;
-    write_witness_replace(&root, expected, 2).map_err(|_| "cleanup")?;
-    remove_namespace(&root).map_err(|_| "cleanup")?;
-    write_witness_replace(&root, expected, 3).map_err(|_| "cleanup")?;
-    remove_witness(&root).map_err(|_| "cleanup")?;
-    Ok(format!(
-        "cleanup-isolated-t050-backup result=cleaned status=0 count={count}"
-    ))
+    if record.phase == Phase::RestoreJournalRemoved {
+        transition(namespace, record, Phase::Terminal)?;
+    }
+    Ok(count)
+}
+
+fn remove_step(
+    namespace: &File,
+    record: &mut Record,
+    name: &str,
+    identity: Option<super::codec::Identity>,
+    predecessor: Phase,
+    intent: Phase,
+    acknowledged: Phase,
+) -> Result<u32, &'static str> {
+    if record.phase == predecessor {
+        transition(namespace, record, intent)?;
+    }
+    if record.phase == intent {
+        match identity {
+            Some(identity) => {
+                remove_exact(namespace, name, Some(identity)).map_err(|_| "cleanup")?
+            }
+            None => {
+                if !fs::leaf_absent(namespace, name).map_err(|_| "cleanup")? {
+                    return Err("cleanup");
+                }
+            }
+        }
+        transition(namespace, record, acknowledged)?;
+        return Ok(u32::from(identity.is_some()));
+    }
+    Ok(0)
+}
+
+fn transition(namespace: &File, record: &mut Record, phase: Phase) -> Result<(), &'static str> {
+    let acknowledged = match phase {
+        Phase::ManifestDisabled => 1,
+        Phase::ShmRemoved => 2,
+        Phase::WalRemoved => 4,
+        Phase::MainRemoved => 8,
+        Phase::SnapshotRemoved => 16,
+        Phase::ManifestRemoved => 32,
+        Phase::RestoreJournalRemoved => 64,
+        _ => 0,
+    };
+    cleanup_journal::transition(namespace, record, phase, record.bitmap | acknowledged)
+        .map_err(|_| "journal")
+}
+
+fn adopt_manifest_disable(namespace: &File, expected: super::codec::Identity) -> Result<(), ()> {
+    let original = observed(namespace, MANIFEST)?;
+    let quarantine = observed(namespace, MANIFEST_Q)?;
+    match (original, quarantine) {
+        (Some(value), None) if fs::same(value, expected) => {
+            fs::rename_noreplace(namespace, MANIFEST, namespace, MANIFEST_Q)?;
+            namespace.sync_all().map_err(|_| ())
+        }
+        (None, Some(value)) if fs::same(value, expected) => namespace.sync_all().map_err(|_| ()),
+        _ => Err(()),
+    }
+}
+
+fn observed(dir: &File, name: &str) -> Result<Option<super::codec::Identity>, ()> {
+    if fs::leaf_absent(dir, name)? {
+        return Ok(None);
+    }
+    let file = fs::open_leaf(dir, name, false)?;
+    Ok(Some(fs::identity(&file.metadata().map_err(|_| ())?)?))
+}
+fn remove_exact(
+    dir: &File,
+    name: &str,
+    expected: Option<super::codec::Identity>,
+) -> Result<(), ()> {
+    match observed(dir, name)? {
+        None => dir.sync_all().map_err(|_| ()),
+        Some(value) if expected.is_none_or(|e| fs::same(e, value)) => {
+            fs::unlink(dir, name)?;
+            dir.sync_all().map_err(|_| ())
+        }
+        Some(_) => Err(()),
+    }
+}
+
+fn success(count: u32) -> String {
+    format!("cleanup-isolated-t050-backup result=cleaned status=0 count={count}")
 }
 
 #[cfg(test)]
 pub(crate) fn cleanup_fixture(paths: &Paths, expected: [u8; 32]) -> Result<String, &'static str> {
     cleanup(paths, expected)
-}
-
-fn read_restore(namespace: &File) -> Result<Option<RestoreRecord>, &'static str> {
-    if fs::leaf_absent(namespace, RESTORE_JOURNAL).map_err(|_| "journal")? {
-        return Ok(None);
-    }
-    let mut file = fs::open_leaf(namespace, RESTORE_JOURNAL, false).map_err(|_| "journal")?;
-    let bytes = fs::read_small(&mut file).map_err(|_| "journal")?;
-    RestoreRecord::decode(&bytes)
-        .map(Some)
-        .map_err(|_| "journal")
-}
-
-fn disable_manifest(namespace: &File) -> Result<(), ()> {
-    fs::rename_noreplace(
-        namespace,
-        MANIFEST,
-        namespace,
-        "snapshot.manifest.quarantine",
-    )?;
-    namespace.sync_all().map_err(|_| ())
-}
-
-fn remove_if_present(namespace: &File, name: &str) -> Result<u32, ()> {
-    if fs::leaf_absent(namespace, name)? {
-        return Ok(0);
-    }
-    let _retained = fs::open_leaf(namespace, name, false)?;
-    fs::unlink(namespace, name)?;
-    namespace.sync_all().map_err(|_| ())?;
-    Ok(1)
-}
-
-fn write_record(namespace: &File, name: &str, magic: &[u8; 8], phase: u8) -> Result<(), ()> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(magic);
-    bytes.push(1);
-    bytes.push(phase);
-    let digest = Sha256::digest(&bytes);
-    bytes.extend_from_slice(&digest);
-    let mut file = fs::create_leaf(namespace, name, 0o600)?;
-    fs::write_sync(&mut file, &bytes)?;
-    namespace.sync_all().map_err(|_| ())
-}
-
-fn witness_bytes(expected: [u8; 32], phase: u8) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend_from_slice(b"GGT50O01");
-    bytes.push(1);
-    bytes.push(phase);
-    bytes.extend_from_slice(&expected);
-    let digest = Sha256::digest(&bytes);
-    bytes.extend_from_slice(&digest);
-    bytes
-}
-fn write_witness(root: &File, expected: [u8; 32], phase: u8) -> Result<(), ()> {
-    let mut file = fs::create_leaf(root, WITNESS, 0o600)?;
-    fs::write_sync(&mut file, &witness_bytes(expected, phase))?;
-    root.sync_all().map_err(|_| ())
-}
-fn write_witness_replace(root: &File, expected: [u8; 32], phase: u8) -> Result<(), ()> {
-    let next = ".t050-backup-cleanup-owner.next";
-    let previous = ".t050-backup-cleanup-owner.prev";
-    let mut file = fs::create_leaf(root, next, 0o600)?;
-    fs::write_sync(&mut file, &witness_bytes(expected, phase))?;
-    root.sync_all().map_err(|_| ())?;
-    fs::rename_noreplace(root, WITNESS, root, previous)?;
-    root.sync_all().map_err(|_| ())?;
-    fs::rename_noreplace(root, next, root, WITNESS)?;
-    root.sync_all().map_err(|_| ())?;
-    fs::unlink(root, previous)?;
-    root.sync_all().map_err(|_| ())
-}
-fn remove_namespace(root: &File) -> Result<(), ()> {
-    let name = CString::new(NAMESPACE).map_err(|_| ())?;
-    if unsafe { libc::unlinkat(root.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
-        return Err(());
-    }
-    root.sync_all().map_err(|_| ())
-}
-fn remove_witness(root: &File) -> Result<(), ()> {
-    let _file = fs::open_leaf(root, WITNESS, false)?;
-    fs::unlink(root, WITNESS)?;
-    root.sync_all().map_err(|_| ())
 }

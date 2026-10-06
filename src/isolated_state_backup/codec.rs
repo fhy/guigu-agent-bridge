@@ -127,6 +127,12 @@ pub(crate) enum RestorePhase {
     RollbackWal = 14,
     RollbackShm = 15,
     Restored = 16,
+    RollbackIntentRemoveNew = 17,
+    RollbackIntentMain = 18,
+    RollbackIntentWal = 19,
+    RollbackIntentShm = 20,
+    RollbackVerifying = 21,
+    IntentNew = 22,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -204,6 +210,12 @@ impl RestoreRecord {
             14 => RestorePhase::RollbackWal,
             15 => RestorePhase::RollbackShm,
             16 => RestorePhase::Restored,
+            17 => RestorePhase::RollbackIntentRemoveNew,
+            18 => RestorePhase::RollbackIntentMain,
+            19 => RestorePhase::RollbackIntentWal,
+            20 => RestorePhase::RollbackIntentShm,
+            21 => RestorePhase::RollbackVerifying,
+            22 => RestorePhase::IntentNew,
             _ => return Err(()),
         };
         let value = Self {

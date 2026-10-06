@@ -237,19 +237,39 @@ pub(crate) fn leaf_absent(dir: &File, name: &str) -> Result<bool, ()> {
 }
 
 pub(crate) fn create_namespace(root: &File, name: &str, uid: u32, gid: u32) -> Result<File, ()> {
+    if !leaf_absent(root, name)? {
+        return Err(());
+    }
     let name = CString::new(name).map_err(|_| ())?;
     if unsafe { libc::mkdirat(root.as_raw_fd(), name.as_ptr(), 0o700) } != 0 {
         return Err(());
     }
-    let dir = openat_dir(root, name.as_c_str())?;
-    if unsafe { libc::fchown(dir.as_raw_fd(), uid, gid) } != 0
-        || unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) } != 0
-    {
-        return Err(());
+    let outcome = (|| {
+        let dir = openat_dir(root, name.as_c_str())?;
+        let created = dir.metadata().map_err(|_| ())?;
+        if !created.is_dir() {
+            return Err(());
+        }
+        if unsafe { libc::fchown(dir.as_raw_fd(), uid, gid) } != 0
+            || unsafe { libc::fchmod(dir.as_raw_fd(), 0o700) } != 0
+        {
+            return Err(());
+        }
+        dir.sync_all().map_err(|_| ())?;
+        root.sync_all().map_err(|_| ())?;
+        Ok(dir)
+    })();
+    if outcome.is_err() {
+        let pending = openat_dir(root, name.as_c_str())?;
+        let metadata = pending.metadata().map_err(|_| ())?;
+        if !metadata.is_dir() {
+            return Err(());
+        }
+        drop(pending);
+        remove_dir(root, name.to_str().map_err(|_| ())?)?;
+        root.sync_all().map_err(|_| ())?;
     }
-    dir.sync_all().map_err(|_| ())?;
-    root.sync_all().map_err(|_| ())?;
-    Ok(dir)
+    outcome
 }
 
 fn openat_dir(parent: &File, name: &std::ffi::CStr) -> Result<File, ()> {
@@ -274,6 +294,13 @@ fn openat_dir(parent: &File, name: &std::ffi::CStr) -> Result<File, ()> {
     }
 }
 
+pub(crate) fn open_child_dir(parent: &File, name: &str) -> Result<File, ()> {
+    let name = CString::new(name).map_err(|_| ())?;
+    let file = openat_dir(parent, name.as_c_str())?;
+    dir_identity(&file.metadata().map_err(|_| ())?)?;
+    Ok(file)
+}
+
 pub(crate) struct OperationLock {
     _file: File,
     dir: File,
@@ -283,11 +310,28 @@ pub(crate) struct OperationLock {
 impl OperationLock {
     pub(crate) fn acquire(dir: &File) -> Result<Self, ()> {
         let file = create_leaf(dir, super::codec::LOCK, 0o600)?;
-        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
-            return Err(());
-        }
-        let identity = identity(&file.metadata().map_err(|_| ())?)?;
-        dir.sync_all().map_err(|_| ())?;
+        let pending = identity(&file.metadata().map_err(|_| ())?);
+        let outcome = pending.and_then(|identity| {
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } != 0 {
+                return Err(());
+            }
+            dir.sync_all().map_err(|_| ())?;
+            Ok(identity)
+        });
+        let identity = match outcome {
+            Ok(identity) => identity,
+            Err(()) => {
+                let observed = identity(&file.metadata().map_err(|_| ())?)?;
+                let current = open_leaf(dir, super::codec::LOCK, false)?;
+                let current_identity = identity(&current.metadata().map_err(|_| ())?)?;
+                if !same_object(observed, current_identity) {
+                    return Err(());
+                }
+                unlink(dir, super::codec::LOCK)?;
+                dir.sync_all().map_err(|_| ())?;
+                return Err(());
+            }
+        };
         Ok(Self {
             _file: file,
             dir: dir.try_clone().map_err(|_| ())?,

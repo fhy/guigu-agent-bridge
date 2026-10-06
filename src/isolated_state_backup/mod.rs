@@ -1,9 +1,13 @@
 mod backup;
 mod cleanup;
+mod cleanup_codec;
+mod cleanup_journal;
+mod cleanup_witness;
 mod codec;
 mod fs;
 mod journal;
 mod restore;
+mod restore_io;
 mod rollback;
 mod sqlite;
 
@@ -110,5 +114,7 @@ fn command_name(value: &str) -> &'static str {
 
 #[cfg(test)]
 mod journal_tests;
+#[cfg(test)]
+mod recovery_tests;
 #[cfg(test)]
 mod tests;

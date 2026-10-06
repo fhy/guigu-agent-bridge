@@ -302,9 +302,6 @@ impl Guard {
 }
 
 fn reject_restore_interlock(database: &Path, kind: &str) -> std::io::Result<()> {
-    if matches!(kind, "backup" | "backup-verify" | "restore") {
-        return Ok(());
-    }
     let root = database
         .parent()
         .ok_or_else(|| std::io::Error::other("database has no parent"))?;
@@ -316,16 +313,36 @@ fn reject_restore_interlock(database: &Path, kind: &str) -> std::io::Result<()> 
         "cleanup.restore.journal.v1",
         "cleanup.restore.journal.next",
         "cleanup.restore.journal.prev",
+        "cleanup.backup.journal.v1",
+        "cleanup.backup.journal.next",
+        "cleanup.backup.journal.prev",
+        "snapshot.manifest.quarantine",
         "restore.new.sqlite3",
         "pre-restore.main",
         "pre-restore.wal",
         "pre-restore.shm",
     ];
     for marker in markers {
+        if kind == "restore"
+            && (marker.starts_with("restore.") || marker.starts_with("pre-restore."))
+        {
+            continue;
+        }
         match std::fs::symlink_metadata(namespace.join(marker)) {
             Ok(_) => return Err(std::io::Error::other("restore interlock is active")),
             Err(error) if error.kind() == ErrorKind::NotFound => {}
             Err(_) => return Err(std::io::Error::other("restore interlock is ambiguous")),
+        }
+    }
+    for witness in [
+        ".t050-backup-cleanup-owner.v1",
+        ".t050-backup-cleanup-owner.next",
+        ".t050-backup-cleanup-owner.prev",
+    ] {
+        match std::fs::symlink_metadata(root.join(witness)) {
+            Ok(_) => return Err(std::io::Error::other("cleanup interlock is active")),
+            Err(error) if error.kind() == ErrorKind::NotFound => {}
+            Err(_) => return Err(std::io::Error::other("cleanup interlock is ambiguous")),
         }
     }
     Ok(())

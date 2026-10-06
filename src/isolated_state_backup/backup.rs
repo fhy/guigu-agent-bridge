@@ -1,4 +1,4 @@
-use std::{fs::File, path::Path};
+use std::fs::File;
 
 use chrono::Utc;
 use sha2::{Digest, Sha256};
@@ -11,14 +11,15 @@ use super::{
 
 const COMMAND: &str = "backup-isolated-t050-state";
 
+#[derive(Clone)]
 pub(crate) struct SourceSet {
     pub(crate) main: super::codec::Identity,
     pub(crate) wal: Option<super::codec::Identity>,
     pub(crate) shm: Option<super::codec::Identity>,
     pub(crate) hash: [u8; 32],
     pub(crate) bytes: u64,
-    main_hash: [u8; 32],
-    wal_hash: Option<[u8; 32]>,
+    pub(crate) main_hash: [u8; 32],
+    pub(crate) wal_hash: Option<[u8; 32]>,
 }
 
 pub(crate) async fn run(paths: Paths) -> Result<String, Failure> {
@@ -39,12 +40,13 @@ async fn create(paths: Paths) -> Result<String, Failure> {
         .map_err(|_| Failure::rejected(COMMAND, "target"))?;
     let mut publication = Publication::default();
     let outcome = create_in_namespace(&paths, &root, &namespace, uid, gid, &mut publication).await;
-    if outcome.is_err()
-        && (publication.rollback(&namespace).is_err()
-            || fs::remove_dir(&root, NAMESPACE).is_err()
-            || root.sync_all().is_err())
-    {
-        return Err(Failure::rejected(COMMAND, "cleanup"));
+    if outcome.is_err() {
+        publication
+            .rollback(&namespace)
+            .map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
+        fs::remove_dir(&root, NAMESPACE).map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
+        root.sync_all()
+            .map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
     }
     outcome
 }
@@ -69,6 +71,20 @@ async fn create_in_namespace(
 ) -> Result<String, Failure> {
     let operation =
         fs::OperationLock::acquire(namespace).map_err(|_| Failure::rejected(COMMAND, "target"))?;
+    let outcome = create_locked(paths, namespace, uid, gid, publication).await;
+    if operation.finish().is_err() {
+        return Err(Failure::rejected(COMMAND, "cleanup"));
+    }
+    outcome
+}
+
+async fn create_locked(
+    paths: &Paths,
+    namespace: &File,
+    uid: u32,
+    gid: u32,
+    publication: &mut Publication,
+) -> Result<String, Failure> {
     let before = source_set(paths).map_err(|_| Failure::rejected(COMMAND, "identity"))?;
     let temporary = format!("snapshot.tmp.{}", uuid::Uuid::now_v7().simple());
     let destination = fs::create_leaf(namespace, &temporary, 0o600)
@@ -76,14 +92,13 @@ async fn create_in_namespace(
     publication
         .arm(&temporary, &destination)
         .map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
-    let destination_path = paths.namespace().join(&temporary);
-    let facts = sqlite::online_backup(&paths.database, &destination)
+    let (facts, after) = sqlite::online_backup(paths, &before, &destination)
         .await
         .map_err(|_| Failure::rejected(COMMAND, "sqlite"))?;
     destination
         .sync_all()
         .map_err(|_| Failure::rejected(COMMAND, "publication"))?;
-    let verified = sqlite::verify(&destination_path)
+    let verified = sqlite::verify_retained(&destination)
         .await
         .map_err(|_| Failure::rejected(COMMAND, "sqlite"))?;
     if facts != verified {
@@ -97,14 +112,6 @@ async fn create_in_namespace(
     publication
         .promote(&temporary, &destination_hash_file)
         .map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
-    let after = source_set(paths).map_err(|_| Failure::rejected(COMMAND, "identity"))?;
-    if before.main_hash != after.main_hash
-        || before.wal_hash != after.wal_hash
-        || before.main != after.main
-        || before.wal != after.wal
-    {
-        return Err(Failure::rejected(COMMAND, "identity"));
-    }
     fs::rename_noreplace(namespace, &temporary, namespace, SNAPSHOT)
         .map_err(|_| Failure::rejected(COMMAND, "publication"))?;
     publication.rename(&temporary, SNAPSHOT);
@@ -157,9 +164,6 @@ async fn create_in_namespace(
     namespace
         .sync_all()
         .map_err(|_| Failure::rejected(COMMAND, "publication"))?;
-    operation
-        .finish()
-        .map_err(|_| Failure::rejected(COMMAND, "cleanup"))?;
     publication.disarm();
     Ok(format!(
         "backup-isolated-t050-state result=created status=0 snapshot_sha256={} source_set_sha256={} bytes={}",
@@ -186,13 +190,21 @@ pub(crate) async fn verify(paths: Paths) -> Result<String, Failure> {
 pub(crate) async fn verify_inner(paths: &Paths) -> Result<String, &'static str> {
     let namespace = fs::open_dir(&paths.namespace()).map_err(|_| "identity")?;
     let operation = fs::OperationLock::acquire(&namespace).map_err(|_| "cleanup")?;
-    let manifest = load_manifest(&namespace).map_err(|_| "manifest")?;
-    let mut snapshot = fs::open_leaf(&namespace, SNAPSHOT, false).map_err(|_| "snapshot")?;
+    let outcome = verify_locked(paths, &namespace).await;
+    if operation.finish().is_err() {
+        return Err("cleanup");
+    }
+    outcome
+}
+
+async fn verify_locked(paths: &Paths, namespace: &File) -> Result<String, &'static str> {
+    let manifest = load_manifest(namespace).map_err(|_| "manifest")?;
+    let mut snapshot = fs::open_leaf(namespace, SNAPSHOT, false).map_err(|_| "snapshot")?;
     let (snapshot_hash, snapshot_identity) = fs::hash(&mut snapshot).map_err(|_| "snapshot")?;
     if snapshot_hash != manifest.snapshot_hash || !fs::same(snapshot_identity, manifest.snapshot) {
         return Err("snapshot");
     }
-    let facts = sqlite::verify(&paths.namespace().join(SNAPSHOT))
+    let facts = sqlite::verify_retained(&snapshot)
         .await
         .map_err(|_| "snapshot")?;
     if facts.page_size != manifest.page_size
@@ -209,7 +221,6 @@ pub(crate) async fn verify_inner(paths: &Paths) -> Result<String, &'static str> 
         hex(current.hash),
         snapshot_identity.size
     );
-    operation.finish().map_err(|_| "cleanup")?;
     Ok(output)
 }
 
@@ -219,9 +230,15 @@ pub(crate) fn load_manifest(namespace: &File) -> Result<Manifest, ()> {
 }
 
 pub(crate) fn source_set(paths: &Paths) -> Result<SourceSet, ()> {
-    let (main, main_hash) = source_leaf(&paths.database)?;
-    let (wal, wal_hash) = optional_source(&paths.database.with_file_name("state.db-wal"))?;
-    let (shm, _) = optional_source(&paths.database.with_file_name("state.db-shm"))?;
+    let root = fs::open_dir(&paths.root)?;
+    let (main, main_hash) = source_leaf(&root, "state.db")?;
+    let (wal, wal_hash) = optional_source(&root, "state.db-wal")?;
+    let (shm, _) = optional_source(&root, "state.db-shm")?;
+    for sidecar in [wal, shm].into_iter().flatten() {
+        if sidecar.uid != main.uid || sidecar.gid != main.gid || sidecar.mode != main.mode {
+            return Err(());
+        }
+    }
     let mut digest = Sha256::new();
     encode_component(&mut digest, 1, Some((main, main_hash)));
     encode_component(&mut digest, 2, wal.zip(wal_hash));
@@ -252,20 +269,20 @@ pub(crate) fn source_set(paths: &Paths) -> Result<SourceSet, ()> {
     })
 }
 
-fn source_leaf(path: &Path) -> Result<(super::codec::Identity, [u8; 32]), ()> {
-    use std::os::unix::fs::OpenOptionsExt;
-    let mut file = std::fs::OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW)
-        .open(path)
-        .map_err(|_| ())?;
+fn source_leaf(dir: &File, name: &str) -> Result<(super::codec::Identity, [u8; 32]), ()> {
+    let mut file = fs::open_leaf(dir, name, false)?;
     let (hash, identity) = fs::hash(&mut file)?;
     Ok((identity, hash))
 }
-fn optional_source(path: &Path) -> Result<(Option<super::codec::Identity>, Option<[u8; 32]>), ()> {
-    match source_leaf(path) {
+fn optional_source(
+    dir: &File,
+    name: &str,
+) -> Result<(Option<super::codec::Identity>, Option<[u8; 32]>), ()> {
+    if fs::leaf_absent(dir, name)? {
+        return Ok((None, None));
+    }
+    match source_leaf(dir, name) {
         Ok((identity, hash)) => Ok((Some(identity), Some(hash))),
-        Err(()) if !path.exists() => Ok((None, None)),
         Err(()) => Err(()),
     }
 }
@@ -282,15 +299,14 @@ fn encode_component(
 }
 #[derive(Default)]
 struct Publication {
-    leaves: Vec<(String, super::codec::Identity)>,
+    leaves: Vec<(String, Option<super::codec::Identity>)>,
 }
 
 impl Publication {
     fn arm(&mut self, name: &str, file: &File) -> Result<(), ()> {
-        self.leaves.push((
-            name.to_owned(),
-            fs::identity(&file.metadata().map_err(|_| ())?)?,
-        ));
+        self.leaves.push((name.to_owned(), None));
+        let identity = fs::identity(&file.metadata().map_err(|_| ())?)?;
+        self.leaves.last_mut().ok_or(())?.1 = Some(identity);
         Ok(())
     }
 
@@ -301,10 +317,13 @@ impl Publication {
             .find(|(candidate, _)| candidate == name)
             .ok_or(())?;
         let observed = fs::identity(&file.metadata().map_err(|_| ())?)?;
-        if !fs::same_object(entry.1, observed) {
+        if entry
+            .1
+            .is_none_or(|expected| !fs::same_object(expected, observed))
+        {
             return Err(());
         }
-        entry.1 = observed;
+        entry.1 = Some(observed);
         Ok(())
     }
 
@@ -322,7 +341,7 @@ impl Publication {
         while let Some((name, expected)) = self.leaves.pop() {
             let file = fs::open_leaf(namespace, &name, false)?;
             let observed = fs::identity(&file.metadata().map_err(|_| ())?)?;
-            if !fs::same(expected, observed) {
+            if expected.is_some_and(|value| !fs::same(value, observed)) {
                 return Err(());
             }
             fs::unlink(namespace, &name)?;
