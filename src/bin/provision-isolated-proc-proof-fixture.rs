@@ -22,6 +22,14 @@ enum RecordError {
     Duplicate,
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum ChildOutcome {
+    Success,
+    ProvisionRefusal,
+    ChildFailure,
+    InvalidResult,
+}
+
 fn provision_binding(parent: &str, helper: &str, policy: &str) -> String {
     let mut digest = Sha256::new();
     digest.update(b"GGT050PB1");
@@ -44,6 +52,10 @@ fn root_result(binding: &str) -> String {
     format!("production-provision phase=result status=0 binding_sha256={binding}")
 }
 
+fn root_refusal(binding: &str) -> String {
+    format!("production-provision phase=result status=3 binding_sha256={binding}")
+}
+
 fn validate_child_records(bytes: &[u8], binding: &str) -> Result<(), RecordError> {
     if bytes.is_empty() {
         return Err(RecordError::Missing);
@@ -62,10 +74,52 @@ fn validate_child_records(bytes: &[u8], binding: &str) -> Result<(), RecordError
     Ok(())
 }
 
-fn emit_boundary_result(binding: &str, status: u8, cause: &str) -> Result<(), ()> {
-    println!(
+fn validate_root_refusal(bytes: &[u8], binding: &str) -> Result<(), RecordError> {
+    if bytes.is_empty() {
+        return Err(RecordError::Missing);
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| RecordError::Malformed)?;
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.len() > 2 {
+        return Err(RecordError::Duplicate);
+    }
+    if lines.len() < 2 {
+        return Err(RecordError::Missing);
+    }
+    if lines[0] != root_start(binding) || lines[1] != root_refusal(binding) {
+        return Err(RecordError::Malformed);
+    }
+    Ok(())
+}
+
+fn classify_child(output: &std::process::Output, binding: &str) -> ChildOutcome {
+    if !output.stderr.is_empty() {
+        return ChildOutcome::ChildFailure;
+    }
+    if output.status.success() {
+        return if validate_child_records(&output.stdout, binding).is_ok() {
+            ChildOutcome::Success
+        } else {
+            ChildOutcome::InvalidResult
+        };
+    }
+    if output.status.code() == Some(3) && validate_root_refusal(&output.stdout, binding).is_ok() {
+        ChildOutcome::ProvisionRefusal
+    } else if output.stdout.is_empty() {
+        ChildOutcome::ChildFailure
+    } else {
+        ChildOutcome::InvalidResult
+    }
+}
+
+fn boundary_result(binding: &str, status: u8, cause: &str) -> String {
+    format!(
         "production-provision-boundary phase=result status={status} cause={cause} binding_sha256={binding}"
-    );
+    )
+}
+
+fn emit_boundary_result(binding: &str, status: u8, cause: &str) -> Result<(), ()> {
+    println!("{}", boundary_result(binding, status, cause));
     std::io::stdout().flush().map_err(|_| ())
 }
 
@@ -100,15 +154,21 @@ fn production_boundary(parent: &str, helper: &str, policy: &str) -> Result<(), (
         .stdin(Stdio::from(policy_input))
         .output()
         .map_err(|_| ())?;
-    if !output.status.success() || !output.stderr.is_empty() {
-        emit_boundary_result(&binding, 3, "child")?;
-        return Err(());
+    match classify_child(&output, &binding) {
+        ChildOutcome::Success => emit_boundary_result(&binding, 0, "none"),
+        ChildOutcome::ProvisionRefusal => {
+            emit_boundary_result(&binding, 3, "provision")?;
+            Err(())
+        }
+        ChildOutcome::ChildFailure => {
+            emit_boundary_result(&binding, 3, "child")?;
+            Err(())
+        }
+        ChildOutcome::InvalidResult => {
+            emit_boundary_result(&binding, 3, "result")?;
+            Err(())
+        }
     }
-    if validate_child_records(&output.stdout, &binding).is_err() {
-        emit_boundary_result(&binding, 3, "result")?;
-        return Err(());
-    }
-    emit_boundary_result(&binding, 0, "none")
 }
 
 fn usage() -> ! {
@@ -181,7 +241,7 @@ fn main() {
             )
             .is_err()
             {
-                println!("production-provision phase=result status=3 binding_sha256={binding}");
+                println!("{}", root_refusal(&binding));
                 let _ = std::io::stdout().flush();
                 std::process::exit(3);
             }
@@ -303,49 +363,5 @@ fn main() {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    const BINDING: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-
-    #[test]
-    fn success_result_records_are_accepted() {
-        let records = format!("{}\n{}\n", root_start(BINDING), root_result(BINDING));
-        assert_eq!(validate_child_records(records.as_bytes(), BINDING), Ok(()));
-    }
-
-    #[test]
-    fn missing_result_record_is_rejected() {
-        let records = format!("{}\n", root_start(BINDING));
-        assert_eq!(
-            validate_child_records(records.as_bytes(), BINDING),
-            Err(RecordError::Missing)
-        );
-    }
-
-    #[test]
-    fn malformed_result_record_is_rejected() {
-        let records = format!(
-            "{}\nproduction-provision phase=result status=0 binding_sha256=wrong\n",
-            root_start(BINDING)
-        );
-        assert_eq!(
-            validate_child_records(records.as_bytes(), BINDING),
-            Err(RecordError::Malformed)
-        );
-    }
-
-    #[test]
-    fn duplicate_result_record_is_rejected() {
-        let records = format!(
-            "{}\n{}\n{}\n",
-            root_start(BINDING),
-            root_result(BINDING),
-            root_result(BINDING)
-        );
-        assert_eq!(
-            validate_child_records(records.as_bytes(), BINDING),
-            Err(RecordError::Duplicate)
-        );
-    }
-}
+#[path = "provision-isolated-proc-proof-fixture/tests.rs"]
+mod tests;
