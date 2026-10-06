@@ -1,8 +1,115 @@
-use std::path::PathBuf;
+use std::{
+    fmt::Write as _,
+    fs::File,
+    io::Write as _,
+    os::fd::FromRawFd,
+    path::PathBuf,
+    process::{Command, Stdio},
+};
 
 use guigu_agent_bridge::privileged_proc_proof::{
     FixturePaths, provision_temp_fixture, stage_policy, teardown_temp_fixture,
 };
+use sha2::{Digest, Sha256};
+
+const PRODUCTION_PROVISIONER: &str =
+    "/home/fhy/.cache/cargo-target/guigu-agent-bridge/debug/provision-isolated-proc-proof-fixture";
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecordError {
+    Missing,
+    Malformed,
+    Duplicate,
+}
+
+fn provision_binding(parent: &str, helper: &str, policy: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(b"GGT050PB1");
+    for value in [parent, helper, policy] {
+        digest.update((value.len() as u64).to_be_bytes());
+        digest.update(value.as_bytes());
+    }
+    let mut encoded = String::with_capacity(64);
+    for byte in digest.finalize() {
+        write!(&mut encoded, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    encoded
+}
+
+fn root_start(binding: &str) -> String {
+    format!("production-provision phase=start status=attempting binding_sha256={binding}")
+}
+
+fn root_result(binding: &str) -> String {
+    format!("production-provision phase=result status=0 binding_sha256={binding}")
+}
+
+fn validate_child_records(bytes: &[u8], binding: &str) -> Result<(), RecordError> {
+    if bytes.is_empty() {
+        return Err(RecordError::Missing);
+    }
+    let text = std::str::from_utf8(bytes).map_err(|_| RecordError::Malformed)?;
+    let lines = text.lines().collect::<Vec<_>>();
+    if lines.len() > 2 {
+        return Err(RecordError::Duplicate);
+    }
+    if lines.len() < 2 {
+        return Err(RecordError::Missing);
+    }
+    if lines[0] != root_start(binding) || lines[1] != root_result(binding) {
+        return Err(RecordError::Malformed);
+    }
+    Ok(())
+}
+
+fn emit_boundary_result(binding: &str, status: u8, cause: &str) -> Result<(), ()> {
+    println!(
+        "production-provision-boundary phase=result status={status} cause={cause} binding_sha256={binding}"
+    );
+    std::io::stdout().flush().map_err(|_| ())
+}
+
+fn production_boundary(parent: &str, helper: &str, policy: &str) -> Result<(), ()> {
+    let binding = provision_binding(parent, helper, policy);
+    println!(
+        "production-provision-boundary phase=start status=attempting binding_sha256={binding}"
+    );
+    std::io::stdout().flush().map_err(|_| ())?;
+    let current = std::env::current_exe()
+        .and_then(std::fs::canonicalize)
+        .map_err(|_| ())?;
+    let expected = std::fs::canonicalize(PRODUCTION_PROVISIONER).map_err(|_| ())?;
+    if current != expected {
+        emit_boundary_result(&binding, 3, "identity")?;
+        return Err(());
+    }
+    let policy_fd = unsafe { libc::dup(3) };
+    if policy_fd < 0 {
+        emit_boundary_result(&binding, 3, "policy")?;
+        return Err(());
+    }
+    let policy_input = unsafe { File::from_raw_fd(policy_fd) };
+    let output = Command::new("/usr/bin/sudo")
+        .args(["-n", "/bin/sh", "-c"])
+        .arg("exec 3<&0; exec \"$1\" production-provision --parent-sha \"$2\" --helper-sha \"$3\" --policy-sha \"$4\"")
+        .arg("sh")
+        .arg(PRODUCTION_PROVISIONER)
+        .arg(parent)
+        .arg(helper)
+        .arg(policy)
+        .stdin(Stdio::from(policy_input))
+        .output()
+        .map_err(|_| ())?;
+    if !output.status.success() || !output.stderr.is_empty() {
+        emit_boundary_result(&binding, 3, "child")?;
+        return Err(());
+    }
+    if validate_child_records(&output.stdout, &binding).is_err() {
+        emit_boundary_result(&binding, 3, "result")?;
+        return Err(());
+    }
+    emit_boundary_result(&binding, 0, "none")
+}
 
 fn usage() -> ! {
     eprintln!(
@@ -64,14 +171,47 @@ fn main() {
             let (Some(parent), Some(helper), Some(policy)) = (parent, helper, policy) else {
                 std::process::exit(3)
             };
+            let binding = provision_binding(&parent, &helper, &policy);
+            println!("{}", root_start(&binding));
+            if std::io::stdout().flush().is_err() {
+                std::process::exit(3);
+            }
             if guigu_agent_bridge::privileged_proc_proof::provision_production(
                 &parent, &helper, &policy, 3,
             )
             .is_err()
             {
+                println!("production-provision phase=result status=3 binding_sha256={binding}");
+                let _ = std::io::stdout().flush();
                 std::process::exit(3);
             }
-            println!("production provisioning complete");
+            println!("{}", root_result(&binding));
+            if std::io::stdout().flush().is_err() {
+                std::process::exit(3);
+            }
+        }
+        Some("production-provision-boundary") => {
+            let parent = match (args.next(), args.next()) {
+                (Some(flag), value) if flag == "--parent-sha" => value,
+                _ => None,
+            };
+            let helper = match (args.next(), args.next()) {
+                (Some(flag), value) if flag == "--helper-sha" => value,
+                _ => None,
+            };
+            let policy = match (args.next(), args.next()) {
+                (Some(flag), value) if flag == "--policy-sha" => value,
+                _ => None,
+            };
+            if args.next().is_some() {
+                std::process::exit(3);
+            }
+            let (Some(parent), Some(helper), Some(policy)) = (parent, helper, policy) else {
+                std::process::exit(3)
+            };
+            if production_boundary(&parent, &helper, &policy).is_err() {
+                std::process::exit(3);
+            }
         }
         Some("production-teardown") => {
             let parent = match (args.next(), args.next()) {
@@ -159,5 +299,53 @@ fn main() {
             println!("teardown manifest-first complete");
         }
         _ => usage(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const BINDING: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn success_result_records_are_accepted() {
+        let records = format!("{}\n{}\n", root_start(BINDING), root_result(BINDING));
+        assert_eq!(validate_child_records(records.as_bytes(), BINDING), Ok(()));
+    }
+
+    #[test]
+    fn missing_result_record_is_rejected() {
+        let records = format!("{}\n", root_start(BINDING));
+        assert_eq!(
+            validate_child_records(records.as_bytes(), BINDING),
+            Err(RecordError::Missing)
+        );
+    }
+
+    #[test]
+    fn malformed_result_record_is_rejected() {
+        let records = format!(
+            "{}\nproduction-provision phase=result status=0 binding_sha256=wrong\n",
+            root_start(BINDING)
+        );
+        assert_eq!(
+            validate_child_records(records.as_bytes(), BINDING),
+            Err(RecordError::Malformed)
+        );
+    }
+
+    #[test]
+    fn duplicate_result_record_is_rejected() {
+        let records = format!(
+            "{}\n{}\n{}\n",
+            root_start(BINDING),
+            root_result(BINDING),
+            root_result(BINDING)
+        );
+        assert_eq!(
+            validate_child_records(records.as_bytes(), BINDING),
+            Err(RecordError::Duplicate)
+        );
     }
 }
