@@ -109,6 +109,62 @@ fn synthetic_cleanup_and_diagnostics_leave_no_residue() {
 }
 
 #[test]
+fn fixed_generic_and_eligibility_aggregate_diagnostics_are_valid() {
+    let generic = classify(&result(&format!(
+        "printf 'prepare-isolated-legacy-fixture-migration-manifest stage=sqlite-open cause=sidecar-auth counts=failures=1\\n'; printf '%s' '{TERMINAL_REFUSED}'; exit 3"
+    )));
+    assert_eq!(generic.stdout, StreamShape::Valid);
+    assert_eq!(generic.cause, "prepare");
+
+    for diagnostic in [
+        "stage=eligibility cause=open-sessions counts=owners=2,continuations=1,sessions=1,children=0,leases=1,admissions=1,work=0",
+        "stage=eligibility cause=witness-or-binding counts=owners=2,continuations=1,sessions=0,children=0,leases=1,admissions=1,work=0",
+        "stage=eligibility cause=database-facts counts=owners=0,continuations=0,sessions=0,children=0,leases=0,admissions=0,work=0",
+    ] {
+        let child = classify(&result(&format!(
+            "printf 'prepare-isolated-legacy-fixture-migration-manifest {diagnostic}\\n'; printf '%s' '{TERMINAL_REFUSED}'; exit 3"
+        )));
+        assert_eq!(child.stdout, StreamShape::Valid, "{diagnostic}");
+        assert_eq!(child.cause, "prepare", "{diagnostic}");
+    }
+}
+
+#[test]
+fn hostile_diagnostic_grammar_is_malformed_and_fail_closed() {
+    let hostile = [
+        "stage=unknown cause=root-path counts=failures=1",
+        "stage=preflight cause=unknown counts=failures=1",
+        "stage=preflight counts=failures=1",
+        "stage=preflight cause=root-path",
+        "cause=root-path stage=preflight counts=failures=1",
+        "stage=preflight counts=failures=1 cause=root-path",
+        "stage=preflight cause=root-path counts=failures=1 extra=planted",
+        "stage=preflight cause=root-path counts=failures=2",
+        "stage=preflight cause=root-path counts=failures=01",
+        "stage=eligibility cause=open-sessions counts=sessions=1,owners=2,continuations=1,children=0,leases=1,admissions=1,work=0",
+        "stage=eligibility cause=open-sessions counts=owners=2,continuations=1,sessions=01,children=0,leases=1,admissions=1,work=0",
+        "stage=eligibility cause=open-sessions counts=owners=2,continuations=1,sessions=1,children=0,leases=1,admissions=1,work=0,planted=1",
+        "stage=eligibility cause=owner-topology counts=owners=2,continuations=1,sessions=1,children=0,leases=1,admissions=1,work=0",
+        "stage=preflight cause=root-path counts=failures=1 planted-ascii",
+    ];
+    for diagnostic in hostile {
+        let child = classify(&result(&format!(
+            "printf 'prepare-isolated-legacy-fixture-migration-manifest {diagnostic}\\n'; printf '%s' '{TERMINAL_OK}'"
+        )));
+        assert_eq!(child.status, 3, "{diagnostic}");
+        assert_eq!(child.cause, "result", "{diagnostic}");
+        assert_eq!(child.stdout, StreamShape::Malformed, "{diagnostic}");
+    }
+
+    let valid_but_impossible_success = classify(&result(&format!(
+        "printf 'prepare-isolated-legacy-fixture-migration-manifest stage=preflight cause=root-path counts=failures=1\\n'; printf '%s' '{TERMINAL_OK}'"
+    )));
+    assert_eq!(valid_but_impossible_success.status, 3);
+    assert_eq!(valid_but_impossible_success.cause, "result");
+    assert_eq!(valid_but_impossible_success.stdout, StreamShape::Valid);
+}
+
+#[test]
 fn invalid_program_is_spawn_failure_and_binding_is_redacted() {
     let args = vec![COMMAND.to_owned(), "planted-secret-body".to_owned()];
     let digest = binding(&args);

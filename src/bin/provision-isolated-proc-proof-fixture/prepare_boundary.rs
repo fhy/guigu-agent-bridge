@@ -9,6 +9,9 @@ use std::{
 
 use sha2::{Digest, Sha256};
 
+#[path = "prepare_boundary/diagnostic.rs"]
+mod diagnostic;
+
 const INSTALLED_PARENT: &str = "/home/fhy/.local/lib/guigu-codex-test/guigu-agent-bridge";
 const COMMAND: &str = "prepare-isolated-legacy-fixture-migration-manifest";
 const MAX_CHANNEL_BYTES: usize = 16 * 1024;
@@ -175,12 +178,9 @@ fn stdout_shape(result: &ChildResult) -> StreamShape {
             | "prepare-isolated-legacy-fixture-migration-manifest result=rejected status=3"
             | "prepare-isolated-legacy-fixture-migration-manifest result=database status=3"
     );
-    let diagnostics = lines[..lines.len() - 1].iter().all(|line| {
-        line.starts_with("prepare-isolated-legacy-fixture-migration-manifest stage=")
-            && line.is_ascii()
-            && !line.contains('/')
-            && !line.contains('\\')
-    });
+    let diagnostics = lines[..lines.len() - 1]
+        .iter()
+        .all(|line| diagnostic::valid(line));
     if terminal && diagnostics {
         StreamShape::Valid
     } else {
@@ -199,17 +199,34 @@ fn classify(result: &ChildResult) -> Classification {
     } else {
         "nonempty"
     };
-    let (child, expected_terminal) = match result.status {
-        Some(status) if status.success() => ("exit-0", "result=prepared status=0"),
-        Some(status) if status.code() == Some(3) => ("exit-3", "status=3"),
-        Some(status) if status.signal().is_some() => ("signal", ""),
-        Some(_) => ("exit-other", ""),
-        None => ("unknown", ""),
-    };
-    let terminal_matches = std::str::from_utf8(&result.stdout)
+    let lines = std::str::from_utf8(&result.stdout)
         .ok()
-        .and_then(|text| text.lines().last())
-        .is_some_and(|line| line.contains(expected_terminal));
+        .map(|text| text.lines().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let last = lines.last().copied();
+    let (child, terminal_matches) = match result.status {
+        Some(status) if status.success() => (
+            "exit-0",
+            lines.len() == 1
+                && last
+                    == Some(
+                        "prepare-isolated-legacy-fixture-migration-manifest result=prepared status=0",
+                    ),
+        ),
+        Some(status) if status.code() == Some(3) => (
+            "exit-3",
+            matches!(
+                last,
+                Some(
+                    "prepare-isolated-legacy-fixture-migration-manifest result=rejected status=3"
+                        | "prepare-isolated-legacy-fixture-migration-manifest result=database status=3"
+                )
+            ),
+        ),
+        Some(status) if status.signal().is_some() => ("signal", true),
+        Some(_) => ("exit-other", true),
+        None => ("unknown", false),
+    };
     let (status, cause) = if result.reap != "complete" {
         (
             3,
