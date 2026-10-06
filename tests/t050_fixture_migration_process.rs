@@ -1,4 +1,5 @@
 use std::{
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
     time::{Duration, Instant},
@@ -223,6 +224,23 @@ impl Fixture {
         .arg("--commit-timestamp")
         .arg("2026-10-04T00:00:00.000000000Z");
         c
+    }
+
+    fn prepare_with_bounded_address_space(&self) -> Command {
+        let mut command = self.prepare();
+        unsafe {
+            command.pre_exec(|| {
+                let limit = libc::rlimit {
+                    rlim_cur: 2 * 1024 * 1024 * 1024,
+                    rlim_max: 2 * 1024 * 1024 * 1024,
+                };
+                if libc::setrlimit(libc::RLIMIT_AS, &limit) != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        command
     }
     fn run(&self) -> Command {
         let mut c = self.base();
@@ -523,6 +541,27 @@ async fn prepare_accepts_a_closed_database_with_retained_wal_sidecars() {
     assert!(!shm.exists());
     assert!(fixture.manifest.exists());
     assert!(!fixture.evidence.exists());
+}
+
+#[tokio::test]
+async fn prepare_streams_parent_identity_with_bounded_address_space() {
+    let fixture = Fixture::new_unprepared().await;
+    let output = fixture
+        .prepare_with_bounded_address_space()
+        .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    assert_eq!(output.status.code(), Some(0), "{stdout}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        stdout.trim(),
+        "prepare-isolated-legacy-fixture-migration-manifest result=prepared status=0"
+    );
+    assert!(fixture.manifest.exists());
+    assert!(!fixture.evidence.exists());
+    assert!(!fixture.root.join(".runtime-admission.lock").exists());
 }
 
 #[tokio::test]

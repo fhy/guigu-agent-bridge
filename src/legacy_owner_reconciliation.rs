@@ -9,6 +9,8 @@ use sha2::{Digest, Sha256};
 use sqlx::{Connection, Row, SqliteConnection, sqlite::SqliteConnectOptions};
 
 const O_NOFOLLOW: i32 = 0o400000;
+const MAX_IDENTITY_CONTENT_SIZE: u64 = 1024 * 1024 * 1024;
+const IDENTITY_HASH_BUFFER_SIZE: usize = 64 * 1024;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Sidecar {
@@ -241,14 +243,28 @@ pub(crate) fn path_identity(path: &Path, include_content: bool) -> Result<String
         return Err(Error::Rejected);
     }
     let content = if include_content {
-        let mut bytes = Vec::new();
-        file.read_to_end(&mut bytes).map_err(|_| Error::Rejected)?;
-        format!("{:x}", Sha256::digest(bytes))
+        if before.len() > MAX_IDENTITY_CONTENT_SIZE {
+            return Err(Error::Rejected);
+        }
+        let mut hash = Sha256::new();
+        let mut buffer = [0u8; IDENTITY_HASH_BUFFER_SIZE];
+        loop {
+            let read = file.read(&mut buffer).map_err(|_| Error::Rejected)?;
+            if read == 0 {
+                break;
+            }
+            hash.update(&buffer[..read]);
+        }
+        format!("{:x}", hash.finalize())
     } else {
         "identity-only".to_owned()
     };
     let after = file.metadata().map_err(|_| Error::Rejected)?;
-    if before.dev() != after.dev() || before.ino() != after.ino() || before.mode() != after.mode() {
+    if before.dev() != after.dev()
+        || before.ino() != after.ino()
+        || before.mode() != after.mode()
+        || before.len() != after.len()
+    {
         return Err(Error::Rejected);
     }
     Ok(digest(&[
@@ -1632,6 +1648,31 @@ mod tests {
         let sidecars = Sidecars::capture(&database).unwrap();
         std::fs::write(root.path().join("state.db-wal"), b"partial").unwrap();
         assert!(sidecars.revalidate(&database).is_err());
+    }
+
+    #[test]
+    fn content_identity_streams_compatibly_and_rejects_oversized_sparse_files() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("artifact");
+        let bytes = vec![0x5a; IDENTITY_HASH_BUFFER_SIZE + 17];
+        std::fs::write(&path, &bytes).unwrap();
+        let metadata = std::fs::metadata(&path).unwrap();
+        use std::os::unix::fs::MetadataExt;
+        let expected = digest(&[
+            &path.to_string_lossy(),
+            &metadata.dev().to_string(),
+            &metadata.ino().to_string(),
+            &metadata.mode().to_string(),
+            &format!("{:x}", Sha256::digest(&bytes)),
+        ]);
+        assert_eq!(path_identity(&path, true).unwrap(), expected);
+
+        let oversized = root.path().join("oversized");
+        std::fs::File::create(&oversized)
+            .unwrap()
+            .set_len(MAX_IDENTITY_CONTENT_SIZE + 1)
+            .unwrap();
+        assert!(path_identity(&oversized, true).is_err());
     }
 
     #[test]
