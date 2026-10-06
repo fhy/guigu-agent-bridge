@@ -129,7 +129,13 @@ fn fd_hash_observed(
 }
 
 fn capability_tuple(file: &File) -> Result<(u64, u64, u32), ()> {
-    let name = c"security.capability";
+    capability_tuple_named(file, c"security.capability")
+}
+
+fn capability_tuple_named(
+    file: &File,
+    name: &std::ffi::CStr,
+) -> Result<(u64, u64, u32), ()> {
     let mut bytes = [0u8; 24];
     let size = unsafe {
         libc::fgetxattr(

@@ -108,6 +108,7 @@ include!("protocol.rs");
 include!("proc_lookup.rs");
 include!("scan.rs");
 include!("artifact.rs");
+include!("capability_evidence.rs");
 include!("client.rs");
 include!("sandbox.rs");
 include!("helper.rs");

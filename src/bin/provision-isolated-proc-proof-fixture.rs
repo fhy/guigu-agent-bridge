@@ -123,6 +123,19 @@ fn emit_boundary_result(binding: &str, status: u8, cause: &str) -> Result<(), ()
     std::io::stdout().flush().map_err(|_| ())
 }
 
+fn capability_evidence() -> guigu_agent_bridge::privileged_proc_proof::CapabilityEvidence {
+    let (Ok(current), Ok(expected)) = (
+        std::env::current_exe().and_then(std::fs::canonicalize),
+        std::fs::canonicalize(PRODUCTION_PROVISIONER),
+    ) else {
+        return guigu_agent_bridge::privileged_proc_proof::CapabilityEvidence::Refused;
+    };
+    if current != expected {
+        return guigu_agent_bridge::privileged_proc_proof::CapabilityEvidence::Refused;
+    }
+    guigu_agent_bridge::privileged_proc_proof::production_capability_evidence()
+}
+
 fn production_boundary(parent: &str, helper: &str, policy: &str) -> Result<(), ()> {
     let binding = provision_binding(parent, helper, policy);
     println!(
@@ -270,6 +283,16 @@ fn main() {
                 std::process::exit(3)
             };
             if production_boundary(&parent, &helper, &policy).is_err() {
+                std::process::exit(3);
+            }
+        }
+        Some("production-capability-evidence") => {
+            if args.next().is_some() {
+                std::process::exit(3);
+            }
+            let evidence = capability_evidence();
+            println!("{}", evidence.line());
+            if std::io::stdout().flush().is_err() || !evidence.is_success() {
                 std::process::exit(3);
             }
         }
