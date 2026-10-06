@@ -34,6 +34,47 @@ fn prepare_refusal_is_distinct_from_channel_failure() {
     assert_eq!(child.status.and_then(|status| status.code()), Some(3));
     assert_eq!(classify(&child).cause, "prepare");
     assert_eq!(classify(&child).stdout, StreamShape::Valid);
+    assert_eq!(classify(&child).prepare_stage, "unknown");
+    assert_eq!(classify(&child).prepare_cause, "unknown");
+}
+
+#[test]
+fn exit_three_without_authenticated_diagnostic_is_unknown_matrix() {
+    for (name, script, shape) in [
+        (
+            "terminal-only",
+            format!("printf '%s' '{TERMINAL_REFUSED}'; exit 3"),
+            StreamShape::Valid,
+        ),
+        ("missing", "exit 3".to_owned(), StreamShape::Missing),
+        (
+            "malformed",
+            "printf 'prepare-isolated-legacy-fixture-migration-manifest result=planted-secret-body status=3\\n'; exit 3".to_owned(),
+            StreamShape::Malformed,
+        ),
+        (
+            "duplicate",
+            format!("printf '%s%s' '{TERMINAL_REFUSED}' '{TERMINAL_REFUSED}'; exit 3"),
+            StreamShape::Duplicate,
+        ),
+        (
+            "overflow",
+            "head -c 20000 /dev/zero | tr '\\0' x; printf '\\n'; exit 3".to_owned(),
+            StreamShape::Overflow,
+        ),
+    ] {
+        let classification = classify(&result(&script));
+        assert_eq!(classification.child, "exit-3", "{name}");
+        assert_eq!(classification.stdout, shape, "{name}");
+        assert_eq!(classification.prepare_stage, "unknown", "{name}");
+        assert_eq!(classification.prepare_cause, "unknown", "{name}");
+        let line = result_line("00", &classification);
+        assert!(
+            line.contains("prepare_stage=unknown prepare_cause=unknown"),
+            "{name}"
+        );
+        assert!(!line.contains("planted-secret-body"), "{name}");
+    }
 }
 
 #[test]

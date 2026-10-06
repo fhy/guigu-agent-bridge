@@ -256,11 +256,11 @@ fn classify(result: &ChildResult) -> Classification {
     } else {
         (3, "child")
     };
-    let (prepare_stage, prepare_cause) = if child == "exit-3" {
+    let (prepare_stage, prepare_cause) = if cause == "prepare" {
         retained_diagnostic
             .map(|value| (value.stage, value.cause))
-            .unwrap_or(("none", "none"))
-    } else if stdout == StreamShape::Valid {
+            .unwrap_or(("unknown", "unknown"))
+    } else if stdout == StreamShape::Valid && child != "exit-3" {
         ("none", "none")
     } else {
         ("unknown", "unknown")
