@@ -20,46 +20,103 @@ pub(crate) struct SqliteFacts {
     pub schema_hash: [u8; 32],
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum SnapshotStage {
+    RetainedSource,
+    SourceOptions,
+    SourceOpen,
+    SourceRevalidation,
+    SourceBegin,
+    SourceFacts,
+    S3Observation,
+    DestinationName,
+    DestinationOpen,
+    CopyOrJournal,
+    S5Observation,
+    DestinationClose,
+    SourceRollback,
+    SourceClose,
+    S7Observation,
+}
+
+#[cfg(test)]
+impl SnapshotStage {
+    pub(crate) const fn code(self) -> &'static str {
+        match self {
+            Self::RetainedSource => "retained-source",
+            Self::SourceOptions => "source-options",
+            Self::SourceOpen => "source-open",
+            Self::SourceRevalidation => "source-revalidation",
+            Self::SourceBegin => "source-begin",
+            Self::SourceFacts => "source-facts",
+            Self::S3Observation => "s3-observation",
+            Self::DestinationName => "destination-name",
+            Self::DestinationOpen => "destination-open",
+            Self::CopyOrJournal => "copy-or-journal",
+            Self::S5Observation => "s5-observation",
+            Self::DestinationClose => "destination-close",
+            Self::SourceRollback => "source-rollback",
+            Self::SourceClose => "source-close",
+            Self::S7Observation => "s7-observation",
+        }
+    }
+}
+
 pub(crate) async fn online_backup(
     paths: &Paths,
     s0: &SourceSet,
     source_main: &std::fs::File,
     destination: &std::fs::File,
-) -> Result<(SqliteFacts, SourceSet), ()> {
-    let retained = fs::identity(&source_main.metadata().map_err(|_| ())?)?;
+) -> Result<(SqliteFacts, SourceSet), SnapshotStage> {
+    let retained = fs::identity(
+        &source_main
+            .metadata()
+            .map_err(|_| SnapshotStage::RetainedSource)?,
+    )
+    .map_err(|_| SnapshotStage::RetainedSource)?;
     if !fs::same(retained, s0.main) {
-        return Err(());
+        return Err(SnapshotStage::RetainedSource);
     }
-    super::fault::hit("sqlite-s0-retained")?;
+    super::fault::hit("sqlite-s0-retained").map_err(|_| SnapshotStage::RetainedSource)?;
     let source_path = format!("/proc/self/fd/{}", source_main.as_raw_fd());
     let options = SqliteConnectOptions::from_str(&source_path)
-        .map_err(|_| ())?
+        .map_err(|_| SnapshotStage::SourceOptions)?
         .read_only(true)
         .create_if_missing(false)
         .shared_cache(false);
     let mut source = SqliteConnection::connect_with(&options)
         .await
-        .map_err(|_| ())?;
-    super::fault::hit("sqlite-s1-open")?;
-    validate_main(paths, s0.main)?;
+        .map_err(|_| SnapshotStage::SourceOpen)?;
+    super::fault::hit("sqlite-s1-open").map_err(|_| SnapshotStage::SourceOpen)?;
+    validate_main(paths, s0.main).map_err(|_| SnapshotStage::SourceRevalidation)?;
     if !fs::same(
         retained,
-        fs::identity(&source_main.metadata().map_err(|_| ())?)?,
+        fs::identity(
+            &source_main
+                .metadata()
+                .map_err(|_| SnapshotStage::SourceRevalidation)?,
+        )
+        .map_err(|_| SnapshotStage::SourceRevalidation)?,
     ) {
-        return Err(());
+        return Err(SnapshotStage::SourceRevalidation);
     }
     sqlx::query("BEGIN")
         .execute(&mut source)
         .await
-        .map_err(|_| ())?;
-    let facts = facts(&mut source).await?;
-    super::fault::hit("sqlite-s3-transaction")?;
-    let s3 = super::backup::source_set(paths)?;
-    validate_observation(s0, &s3, None)?;
-    let mut handle = source.lock_handle().await.map_err(|_| ())?;
+        .map_err(|_| SnapshotStage::SourceBegin)?;
+    let facts = facts(&mut source)
+        .await
+        .map_err(|_| SnapshotStage::SourceFacts)?;
+    super::fault::hit("sqlite-s3-transaction").map_err(|_| SnapshotStage::S3Observation)?;
+    let s3 = super::backup::source_set(paths).map_err(|_| SnapshotStage::S3Observation)?;
+    validate_observation(s0, &s3, None).map_err(|_| SnapshotStage::S3Observation)?;
+    let mut handle = source
+        .lock_handle()
+        .await
+        .map_err(|_| SnapshotStage::SourceFacts)?;
     let raw_source = handle.as_raw_handle().as_ptr();
-    let destination_name =
-        CString::new(format!("/proc/self/fd/{}", destination.as_raw_fd())).map_err(|_| ())?;
+    let destination_name = CString::new(format!("/proc/self/fd/{}", destination.as_raw_fd()))
+        .map_err(|_| SnapshotStage::DestinationName)?;
     let mut raw_destination = std::ptr::null_mut();
     let opened = unsafe {
         ffi::sqlite3_open_v2(
@@ -75,23 +132,32 @@ pub(crate) async fn online_backup(
                 ffi::sqlite3_close(raw_destination);
             }
         }
-        return Err(());
+        return Err(SnapshotStage::DestinationOpen);
     }
     let copied =
         backup_raw(raw_source, raw_destination).and_then(|()| journal_delete(raw_destination));
-    super::fault::hit("sqlite-s5-copy")?;
-    let s5 = super::backup::source_set(paths)?;
-    validate_observation(s0, &s5, Some(&s3))?;
+    super::fault::hit("sqlite-s5-copy").map_err(|_| SnapshotStage::CopyOrJournal)?;
+    let s5 = super::backup::source_set(paths).map_err(|_| SnapshotStage::S5Observation)?;
+    validate_observation(s0, &s5, Some(&s3)).map_err(|_| SnapshotStage::S5Observation)?;
     let closed = unsafe { ffi::sqlite3_close(raw_destination) };
     drop(handle);
     let rolled_back = sqlx::query("ROLLBACK").execute(&mut source).await;
-    source.close().await.map_err(|_| ())?;
-    super::fault::hit("sqlite-s7-close")?;
-    if copied.is_err() || closed != ffi::SQLITE_OK || rolled_back.is_err() {
-        return Err(());
+    source
+        .close()
+        .await
+        .map_err(|_| SnapshotStage::SourceClose)?;
+    super::fault::hit("sqlite-s7-close").map_err(|_| SnapshotStage::SourceClose)?;
+    if copied.is_err() {
+        return Err(SnapshotStage::CopyOrJournal);
     }
-    let s7 = super::backup::source_set(paths)?;
-    validate_observation(s0, &s7, Some(&s3))?;
+    if closed != ffi::SQLITE_OK {
+        return Err(SnapshotStage::DestinationClose);
+    }
+    if rolled_back.is_err() {
+        return Err(SnapshotStage::SourceRollback);
+    }
+    let s7 = super::backup::source_set(paths).map_err(|_| SnapshotStage::S7Observation)?;
+    validate_observation(s0, &s7, Some(&s3)).map_err(|_| SnapshotStage::S7Observation)?;
     Ok((facts, s7))
 }
 
@@ -195,11 +261,13 @@ fn validate_observation(
     observed: &SourceSet,
     baseline: Option<&SourceSet>,
 ) -> Result<(), ()> {
-    if s0.main != observed.main
-        || s0.main_hash != observed.main_hash
-        || s0.wal != observed.wal
-        || s0.wal_hash != observed.wal_hash
-    {
+    if s0.main != observed.main || s0.main_hash != observed.main_hash {
+        return Err(());
+    }
+    if s0.wal.is_none() && s0.shm.is_none() {
+        return validate_created_sidecars(s0, observed, baseline);
+    }
+    if s0.wal != observed.wal || s0.wal_hash != observed.wal_hash {
         return Err(());
     }
     match (s0.shm, baseline.and_then(|v| v.shm), observed.shm) {
@@ -221,6 +289,51 @@ fn validate_observation(
         }
         (Some(initial), None, Some(now)) if fs::same(initial, now) => Ok(()),
         _ => Err(()),
+    }
+}
+
+fn validate_created_sidecars(
+    s0: &SourceSet,
+    observed: &SourceSet,
+    baseline: Option<&SourceSet>,
+) -> Result<(), ()> {
+    let valid_created = |set: &SourceSet| {
+        let (Some(wal), Some(wal_hash), Some(shm)) = (set.wal, set.wal_hash, set.shm) else {
+            return false;
+        };
+        wal.size == 0
+            && wal_hash == <[u8; 32]>::from(Sha256::digest([]))
+            && [wal, shm].iter().all(|sidecar| {
+                sidecar.uid == s0.main.uid
+                    && sidecar.gid == s0.main.gid
+                    && sidecar.mode == s0.main.mode
+            })
+    };
+    match baseline {
+        None => match (observed.wal, observed.shm) {
+            (None, None) => Ok(()),
+            (Some(_), Some(_)) if valid_created(observed) => Ok(()),
+            _ => Err(()),
+        },
+        Some(base) if base.wal.is_none() && base.shm.is_none() => {
+            if observed.wal.is_none() && observed.shm.is_none() {
+                Ok(())
+            } else {
+                Err(())
+            }
+        }
+        Some(base) if valid_created(base) => match (observed.wal, observed.shm) {
+            (None, None) => Ok(()),
+            (Some(_), Some(_))
+                if observed.wal == base.wal
+                    && observed.wal_hash == base.wal_hash
+                    && observed.shm == base.shm =>
+            {
+                Ok(())
+            }
+            _ => Err(()),
+        },
+        Some(_) => Err(()),
     }
 }
 
@@ -261,48 +374,5 @@ async fn facts(connection: &mut SqliteConnection) -> Result<SqliteFacts, ()> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    fn id(inode: u64, size: u64) -> Identity {
-        Identity {
-            device: 1,
-            inode,
-            size,
-            uid: 1000,
-            gid: 1000,
-            mode: 0o600,
-        }
-    }
-    fn set(shm: Option<Identity>) -> SourceSet {
-        SourceSet {
-            main: id(1, 10),
-            wal: Some(id(2, 20)),
-            shm,
-            hash: [0; 32],
-            bytes: 30,
-            main_hash: [1; 32],
-            wal_hash: Some([2; 32]),
-        }
-    }
-    #[test]
-    fn s0_s7_shm_transition_table_is_exhaustive() {
-        let absent = set(None);
-        assert!(validate_observation(&absent, &set(None), None).is_ok());
-        let created = set(Some(id(3, 30)));
-        assert!(validate_observation(&absent, &created, None).is_ok());
-        assert!(validate_observation(&absent, &created, Some(&created)).is_ok());
-        assert!(validate_observation(&absent, &set(None), Some(&created)).is_ok());
-        let existing = set(Some(id(4, 40)));
-        assert!(validate_observation(&existing, &existing, None).is_ok());
-        assert!(validate_observation(&existing, &existing, Some(&existing)).is_ok());
-        assert!(validate_observation(&existing, &set(None), Some(&existing)).is_ok());
-        assert!(validate_observation(&existing, &set(Some(id(5, 40))), Some(&existing)).is_err());
-        assert!(validate_observation(&absent, &set(Some(id(3, 31))), Some(&created)).is_err());
-        let mut main_drift = existing.clone();
-        main_drift.main_hash = [9; 32];
-        assert!(validate_observation(&existing, &main_drift, Some(&existing)).is_err());
-        let mut wal_drift = existing.clone();
-        wal_drift.wal_hash = Some([9; 32]);
-        assert!(validate_observation(&existing, &wal_drift, Some(&existing)).is_err());
-    }
-}
+#[path = "sqlite_unit_tests.rs"]
+mod tests;

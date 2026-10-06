@@ -46,6 +46,31 @@ async fn database(paths: &Paths) -> sqlx::SqliteConnection {
 }
 
 #[tokio::test]
+async fn closed_wal_main_only_snapshot_is_supported() {
+    let temp = tempfile::tempdir().unwrap();
+    let paths = fixture_paths(&temp);
+    database(&paths).await.close().await.unwrap();
+    assert!(!paths.root.join("state.db-wal").exists());
+    assert!(!paths.root.join("state.db-shm").exists());
+
+    let (source, retained) = backup::source_set_retained(&paths).unwrap();
+    let destination_path = paths.root.join("diagnostic-snapshot");
+    let destination = std::fs::File::create(&destination_path).unwrap();
+    super::sqlite::online_backup(&paths, &source, &retained, &destination)
+        .await
+        .unwrap();
+    drop(destination);
+    std::fs::remove_file(destination_path).unwrap();
+
+    let created = backup::create_fixture(paths.clone()).await.unwrap();
+    assert!(created.contains("result=created"));
+    let namespace = super::fs::open_dir(&paths.namespace()).unwrap();
+    let expected = backup::load_manifest(&namespace).unwrap().snapshot_hash;
+    drop(namespace);
+    cleanup::cleanup_fixture(&paths, expected).unwrap();
+}
+
+#[tokio::test]
 async fn retained_main_replacement_at_s0_s1_s3_s5_s7_is_invariant() {
     for point in [
         "sqlite-s0-retained",
