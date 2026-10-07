@@ -164,6 +164,48 @@ fn valid_legacy(value: &str) -> bool {
         && !value.chars().any(char::is_whitespace)
 }
 
+const OPEN_SESSION_COUNT: &str = "SELECT count(*) FROM sessions s
+WHERE s.state <> 'closed'
+  AND NOT (s.state = 'ready' AND EXISTS (
+    SELECT 1
+    FROM delivery_dispositions p
+    JOIN deliveries d ON d.delivery_id = p.delivery_id
+      AND d.task_id = p.task_id AND d.attempt = p.attempt
+    JOIN tasks t ON t.task_id = d.task_id
+    JOIN task_admissions a ON a.task_id = t.task_id
+    JOIN execution_leases l ON l.task_id = t.task_id
+    JOIN task_continuations c ON c.task_id = t.task_id
+      AND c.resource_key = l.resource_key
+      AND c.delivery_id = d.delivery_id
+      AND c.lease_fence = l.fence
+    WHERE p.session_id = s.session_id
+      AND d.target_endpoint_id = s.endpoint_id
+      AND t.conversation_id = s.conversation_id
+      AND p.state = 'terminal'
+      AND p.child_fingerprint IS NOT NULL
+      AND p.reap_status = 'reaped'
+      AND p.reap_at IS NOT NULL
+      AND d.acknowledged_at IS NOT NULL
+      AND a.state = 'terminal'
+      AND a.runtime_instance = l.owner_token
+      AND l.state = 'released'
+      AND c.state = 'blocked'
+      AND t.version + 1 = (
+        SELECT max(e.seq) FROM task_events e WHERE e.task_id = t.task_id
+      )
+      AND (
+        SELECT e.status FROM task_events e
+        WHERE e.task_id = t.task_id ORDER BY e.seq DESC LIMIT 1
+      ) IN ('completed','failed','timed_out','cancelled')
+  ))";
+
+async fn open_session_count(c: &mut SqliteConnection) -> Result<i64, Error> {
+    sqlx::query_scalar(OPEN_SESSION_COUNT)
+        .fetch_one(c)
+        .await
+        .map_err(|_| Error::Database)
+}
+
 async fn eligible(c: &mut SqliteConnection) -> Result<Facts, Error> {
     let owners = sqlx::query("SELECT instance_token,started_at,heartbeat_at,state,process_fingerprint FROM runtime_instances WHERE state IN ('active','stopping') ORDER BY state,instance_token")
         .fetch_all(&mut *c).await.map_err(|_| Error::Database)?;
@@ -249,11 +291,7 @@ async fn eligible(c: &mut SqliteConnection) -> Result<Facts, Error> {
         .bind(&stopping.token).bind(&stopping.token).bind(&stopping.token).bind(&stopping.token).fetch_one(&mut *c).await.map_err(|_|Error::Database)?;
     let other_owners: i64 = sqlx::query_scalar("SELECT count(*) FROM runtime_instances WHERE state<>'stopped' AND instance_token NOT IN (?,?)")
         .bind(&active.token).bind(&stopping.token).fetch_one(&mut *c).await.map_err(|_|Error::Database)?;
-    let open_sessions: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM sessions WHERE state <> 'closed'")
-            .fetch_one(&mut *c)
-            .await
-            .map_err(|_| Error::Database)?;
+    let open_sessions = open_session_count(&mut *c).await?;
     if exact != 1
         || !response_valid
         || counts != (1, 1, 1, 1, 0, 0, 0)
@@ -274,11 +312,10 @@ async fn emit_eligibility_diagnostic(c: &mut SqliteConnection) {
     if std::env::var_os("T050_FIXTURE_MIGRATION_DIAGNOSTIC").is_none() {
         return;
     }
-    let counts = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64, i64)>(
+    let counts = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64)>(
         "SELECT
          (SELECT count(*) FROM runtime_instances WHERE state IN ('active','stopping')),
          (SELECT count(*) FROM task_continuations),
-         (SELECT count(*) FROM sessions WHERE state <> 'closed'),
          (SELECT count(*) FROM delivery_dispositions WHERE
             NOT ((child_fingerprint IS NULL AND reap_status IS NULL AND reap_at IS NULL)
               OR (child_fingerprint IS NOT NULL AND reap_status='reaped' AND reap_at IS NOT NULL))),
@@ -288,8 +325,9 @@ async fn emit_eligibility_diagnostic(c: &mut SqliteConnection) {
     )
     .fetch_one(&mut *c)
     .await;
-    let (cause, values) = match counts {
-        Ok((owners, continuations, sessions, children, leases, admissions, work)) => {
+    let sessions = open_session_count(&mut *c).await;
+    let (cause, values) = match (counts, sessions) {
+        (Ok((owners, continuations, children, leases, admissions, work)), Ok(sessions)) => {
             let cause = if owners != 2 {
                 "owner-topology"
             } else if continuations != 1 {
@@ -312,7 +350,7 @@ async fn emit_eligibility_diagnostic(c: &mut SqliteConnection) {
                 ),
             )
         }
-        Err(_) => (
+        _ => (
             "database-facts",
             "owners=0,continuations=0,sessions=0,children=0,leases=0,admissions=0,work=0"
                 .to_owned(),

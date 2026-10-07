@@ -413,6 +413,117 @@ async fn open_session_refuses_before_manifest_publication() {
     .await;
 }
 
+async fn terminal_ready_session_fixture() -> Fixture {
+    let fixture = Fixture::new_unprepared().await;
+    let pool = connect(&fixture.db).await.unwrap();
+    sqlx::query("UPDATE sessions SET state='ready' WHERE session_id='closed-session'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE delivery_dispositions SET session_id='closed-session',child_fingerprint='child-v1',reap_status='reaped',reap_at='2026-10-01T00:00:03.000000000Z' WHERE delivery_id='delivery'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    fixture
+}
+
+#[tokio::test]
+async fn terminal_ready_session_is_history_but_every_open_chain_drift_refuses() {
+    let fixture = terminal_ready_session_fixture().await;
+    let output = fixture
+        .prepare()
+        .env("T050_FIXTURE_MIGRATION_DIAGNOSTIC", "1")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(fixture.manifest.exists());
+    assert!(!fixture.evidence.exists());
+    assert!(!fixture.root.join(".runtime-admission.lock").exists());
+
+    for (name, setup) in [
+        ("prompting", "UPDATE sessions SET state='prompting'"),
+        (
+            "unbound",
+            "UPDATE delivery_dispositions SET session_id=NULL",
+        ),
+        (
+            "endpoint",
+            "UPDATE deliveries SET target_endpoint_id='agent-a'",
+        ),
+        (
+            "conversation",
+            "UPDATE tasks SET conversation_id='other-conversation'",
+        ),
+        (
+            "unacknowledged",
+            "UPDATE deliveries SET acknowledged_at=NULL",
+        ),
+        (
+            "disposition",
+            "UPDATE delivery_dispositions SET state='acknowledged'",
+        ),
+        (
+            "child",
+            "UPDATE delivery_dispositions SET child_fingerprint=NULL,reap_status=NULL,reap_at=NULL",
+        ),
+        (
+            "reap",
+            "UPDATE delivery_dispositions SET reap_status='unknown'",
+        ),
+        (
+            "task",
+            "UPDATE task_events SET status='running' WHERE seq=2",
+        ),
+        ("admission", "UPDATE task_admissions SET state='running'"),
+        ("lease", "UPDATE execution_leases SET state='active'"),
+        (
+            "continuation",
+            "UPDATE task_continuations SET state='ready'",
+        ),
+    ] {
+        let fixture = terminal_ready_session_fixture().await;
+        let pool = connect(&fixture.db).await.unwrap();
+        if name == "conversation" {
+            sqlx::query(
+                "INSERT INTO conversations VALUES('other-conversation',NULL,NULL,NULL,'[]')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+        sqlx::query(setup).execute(&pool).await.unwrap();
+        pool.close().await;
+        let before = durable_rows(&fixture.db).await;
+        let tree = fixture_tree(&fixture.root);
+        let output = fixture
+            .prepare()
+            .env("T050_FIXTURE_MIGRATION_DIAGNOSTIC", "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(3), "{name}");
+        assert!(output.stderr.is_empty(), "{name}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains("stage=eligibility cause=open-sessions"),
+            "name={name} stdout={stdout}"
+        );
+        assert!(stdout.contains("sessions=1"), "name={name} stdout={stdout}");
+        assert!(!stdout.contains(fixture.root.to_str().unwrap()));
+        assert_eq!(durable_rows(&fixture.db).await, before, "{name}");
+        assert_eq!(fixture_tree(&fixture.root), tree, "{name}");
+        assert!(!fixture.manifest.exists(), "{name}");
+        assert!(!fixture.evidence.exists(), "{name}");
+        assert!(!fixture.root.join(".t050-fixture-migration-marker").exists());
+        assert!(!fixture.root.join(".runtime-admission.lock").exists());
+    }
+}
+
 #[tokio::test]
 async fn eligibility_diagnostic_is_fixed_and_redacted() {
     let f = Fixture::new().await;
