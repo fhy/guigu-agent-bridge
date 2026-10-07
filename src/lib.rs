@@ -119,13 +119,15 @@ pub async fn run() -> Result<(), Error> {
             "prepare-isolated-legacy-fixture-migration-manifest",
         )];
         cli.extend(args);
-        let prepare = isolated_fixture_migration::parse_prepare_args(&cli).map_err(|e| {
-            Error::Cli(error::CliFailure {
-                command: "prepare-isolated-legacy-fixture-migration-manifest",
-                category: e.slug(),
-                status: e.status(),
-            })
-        })?;
+        let prepare = isolated_fixture_migration::parse_prepare_args(&cli)
+            .map_err(isolated_fixture_migration::prepare_cli_rejected)
+            .map_err(|e| {
+                Error::Cli(error::CliFailure {
+                    command: "prepare-isolated-legacy-fixture-migration-manifest",
+                    category: e.slug(),
+                    status: e.status(),
+                })
+            })?;
         isolated_fixture_migration::prepare_manifest(prepare)
             .await
             .map_err(|e| {

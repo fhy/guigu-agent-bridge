@@ -31,8 +31,10 @@ fn canonical_cause(value: &str) -> Option<&'static str> {
         &[
             "root-path",
             "root-contract",
+            "arguments",
             "config-path",
             "database-path",
+            "binary-path",
             "path-identity",
             "admission-lock",
             "unit-state",
@@ -116,8 +118,10 @@ fn generic(stage: &str, cause: &str) -> bool {
                 cause,
                 "root-path"
                     | "root-contract"
+                    | "arguments"
                     | "config-path"
                     | "database-path"
+                    | "binary-path"
                     | "path-identity"
                     | "admission-lock"
                     | "unit-state"

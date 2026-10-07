@@ -155,13 +155,37 @@ fn synthetic_cleanup_and_diagnostics_leave_no_residue() {
 
 #[test]
 fn fixed_generic_and_eligibility_aggregate_diagnostics_are_valid() {
-    let generic = classify(&result(&format!(
-        "printf 'prepare-isolated-legacy-fixture-migration-manifest stage=sqlite-open cause=sidecar-auth counts=failures=1\\n'; printf '%s' '{TERMINAL_REFUSED}'; exit 3"
-    )));
-    assert_eq!(generic.stdout, StreamShape::Valid);
-    assert_eq!(generic.cause, "prepare");
-    assert_eq!(generic.prepare_stage, "sqlite-open");
-    assert_eq!(generic.prepare_cause, "sidecar-auth");
+    for diagnostic in [
+        "stage=preflight cause=arguments counts=failures=1",
+        "stage=preflight cause=binary-path counts=failures=1",
+        "stage=sqlite-open cause=sidecar-auth counts=failures=1",
+    ] {
+        let generic = classify(&result(&format!(
+            "printf 'prepare-isolated-legacy-fixture-migration-manifest {diagnostic}\\n'; printf '%s' '{TERMINAL_REFUSED}'; exit 3"
+        )));
+        assert_eq!(generic.stdout, StreamShape::Valid, "{diagnostic}");
+        assert_eq!(generic.cause, "prepare", "{diagnostic}");
+        assert_eq!(
+            generic.prepare_stage,
+            diagnostic
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .strip_prefix("stage=")
+                .unwrap(),
+            "{diagnostic}"
+        );
+        assert_eq!(
+            generic.prepare_cause,
+            diagnostic
+                .split_whitespace()
+                .nth(1)
+                .unwrap()
+                .strip_prefix("cause=")
+                .unwrap(),
+            "{diagnostic}"
+        );
+    }
 
     for diagnostic in [
         "stage=eligibility cause=open-sessions counts=owners=2,continuations=1,sessions=1,children=0,leases=1,admissions=1,work=0",

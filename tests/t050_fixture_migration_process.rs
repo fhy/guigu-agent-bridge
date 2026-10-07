@@ -676,6 +676,157 @@ async fn publication_and_sqlite_open_diagnostics_are_fixed_and_invariant() {
 }
 
 #[tokio::test]
+async fn terminal_only_argument_rejections_are_fixed_redacted_and_invariant() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let fixture = Fixture::new_unprepared().await;
+    let tree = fixture_tree(&fixture.root);
+    let binary = std::env::var_os("CARGO_BIN_EXE_guigu-agent-bridge").unwrap();
+    let mut cases = Vec::new();
+
+    let mut missing = fixture.prepare();
+    missing.arg("--extra");
+    cases.push(missing);
+
+    let bad_uuid = fixture.prepare();
+    let args = bad_uuid
+        .get_args()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let uuid = args
+        .iter()
+        .position(|value| value == "--operation-id")
+        .unwrap()
+        + 1;
+    let mut bad_uuid = Command::new(&binary);
+    bad_uuid
+        .args(&args[..uuid])
+        .arg("not-a-uuid")
+        .args(&args[uuid + 1..]);
+    cases.push(bad_uuid);
+
+    let args = fixture
+        .prepare()
+        .get_args()
+        .map(ToOwned::to_owned)
+        .collect::<Vec<_>>();
+    let timestamp = args
+        .iter()
+        .position(|value| value == "--commit-timestamp")
+        .unwrap()
+        + 1;
+    let mut bad_timestamp = Command::new(&binary);
+    bad_timestamp
+        .args(&args[..timestamp])
+        .arg("not-a-timestamp")
+        .args(&args[timestamp + 1..]);
+    cases.push(bad_timestamp);
+
+    let mut non_utf8 = Command::new(&binary);
+    non_utf8
+        .args(&args[..uuid])
+        .arg(std::ffi::OsString::from_vec(vec![0xff]))
+        .args(&args[uuid + 1..]);
+    cases.push(non_utf8);
+
+    for mut command in cases {
+        let output = command
+            .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(3));
+        assert!(output.stderr.is_empty());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(stdout.contains("stage=preflight cause=arguments counts=failures=1"));
+        assert!(stdout.contains(
+            "prepare-isolated-legacy-fixture-migration-manifest result=rejected status=3"
+        ));
+        assert!(!stdout.contains(fixture.root.to_str().unwrap()));
+        assert_eq!(fixture_tree(&fixture.root), tree);
+        assert!(!fixture.manifest.exists());
+        assert!(!fixture.evidence.exists());
+        assert!(!fixture.root.join(".runtime-admission.lock").exists());
+    }
+}
+
+#[tokio::test]
+async fn pre_diagnostic_metadata_rejections_are_fixed_redacted_and_invariant() {
+    for (fault, cause) in [
+        ("root-metadata", "root-path"),
+        ("binary-current-exe", "binary-path"),
+        ("binary-canonicalize", "binary-path"),
+    ] {
+        let fixture = Fixture::new_unprepared().await;
+        let tree = fixture_tree(&fixture.root);
+        let output = fixture
+            .prepare()
+            .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+            .env("T050_FIXTURE_MIGRATION_TEST_PREPARE_FAULT", fault)
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(3), "fault={fault}");
+        assert!(output.stderr.is_empty(), "fault={fault}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("stage=preflight cause={cause} counts=failures=1")),
+            "fault={fault} stdout={stdout}"
+        );
+        assert!(stdout.contains(
+            "prepare-isolated-legacy-fixture-migration-manifest result=rejected status=3"
+        ));
+        assert!(!stdout.contains(fixture.root.to_str().unwrap()));
+        assert_eq!(fixture_tree(&fixture.root), tree, "fault={fault}");
+        assert!(!fixture.manifest.exists());
+        assert!(!fixture.evidence.exists());
+        assert!(!fixture.root.join(".runtime-admission.lock").exists());
+    }
+}
+
+#[tokio::test]
+async fn r11_target_names_are_root_confined_and_not_basename_restricted() {
+    let mut accepted = Fixture::new_unprepared().await;
+    accepted.manifest = accepted.root.join("fixture-migration.manifest.json");
+    accepted.evidence = accepted.root.join("fixture-migration.evidence.txt");
+    let output = accepted
+        .prepare()
+        .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "prepare-isolated-legacy-fixture-migration-manifest result=prepared status=0"
+    );
+    assert!(accepted.manifest.exists());
+    assert!(!accepted.evidence.exists());
+
+    let mut rejected = Fixture::new_unprepared().await;
+    let outside = tempfile::tempdir().unwrap();
+    rejected.manifest = outside.path().join("fixture-migration.manifest.json");
+    let tree = fixture_tree(&rejected.root);
+    let output = rejected
+        .prepare()
+        .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("stage=preflight cause=root-contract counts=failures=1"));
+    assert!(!stdout.contains(rejected.root.to_str().unwrap()));
+    assert_eq!(fixture_tree(&rejected.root), tree);
+    assert!(!rejected.manifest.exists());
+    assert!(!rejected.evidence.exists());
+}
+
+#[tokio::test]
 async fn prepare_accepts_a_closed_database_with_retained_wal_sidecars() {
     let fixture = Fixture::new_unprepared().await;
     let (wal, shm) = fixture.restore_closed_wal_sidecars().await;

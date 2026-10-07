@@ -121,6 +121,10 @@ pub fn parse_prepare_args(args: &[std::ffi::OsString]) -> Result<PrepareArgs, Er
     })
 }
 
+pub fn prepare_cli_rejected(error: Error) -> Error {
+    prepare_rejected("preflight", "arguments", error)
+}
+
 #[derive(Clone)]
 struct Owner {
     token: String,
@@ -700,9 +704,13 @@ pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
         .canonicalize()
         .map_err(|_| prepare_rejected("preflight", "root-path", Error::Rejected))?;
     if root != args.root
-        || std::fs::symlink_metadata(&root)
-            .map_err(|_| Error::Rejected)?
-            .mode()
+        || (if prepare_test_fault("root-metadata") {
+            Err(Error::Rejected)
+        } else {
+            std::fs::symlink_metadata(&root).map_err(|_| Error::Rejected)
+        })
+        .map_err(|_| prepare_rejected("preflight", "root-path", Error::Rejected))?
+        .mode()
             & 0o022
             != 0
         || args.unit != "guigu-codex-test.service"
@@ -724,10 +732,25 @@ pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
         .database
         .canonicalize()
         .map_err(|_| prepare_rejected("preflight", "database-path", Error::Rejected))?;
-    let binary = std::env::current_exe()
-        .map_err(|_| Error::Rejected)?
-        .canonicalize()
-        .map_err(|_| Error::Rejected)?;
+    let binary = if prepare_test_fault("binary-current-exe") {
+        Err(std::io::Error::other(
+            "synthetic current executable failure",
+        ))
+    } else {
+        std::env::current_exe()
+    }
+    .map_err(|_| prepare_rejected("preflight", "binary-path", Error::Rejected))?
+    .canonicalize()
+    .and_then(|path| {
+        if prepare_test_fault("binary-canonicalize") {
+            Err(std::io::Error::other(
+                "synthetic executable canonicalization failure",
+            ))
+        } else {
+            Ok(path)
+        }
+    })
+    .map_err(|_| prepare_rejected("preflight", "binary-path", Error::Rejected))?;
     if config != args.config || database != args.database {
         return Err(prepare_rejected(
             "preflight",
