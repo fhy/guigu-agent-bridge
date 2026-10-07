@@ -15,7 +15,7 @@ mod restore_io;
 mod rollback;
 mod sqlite;
 
-use std::{ffi::OsString, path::PathBuf};
+use std::{ffi::OsString, fs::File, path::PathBuf};
 
 pub(crate) const STATE_ROOT: &str = "/home/fhy/.local/share/guigu-codex-test";
 pub(crate) const DATABASE: &str = "/home/fhy/.local/share/guigu-codex-test/state.db";
@@ -61,14 +61,154 @@ impl Failure {
     }
 }
 
-pub(crate) fn current_source_set_hex() -> Result<String, ()> {
-    Ok(backup::hex(backup::source_set(&Paths::production())?.hash))
+struct BoundLeaf {
+    file: File,
+    identity: codec::Identity,
+    hash: Option<[u8; 32]>,
 }
 
-pub(crate) async fn verify_owner_binding_backup(
+pub(crate) struct OwnerBindingAnchor {
+    live_root: File,
+    live_main: BoundLeaf,
+    live_wal: Option<BoundLeaf>,
+    live_shm: Option<BoundLeaf>,
+    namespace: File,
+    manifest: BoundLeaf,
+    snapshot: BoundLeaf,
+    decoded_manifest: codec::Manifest,
+    source_set: backup::SourceSet,
+}
+
+fn bound_leaf(parent: &File, name: &str, content: bool) -> Result<BoundLeaf, ()> {
+    let mut file = fs::open_leaf(parent, name, false)?;
+    let (hash, identity) = fs::hash(&mut file)?;
+    Ok(BoundLeaf {
+        file,
+        identity,
+        hash: content.then_some(hash),
+    })
+}
+
+fn optional_bound(parent: &File, name: &str, content: bool) -> Result<Option<BoundLeaf>, ()> {
+    if fs::leaf_absent(parent, name)? {
+        Ok(None)
+    } else {
+        bound_leaf(parent, name, content).map(Some)
+    }
+}
+
+fn same_bound(parent: &File, name: &str, expected: &BoundLeaf) -> Result<(), ()> {
+    let current = bound_leaf(parent, name, expected.hash.is_some())?;
+    let held = fs::identity(&expected.file.metadata().map_err(|_| ())?)?;
+    if !fs::same(current.identity, expected.identity)
+        || current.hash != expected.hash
+        || !fs::same(held, expected.identity)
+    {
+        return Err(());
+    }
+    Ok(())
+}
+
+impl OwnerBindingAnchor {
+    pub(crate) fn source_set_hex(&self) -> String {
+        backup::hex(self.source_set.hash)
+    }
+
+    pub(crate) fn snapshot_fd(&self) -> &File {
+        &self.snapshot.file
+    }
+
+    fn same_live(parent: &File, name: &str, expected: &BoundLeaf) -> Result<(), ()> {
+        let current = bound_leaf(parent, name, false)?;
+        let held = fs::identity(&expected.file.metadata().map_err(|_| ())?)?;
+        if !fs::same_object(current.identity, expected.identity)
+            || !fs::same_object(held, expected.identity)
+        {
+            return Err(());
+        }
+        Ok(())
+    }
+
+    fn same_live_optional(
+        parent: &File,
+        name: &str,
+        expected: &Option<BoundLeaf>,
+    ) -> Result<(), ()> {
+        match expected {
+            Some(expected) => Self::same_live(parent, name, expected),
+            None if fs::leaf_absent(parent, name)? => Ok(()),
+            None => Err(()),
+        }
+    }
+
+    pub(crate) fn refresh_live_sidecars(
+        &mut self,
+    ) -> Result<(), crate::owner_binding_remediation::Failure> {
+        Self::same_live(&self.live_root, "state.db", &self.live_main).map_err(|_| {
+            crate::owner_binding_remediation::Failure {
+                cause: "postflight",
+                substage: "database-identity",
+            }
+        })?;
+        self.live_main = bound_leaf(&self.live_root, "state.db", false).map_err(|_| {
+            crate::owner_binding_remediation::Failure {
+                cause: "postflight",
+                substage: "database-identity",
+            }
+        })?;
+        self.live_wal = optional_bound(&self.live_root, "state.db-wal", false).map_err(|_| {
+            crate::owner_binding_remediation::Failure {
+                cause: "postflight",
+                substage: "sidecar",
+            }
+        })?;
+        self.live_shm = optional_bound(&self.live_root, "state.db-shm", false).map_err(|_| {
+            crate::owner_binding_remediation::Failure {
+                cause: "postflight",
+                substage: "sidecar",
+            }
+        })?;
+        Ok(())
+    }
+
+    pub(crate) fn revalidate(&self) -> Result<(), crate::owner_binding_remediation::Failure> {
+        Self::same_live(&self.live_root, "state.db", &self.live_main)
+            .and_then(|()| {
+                Self::same_live_optional(&self.live_root, "state.db-wal", &self.live_wal)
+            })
+            .and_then(|()| {
+                Self::same_live_optional(&self.live_root, "state.db-shm", &self.live_shm)
+            })
+            .map_err(|_| crate::owner_binding_remediation::Failure {
+                cause: "postflight",
+                substage: "database-identity",
+            })?;
+        same_bound(&self.namespace, codec::MANIFEST, &self.manifest)
+            .and_then(|()| same_bound(&self.namespace, codec::SNAPSHOT, &self.snapshot))
+            .map_err(|_| crate::owner_binding_remediation::Failure {
+                cause: "postflight",
+                substage: "backup-identity",
+            })?;
+        let decoded = backup::load_manifest(&self.namespace).map_err(|_| {
+            crate::owner_binding_remediation::Failure {
+                cause: "postflight",
+                substage: "backup-identity",
+            }
+        })?;
+        if decoded != self.decoded_manifest {
+            return Err(crate::owner_binding_remediation::Failure {
+                cause: "postflight",
+                substage: "backup-identity",
+            });
+        }
+        Ok(())
+    }
+}
+
+pub(crate) async fn owner_binding_anchor(
     snapshot: &str,
     source_set: &str,
-) -> Result<std::fs::File, crate::owner_binding_remediation::Failure> {
+) -> Result<OwnerBindingAnchor, crate::owner_binding_remediation::Failure> {
     let paths = Paths::production();
     let output = backup::verify(paths.clone()).await.map_err(|_| {
         crate::owner_binding_remediation::Failure {
@@ -86,42 +226,96 @@ pub(crate) async fn verify_owner_binding_backup(
             substage: "snapshot",
         });
     }
+    let live_root =
+        fs::open_dir(&paths.root).map_err(|_| crate::owner_binding_remediation::Failure {
+            cause: "identity",
+            substage: "database",
+        })?;
+    let live_main = bound_leaf(&live_root, "state.db", true).map_err(|_| {
+        crate::owner_binding_remediation::Failure {
+            cause: "identity",
+            substage: "database",
+        }
+    })?;
+    let live_wal = optional_bound(&live_root, "state.db-wal", true).map_err(|_| {
+        crate::owner_binding_remediation::Failure {
+            cause: "identity",
+            substage: "sidecar",
+        }
+    })?;
+    let live_shm = optional_bound(&live_root, "state.db-shm", false).map_err(|_| {
+        crate::owner_binding_remediation::Failure {
+            cause: "identity",
+            substage: "sidecar",
+        }
+    })?;
+    let live_source_set =
+        backup::source_set(&paths).map_err(|_| crate::owner_binding_remediation::Failure {
+            cause: "identity",
+            substage: "database",
+        })?;
+    if live_main.identity != live_source_set.main
+        || live_main.hash != Some(live_source_set.main_hash)
+        || live_wal.as_ref().map(|leaf| leaf.identity) != live_source_set.wal
+        || live_wal.as_ref().and_then(|leaf| leaf.hash) != live_source_set.wal_hash
+        || live_shm.as_ref().map(|leaf| leaf.identity) != live_source_set.shm
+    {
+        return Err(crate::owner_binding_remediation::Failure {
+            cause: "identity",
+            substage: "database",
+        });
+    }
     let namespace = fs::open_dir(&paths.namespace()).map_err(|_| {
         crate::owner_binding_remediation::Failure {
             cause: "backup",
             substage: "namespace",
         }
     })?;
-    let manifest = backup::load_manifest(&namespace).map_err(|_| {
+    let decoded_manifest = backup::load_manifest(&namespace).map_err(|_| {
         crate::owner_binding_remediation::Failure {
             cause: "backup",
             substage: "manifest",
         }
     })?;
-    if backup::hex(manifest.source_set_hash) != source_set {
+    if backup::hex(decoded_manifest.source_set_hash) != source_set {
         return Err(crate::owner_binding_remediation::Failure {
             cause: "backup",
             substage: "source-binding",
         });
     }
-    let mut snapshot_file = fs::open_leaf(&namespace, codec::SNAPSHOT, false).map_err(|_| {
+    let manifest = bound_leaf(&namespace, codec::MANIFEST, true).map_err(|_| {
+        crate::owner_binding_remediation::Failure {
+            cause: "backup",
+            substage: "manifest",
+        }
+    })?;
+    let snapshot = bound_leaf(&namespace, codec::SNAPSHOT, true).map_err(|_| {
         crate::owner_binding_remediation::Failure {
             cause: "backup",
             substage: "snapshot",
         }
     })?;
-    let (hash, identity) =
-        fs::hash(&mut snapshot_file).map_err(|_| crate::owner_binding_remediation::Failure {
-            cause: "backup",
-            substage: "snapshot",
-        })?;
-    if hash != manifest.snapshot_hash || !fs::same(identity, manifest.snapshot) {
+    if snapshot.hash != Some(decoded_manifest.snapshot_hash)
+        || !fs::same(snapshot.identity, decoded_manifest.snapshot)
+    {
         return Err(crate::owner_binding_remediation::Failure {
             cause: "backup",
             substage: "replacement",
         });
     }
-    Ok(snapshot_file)
+    let anchor = OwnerBindingAnchor {
+        live_root,
+        live_main,
+        live_wal,
+        live_shm,
+        namespace,
+        manifest,
+        snapshot,
+        decoded_manifest,
+        source_set: live_source_set,
+    };
+    anchor.revalidate()?;
+    Ok(anchor)
 }
 
 fn exact_hash(value: &OsString) -> Option<[u8; 32]> {
@@ -197,3 +391,24 @@ mod recovery_tests;
 mod sqlite_fault_tests;
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod owner_binding_anchor_tests {
+    use super::*;
+
+    #[test]
+    fn retained_leaf_name_must_remain_bound_to_authenticated_inode_and_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let path = root.path().join("snapshot.sqlite3");
+        std::fs::write(&path, b"authenticated").unwrap();
+        let parent = File::open(root.path()).unwrap();
+        let bound = bound_leaf(&parent, "snapshot.sqlite3", true).unwrap();
+        assert_eq!(same_bound(&parent, "snapshot.sqlite3", &bound), Ok(()));
+
+        let foreign = root.path().join("foreign");
+        std::fs::write(&foreign, b"authenticated").unwrap();
+        std::fs::rename(&foreign, &path).unwrap();
+        assert_eq!(same_bound(&parent, "snapshot.sqlite3", &bound), Err(()));
+        assert_eq!(std::fs::read(&path).unwrap(), b"authenticated");
+    }
+}
