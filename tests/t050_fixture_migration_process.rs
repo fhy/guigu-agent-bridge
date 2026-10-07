@@ -479,45 +479,71 @@ async fn terminal_ready_session_is_history_but_every_open_chain_drift_refuses() 
     assert!(!fixture.evidence.exists());
     assert!(!fixture.root.join(".runtime-admission.lock").exists());
 
-    for (name, setup) in [
-        ("prompting", "UPDATE sessions SET state='prompting'"),
+    for (name, setup, cause) in [
+        (
+            "prompting",
+            "UPDATE sessions SET state='prompting'",
+            "open-sessions",
+        ),
         (
             "unbound",
             "UPDATE delivery_dispositions SET session_id=NULL",
+            "open-sessions",
         ),
         (
             "endpoint",
             "UPDATE deliveries SET target_endpoint_id='agent-a'",
+            "open-sessions",
         ),
         (
             "conversation",
             "UPDATE tasks SET conversation_id='other-conversation'",
+            "open-sessions",
         ),
         (
             "unacknowledged",
             "UPDATE deliveries SET acknowledged_at=NULL",
+            "open-sessions",
         ),
         (
             "disposition",
             "UPDATE delivery_dispositions SET state='acknowledged'",
+            "open-sessions",
         ),
         (
             "child",
             "UPDATE delivery_dispositions SET child_fingerprint=NULL",
+            "open-sessions",
         ),
         (
             "reap",
             "UPDATE delivery_dispositions SET reap_status='unknown'",
+            "open-sessions",
         ),
         (
             "task",
             "UPDATE task_events SET status='running' WHERE seq=2",
+            "open-sessions",
         ),
-        ("admission", "UPDATE task_admissions SET state='running'"),
-        ("lease", "UPDATE execution_leases SET state='active'"),
+        (
+            "admission-state",
+            "UPDATE task_admissions SET state='running'",
+            "admission-binding",
+        ),
+        (
+            "admission-owner",
+            "UPDATE task_admissions SET runtime_instance='owner-s'",
+            "admission-binding",
+        ),
+        (
+            "lease",
+            "UPDATE execution_leases SET state='active'",
+            "open-sessions",
+        ),
         (
             "continuation",
             "UPDATE task_continuations SET state='ready'",
+            "open-sessions",
         ),
     ] {
         let fixture = terminal_ready_session_fixture().await;
@@ -543,10 +569,12 @@ async fn terminal_ready_session_is_history_but_every_open_chain_drift_refuses() 
         assert!(output.stderr.is_empty(), "{name}");
         let stdout = String::from_utf8_lossy(&output.stdout);
         assert!(
-            stdout.contains("stage=eligibility cause=open-sessions"),
+            stdout.contains(&format!("stage=eligibility cause={cause}")),
             "name={name} stdout={stdout}"
         );
-        assert!(stdout.contains("sessions=1"), "name={name} stdout={stdout}");
+        if cause == "open-sessions" {
+            assert!(stdout.contains("sessions=1"), "name={name} stdout={stdout}");
+        }
         assert!(!stdout.contains(fixture.root.to_str().unwrap()));
         assert_eq!(durable_rows(&fixture.db).await, before, "{name}");
         assert_eq!(fixture_tree(&fixture.root), tree, "{name}");

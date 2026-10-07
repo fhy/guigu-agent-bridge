@@ -176,7 +176,6 @@ WHERE s.state <> 'closed'
     JOIN deliveries d ON d.delivery_id = p.delivery_id
       AND d.task_id = p.task_id AND d.attempt = p.attempt
     JOIN tasks t ON t.task_id = d.task_id
-    JOIN task_admissions a ON a.task_id = t.task_id
     JOIN execution_leases l ON l.task_id = t.task_id
     JOIN task_continuations c ON c.task_id = t.task_id
       AND c.resource_key = l.resource_key
@@ -190,8 +189,6 @@ WHERE s.state <> 'closed'
         OR (p.child_fingerprint IS NOT NULL AND p.reap_status = 'reaped'
           AND p.reap_at IS NOT NULL))
       AND d.acknowledged_at IS NOT NULL
-      AND a.state = 'terminal'
-      AND a.runtime_instance = l.owner_token
       AND l.state = 'released'
       AND c.state = 'blocked'
       AND t.version + 1 = (
