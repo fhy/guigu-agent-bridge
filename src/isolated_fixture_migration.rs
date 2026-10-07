@@ -210,11 +210,21 @@ async fn open_session_count(c: &mut SqliteConnection) -> Result<i64, Error> {
         .map_err(|_| Error::Database)
 }
 
-async fn eligible(c: &mut SqliteConnection) -> Result<Facts, Error> {
+type EligibilityResult<T> = Result<T, (Error, &'static str)>;
+
+fn rejected(cause: &'static str) -> (Error, &'static str) {
+    (Error::Rejected, cause)
+}
+
+fn database_facts() -> (Error, &'static str) {
+    (Error::Database, "database-facts")
+}
+
+async fn eligible(c: &mut SqliteConnection) -> EligibilityResult<Facts> {
     let owners = sqlx::query("SELECT instance_token,started_at,heartbeat_at,state,process_fingerprint FROM runtime_instances WHERE state IN ('active','stopping') ORDER BY state,instance_token")
-        .fetch_all(&mut *c).await.map_err(|_| Error::Database)?;
+        .fetch_all(&mut *c).await.map_err(|_| database_facts())?;
     if owners.len() != 2 {
-        return Err(Error::Rejected);
+        return Err(rejected("owner-topology"));
     }
     let owner = |row: &sqlx::sqlite::SqliteRow| -> Result<Owner, Error> {
         Ok(Owner {
@@ -228,82 +238,124 @@ async fn eligible(c: &mut SqliteConnection) -> Result<Facts, Error> {
     let mut active = None;
     let mut stopping = None;
     for row in &owners {
-        let value = owner(row)?;
+        let value = owner(row).map_err(|_| database_facts())?;
         if !valid_legacy(&value.fingerprint) {
-            return Err(Error::Rejected);
+            return Err(rejected("owner-identity"));
         }
         match value.state.as_str() {
             "active" if active.is_none() => active = Some(value),
             "stopping" if stopping.is_none() => stopping = Some(value),
-            _ => return Err(Error::Rejected),
+            _ => return Err(rejected("owner-topology")),
         }
     }
-    let active = active.ok_or(Error::Rejected)?;
-    let stopping = stopping.ok_or(Error::Rejected)?;
+    let active = active.ok_or_else(|| rejected("owner-topology"))?;
+    let stopping = stopping.ok_or_else(|| rejected("owner-topology"))?;
     if stopping.started >= active.started || stopping.heartbeat > active.started {
-        return Err(Error::Rejected);
+        return Err(rejected("owner-ordering"));
     }
     let continuation_rows = sqlx::query("SELECT task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes,runtime_generation,runtime_generation_version FROM task_continuations")
-        .fetch_all(&mut *c).await.map_err(|_|Error::Database)?;
+        .fetch_all(&mut *c).await.map_err(|_|database_facts())?;
     if continuation_rows.len() != 1 {
-        return Err(Error::Rejected);
+        return Err(rejected("continuation-topology"));
     }
     let r = &continuation_rows[0];
     let continuation = Continuation {
-        task: r.try_get(0).map_err(|_| Error::Database)?,
-        resource: r.try_get(1).map_err(|_| Error::Database)?,
-        delivery: r.try_get(2).map_err(|_| Error::Database)?,
-        fence: r.try_get(3).map_err(|_| Error::Database)?,
-        revision: r.try_get(4).map_err(|_| Error::Database)?,
-        state: r.try_get(5).map_err(|_| Error::Database)?,
-        next_turn: r.try_get(6).map_err(|_| Error::Database)?,
-        completed_turns: r.try_get(7).map_err(|_| Error::Database)?,
-        no_progress: r.try_get(8).map_err(|_| Error::Database)?,
-        prompt: r.try_get(9).map_err(|_| Error::Database)?,
-        started: r.try_get(10).map_err(|_| Error::Database)?,
-        heartbeat: r.try_get(11).map_err(|_| Error::Database)?,
-        last_progress: r.try_get(12).map_err(|_| Error::Database)?,
-        output_bytes: r.try_get(13).map_err(|_| Error::Database)?,
-        generation: r.try_get(14).map_err(|_| Error::Database)?,
-        generation_version: r.try_get(15).map_err(|_| Error::Database)?,
+        task: r.try_get(0).map_err(|_| database_facts())?,
+        resource: r.try_get(1).map_err(|_| database_facts())?,
+        delivery: r.try_get(2).map_err(|_| database_facts())?,
+        fence: r.try_get(3).map_err(|_| database_facts())?,
+        revision: r.try_get(4).map_err(|_| database_facts())?,
+        state: r.try_get(5).map_err(|_| database_facts())?,
+        next_turn: r.try_get(6).map_err(|_| database_facts())?,
+        completed_turns: r.try_get(7).map_err(|_| database_facts())?,
+        no_progress: r.try_get(8).map_err(|_| database_facts())?,
+        prompt: r.try_get(9).map_err(|_| database_facts())?,
+        started: r.try_get(10).map_err(|_| database_facts())?,
+        heartbeat: r.try_get(11).map_err(|_| database_facts())?,
+        last_progress: r.try_get(12).map_err(|_| database_facts())?,
+        output_bytes: r.try_get(13).map_err(|_| database_facts())?,
+        generation: r.try_get(14).map_err(|_| database_facts())?,
+        generation_version: r.try_get(15).map_err(|_| database_facts())?,
     };
-    if continuation.state != "blocked" || continuation.revision < 2 {
-        return Err(Error::Rejected);
+    let open_sessions = open_session_count(&mut *c)
+        .await
+        .map_err(|_| database_facts())?;
+    if open_sessions != 0 {
+        return Err(rejected("open-sessions"));
     }
-    let exact: i64 = sqlx::query_scalar("SELECT count(*) FROM execution_leases l JOIN task_admissions a ON a.task_id=l.task_id JOIN deliveries d ON d.task_id=l.task_id JOIN delivery_dispositions p ON p.delivery_id=d.delivery_id AND p.task_id=d.task_id AND p.attempt=d.attempt JOIN tasks t ON t.task_id=l.task_id WHERE l.resource_key=? AND l.task_id=? AND l.owner_token=? AND l.fence=? AND l.state='released' AND a.state='terminal' AND a.runtime_instance=? AND d.delivery_id=? AND d.acknowledged_at IS NOT NULL AND p.state='terminal' AND ((p.child_fingerprint IS NULL AND p.reap_status IS NULL AND p.reap_at IS NULL) OR (p.child_fingerprint IS NOT NULL AND p.reap_status='reaped' AND p.reap_at IS NOT NULL)) AND t.version+1=(SELECT max(seq) FROM task_events WHERE task_id=t.task_id) AND (SELECT status FROM task_events WHERE task_id=t.task_id ORDER BY seq DESC LIMIT 1) IN ('completed','failed','timed_out','cancelled')")
-        .bind(&continuation.resource).bind(&continuation.task).bind(&active.token).bind(continuation.fence).bind(&active.token).bind(&continuation.delivery).fetch_one(&mut *c).await.map_err(|_|Error::Database)?;
+    if continuation.state != "blocked" || continuation.revision < 2 {
+        return Err(rejected("continuation-state"));
+    }
+    let lease: i64 = sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='released'")
+        .bind(&continuation.resource).bind(&continuation.task).bind(&active.token).bind(continuation.fence).fetch_one(&mut *c).await.map_err(|_|database_facts())?;
+    if lease != 1 {
+        return Err(rejected("lease-binding"));
+    }
+    let admission: i64 = sqlx::query_scalar("SELECT count(*) FROM task_admissions WHERE task_id=? AND state='terminal' AND runtime_instance=?")
+        .bind(&continuation.task).bind(&active.token).fetch_one(&mut *c).await.map_err(|_|database_facts())?;
+    if admission != 1 {
+        return Err(rejected("admission-binding"));
+    }
+    let delivery: i64 = sqlx::query_scalar("SELECT count(*) FROM deliveries WHERE task_id=? AND delivery_id=? AND acknowledged_at IS NOT NULL")
+        .bind(&continuation.task).bind(&continuation.delivery).fetch_one(&mut *c).await.map_err(|_|database_facts())?;
+    if delivery != 1 {
+        return Err(rejected("delivery-binding"));
+    }
+    let disposition: i64 = sqlx::query_scalar("SELECT count(*) FROM delivery_dispositions p JOIN deliveries d ON d.delivery_id=p.delivery_id AND d.task_id=p.task_id AND d.attempt=p.attempt WHERE p.task_id=? AND p.delivery_id=? AND p.state='terminal' AND ((p.child_fingerprint IS NULL AND p.reap_status IS NULL AND p.reap_at IS NULL) OR (p.child_fingerprint IS NOT NULL AND p.reap_status='reaped' AND p.reap_at IS NOT NULL))")
+        .bind(&continuation.task).bind(&continuation.delivery).fetch_one(&mut *c).await.map_err(|_|database_facts())?;
+    if disposition != 1 {
+        return Err(rejected("child-reap"));
+    }
+    let terminal: i64 = sqlx::query_scalar("SELECT count(*) FROM tasks t WHERE t.task_id=? AND t.version+1=(SELECT max(seq) FROM task_events WHERE task_id=t.task_id) AND (SELECT status FROM task_events WHERE task_id=t.task_id ORDER BY seq DESC LIMIT 1) IN ('completed','failed','timed_out','cancelled')")
+        .bind(&continuation.task).fetch_one(&mut *c).await.map_err(|_|database_facts())?;
+    if terminal != 1 {
+        return Err(rejected("terminal-event"));
+    }
     let response = sqlx::query("SELECT r.response_hash,r.output_bytes,r.outcome,e.payload FROM continuation_response_receipts r JOIN task_events e ON e.task_id=r.task_id WHERE r.task_id=? AND r.delivery_id=? AND r.resource_key=? AND r.lease_fence=? AND r.continuation_revision=? AND r.runtime_generation=? ORDER BY e.seq DESC LIMIT 1")
-        .bind(&continuation.task).bind(&continuation.delivery).bind(&continuation.resource).bind(continuation.fence).bind(continuation.revision-1).bind(&continuation.generation).fetch_optional(&mut *c).await.map_err(|_|Error::Database)?;
+        .bind(&continuation.task).bind(&continuation.delivery).bind(&continuation.resource).bind(continuation.fence).bind(continuation.revision-1).bind(&continuation.generation).fetch_optional(&mut *c).await.map_err(|_|database_facts())?;
     let response_valid = if let Some(row) = response {
-        let payload: String = row.try_get(3).map_err(|_| Error::Database)?;
+        let payload: String = row.try_get(3).map_err(|_| database_facts())?;
         let canonical = serde_json::to_string(
-            &serde_json::from_str::<serde_json::Value>(&payload).map_err(|_| Error::Rejected)?,
+            &serde_json::from_str::<serde_json::Value>(&payload)
+                .map_err(|_| rejected("response-receipt"))?,
         )
-        .map_err(|_| Error::Rejected)?;
+        .map_err(|_| rejected("response-receipt"))?;
         let expected = uuid::Uuid::new_v5(&RESPONSE_NAMESPACE, canonical.as_bytes()).to_string();
-        row.try_get::<String, _>(0).map_err(|_| Error::Database)? == expected
-            && row.try_get::<i64, _>(1).map_err(|_| Error::Database)?
-                == i64::try_from(canonical.len()).map_err(|_| Error::Rejected)?
-            && row.try_get::<String, _>(2).map_err(|_| Error::Database)? == "structured"
+        row.try_get::<String, _>(0).map_err(|_| database_facts())? == expected
+            && row.try_get::<i64, _>(1).map_err(|_| database_facts())?
+                == i64::try_from(canonical.len()).map_err(|_| rejected("response-receipt"))?
+            && row.try_get::<String, _>(2).map_err(|_| database_facts())? == "structured"
             && canonical == payload
     } else {
         false
     };
     let counts: (i64,i64,i64,i64,i64,i64,i64) = sqlx::query_as("SELECT (SELECT count(*) FROM execution_leases),(SELECT count(*) FROM task_admissions),(SELECT count(*) FROM deliveries),(SELECT count(*) FROM delivery_dispositions),(SELECT count(*) FROM agent_work_queue WHERE state NOT IN ('completed','expired','superseded')),(SELECT count(*) FROM workspace_claims),(SELECT count(*) FROM projection_outbox WHERE state IN ('pending','sending'))")
-        .fetch_one(&mut *c).await.map_err(|_|Error::Database)?;
+        .fetch_one(&mut *c).await.map_err(|_|database_facts())?;
     let stopping_refs: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM execution_leases WHERE owner_token=?)+(SELECT count(*) FROM task_admissions WHERE runtime_instance=?)+(SELECT count(*) FROM agent_work_queue WHERE runtime_owner=?)+(SELECT count(*) FROM workspace_claims WHERE runtime_owner=?)")
-        .bind(&stopping.token).bind(&stopping.token).bind(&stopping.token).bind(&stopping.token).fetch_one(&mut *c).await.map_err(|_|Error::Database)?;
-    let other_owners: i64 = sqlx::query_scalar("SELECT count(*) FROM runtime_instances WHERE state<>'stopped' AND instance_token NOT IN (?,?)")
-        .bind(&active.token).bind(&stopping.token).fetch_one(&mut *c).await.map_err(|_|Error::Database)?;
-    let open_sessions = open_session_count(&mut *c).await?;
-    if exact != 1
-        || !response_valid
-        || counts != (1, 1, 1, 1, 0, 0, 0)
-        || stopping_refs != 0
-        || other_owners != 0
-        || open_sessions != 0
-    {
-        return Err(Error::Rejected);
+        .bind(&stopping.token).bind(&stopping.token).bind(&stopping.token).bind(&stopping.token).fetch_one(&mut *c).await.map_err(|_|database_facts())?;
+    if !response_valid {
+        return Err(rejected("response-receipt"));
+    }
+    if stopping_refs != 0 {
+        return Err(rejected("stopping-references"));
+    }
+    if counts.0 != 1 {
+        return Err(rejected("lease-topology"));
+    }
+    if counts.1 != 1 {
+        return Err(rejected("admission-topology"));
+    }
+    if counts.2 != 1 || counts.3 != 1 {
+        return Err(rejected("delivery-topology"));
+    }
+    if counts.4 != 0 {
+        return Err(rejected("work-queue"));
+    }
+    if counts.5 != 0 {
+        return Err(rejected("workspace-claim"));
+    }
+    if counts.6 != 0 {
+        return Err(rejected("projection-outbox"));
     }
     Ok(Facts {
         active,
@@ -312,8 +364,10 @@ async fn eligible(c: &mut SqliteConnection) -> Result<Facts, Error> {
     })
 }
 
-async fn emit_eligibility_diagnostic(c: &mut SqliteConnection) {
-    if std::env::var_os("T050_FIXTURE_MIGRATION_DIAGNOSTIC").is_none() {
+async fn emit_eligibility_diagnostic(c: &mut SqliteConnection, rejected_cause: &'static str) {
+    if std::env::var_os("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC").is_none()
+        && std::env::var_os("T050_FIXTURE_MIGRATION_DIAGNOSTIC").is_none()
+    {
         return;
     }
     let counts = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64)>(
@@ -331,29 +385,12 @@ async fn emit_eligibility_diagnostic(c: &mut SqliteConnection) {
     .await;
     let sessions = open_session_count(&mut *c).await;
     let (cause, values) = match (counts, sessions) {
-        (Ok((owners, continuations, children, leases, admissions, work)), Ok(sessions)) => {
-            let cause = if owners != 2 {
-                "owner-topology"
-            } else if continuations != 1 {
-                "continuation-topology"
-            } else if sessions != 0 {
-                "open-sessions"
-            } else if children != 0 {
-                "child-reap"
-            } else if leases != 1 || admissions != 1 {
-                "lease-admission"
-            } else if work != 0 {
-                "work-queue"
-            } else {
-                "witness-or-binding"
-            };
-            (
-                cause,
-                format!(
-                    "owners={owners},continuations={continuations},sessions={sessions},children={children},leases={leases},admissions={admissions},work={work}"
-                ),
-            )
-        }
+        (Ok((owners, continuations, children, leases, admissions, work)), Ok(sessions)) => (
+            rejected_cause,
+            format!(
+                "owners={owners},continuations={continuations},sessions={sessions},children={children},leases={leases},admissions={admissions},work={work}"
+            ),
+        ),
         _ => (
             "database-facts",
             "owners=0,continuations=0,sessions=0,children=0,leases=0,admissions=0,work=0"
@@ -814,9 +851,9 @@ pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
         .map_err(|_| prepare_rejected("sqlite-open", "begin", Error::Database))?;
     let facts = match eligible(&mut c).await {
         Ok(facts) => facts,
-        Err(error) => {
+        Err((error, cause)) => {
             emit_prepare_diagnostic("eligibility", "durable-facts", "failures=1");
-            emit_eligibility_diagnostic(&mut c).await;
+            emit_eligibility_diagnostic(&mut c, cause).await;
             let _ = sqlx::query("ROLLBACK").execute(&mut c).await;
             return Err(error);
         }
@@ -998,7 +1035,7 @@ async fn execute_transaction(c: &mut SqliteConnection, m: &Manifest) -> Result<O
     if snapshot(c, None).await? != m.pre_state_digest {
         return Err(Error::Rejected);
     }
-    let facts = eligible(c).await?;
+    let facts = eligible(c).await.map_err(|(error, _)| error)?;
     if owner_digest(&facts.active) != m.active_owner_digest
         || owner_digest(&facts.stopping) != m.stopping_owner_digest
         || continuation_digest(&facts.continuation) != m.continuation_digest

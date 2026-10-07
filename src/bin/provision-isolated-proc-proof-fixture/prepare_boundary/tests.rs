@@ -187,11 +187,30 @@ fn fixed_generic_and_eligibility_aggregate_diagnostics_are_valid() {
         );
     }
 
-    for diagnostic in [
-        "stage=eligibility cause=open-sessions counts=owners=2,continuations=1,sessions=1,children=0,leases=1,admissions=1,work=0",
-        "stage=eligibility cause=witness-or-binding counts=owners=2,continuations=1,sessions=0,children=0,leases=1,admissions=1,work=0",
-        "stage=eligibility cause=database-facts counts=owners=0,continuations=0,sessions=0,children=0,leases=0,admissions=0,work=0",
+    let nominal =
+        "counts=owners=2,continuations=1,sessions=0,children=0,leases=1,admissions=1,work=0";
+    let mut diagnostics = vec![
+        "stage=eligibility cause=open-sessions counts=owners=2,continuations=1,sessions=1,children=0,leases=1,admissions=1,work=0".to_owned(),
+        "stage=eligibility cause=database-facts counts=owners=0,continuations=0,sessions=0,children=0,leases=0,admissions=0,work=0".to_owned(),
+    ];
+    for cause in [
+        "owner-identity",
+        "owner-ordering",
+        "continuation-state",
+        "child-reap",
+        "lease-binding",
+        "admission-binding",
+        "delivery-binding",
+        "delivery-topology",
+        "terminal-event",
+        "response-receipt",
+        "stopping-references",
+        "workspace-claim",
+        "projection-outbox",
     ] {
+        diagnostics.push(format!("stage=eligibility cause={cause} {nominal}"));
+    }
+    for diagnostic in diagnostics {
         let child = classify(&result(&format!(
             "printf 'prepare-isolated-legacy-fixture-migration-manifest {diagnostic}\\n'; printf '%s' '{TERMINAL_REFUSED}'; exit 3"
         )));

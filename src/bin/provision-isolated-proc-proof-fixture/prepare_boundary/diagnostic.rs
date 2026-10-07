@@ -61,12 +61,24 @@ fn canonical_cause(value: &str) -> Option<&'static str> {
             "binary-identity",
             "database-facts",
             "owner-topology",
+            "owner-identity",
+            "owner-ordering",
             "continuation-topology",
+            "continuation-state",
             "open-sessions",
             "child-reap",
-            "lease-admission",
+            "lease-binding",
+            "lease-topology",
+            "admission-binding",
+            "admission-topology",
+            "delivery-binding",
+            "delivery-topology",
+            "terminal-event",
+            "response-receipt",
+            "stopping-references",
             "work-queue",
-            "witness-or-binding",
+            "workspace-claim",
+            "projection-outbox",
             "runtime-unknown-procfs-permission",
             "runtime-unknown-procfs-io",
             "runtime-unknown-procfs-parse",
@@ -189,24 +201,33 @@ fn aggregate(cause: &str, counts: &str) -> bool {
         };
         values[index] = value;
     }
-    let expected = if values == [0; 7] && cause == "database-facts" {
-        "database-facts"
-    } else if values[0] != 2 {
-        "owner-topology"
-    } else if values[1] != 1 {
-        "continuation-topology"
-    } else if values[2] != 0 {
-        "open-sessions"
-    } else if values[3] != 0 {
-        "child-reap"
-    } else if values[4] != 1 || values[5] != 1 {
-        "lease-admission"
-    } else if values[6] != 0 {
-        "work-queue"
-    } else {
-        "witness-or-binding"
-    };
-    cause == expected
+    if values == [0; 7] {
+        return cause == "database-facts";
+    }
+    let cause_matches_count = (values[0] != 2 && cause == "owner-topology")
+        || (values[1] != 1 && cause == "continuation-topology")
+        || (values[2] != 0 && cause == "open-sessions")
+        || (values[3] != 0 && cause == "child-reap")
+        || (values[4] != 1 && cause == "lease-topology")
+        || (values[5] != 1 && cause == "admission-topology")
+        || (values[6] != 0 && cause == "work-queue");
+    let detailed = matches!(
+        cause,
+        "owner-identity"
+            | "owner-ordering"
+            | "continuation-state"
+            | "child-reap"
+            | "lease-binding"
+            | "admission-binding"
+            | "delivery-binding"
+            | "delivery-topology"
+            | "terminal-event"
+            | "response-receipt"
+            | "stopping-references"
+            | "workspace-claim"
+            | "projection-outbox"
+    );
+    cause_matches_count || (values == [2, 1, 0, 0, 1, 1, 0] && detailed)
 }
 
 pub(super) fn parse(line: &str) -> Option<Diagnostic> {

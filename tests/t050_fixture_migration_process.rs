@@ -549,6 +549,213 @@ async fn eligibility_diagnostic_is_fixed_and_redacted() {
     assert!(!stdout.contains("closed-session"));
 }
 
+#[tokio::test]
+async fn durable_fact_predicates_have_specific_fixed_diagnostics() {
+    for (name, sql, cause) in [
+        (
+            "owner identity",
+            "UPDATE runtime_instances SET process_fingerprint='pid:1' WHERE state='active'",
+            "owner-identity",
+        ),
+        (
+            "owner ordering",
+            "UPDATE runtime_instances SET started_at='2026-10-01T00:00:00.000000000Z' WHERE state='stopping'",
+            "owner-ordering",
+        ),
+        (
+            "continuation state",
+            "UPDATE task_continuations SET state='ready'",
+            "continuation-state",
+        ),
+        (
+            "lease binding",
+            "UPDATE execution_leases SET fence=8",
+            "lease-binding",
+        ),
+        (
+            "admission binding",
+            "UPDATE task_admissions SET runtime_instance='owner-s'",
+            "admission-binding",
+        ),
+        (
+            "delivery binding",
+            "UPDATE deliveries SET acknowledged_at=NULL",
+            "delivery-binding",
+        ),
+        (
+            "child reap",
+            "UPDATE delivery_dispositions SET state='acknowledged'",
+            "child-reap",
+        ),
+        (
+            "terminal event",
+            "UPDATE task_events SET status='running' WHERE seq=2",
+            "terminal-event",
+        ),
+        (
+            "response receipt",
+            "DELETE FROM continuation_response_receipts",
+            "response-receipt",
+        ),
+        (
+            "open session",
+            "UPDATE sessions SET state='prompting'",
+            "open-sessions",
+        ),
+        (
+            "stopping reference",
+            "INSERT INTO workspace_claims VALUES('claim','owner-s','task','/tmp','[]',7,1,'active','2026-10-01T00:00:00Z','2026-10-01T00:00:00Z')",
+            "stopping-references",
+        ),
+        (
+            "workspace claim",
+            "INSERT INTO workspace_claims VALUES('claim','owner-a','task','/tmp','[]',7,1,'active','2026-10-01T00:00:00Z','2026-10-01T00:00:00Z')",
+            "workspace-claim",
+        ),
+    ] {
+        let fixture = Fixture::new_unprepared().await;
+        let pool = connect(&fixture.db).await.unwrap();
+        sqlx::query(sql).execute(&pool).await.unwrap();
+        pool.close().await;
+        let before = durable_rows(&fixture.db).await;
+        let tree = fixture_tree(&fixture.root);
+        let output = fixture
+            .prepare()
+            .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(3), "{name}");
+        assert!(output.stderr.is_empty(), "{name}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!("stage=eligibility cause={cause} counts=")),
+            "name={name} stdout={stdout}"
+        );
+        assert!(!stdout.contains(fixture.root.to_str().unwrap()), "{name}");
+        assert_eq!(durable_rows(&fixture.db).await, before, "{name}");
+        assert_eq!(fixture_tree(&fixture.root), tree, "{name}");
+        assert!(!fixture.manifest.exists(), "{name}");
+        assert!(!fixture.evidence.exists(), "{name}");
+        assert!(
+            !fixture.root.join(".runtime-admission.lock").exists(),
+            "{name}"
+        );
+    }
+}
+
+async fn assert_durable_diagnostic(sql: &'static [&'static str], cause: &'static str) {
+    let fixture = Fixture::new_unprepared().await;
+    let pool = connect(&fixture.db).await.unwrap();
+    for statement in sql {
+        sqlx::query(*statement).execute(&pool).await.unwrap();
+    }
+    pool.close().await;
+    let before = durable_rows(&fixture.db).await;
+    let tree = fixture_tree(&fixture.root);
+    let output = fixture
+        .prepare()
+        .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(3), "{cause}");
+    assert!(output.stderr.is_empty(), "{cause}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        stdout.contains(&format!("stage=eligibility cause={cause} counts=")),
+        "cause={cause} stdout={stdout}"
+    );
+    assert!(!stdout.contains(fixture.root.to_str().unwrap()), "{cause}");
+    assert_eq!(durable_rows(&fixture.db).await, before, "{cause}");
+    assert_eq!(fixture_tree(&fixture.root), tree, "{cause}");
+    assert!(!fixture.manifest.exists(), "{cause}");
+    assert!(!fixture.evidence.exists(), "{cause}");
+    assert!(
+        !fixture.root.join(".runtime-admission.lock").exists(),
+        "{cause}"
+    );
+}
+
+#[tokio::test]
+async fn durable_fact_aggregate_topology_and_work_matrix_is_complete() {
+    let cases: &[(&'static [&'static str], &'static str)] = &[
+        (
+            &[
+                "INSERT INTO runtime_instances VALUES('owner-extra','2026-09-29T00:00:00.000000000Z','2026-09-29T00:00:01.000000000Z','stopping','legacy-extra')",
+            ],
+            "owner-topology",
+        ),
+        (
+            &[
+                "INSERT INTO tasks VALUES('task-extra','task-extra',NULL,'agent-a','agent-b','conversation',NULL,'closed fixture',5,0,0,NULL,0)",
+                "INSERT INTO deliveries VALUES('delivery-extra','task-extra',1,'agent-b','2026-10-01T00:00:01.000000000Z','2026-10-01T00:00:03.000000000Z')",
+                "INSERT INTO execution_leases VALUES('resource-extra','task-extra','owner-a',8,'released','2026-10-01T00:00:00.000000000Z','2026-10-01T00:00:03.000000000Z','2026-10-01T00:00:03.000000000Z')",
+                "INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes,runtime_generation,runtime_generation_version) VALUES('task-extra','resource-extra','delivery-extra',8,2,'blocked',1,1,0,'','2026-10-01T00:00:00.000000000Z','2026-10-01T00:00:03.000000000Z','2026-10-01T00:00:03.000000000Z',12,'generation.v1:strict',1)",
+            ],
+            "continuation-topology",
+        ),
+        (
+            &[
+                "INSERT INTO execution_leases VALUES('resource-extra','task','owner-a',8,'released','2026-10-01T00:00:00.000000000Z','2026-10-01T00:00:03.000000000Z','2026-10-01T00:00:03.000000000Z')",
+            ],
+            "lease-topology",
+        ),
+        (
+            &[
+                "INSERT INTO tasks VALUES('task-extra','task-extra',NULL,'agent-a','agent-b','conversation',NULL,'closed fixture',5,0,0,NULL,0)",
+                "INSERT INTO task_admissions(task_id,state,revision,runtime_instance,created_at,updated_at) VALUES('task-extra','ready',0,NULL,'2026-10-01T00:00:00.000000000Z','2026-10-01T00:00:03.000000000Z')",
+            ],
+            "admission-topology",
+        ),
+        (
+            &[
+                "INSERT INTO deliveries VALUES('delivery-extra','task',2,'agent-b','2026-10-01T00:00:01.000000000Z','2026-10-01T00:00:03.000000000Z')",
+            ],
+            "delivery-topology",
+        ),
+        (
+            &[
+                "INSERT INTO agent_work_queue(queue_id,task_id,delivery_id,target_endpoint_id,room_id,sender_endpoint_id,idempotency_key,body_hash,lane,state,sequence,revision,send_started,created_at,updated_at) VALUES('queue','task','delivery','agent-b','room','agent-a','key','hash','ordinary','queued',1,0,0,'2026-10-01T00:00:00.000000000Z','2026-10-01T00:00:03.000000000Z')",
+            ],
+            "work-queue",
+        ),
+        (
+            &[
+                "INSERT INTO projection_outbox(source_kind,source_id,projection,stable_txn_id,room_id,render_version,body,body_hash,state,attempt_count,created_at,updated_at) VALUES('task_event','event-2','observer','txn','room','v1','{}','hash','pending',0,'2026-10-01T00:00:00.000000000Z','2026-10-01T00:00:03.000000000Z')",
+            ],
+            "projection-outbox",
+        ),
+    ];
+    for (sql, cause) in cases {
+        assert_durable_diagnostic(sql, cause).await;
+    }
+}
+
+#[tokio::test]
+async fn terminal_work_history_is_not_a_durable_fact_false_positive() {
+    let fixture = Fixture::new_unprepared().await;
+    let pool = connect(&fixture.db).await.unwrap();
+    sqlx::query("INSERT INTO agent_work_queue(queue_id,task_id,delivery_id,target_endpoint_id,room_id,sender_endpoint_id,idempotency_key,body_hash,lane,state,sequence,revision,send_started,created_at,updated_at) VALUES('queue','task','delivery','agent-b','room','agent-a','key','hash','ordinary','completed',1,0,0,'2026-10-01T00:00:00.000000000Z','2026-10-01T00:00:03.000000000Z')")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO projection_outbox(source_kind,source_id,projection,stable_txn_id,room_id,render_version,body,body_hash,state,attempt_count,created_at,updated_at) VALUES('task_event','event-2','observer','txn','room','v1','{}','hash','sent',1,'2026-10-01T00:00:00.000000000Z','2026-10-01T00:00:03.000000000Z')")
+        .execute(&pool).await.unwrap();
+    pool.close().await;
+    let output = fixture
+        .prepare()
+        .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+        .output()
+        .unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty());
+    assert!(fixture.manifest.exists());
+    assert!(!fixture.evidence.exists());
+    assert!(!fixture.root.join(".runtime-admission.lock").exists());
+}
+
 #[cfg(not(debug_assertions))]
 #[tokio::test]
 async fn optimized_prepare_child_exposes_only_opt_in_fixed_internal_classification() {
