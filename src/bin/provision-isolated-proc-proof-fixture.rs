@@ -277,14 +277,7 @@ fn main() {
             }
         }
         Some("production-remediate-isolated-unit-residue") => {
-            let expected = match (args.next(), args.next()) {
-                (Some(flag), value) if flag == "--expected-sha256" => value,
-                _ => None,
-            };
-            if args.next().is_some() || expected.is_none() {
-                std::process::exit(3);
-            }
-            match unit_residue_command::run_production(&expected.unwrap()) {
+            match unit_residue_command::run_cli(args) {
                 Ok(()) => println!(
                     "production-remediate-isolated-unit-residue result=remediated status=0"
                 ),

@@ -73,3 +73,65 @@ pub(super) fn run_production(expected: &str) -> Result<(), Cause> {
         },
     )
 }
+
+fn run_cli_with(
+    mut args: impl Iterator<Item = String>,
+    action: impl FnOnce(&str) -> Result<(), Cause>,
+) -> Result<(), Cause> {
+    let expected = match (args.next(), args.next(), args.next()) {
+        (Some(flag), Some(expected), None) if flag == "--expected-sha256" => expected,
+        _ => return Err(Cause::Arguments),
+    };
+    parse_expected(&expected)?;
+    action(&expected)
+}
+
+pub(super) fn run_cli(args: impl Iterator<Item = String>) -> Result<(), Cause> {
+    run_cli_with(args, run_production)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_shapes_are_strict_and_refuse_before_action() {
+        let valid = "01".repeat(32);
+        let uppercase = "AA".repeat(32);
+        let cases = [
+            vec![],
+            vec!["--wrong"],
+            vec!["--wrong", &valid],
+            vec!["--expected-sha256"],
+            vec!["--expected-sha256", "bad-digest"],
+            vec!["--expected-sha256", &uppercase],
+            vec!["--expected-sha256", &valid, "--expected-sha256", &valid],
+            vec!["--expected-sha256", &valid, "extra"],
+        ];
+        for case in cases {
+            let mut called = false;
+            assert_eq!(
+                run_cli_with(case.into_iter().map(str::to_owned), |_| {
+                    called = true;
+                    Ok(())
+                }),
+                Err(Cause::Arguments)
+            );
+            assert!(!called);
+        }
+
+        let mut called = false;
+        assert_eq!(
+            run_cli_with(
+                ["--expected-sha256".to_owned(), valid.clone()].into_iter(),
+                |expected| {
+                    called = true;
+                    assert_eq!(expected, valid);
+                    Ok(())
+                },
+            ),
+            Ok(())
+        );
+        assert!(called);
+    }
+}
