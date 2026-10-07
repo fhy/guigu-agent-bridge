@@ -451,6 +451,11 @@ async fn terminal_ready_session_without_child_is_history() {
         "{}",
         String::from_utf8_lossy(&output.stdout)
     );
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(output.stdout).unwrap(),
+        "prepare-isolated-legacy-fixture-migration-manifest result=prepared status=0\n"
+    );
     assert!(fixture.manifest.exists());
     assert!(!fixture.evidence.exists());
     assert!(!fixture.root.join(".runtime-admission.lock").exists());
