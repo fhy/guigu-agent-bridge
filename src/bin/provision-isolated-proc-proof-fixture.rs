@@ -4,6 +4,8 @@ use std::{fmt::Write as _, io::Write as _, path::PathBuf};
 mod orchestration;
 #[path = "provision-isolated-proc-proof-fixture/prepare_boundary.rs"]
 mod prepare_boundary;
+#[path = "provision-isolated-proc-proof-fixture/unit_bootstrap.rs"]
+mod unit_bootstrap;
 
 use guigu_agent_bridge::privileged_proc_proof::{
     FixturePaths, StageCause, provision_temp_fixture, stage_policy, teardown_temp_fixture,
@@ -249,6 +251,24 @@ fn main() {
             println!("{}", evidence.line());
             if std::io::stdout().flush().is_err() || !evidence.is_success() {
                 std::process::exit(3);
+            }
+        }
+        Some("production-bootstrap-isolated-unit") => {
+            if args.next().is_some() {
+                std::process::exit(3);
+            }
+            match unit_bootstrap::run_production() {
+                Ok(outcome) => println!(
+                    "production-bootstrap-isolated-unit result={} status=0",
+                    outcome.code()
+                ),
+                Err(cause) => {
+                    println!(
+                        "production-bootstrap-isolated-unit result=rejected status=3 cause={}",
+                        cause.code()
+                    );
+                    std::process::exit(3);
+                }
             }
         }
         Some("production-prepare-boundary") => {
