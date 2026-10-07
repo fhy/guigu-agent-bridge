@@ -429,6 +429,34 @@ async fn terminal_ready_session_fixture() -> Fixture {
 }
 
 #[tokio::test]
+async fn terminal_ready_session_without_child_is_history() {
+    let fixture = Fixture::new_unprepared().await;
+    let pool = connect(&fixture.db).await.unwrap();
+    sqlx::query("UPDATE sessions SET state='ready' WHERE session_id='closed-session'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE delivery_dispositions SET session_id='closed-session' WHERE delivery_id='delivery'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let output = fixture.prepare().output().unwrap();
+    assert_eq!(
+        output.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(fixture.manifest.exists());
+    assert!(!fixture.evidence.exists());
+    assert!(!fixture.root.join(".runtime-admission.lock").exists());
+}
+
+#[tokio::test]
 async fn terminal_ready_session_is_history_but_every_open_chain_drift_refuses() {
     let fixture = terminal_ready_session_fixture().await;
     let output = fixture
@@ -470,7 +498,7 @@ async fn terminal_ready_session_is_history_but_every_open_chain_drift_refuses() 
         ),
         (
             "child",
-            "UPDATE delivery_dispositions SET child_fingerprint=NULL,reap_status=NULL,reap_at=NULL",
+            "UPDATE delivery_dispositions SET child_fingerprint=NULL",
         ),
         (
             "reap",

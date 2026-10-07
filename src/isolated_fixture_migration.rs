@@ -186,9 +186,9 @@ WHERE s.state <> 'closed'
       AND d.target_endpoint_id = s.endpoint_id
       AND t.conversation_id = s.conversation_id
       AND p.state = 'terminal'
-      AND p.child_fingerprint IS NOT NULL
-      AND p.reap_status = 'reaped'
-      AND p.reap_at IS NOT NULL
+      AND ((p.child_fingerprint IS NULL AND p.reap_status IS NULL AND p.reap_at IS NULL)
+        OR (p.child_fingerprint IS NOT NULL AND p.reap_status = 'reaped'
+          AND p.reap_at IS NOT NULL))
       AND d.acknowledged_at IS NOT NULL
       AND a.state = 'terminal'
       AND a.runtime_instance = l.owner_token
