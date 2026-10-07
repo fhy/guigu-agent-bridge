@@ -178,8 +178,21 @@ fn verify_staged(file: &mut File, identity: Identity) -> Result<(), Cause> {
         .map_err(|_| write)?;
     let after = file.metadata().map_err(|_| write)?;
     if bytes != UNIT
-        || (before.dev(), before.ino(), before.mode(), before.len())
-            != (after.dev(), after.ino(), after.mode(), after.len())
+        || (
+            before.dev(),
+            before.ino(),
+            before.uid(),
+            before.gid(),
+            before.mode(),
+            before.len(),
+        ) != (
+            after.dev(),
+            after.ino(),
+            after.uid(),
+            after.gid(),
+            after.mode(),
+            after.len(),
+        )
     {
         return Err(write);
     }
@@ -228,6 +241,25 @@ fn rename_noreplace(parent: &File, from: &str, to: &str, cause: Cause) -> Result
     if result == 0 { Ok(()) } else { Err(cause) }
 }
 
+fn publish_verified(parent: &File, file: &File) -> Result<(), Cause> {
+    let source = c_name(&format!("/proc/self/fd/{}", file.as_raw_fd()));
+    let unit = c_name(UNIT_NAME);
+    let result = unsafe {
+        libc::linkat(
+            libc::AT_FDCWD,
+            source.as_ptr(),
+            parent.as_raw_fd(),
+            unit.as_ptr(),
+            libc::AT_SYMLINK_FOLLOW,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(Cause::Artifact(ArtifactStage::Publish))
+    }
+}
+
 fn quarantine(
     parent: &File,
     name: &str,
@@ -260,17 +292,18 @@ fn parent_still_bound(path: &Path, parent: &File) -> bool {
 #[derive(Clone, Copy)]
 enum HookPoint {
     ParentAuthenticated,
-    BeforePublish,
+    BeforeVerify,
+    AfterVerify,
 }
 
 fn run_with_reload_and_hook(
     parent_path: &Path,
-    mut hook: impl FnMut(HookPoint),
+    mut hook: impl FnMut(HookPoint, Option<libc::c_int>),
     mut reload: impl FnMut() -> bool,
     fault: Option<ArtifactStage>,
 ) -> Result<Outcome, Cause> {
     let parent = authenticated_parent(parent_path)?;
-    hook(HookPoint::ParentAuthenticated);
+    hook(HookPoint::ParentAuthenticated, None);
     let inspect = Cause::Artifact(ArtifactStage::Inspect);
     if fault == Some(ArtifactStage::Inspect)
         || inspect_leaf(&parent, QUARANTINE_NAME, inspect)?.is_some()
@@ -290,13 +323,16 @@ fn run_with_reload_and_hook(
     if inspect_leaf(&parent, UNIT_NAME, inspect)?.is_some() {
         return Err(inspect);
     }
+    if inspect_leaf(&parent, TEMP_NAME, Cause::Artifact(ArtifactStage::Create))?.is_some() {
+        return Err(Cause::Artifact(ArtifactStage::Create));
+    }
     if fault == Some(ArtifactStage::Create) {
         return Err(Cause::Artifact(ArtifactStage::Create));
     }
     let mut file = open_leaf(
         &parent,
-        TEMP_NAME,
-        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        ".",
+        libc::O_RDWR | libc::O_TMPFILE | libc::O_CLOEXEC,
         0o600,
     )
     .map_err(|_| Cause::Artifact(ArtifactStage::Create))?;
@@ -325,26 +361,23 @@ fn run_with_reload_and_hook(
             .map_err(|_| Cause::Artifact(ArtifactStage::Chmod))?;
         file.sync_all()
             .map_err(|_| Cause::Artifact(ArtifactStage::FileSync))?;
-        hook(HookPoint::BeforePublish);
+        hook(HookPoint::BeforeVerify, Some(file.as_raw_fd()));
         verify_staged(&mut file, identity)?;
-        drop(file);
+        hook(HookPoint::AfterVerify, Some(file.as_raw_fd()));
         if fault == Some(ArtifactStage::Publish) {
             return Err(Cause::Artifact(ArtifactStage::Publish));
         }
-        rename_noreplace(
-            &parent,
-            TEMP_NAME,
-            UNIT_NAME,
-            Cause::Artifact(ArtifactStage::Publish),
-        )?;
+        publish_verified(&parent, &file)?;
+        if inspect_leaf(&parent, TEMP_NAME, Cause::Artifact(ArtifactStage::Publish))?.is_some() {
+            quarantine(&parent, UNIT_NAME, identity, true)?;
+            return Err(Cause::Artifact(ArtifactStage::Publish));
+        }
+        drop(file);
         Ok(())
     })();
     match staged {
         Ok(()) => {}
-        Err(cause) => {
-            quarantine(&parent, TEMP_NAME, identity, false)?;
-            return Err(cause);
-        }
+        Err(cause) => return Err(cause),
     }
     if fault == Some(ArtifactStage::ParentSync) || parent.sync_all().is_err() {
         quarantine(&parent, UNIT_NAME, identity, true)?;
@@ -368,7 +401,7 @@ fn run_with_reload_and_hook(
 }
 
 fn run_with_reload(parent_path: &Path, reload: impl FnMut() -> bool) -> Result<Outcome, Cause> {
-    run_with_reload_and_hook(parent_path, |_| {}, reload, None)
+    run_with_reload_and_hook(parent_path, |_, _| {}, reload, None)
 }
 
 pub(super) fn run_production() -> Result<Outcome, Cause> {
@@ -531,7 +564,7 @@ mod tests {
         assert_eq!(
             run_with_reload_and_hook(
                 &active,
-                |point| {
+                |point, _| {
                     if matches!(point, HookPoint::ParentAuthenticated) {
                         std::fs::rename(&active, &retained).unwrap();
                         std::fs::create_dir(&active).unwrap();
@@ -555,14 +588,14 @@ mod tests {
     }
 
     #[test]
-    fn publication_collision_preserves_foreign_leaf_and_quarantines_staged_inode() {
+    fn publication_collision_preserves_foreign_leaf_without_publishing_staged_inode() {
         let temp = parent();
         let foreign = b"foreign-unit";
         assert_eq!(
             run_with_reload_and_hook(
                 temp.path(),
-                |point| {
-                    if matches!(point, HookPoint::BeforePublish) {
+                |point, _| {
+                    if matches!(point, HookPoint::AfterVerify) {
                         std::fs::write(temp.path().join(UNIT_NAME), foreign).unwrap();
                     }
                 },
@@ -572,11 +605,38 @@ mod tests {
             Err(Cause::Artifact(ArtifactStage::Publish))
         );
         assert_eq!(std::fs::read(temp.path().join(UNIT_NAME)).unwrap(), foreign);
+        assert!(!temp.path().join(QUARANTINE_NAME).exists());
+        assert!(!temp.path().join(TEMP_NAME).exists());
+    }
+
+    #[test]
+    fn post_verify_temp_replacement_cannot_be_published_and_is_preserved() {
+        let temp = parent();
+        let foreign = b"foreign-post-verify-temp";
+        let mut reloaded = false;
+        assert_eq!(
+            run_with_reload_and_hook(
+                temp.path(),
+                |point, _| {
+                    if matches!(point, HookPoint::AfterVerify) {
+                        std::fs::write(temp.path().join(TEMP_NAME), foreign).unwrap();
+                    }
+                },
+                || {
+                    reloaded = true;
+                    true
+                },
+                None,
+            ),
+            Err(Cause::Artifact(ArtifactStage::Publish))
+        );
+        assert!(!reloaded);
+        assert_eq!(std::fs::read(temp.path().join(TEMP_NAME)).unwrap(), foreign);
+        assert!(!temp.path().join(UNIT_NAME).exists());
         assert_eq!(
             std::fs::read(temp.path().join(QUARANTINE_NAME)).unwrap(),
             UNIT
         );
-        assert!(!temp.path().join(TEMP_NAME).exists());
     }
 
     #[test]
@@ -586,11 +646,11 @@ mod tests {
         assert_eq!(
             run_with_reload_and_hook(
                 temp.path(),
-                |point| {
-                    if matches!(point, HookPoint::BeforePublish) {
+                |point, fd| {
+                    if matches!(point, HookPoint::BeforeVerify) {
                         let mut staged = OpenOptions::new()
                             .append(true)
-                            .open(temp.path().join(TEMP_NAME))
+                            .open(format!("/proc/self/fd/{}", fd.unwrap()))
                             .unwrap();
                         staged.write_all(&vec![b'x'; 698 - UNIT.len()]).unwrap();
                         staged.sync_all().unwrap();
@@ -607,12 +667,7 @@ mod tests {
         assert!(!reloaded);
         assert!(!temp.path().join(UNIT_NAME).exists());
         assert!(!temp.path().join(TEMP_NAME).exists());
-        assert_eq!(
-            std::fs::metadata(temp.path().join(QUARANTINE_NAME))
-                .unwrap()
-                .len(),
-            698
-        );
+        assert!(!temp.path().join(QUARANTINE_NAME).exists());
     }
 
     #[test]
@@ -639,7 +694,7 @@ mod tests {
     }
 
     #[test]
-    fn injected_pre_reload_artifact_stages_are_exact_and_retain_owned_residue() {
+    fn injected_pre_reload_artifact_stages_are_exact_and_residue_safe() {
         for stage in [
             ArtifactStage::Write,
             ArtifactStage::FileSync,
@@ -651,7 +706,7 @@ mod tests {
             assert_eq!(
                 run_with_reload_and_hook(
                     temp.path(),
-                    |_| {},
+                    |_, _| {},
                     || {
                         reloaded = true;
                         true
@@ -663,7 +718,10 @@ mod tests {
             assert!(!reloaded);
             assert!(!temp.path().join(UNIT_NAME).exists());
             assert!(!temp.path().join(TEMP_NAME).exists());
-            assert!(temp.path().join(QUARANTINE_NAME).is_file());
+            assert_eq!(
+                temp.path().join(QUARANTINE_NAME).is_file(),
+                stage == ArtifactStage::ParentSync
+            );
         }
     }
 
