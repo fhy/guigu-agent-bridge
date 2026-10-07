@@ -154,11 +154,34 @@ fn synthetic_cleanup_and_diagnostics_leave_no_residue() {
 }
 
 #[test]
+fn production_child_invocation_enables_fixed_diagnostics() {
+    let script = format!(
+        "test \"$T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC\" = 1 || exit 9; printf 'prepare-isolated-legacy-fixture-migration-manifest stage=preflight cause=root-path counts=failures=1\\n'; printf '%s' '{TERMINAL_REFUSED}'; exit 3"
+    );
+    let args = vec![COMMAND.to_owned()];
+    let mut command = shell(&script);
+    configure_child(&mut command, &args);
+    let child = capture(command, Duration::from_secs(2)).unwrap();
+    let classification = classify(&child);
+    assert_eq!(classification.status, 3);
+    assert_eq!(classification.cause, "prepare");
+    assert_eq!(classification.stdout, StreamShape::Valid);
+    assert_eq!(classification.stderr, "empty");
+    assert_eq!(classification.reap, "complete");
+    assert_eq!(classification.prepare_stage, "preflight");
+    assert_eq!(classification.prepare_cause, "root-path");
+    let line = result_line(&binding(&args), &classification);
+    assert!(!line.contains("planted-secret-body"));
+}
+
+#[test]
 fn fixed_generic_and_eligibility_aggregate_diagnostics_are_valid() {
     for diagnostic in [
         "stage=preflight cause=arguments counts=failures=1",
         "stage=preflight cause=binary-path counts=failures=1",
         "stage=sqlite-open cause=sidecar-auth counts=failures=1",
+        "stage=sqlite-close cause=sidecar-replacement-write counts=failures=1",
+        "stage=sqlite-close cause=sidecar-replacement-mode counts=failures=1",
     ] {
         let generic = classify(&result(&format!(
             "printf 'prepare-isolated-legacy-fixture-migration-manifest {diagnostic}\\n'; printf '%s' '{TERMINAL_REFUSED}'; exit 3"

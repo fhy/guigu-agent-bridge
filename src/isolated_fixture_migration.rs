@@ -885,9 +885,26 @@ pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
         use std::os::unix::fs::PermissionsExt;
 
         let wal = PathBuf::from(format!("{}-wal", database.to_string_lossy()));
-        std::fs::write(&wal, b"replacement").map_err(|_| Error::Rejected)?;
-        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o600))
-            .map_err(|_| Error::Rejected)?;
+        if prepare_test_fault("sidecar-replacement-write") {
+            return Err(prepare_rejected(
+                "sqlite-close",
+                "sidecar-replacement-write",
+                Error::Rejected,
+            ));
+        }
+        std::fs::write(&wal, b"replacement").map_err(|_| {
+            prepare_rejected("sqlite-close", "sidecar-replacement-write", Error::Rejected)
+        })?;
+        if prepare_test_fault("sidecar-replacement-mode") {
+            return Err(prepare_rejected(
+                "sqlite-close",
+                "sidecar-replacement-mode",
+                Error::Rejected,
+            ));
+        }
+        std::fs::set_permissions(&wal, std::fs::Permissions::from_mode(0o600)).map_err(|_| {
+            prepare_rejected("sqlite-close", "sidecar-replacement-mode", Error::Rejected)
+        })?;
     }
     sidecars
         .revalidate(&database)

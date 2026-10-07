@@ -55,6 +55,8 @@ fn canonical_cause(value: &str) -> Option<&'static str> {
             "sibling-receipts",
             "rollback",
             "connection",
+            "sidecar-replacement-write",
+            "sidecar-replacement-mode",
             "runtime-absence",
             "config-identity",
             "database-identity",
@@ -155,7 +157,14 @@ fn generic(stage: &str, cause: &str) -> bool {
         ),
         "eligibility" => cause == "durable-facts",
         "sqlite-read" => matches!(cause, "pre-snapshot" | "post-snapshot" | "sibling-receipts"),
-        "sqlite-close" => matches!(cause, "rollback" | "connection" | "sidecar-revalidation"),
+        "sqlite-close" => matches!(
+            cause,
+            "rollback"
+                | "connection"
+                | "sidecar-replacement-write"
+                | "sidecar-replacement-mode"
+                | "sidecar-revalidation"
+        ),
         "postflight" => matches!(
             cause,
             "admission-lock"

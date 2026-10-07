@@ -1140,6 +1140,51 @@ async fn post_close_sidecar_replacement_is_fixed_redacted_and_fail_closed() {
 }
 
 #[tokio::test]
+async fn sidecar_replacement_setup_failures_are_fixed_redacted_and_invariant() {
+    for fault in ["sidecar-replacement-write", "sidecar-replacement-mode"] {
+        let fixture = Fixture::new_unprepared().await;
+        let before = durable_rows(&fixture.db).await;
+        let tree = fixture_tree(&fixture.root);
+        let output = fixture
+            .prepare()
+            .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+            .env(
+                "T050_FIXTURE_MIGRATION_TEST_REPLACE_SIDECAR_AFTER_CLOSE",
+                "1",
+            )
+            .env("T050_FIXTURE_MIGRATION_TEST_PREPARE_FAULT", fault)
+            .output()
+            .unwrap();
+
+        assert_eq!(output.status.code(), Some(3), "fault={fault}");
+        assert!(output.stderr.is_empty(), "fault={fault}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.contains(&format!(
+                "stage=sqlite-close cause={fault} counts=failures=1"
+            )),
+            "fault={fault} stdout={stdout}"
+        );
+        assert!(stdout.contains(
+            "prepare-isolated-legacy-fixture-migration-manifest result=rejected status=3"
+        ));
+        assert!(!stdout.contains(fixture.root.to_str().unwrap()));
+        assert_eq!(durable_rows(&fixture.db).await, before, "fault={fault}");
+        assert_eq!(fixture_tree(&fixture.root), tree, "fault={fault}");
+        assert!(!fixture.manifest.exists(), "fault={fault}");
+        assert!(!fixture.evidence.exists(), "fault={fault}");
+        assert!(
+            !fixture.root.join(".t050-fixture-migration-marker").exists(),
+            "fault={fault}"
+        );
+        assert!(
+            !fixture.root.join(".runtime-admission.lock").exists(),
+            "fault={fault}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn postflight_identity_and_serialization_failures_are_fixed_and_invariant() {
     for (fault, stage) in [
         ("config-identity", "postflight"),

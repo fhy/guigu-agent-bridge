@@ -296,11 +296,17 @@ fn emit_result(binding: &str, classification: &Classification) -> Result<(), ()>
     std::io::stdout().flush().map_err(|_| ())
 }
 
+fn configure_child(command: &mut Command, args: &[String]) {
+    command
+        .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+        .args(args);
+}
+
 fn run_command(mut command: Command, args: &[String], deadline: Duration) -> Result<(), ()> {
     let binding = binding(args);
     println!("production-prepare-boundary phase=start status=attempting binding_sha256={binding}");
     std::io::stdout().flush().map_err(|_| ())?;
-    command.args(args);
+    configure_child(&mut command, args);
     let result = match capture(command, deadline) {
         Ok(result) => result,
         Err(()) => {
