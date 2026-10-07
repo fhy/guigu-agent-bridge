@@ -264,8 +264,9 @@ fn main() {
                 ),
                 Err(cause) => {
                     println!(
-                        "production-bootstrap-isolated-unit result=rejected status=3 cause={}",
-                        cause.code()
+                        "production-bootstrap-isolated-unit result=rejected status=3 cause={} substage={}",
+                        cause.code(),
+                        cause.substage()
                     );
                     std::process::exit(3);
                 }

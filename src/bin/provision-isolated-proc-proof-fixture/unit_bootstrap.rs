@@ -1,6 +1,6 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{Read as _, Write as _},
+    io::{Read as _, Seek as _, Write as _},
     os::{
         fd::{AsRawFd as _, FromRawFd as _},
         unix::fs::{MetadataExt as _, OpenOptionsExt as _, PermissionsExt as _},
@@ -34,7 +34,7 @@ impl Outcome {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub(super) enum Cause {
     Parent,
-    Artifact,
+    Artifact(ArtifactStage),
     Reload,
     Rollback,
 }
@@ -43,9 +43,43 @@ impl Cause {
     pub(super) const fn code(self) -> &'static str {
         match self {
             Self::Parent => "parent",
-            Self::Artifact => "artifact",
+            Self::Artifact(_) => "artifact",
             Self::Reload => "reload",
             Self::Rollback => "rollback",
+        }
+    }
+
+    pub(super) const fn substage(self) -> &'static str {
+        match self {
+            Self::Artifact(stage) => stage.code(),
+            Self::Parent | Self::Reload | Self::Rollback => "none",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(super) enum ArtifactStage {
+    Inspect,
+    Create,
+    Write,
+    FileSync,
+    Chmod,
+    Publish,
+    ParentSync,
+    ParentBinding,
+}
+
+impl ArtifactStage {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::Inspect => "inspect",
+            Self::Create => "create",
+            Self::Write => "write",
+            Self::FileSync => "file-sync",
+            Self::Chmod => "chmod",
+            Self::Publish => "publish",
+            Self::ParentSync => "parent-sync",
+            Self::ParentBinding => "parent-binding",
         }
     }
 }
@@ -106,20 +140,50 @@ fn inspect_leaf(parent: &File, name: &str, cause: Cause) -> Result<Option<File>,
 }
 
 fn exact_unit(parent: &File) -> Result<bool, Cause> {
-    let Some(mut file) = inspect_leaf(parent, UNIT_NAME, Cause::Artifact)? else {
+    let inspect = Cause::Artifact(ArtifactStage::Inspect);
+    let Some(mut file) = inspect_leaf(parent, UNIT_NAME, inspect)? else {
         return Ok(false);
     };
-    let metadata = file.metadata().map_err(|_| Cause::Artifact)?;
+    let metadata = file.metadata().map_err(|_| inspect)?;
     if !metadata.is_file()
         || metadata.uid() != unsafe { libc::geteuid() }
         || metadata.gid() != unsafe { libc::getegid() }
         || metadata.mode() & 0o7777 != 0o644
     {
-        return Err(Cause::Artifact);
+        return Err(inspect);
     }
     let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes).map_err(|_| Cause::Artifact)?;
+    file.read_to_end(&mut bytes).map_err(|_| inspect)?;
     Ok(bytes == UNIT)
+}
+
+fn verify_staged(file: &mut File, identity: Identity) -> Result<(), Cause> {
+    let write = Cause::Artifact(ArtifactStage::Write);
+    let before = file.metadata().map_err(|_| write)?;
+    if !before.is_file()
+        || before.dev() != identity.dev
+        || before.ino() != identity.ino
+        || before.uid() != unsafe { libc::geteuid() }
+        || before.gid() != unsafe { libc::getegid() }
+        || before.mode() & 0o7777 != 0o644
+        || before.len() != UNIT.len() as u64
+    {
+        return Err(write);
+    }
+    file.rewind().map_err(|_| write)?;
+    let mut bytes = Vec::with_capacity(UNIT.len() + 1);
+    (&mut *file)
+        .take(UNIT.len() as u64 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|_| write)?;
+    let after = file.metadata().map_err(|_| write)?;
+    if bytes != UNIT
+        || (before.dev(), before.ino(), before.mode(), before.len())
+            != (after.dev(), after.ino(), after.mode(), after.len())
+    {
+        return Err(write);
+    }
+    Ok(())
 }
 
 fn verify_quarantine(
@@ -203,15 +267,19 @@ fn run_with_reload_and_hook(
     parent_path: &Path,
     mut hook: impl FnMut(HookPoint),
     mut reload: impl FnMut() -> bool,
+    fault: Option<ArtifactStage>,
 ) -> Result<Outcome, Cause> {
     let parent = authenticated_parent(parent_path)?;
     hook(HookPoint::ParentAuthenticated);
-    if inspect_leaf(&parent, QUARANTINE_NAME, Cause::Artifact)?.is_some() {
-        return Err(Cause::Artifact);
+    let inspect = Cause::Artifact(ArtifactStage::Inspect);
+    if fault == Some(ArtifactStage::Inspect)
+        || inspect_leaf(&parent, QUARANTINE_NAME, inspect)?.is_some()
+    {
+        return Err(inspect);
     }
     if exact_unit(&parent)? {
         if !parent_still_bound(parent_path, &parent) {
-            return Err(Cause::Parent);
+            return Err(Cause::Artifact(ArtifactStage::ParentBinding));
         }
         return if reload() {
             Ok(Outcome::AlreadyPresent)
@@ -219,30 +287,56 @@ fn run_with_reload_and_hook(
             Err(Cause::Reload)
         };
     }
-    if inspect_leaf(&parent, UNIT_NAME, Cause::Artifact)?.is_some() {
-        return Err(Cause::Artifact);
+    if inspect_leaf(&parent, UNIT_NAME, inspect)?.is_some() {
+        return Err(inspect);
+    }
+    if fault == Some(ArtifactStage::Create) {
+        return Err(Cause::Artifact(ArtifactStage::Create));
     }
     let mut file = open_leaf(
         &parent,
         TEMP_NAME,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        libc::O_RDWR | libc::O_CREAT | libc::O_EXCL | libc::O_NOFOLLOW | libc::O_CLOEXEC,
         0o600,
     )
-    .map_err(|_| Cause::Artifact)?;
-    let metadata = file.metadata().map_err(|_| Cause::Artifact)?;
+    .map_err(|_| Cause::Artifact(ArtifactStage::Create))?;
+    let metadata = file
+        .metadata()
+        .map_err(|_| Cause::Artifact(ArtifactStage::Create))?;
     let identity = Identity {
         dev: metadata.dev(),
         ino: metadata.ino(),
     };
     let staged = (|| {
-        file.write_all(UNIT).map_err(|_| Cause::Artifact)?;
-        file.sync_all().map_err(|_| Cause::Artifact)?;
+        if fault == Some(ArtifactStage::Write) {
+            return Err(Cause::Artifact(ArtifactStage::Write));
+        }
+        file.write_all(UNIT)
+            .map_err(|_| Cause::Artifact(ArtifactStage::Write))?;
+        if fault == Some(ArtifactStage::FileSync) {
+            return Err(Cause::Artifact(ArtifactStage::FileSync));
+        }
+        file.sync_all()
+            .map_err(|_| Cause::Artifact(ArtifactStage::FileSync))?;
+        if fault == Some(ArtifactStage::Chmod) {
+            return Err(Cause::Artifact(ArtifactStage::Chmod));
+        }
         file.set_permissions(std::fs::Permissions::from_mode(0o644))
-            .map_err(|_| Cause::Artifact)?;
-        file.sync_all().map_err(|_| Cause::Artifact)?;
-        drop(file);
+            .map_err(|_| Cause::Artifact(ArtifactStage::Chmod))?;
+        file.sync_all()
+            .map_err(|_| Cause::Artifact(ArtifactStage::FileSync))?;
         hook(HookPoint::BeforePublish);
-        rename_noreplace(&parent, TEMP_NAME, UNIT_NAME, Cause::Artifact)?;
+        verify_staged(&mut file, identity)?;
+        drop(file);
+        if fault == Some(ArtifactStage::Publish) {
+            return Err(Cause::Artifact(ArtifactStage::Publish));
+        }
+        rename_noreplace(
+            &parent,
+            TEMP_NAME,
+            UNIT_NAME,
+            Cause::Artifact(ArtifactStage::Publish),
+        )?;
         Ok(())
     })();
     match staged {
@@ -252,13 +346,13 @@ fn run_with_reload_and_hook(
             return Err(cause);
         }
     }
-    if parent.sync_all().is_err() {
+    if fault == Some(ArtifactStage::ParentSync) || parent.sync_all().is_err() {
         quarantine(&parent, UNIT_NAME, identity, true)?;
-        return Err(Cause::Artifact);
+        return Err(Cause::Artifact(ArtifactStage::ParentSync));
     }
-    if !parent_still_bound(parent_path, &parent) {
+    if fault == Some(ArtifactStage::ParentBinding) || !parent_still_bound(parent_path, &parent) {
         quarantine(&parent, UNIT_NAME, identity, true)?;
-        return Err(Cause::Parent);
+        return Err(Cause::Artifact(ArtifactStage::ParentBinding));
     }
     if reload() {
         return Ok(Outcome::Installed);
@@ -274,7 +368,7 @@ fn run_with_reload_and_hook(
 }
 
 fn run_with_reload(parent_path: &Path, reload: impl FnMut() -> bool) -> Result<Outcome, Cause> {
-    run_with_reload_and_hook(parent_path, |_| {}, reload)
+    run_with_reload_and_hook(parent_path, |_| {}, reload, None)
 }
 
 pub(super) fn run_production() -> Result<Outcome, Cause> {
@@ -331,7 +425,11 @@ mod tests {
                     called = true;
                     true
                 }),
-                Err(Cause::Artifact)
+                Err(Cause::Artifact(if name == UNIT_NAME {
+                    ArtifactStage::Inspect
+                } else {
+                    ArtifactStage::Create
+                }))
             );
             assert!(!called);
             assert_eq!(std::fs::read(path).unwrap(), before);
@@ -371,7 +469,10 @@ mod tests {
                 _ => unreachable!(),
             }
             let before = std::fs::symlink_metadata(&unit).unwrap();
-            assert_eq!(run_with_reload(temp.path(), || true), Err(Cause::Artifact));
+            assert_eq!(
+                run_with_reload(temp.path(), || true),
+                Err(Cause::Artifact(ArtifactStage::Inspect))
+            );
             let after = std::fs::symlink_metadata(&unit).unwrap();
             assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
             assert!(!temp.path().join(TEMP_NAME).exists());
@@ -443,8 +544,9 @@ mod tests {
                     reloaded = true;
                     true
                 },
+                None,
             ),
-            Err(Cause::Parent)
+            Err(Cause::Artifact(ArtifactStage::ParentBinding))
         );
         assert!(!reloaded);
         assert_eq!(std::fs::read(active.join(UNIT_NAME)).unwrap(), foreign);
@@ -465,8 +567,9 @@ mod tests {
                     }
                 },
                 || true,
+                None,
             ),
-            Err(Cause::Artifact)
+            Err(Cause::Artifact(ArtifactStage::Publish))
         );
         assert_eq!(std::fs::read(temp.path().join(UNIT_NAME)).unwrap(), foreign);
         assert_eq!(
@@ -474,6 +577,42 @@ mod tests {
             UNIT
         );
         assert!(!temp.path().join(TEMP_NAME).exists());
+    }
+
+    #[test]
+    fn staged_698_byte_mutation_is_rejected_before_publication() {
+        let temp = parent();
+        let mut reloaded = false;
+        assert_eq!(
+            run_with_reload_and_hook(
+                temp.path(),
+                |point| {
+                    if matches!(point, HookPoint::BeforePublish) {
+                        let mut staged = OpenOptions::new()
+                            .append(true)
+                            .open(temp.path().join(TEMP_NAME))
+                            .unwrap();
+                        staged.write_all(&vec![b'x'; 698 - UNIT.len()]).unwrap();
+                        staged.sync_all().unwrap();
+                    }
+                },
+                || {
+                    reloaded = true;
+                    true
+                },
+                None,
+            ),
+            Err(Cause::Artifact(ArtifactStage::Write))
+        );
+        assert!(!reloaded);
+        assert!(!temp.path().join(UNIT_NAME).exists());
+        assert!(!temp.path().join(TEMP_NAME).exists());
+        assert_eq!(
+            std::fs::metadata(temp.path().join(QUARANTINE_NAME))
+                .unwrap()
+                .len(),
+            698
+        );
     }
 
     #[test]
@@ -497,5 +636,56 @@ mod tests {
         assert_eq!(std::fs::read(saved).unwrap(), UNIT);
         assert_eq!(std::fs::read(temp.path().join(UNIT_NAME)).unwrap(), foreign);
         assert!(!temp.path().join(QUARANTINE_NAME).exists());
+    }
+
+    #[test]
+    fn injected_pre_reload_artifact_stages_are_exact_and_retain_owned_residue() {
+        for stage in [
+            ArtifactStage::Write,
+            ArtifactStage::FileSync,
+            ArtifactStage::Chmod,
+            ArtifactStage::ParentSync,
+        ] {
+            let temp = parent();
+            let mut reloaded = false;
+            assert_eq!(
+                run_with_reload_and_hook(
+                    temp.path(),
+                    |_| {},
+                    || {
+                        reloaded = true;
+                        true
+                    },
+                    Some(stage),
+                ),
+                Err(Cause::Artifact(stage))
+            );
+            assert!(!reloaded);
+            assert!(!temp.path().join(UNIT_NAME).exists());
+            assert!(!temp.path().join(TEMP_NAME).exists());
+            assert!(temp.path().join(QUARANTINE_NAME).is_file());
+        }
+    }
+
+    #[test]
+    fn artifact_substage_codes_are_fixed_and_complete() {
+        let cases = [
+            (ArtifactStage::Inspect, "inspect"),
+            (ArtifactStage::Create, "create"),
+            (ArtifactStage::Write, "write"),
+            (ArtifactStage::FileSync, "file-sync"),
+            (ArtifactStage::Chmod, "chmod"),
+            (ArtifactStage::Publish, "publish"),
+            (ArtifactStage::ParentSync, "parent-sync"),
+            (ArtifactStage::ParentBinding, "parent-binding"),
+        ];
+        for (stage, code) in cases {
+            let cause = Cause::Artifact(stage);
+            assert_eq!(cause.code(), "artifact");
+            assert_eq!(cause.substage(), code);
+        }
+        for cause in [Cause::Parent, Cause::Reload, Cause::Rollback] {
+            assert_eq!(cause.substage(), "none");
+        }
     }
 }
