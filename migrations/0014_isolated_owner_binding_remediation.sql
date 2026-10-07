@@ -1,6 +1,6 @@
 CREATE TABLE isolated_owner_binding_remediation_witness (
     singleton INTEGER PRIMARY KEY NOT NULL CHECK (singleton = 1),
-    contract_version INTEGER NOT NULL CHECK (contract_version = 1),
+    contract_version INTEGER NOT NULL CHECK (contract_version = 2),
     operation_id TEXT NOT NULL UNIQUE CHECK (length(operation_id) = 36),
     backup_snapshot_sha256 TEXT NOT NULL CHECK (
         length(backup_snapshot_sha256) = 64
@@ -9,6 +9,10 @@ CREATE TABLE isolated_owner_binding_remediation_witness (
     backup_source_set_sha256 TEXT NOT NULL CHECK (
         length(backup_source_set_sha256) = 64
         AND backup_source_set_sha256 NOT GLOB '*[^0-9a-f]*'
+    ),
+    observed_live_source_set_sha256 TEXT NOT NULL CHECK (
+        length(observed_live_source_set_sha256) = 64
+        AND observed_live_source_set_sha256 NOT GLOB '*[^0-9a-f]*'
     ),
     migration_version INTEGER NOT NULL CHECK (migration_version = 14),
     migration_checksum_digest TEXT NOT NULL CHECK (

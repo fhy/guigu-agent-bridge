@@ -4,8 +4,10 @@ use sha2::{Digest, Sha256};
 use sqlx::{Connection, Row, SqliteConnection, sqlite::SqliteConnectOptions};
 
 const COMMAND: &str = "remediate-isolated-owner-bindings";
-const CONTRACT_VERSION: i64 = 1;
+const CONTRACT_VERSION: i64 = 2;
 const MIGRATION_VERSION: i64 = 14;
+const EXPECTED_LIVE_SOURCE_SET_SHA256: &str =
+    "fdae494127ac9acf616ce16d0e0f5cb9a0ab3d3ac1cc8974e5525bddb45cb10f";
 const OPERATION_NAMESPACE: uuid::Uuid =
     uuid::Uuid::from_u128(0xb0fa_773f_3de1_5cd4_a1af_9110_f33c_c7ae);
 const MIGRATION: &[u8] =
@@ -44,21 +46,28 @@ impl Failure {
 pub struct Args {
     snapshot: String,
     source_set: String,
+    observed_live_source_set: String,
 }
 
 pub fn parse_args(args: &[OsString]) -> Result<Args, Failure> {
-    if args.len() != 5
+    if args.len() != 7
         || args[0] != COMMAND
         || args[1] != "--expected-backup-sha256"
         || args[3] != "--expected-source-set-sha256"
+        || args[5] != "--expected-live-source-set-sha256"
     {
         return Err(Failure::new("arguments", "none"));
     }
     let snapshot = exact_digest(&args[2])?;
     let source_set = exact_digest(&args[4])?;
+    let observed_live_source_set = exact_digest(&args[6])?;
+    if observed_live_source_set != EXPECTED_LIVE_SOURCE_SET_SHA256 {
+        return Err(Failure::new("arguments", "none"));
+    }
     Ok(Args {
         snapshot,
         source_set,
+        observed_live_source_set,
     })
 }
 
@@ -86,11 +95,16 @@ fn framed_digest(domain: &[u8], values: &[&str]) -> String {
 }
 
 fn operation_id(args: &Args) -> String {
-    let framed = format!(
-        "GGT050-OWNER-BINDING-REMEDIATION-V1\0{}\0{}",
-        args.snapshot, args.source_set
-    );
-    uuid::Uuid::new_v5(&OPERATION_NAMESPACE, framed.as_bytes()).to_string()
+    let mut framed = b"GGT050-OWNER-BINDING-REMEDIATION-V2\0".to_vec();
+    for value in [
+        &args.snapshot,
+        &args.source_set,
+        &args.observed_live_source_set,
+    ] {
+        framed.extend_from_slice(&(value.len() as u64).to_be_bytes());
+        framed.extend_from_slice(value.as_bytes());
+    }
+    uuid::Uuid::new_v5(&OPERATION_NAMESPACE, &framed).to_string()
 }
 
 fn migration_checksum() -> String {
@@ -164,10 +178,9 @@ struct Facts {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Boundary {
-    BeforeMigration,
-    AfterMigration,
-    BeforeWitnessCommit,
-    AfterWitnessReread,
+    BeforePublication,
+    BeforePublicationCommit,
+    AfterPublicationReread,
     BeforeBusinessCommit,
     AfterBusinessReread,
 }
@@ -401,12 +414,13 @@ fn admission_digest(v: &Admission) -> String {
 
 fn witness_digest(operation: &str, args: &Args, business: &str) -> String {
     framed_digest(
-        b"GGT050-OWNER-BINDING-WITNESS-V1",
+        b"GGT050-OWNER-BINDING-WITNESS-V2",
         &[
-            "1",
+            "2",
             operation,
             &args.snapshot,
             &args.source_set,
+            &args.observed_live_source_set,
             "14",
             &migration_checksum(),
             business,
@@ -494,8 +508,9 @@ async fn authenticate_migration_ledger(
     c: &mut SqliteConnection,
     expected_versions: usize,
 ) -> Result<(), Failure> {
-    let rows: Vec<(i64, String, bool, Vec<u8>)> = sqlx::query_as(
-        "SELECT version,description,success,checksum FROM _sqlx_migrations ORDER BY version",
+    type LedgerRow = (i64, String, bool, Vec<u8>, String, i64, bool);
+    let rows: Vec<LedgerRow> = sqlx::query_as(
+        "SELECT version,description,success,checksum,installed_on,execution_time,typeof(installed_on)='text' AND length(installed_on)=19 AND strftime('%Y-%m-%d %H:%M:%S',installed_on)=installed_on FROM _sqlx_migrations ORDER BY version",
     )
     .fetch_all(&mut *c)
     .await
@@ -504,11 +519,24 @@ async fn authenticate_migration_ledger(
     if expected_versions > contract.len()
         || rows.len() != expected_versions
         || rows.iter().zip(contract.iter()).any(
-            |((version, description, success, checksum), expected)| {
+            |(
+                (
+                    version,
+                    description,
+                    success,
+                    checksum,
+                    _installed_on,
+                    execution_time,
+                    canonical_installed_on,
+                ),
+                expected,
+            )| {
                 *version != expected.0
                     || description != &expected.1
                     || !*success
                     || checksum != &expected.2
+                    || (*version == MIGRATION_VERSION
+                        && (*execution_time != -1 || !*canonical_installed_on))
             },
         )
     {
@@ -519,6 +547,10 @@ async fn authenticate_migration_ledger(
 
 async fn authenticate_0014_schema(c: &mut SqliteConnection) -> Result<(), Failure> {
     authenticate_migration_ledger(c, MIGRATION_VERSION as usize).await?;
+    authenticate_0014_tables(c).await
+}
+
+async fn authenticate_0014_tables(c: &mut SqliteConnection) -> Result<(), Failure> {
     for name in [
         "isolated_owner_binding_remediation_witness",
         "isolated_owner_binding_remediation_receipts",
@@ -534,6 +566,51 @@ async fn authenticate_0014_schema(c: &mut SqliteConnection) -> Result<(), Failur
         }
     }
     Ok(())
+}
+
+async fn exact_legacy_absence(c: &mut SqliteConnection, business: &str) -> Result<bool, Failure> {
+    if authenticate_migration_ledger(c, (MIGRATION_VERSION - 1) as usize)
+        .await
+        .is_err()
+    {
+        return Ok(false);
+    }
+    let objects: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_schema WHERE name IN ('isolated_owner_binding_remediation_witness','isolated_owner_binding_remediation_receipts')",
+    )
+    .fetch_one(&mut *c)
+    .await
+    .map_err(|_| Failure::new("migration", "compatibility"))?;
+    Ok(objects == 0 && business_digest(c).await? == business)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[allow(dead_code)] // `Unavailable` is exercised by the deterministic classifier matrix.
+enum CommitObservation {
+    Success,
+    Error,
+    Unavailable,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PublicationState {
+    LegacyAbsence,
+    Complete,
+    Other,
+}
+
+fn classify_publication(
+    observation: CommitObservation,
+    state: PublicationState,
+) -> Result<(), Failure> {
+    match (observation, state) {
+        (_, PublicationState::Complete) => Ok(()),
+        (
+            CommitObservation::Error | CommitObservation::Unavailable,
+            PublicationState::LegacyAbsence,
+        ) => Err(Failure::new("unknown-commit", "not-committed")),
+        _ => Err(Failure::new("unknown-commit", "ambiguous")),
+    }
 }
 
 async fn open_live(database: &Path) -> Result<SqliteConnection, Failure> {
@@ -554,7 +631,7 @@ async fn exact_witness(
     args: &Args,
     business: &str,
 ) -> Result<bool, Failure> {
-    let rows=sqlx::query("SELECT contract_version,operation_id,backup_snapshot_sha256,backup_source_set_sha256,migration_version,migration_checksum_digest,retained_pre0014_business_digest,migrated_pre_repair_business_digest,witness_digest FROM isolated_owner_binding_remediation_witness").fetch_all(&mut *c).await.map_err(|_|Failure::new("migration","compatibility"))?;
+    let rows=sqlx::query("SELECT contract_version,operation_id,backup_snapshot_sha256,backup_source_set_sha256,observed_live_source_set_sha256,migration_version,migration_checksum_digest,retained_pre0014_business_digest,migrated_pre_repair_business_digest,witness_digest FROM isolated_owner_binding_remediation_witness").fetch_all(&mut *c).await.map_err(|_|Failure::new("migration","compatibility"))?;
     if rows.is_empty() {
         return Ok(false);
     }
@@ -567,11 +644,12 @@ async fn exact_witness(
         get::<String>(r, 1)?,
         get::<String>(r, 2)?,
         get::<String>(r, 3)?,
-        get::<i64>(r, 4)?,
-        get::<String>(r, 5)?,
+        get::<String>(r, 4)?,
+        get::<i64>(r, 5)?,
         get::<String>(r, 6)?,
         get::<String>(r, 7)?,
         get::<String>(r, 8)?,
+        get::<String>(r, 9)?,
     );
     if values
         != (
@@ -579,6 +657,7 @@ async fn exact_witness(
             operation.to_owned(),
             args.snapshot.clone(),
             args.source_set.clone(),
+            args.observed_live_source_set.clone(),
             MIGRATION_VERSION,
             migration_checksum(),
             business.to_owned(),
@@ -783,6 +862,9 @@ async fn remediate_paths_with_boundaries(
     .await
     .map_err(|_| Failure::new("backup", "snapshot"))?;
     let retained_business = business_digest(&mut retained_c).await?;
+    if exact_legacy_absence(&mut retained_c, &retained_business).await != Ok(true) {
+        return Err(Failure::new("backup", "source-binding"));
+    }
     let retained_facts = load_facts(&mut retained_c)
         .await
         .map_err(|_| Failure::new("backup", "source-binding"))?;
@@ -790,109 +872,151 @@ async fn remediate_paths_with_boundaries(
         .close()
         .await
         .map_err(|_| Failure::new("backup", "snapshot"))?;
-    boundary(Boundary::BeforeMigration)?;
-    let pool = crate::storage::connect(database)
+    boundary(Boundary::BeforePublication)?;
+    let mut c = open_live(database).await?;
+    let latest: i64 = sqlx::query_scalar("SELECT coalesce(max(version),0) FROM _sqlx_migrations")
+        .fetch_one(&mut c)
         .await
-        .map_err(|_| Failure::new("database", "connect"))?;
-    let (applied, latest, total): (i64, i64, i64) = sqlx::query_as(
-        "SELECT (SELECT count(*) FROM _sqlx_migrations WHERE version=14 AND success=1),coalesce((SELECT max(version) FROM _sqlx_migrations),0),(SELECT count(*) FROM _sqlx_migrations WHERE success=1)",
-    )
-            .fetch_one(&pool)
-            .await
-            .map_err(|_| Failure::new("migration", "ledger"))?;
-    if !matches!(latest, 13 | 14)
-        || (latest == 13 && (total != 13 || applied != 0))
-        || (latest == 14 && (total != 14 || applied != 1))
-    {
-        return Err(Failure::new("migration", "compatibility"));
-    }
-    {
-        let mut ledger = pool
-            .acquire()
-            .await
-            .map_err(|_| Failure::new("database", "connect"))?;
-        authenticate_migration_ledger(&mut ledger, latest as usize).await?;
-    }
-    if applied == 0 {
-        let mut live = pool
-            .acquire()
-            .await
-            .map_err(|_| Failure::new("database", "connect"))?;
-        let live_business = business_digest(&mut live).await?;
-        if !legacy_source_matches || live_business != retained_business {
+        .map_err(|_| Failure::new("migration", "ledger"))?;
+    if latest == MIGRATION_VERSION - 1 {
+        authenticate_migration_ledger(&mut c, (MIGRATION_VERSION - 1) as usize).await?;
+        let live_business = business_digest(&mut c).await?;
+        if live_business != retained_business {
             return Err(Failure::new("backup", "source-binding"));
         }
-        drop(live);
-    } else if applied != 1 {
-        return Err(Failure::new("migration", "compatibility"));
-    }
-    crate::storage::migrate(&pool)
-        .await
-        .map_err(|_| Failure::new("migration", "apply"))?;
-    pool.close().await;
-    boundary(Boundary::AfterMigration)?;
-    let mut c = open_live(database).await?;
-    authenticate_0014_schema(&mut c).await?;
-    let live_business = business_digest(&mut c).await?;
-    if !exact_witness(&mut c, &operation, args, &retained_business).await? {
-        let receipts: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM isolated_owner_binding_remediation_receipts")
-                .fetch_one(&mut c)
-                .await
-                .map_err(|_| Failure::new("database", "read"))?;
-        if receipts != 0 || live_business != retained_business {
-            return Err(Failure::new("migration", "compatibility"));
-        }
+        // `legacy_source_matches` distinguishes the exact-byte and business-equivalent
+        // phases; both are authorized only after the caller-bound observed digest check.
+        let _legacy_phase_is_exact_bytes = legacy_source_matches;
         sqlx::query("BEGIN IMMEDIATE")
             .execute(&mut c)
             .await
-            .map_err(|_| Failure::new("database", "busy"))?;
-        let inserted = sqlx::query(
-            "INSERT INTO isolated_owner_binding_remediation_witness VALUES(1,1,?,?,?,14,?,?,?,?)",
-        )
-        .bind(&operation)
-        .bind(&args.snapshot)
-        .bind(&args.source_set)
-        .bind(migration_checksum())
-        .bind(&retained_business)
-        .bind(&retained_business)
-        .bind(witness_digest(&operation, args, &retained_business))
-        .execute(&mut c)
-        .await;
-        if !matches!(inserted, Ok(ref done) if done.rows_affected() == 1) {
-            if sqlx::query("ROLLBACK").execute(&mut c).await.is_err() {
-                return Err(Failure::new("unknown-commit", "ambiguous"));
+            .map_err(|_| Failure::new("migration", "busy"))?;
+        let publication = async {
+            let migration = std::str::from_utf8(MIGRATION)
+                .map_err(|_| Failure::new("migration", "apply"))?;
+            sqlx::raw_sql(migration)
+                .execute(&mut c)
+                .await
+                .map_err(|_| Failure::new("migration", "apply"))?;
+            authenticate_0014_tables(&mut c).await?;
+            let receipts: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM isolated_owner_binding_remediation_receipts",
+            )
+            .fetch_one(&mut c)
+            .await
+            .map_err(|_| Failure::new("migration", "compatibility"))?;
+            if receipts != 0 {
+                return Err(Failure::new("migration", "compatibility"));
             }
-            return Err(Failure::new("migration", "apply"));
+            let contract = crate::storage::migration_contract();
+            let migration = contract
+                .iter()
+                .find(|entry| entry.0 == MIGRATION_VERSION)
+                .ok_or_else(|| Failure::new("migration", "compatibility"))?;
+            let inserted = sqlx::query("INSERT INTO _sqlx_migrations(version,description,success,checksum,execution_time) VALUES(?1,?2,TRUE,?3,-1)")
+                .bind(migration.0)
+                .bind(&migration.1)
+                .bind(&migration.2)
+                .execute(&mut c)
+                .await
+                .map_err(|_| Failure::new("migration", "apply"))?;
+            if inserted.rows_affected() != 1 {
+                return Err(Failure::new("migration", "apply"));
+            }
+            authenticate_migration_ledger(&mut c, MIGRATION_VERSION as usize).await?;
+            let inserted = sqlx::query("INSERT INTO isolated_owner_binding_remediation_witness(singleton,contract_version,operation_id,backup_snapshot_sha256,backup_source_set_sha256,observed_live_source_set_sha256,migration_version,migration_checksum_digest,retained_pre0014_business_digest,migrated_pre_repair_business_digest,witness_digest) VALUES(1,2,?,?,?,?,14,?,?,?,?)")
+                .bind(&operation)
+                .bind(&args.snapshot)
+                .bind(&args.source_set)
+                .bind(&args.observed_live_source_set)
+                .bind(migration_checksum())
+                .bind(&retained_business)
+                .bind(&retained_business)
+                .bind(witness_digest(&operation, args, &retained_business))
+                .execute(&mut c)
+                .await
+                .map_err(|_| Failure::new("migration", "apply"))?;
+            if inserted.rows_affected() != 1
+                || !exact_witness(&mut c, &operation, args, &retained_business).await?
+                || business_digest(&mut c).await? != retained_business
+            {
+                return Err(Failure::new("migration", "compatibility"));
+            }
+            Ok::<(), Failure>(())
         }
-        boundary(Boundary::BeforeWitnessCommit)?;
+        .await;
+        if let Err(error) = publication {
+            let rollback = sqlx::query("ROLLBACK").execute(&mut c).await;
+            drop(c);
+            let mut reread = open_live(database)
+                .await
+                .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
+            boundary(Boundary::AfterPublicationReread)
+                .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
+            if rollback.is_ok()
+                && exact_legacy_absence(&mut reread, &retained_business).await == Ok(true)
+            {
+                return Err(error);
+            }
+            return Err(Failure::new("unknown-commit", "ambiguous"));
+        }
+        if let Err(error) = boundary(Boundary::BeforePublicationCommit) {
+            let rollback = sqlx::query("ROLLBACK").execute(&mut c).await;
+            drop(c);
+            let mut reread = open_live(database)
+                .await
+                .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
+            boundary(Boundary::AfterPublicationReread)
+                .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
+            if rollback.is_ok()
+                && exact_legacy_absence(&mut reread, &retained_business).await == Ok(true)
+            {
+                return Err(error);
+            }
+            return Err(Failure::new("unknown-commit", "ambiguous"));
+        }
         let commit = sqlx::query("COMMIT").execute(&mut c).await;
+        let observation = if commit.is_ok() {
+            CommitObservation::Success
+        } else {
+            CommitObservation::Error
+        };
         drop(c);
         let mut reread = open_live(database)
             .await
             .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
-        authenticate_0014_schema(&mut reread)
+        boundary(Boundary::AfterPublicationReread)
+            .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
+        let receipt_count = sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM isolated_owner_binding_remediation_receipts",
+        )
+        .fetch_one(&mut reread)
+        .await;
+        let state = if exact_legacy_absence(&mut reread, &retained_business)
             .await
-            .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
-        boundary(Boundary::AfterWitnessReread)
-            .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
-        let reread_business = business_digest(&mut reread)
-            .await
-            .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
-        let witness = exact_witness(&mut reread, &operation, args, &retained_business)
-            .await
-            .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
-        if !witness || reread_business != retained_business {
-            return Err(Failure::new(
-                "unknown-commit",
-                if commit.is_err() && !witness {
-                    "not-committed"
-                } else {
-                    "ambiguous"
-                },
-            ));
-        }
+            .unwrap_or(false)
+        {
+            PublicationState::LegacyAbsence
+        } else if authenticate_0014_schema(&mut reread).await.is_ok()
+            && exact_witness(&mut reread, &operation, args, &retained_business)
+                .await
+                .unwrap_or(false)
+            && business_digest(&mut reread).await.as_deref() == Ok(retained_business.as_str())
+            && matches!(receipt_count, Ok(0))
+        {
+            PublicationState::Complete
+        } else {
+            PublicationState::Other
+        };
+        classify_publication(observation, state)?;
         c = reread;
+    } else if latest == MIGRATION_VERSION {
+        authenticate_0014_schema(&mut c).await?;
+        if !exact_witness(&mut c, &operation, args, &retained_business).await? {
+            return Err(Failure::new("migration", "compatibility"));
+        }
+    } else {
+        return Err(Failure::new("migration", "compatibility"));
     }
     let current = business_digest(&mut c).await?;
     if let Some(outcome) = receipt_repeat(
@@ -998,13 +1122,16 @@ pub async fn run_production(args: &Args) -> Result<Outcome, Failure> {
     let mut anchor =
         crate::isolated_state_backup::owner_binding_anchor(&args.snapshot, &args.source_set)
             .await?;
+    if anchor.source_set_hex() != args.observed_live_source_set {
+        return Err(Failure::new("backup", "source-binding"));
+    }
     let live_source_matches = anchor.source_set_hex() == args.source_set;
     let retained_fd = std::path::PathBuf::from(format!(
         "/proc/self/fd/{}",
         anchor.snapshot_fd().as_raw_fd()
     ));
     let mut boundary = |point| {
-        if point == Boundary::AfterMigration {
+        if point == Boundary::AfterPublicationReread {
             anchor.refresh_live_sidecars()?;
         }
         anchor.revalidate()?;
@@ -1144,11 +1271,21 @@ mod tests {
         .to_string();
         sqlx::query("INSERT INTO continuation_response_receipts VALUES('receipt','task','delivery','resource',7,1,?,'structured',2,'generation.v1:strict','2026-10-01T00:00:03.000000000Z')")
             .bind(response_hash).execute(&pool).await.unwrap();
+        pool.execute("DROP TABLE isolated_owner_binding_remediation_receipts")
+            .await
+            .unwrap();
+        pool.execute("DROP TABLE isolated_owner_binding_remediation_witness")
+            .await
+            .unwrap();
+        pool.execute("DELETE FROM _sqlx_migrations WHERE version=14")
+            .await
+            .unwrap();
         pool.close().await;
         std::fs::copy(&database, &retained).unwrap();
         let args = Args {
             snapshot: "01".repeat(32),
             source_set: "02".repeat(32),
+            observed_live_source_set: EXPECTED_LIVE_SOURCE_SET_SHA256.to_owned(),
         };
         (root, database, retained, args)
     }
@@ -1162,6 +1299,8 @@ mod tests {
             hash.clone().into(),
             "--expected-source-set-sha256".into(),
             hash.clone().into(),
+            "--expected-live-source-set-sha256".into(),
+            EXPECTED_LIVE_SOURCE_SET_SHA256.into(),
         ];
         let args = parse_args(&valid).unwrap();
         assert_eq!(operation_id(&args), operation_id(&args));
@@ -1172,6 +1311,8 @@ mod tests {
                 COMMAND.into(),
                 "--wrong".into(),
                 hash.clone().into(),
+                "--expected-live-source-set-sha256".into(),
+                EXPECTED_LIVE_SOURCE_SET_SHA256.into(),
                 "--expected-source-set-sha256".into(),
                 hash.clone().into(),
             ],
@@ -1218,6 +1359,9 @@ mod tests {
     #[tokio::test]
     async fn arbitrary_post_migration_business_drift_refuses_before_witness() {
         let (_root, database, retained, args) = fixture().await;
+        let pool = connect(&database).await.unwrap();
+        migrate(&pool).await.unwrap();
+        pool.close().await;
         let mut c = open(&database).await;
         sqlx::query("UPDATE execution_leases SET fence=8")
             .execute(&mut c)
@@ -1277,22 +1421,6 @@ mod tests {
     #[tokio::test]
     async fn legacy_first_entry_applies_0014_then_witness_and_repair() {
         let (_root, database, retained, args) = fixture().await;
-        for path in [&database, &retained] {
-            let mut c = open(path).await;
-            sqlx::query("DROP TABLE isolated_owner_binding_remediation_receipts")
-                .execute(&mut c)
-                .await
-                .unwrap();
-            sqlx::query("DROP TABLE isolated_owner_binding_remediation_witness")
-                .execute(&mut c)
-                .await
-                .unwrap();
-            sqlx::query("DELETE FROM _sqlx_migrations WHERE version=14")
-                .execute(&mut c)
-                .await
-                .unwrap();
-            c.close().await.unwrap();
-        }
         assert_eq!(
             remediate_paths(&database, &retained, &args, true)
                 .await
@@ -1353,10 +1481,9 @@ mod tests {
         assert_eq!(
             seen,
             [
-                Boundary::BeforeMigration,
-                Boundary::AfterMigration,
-                Boundary::BeforeWitnessCommit,
-                Boundary::AfterWitnessReread,
+                Boundary::BeforePublication,
+                Boundary::BeforePublicationCommit,
+                Boundary::AfterPublicationReread,
                 Boundary::BeforeBusinessCommit,
                 Boundary::AfterBusinessReread,
             ]
@@ -1364,13 +1491,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn boundary_replacement_stops_before_witness_or_business_mutation() {
+    async fn boundary_replacement_is_ambiguous_and_stops_before_business_mutation() {
         let (root, database, retained, args) = fixture().await;
         let replacement = root.path().join("replacement.db");
         std::fs::copy(&database, &replacement).unwrap();
         let expected = std::fs::metadata(&database).unwrap();
         let mut boundary = |point| {
-            if point == Boundary::AfterMigration {
+            if point == Boundary::BeforePublicationCommit {
                 std::fs::rename(&database, root.path().join("original.db")).unwrap();
                 std::fs::rename(&replacement, &database).unwrap();
             }
@@ -1391,12 +1518,14 @@ mod tests {
                 &mut boundary,
             )
             .await,
-            Err(Failure::new("postflight", "database-identity"))
+            Err(Failure::new("unknown-commit", "ambiguous"))
         );
         let mut c = open(&database).await;
-        let counts: (i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM isolated_owner_binding_remediation_witness),(SELECT count(*) FROM isolated_owner_binding_remediation_receipts)")
-            .fetch_one(&mut c).await.unwrap();
-        assert_eq!(counts, (0, 0));
+        let latest: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
+            .fetch_one(&mut c)
+            .await
+            .unwrap();
+        assert_eq!(latest, 13);
     }
 
     #[tokio::test]
@@ -1404,7 +1533,7 @@ mod tests {
         let (root, database, retained, args) = fixture().await;
         let moved = root.path().join("moved.db");
         let mut boundary = |point| {
-            if point == Boundary::BeforeWitnessCommit {
+            if point == Boundary::BeforePublicationCommit {
                 std::fs::rename(&database, &moved).unwrap();
             }
             Ok(())
@@ -1451,6 +1580,9 @@ mod tests {
     async fn exact_schema_and_ledger_drift_are_rejected() {
         for mutation in [0, 1, 2, 3, 4] {
             let (_root, database, retained, args) = fixture().await;
+            let pool = connect(&database).await.unwrap();
+            migrate(&pool).await.unwrap();
+            pool.close().await;
             let mut c = open(&database).await;
             match mutation {
                 0 => {
@@ -1605,5 +1737,100 @@ mod tests {
                 Err(Failure::new("unknown-commit", "ambiguous"))
             );
         }
+    }
+
+    #[test]
+    fn publication_commit_classifier_covers_all_nine_cells() {
+        for observation in [
+            CommitObservation::Success,
+            CommitObservation::Error,
+            CommitObservation::Unavailable,
+        ] {
+            assert_eq!(
+                classify_publication(observation, PublicationState::Complete),
+                Ok(())
+            );
+            assert_eq!(
+                classify_publication(observation, PublicationState::Other),
+                Err(Failure::new("unknown-commit", "ambiguous"))
+            );
+        }
+        assert_eq!(
+            classify_publication(CommitObservation::Success, PublicationState::LegacyAbsence),
+            Err(Failure::new("unknown-commit", "ambiguous"))
+        );
+        for observation in [CommitObservation::Error, CommitObservation::Unavailable] {
+            assert_eq!(
+                classify_publication(observation, PublicationState::LegacyAbsence),
+                Err(Failure::new("unknown-commit", "not-committed"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn atomic_publication_has_v2_witness_exact_ledger_and_is_migrator_noop() {
+        let (_root, database, retained, args) = fixture().await;
+        remediate_paths(&database, &retained, &args, false)
+            .await
+            .unwrap();
+        let mut c = open(&database).await;
+        let ledger: (String, bool, i64, String) = sqlx::query_as(
+            "SELECT description,success,execution_time,installed_on FROM _sqlx_migrations WHERE version=14",
+        )
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+        assert_eq!(ledger.0, "isolated owner binding remediation");
+        assert!(ledger.1);
+        assert_eq!(ledger.2, -1);
+        assert_eq!(ledger.3.len(), 19);
+        let witness: (i64, String) = sqlx::query_as(
+            "SELECT contract_version,observed_live_source_set_sha256 FROM isolated_owner_binding_remediation_witness",
+        )
+        .fetch_one(&mut c)
+        .await
+        .unwrap();
+        assert_eq!(witness, (2, EXPECTED_LIVE_SOURCE_SET_SHA256.to_owned()));
+        c.close().await.unwrap();
+
+        let pool = connect(&database).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let execution_time: i64 =
+            sqlx::query_scalar("SELECT execution_time FROM _sqlx_migrations WHERE version=14")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(execution_time, -1);
+    }
+
+    #[tokio::test]
+    async fn forged_observed_authority_and_recomputed_witness_are_rejected() {
+        let (_root, database, retained, args) = fixture().await;
+        remediate_paths(&database, &retained, &args, false)
+            .await
+            .unwrap();
+        let hostile = Args {
+            snapshot: args.snapshot.clone(),
+            source_set: args.source_set.clone(),
+            observed_live_source_set: "03".repeat(32),
+        };
+        let hostile_operation = operation_id(&hostile);
+        let mut c = open(&database).await;
+        let retained_business = {
+            let mut retained_c = open(&retained).await;
+            business_digest(&mut retained_c).await.unwrap()
+        };
+        sqlx::query("UPDATE isolated_owner_binding_remediation_witness SET operation_id=?,observed_live_source_set_sha256=?,witness_digest=?")
+            .bind(&hostile_operation)
+            .bind(&hostile.observed_live_source_set)
+            .bind(witness_digest(&hostile_operation, &hostile, &retained_business))
+            .execute(&mut c)
+            .await
+            .unwrap();
+        c.close().await.unwrap();
+        assert_eq!(
+            remediate_paths(&database, &retained, &args, false).await,
+            Err(Failure::new("migration", "compatibility"))
+        );
     }
 }

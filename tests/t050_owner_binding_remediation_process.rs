@@ -4,6 +4,7 @@ use guigu_agent_bridge::storage::{connect, migrate};
 use sqlx::Executor;
 
 const COMMAND: &str = "remediate-isolated-owner-bindings";
+const OBSERVED: &str = "fdae494127ac9acf616ce16d0e0f5cb9a0ab3d3ac1cc8974e5525bddb45cb10f";
 const REJECTED: &str =
     "remediate-isolated-owner-bindings result=rejected status=3 cause=arguments substage=none\n";
 
@@ -52,6 +53,43 @@ fn malformed_cli_matrix_is_fixed_redacted_and_terminal() {
         vec![
             COMMAND.into(),
             "--expected-backup-sha256".into(),
+            digest.clone().into(),
+            "--expected-source-set-sha256".into(),
+            digest.clone().into(),
+            "--expected-live-source-set-sha256".into(),
+            "03".repeat(32).into(),
+        ],
+        vec![
+            COMMAND.into(),
+            "--expected-backup-sha256".into(),
+            digest.clone().into(),
+            "--expected-source-set-sha256".into(),
+            digest.clone().into(),
+            "--expected-live-source-set-sha256".into(),
+        ],
+        vec![
+            COMMAND.into(),
+            "--expected-backup-sha256".into(),
+            digest.clone().into(),
+            "--expected-source-set-sha256".into(),
+            digest.clone().into(),
+            "--wrong-live-source-set".into(),
+            OBSERVED.into(),
+        ],
+        vec![
+            COMMAND.into(),
+            "--expected-backup-sha256".into(),
+            digest.clone().into(),
+            "--expected-source-set-sha256".into(),
+            digest.clone().into(),
+            "--expected-live-source-set-sha256".into(),
+            OBSERVED.into(),
+            "--expected-live-source-set-sha256".into(),
+            OBSERVED.into(),
+        ],
+        vec![
+            COMMAND.into(),
+            "--expected-backup-sha256".into(),
             OsString::from_vec(vec![0xff]),
             "--expected-source-set-sha256".into(),
             digest.into(),
@@ -94,6 +132,15 @@ async fn synthetic_child_success_and_repeat_are_canonical() {
     .to_string();
     sqlx::query("INSERT INTO continuation_response_receipts VALUES('receipt','task','delivery','resource',7,1,?,'structured',2,'generation.v1:strict','2026-10-01T00:00:03.000000000Z')")
         .bind(response_hash).execute(&pool).await.unwrap();
+    pool.execute("DROP TABLE isolated_owner_binding_remediation_receipts")
+        .await
+        .unwrap();
+    pool.execute("DROP TABLE isolated_owner_binding_remediation_witness")
+        .await
+        .unwrap();
+    pool.execute("DELETE FROM _sqlx_migrations WHERE version=14")
+        .await
+        .unwrap();
     pool.close().await;
     std::fs::copy(&database, &retained).unwrap();
     let digest = "01".repeat(32);
@@ -105,6 +152,8 @@ async fn synthetic_child_success_and_repeat_are_canonical() {
                 &digest,
                 "--expected-source-set-sha256",
                 &digest,
+                "--expected-live-source-set-sha256",
+                OBSERVED,
             ])
             .env("T050_OWNER_BINDING_TEST_DATABASE", &database)
             .env("T050_OWNER_BINDING_TEST_RETAINED", &retained)
