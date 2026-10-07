@@ -52,6 +52,20 @@ pub const MAX_CONNECTIONS: u32 = 5;
 /// The migrations embedded from `migrations/` at compile time.
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 
+pub(crate) fn migration_contract() -> Vec<(i64, String, Vec<u8>)> {
+    MIGRATOR
+        .migrations
+        .iter()
+        .map(|migration| {
+            (
+                migration.version,
+                migration.description.to_string(),
+                migration.checksum.to_vec(),
+            )
+        })
+        .collect()
+}
+
 /// Open (creating if needed) a SQLite pool for `path` with the frozen options.
 ///
 /// Does **not** apply migrations; call [`migrate`] afterwards. The parent

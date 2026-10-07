@@ -490,20 +490,35 @@ fn migration_table_sql(name: &str) -> Option<String> {
     Some(normalized_sql(&rest[..end]))
 }
 
-async fn authenticate_0014_schema(c: &mut SqliteConnection) -> Result<(), Failure> {
-    let rows: Vec<(i64, bool)> =
-        sqlx::query_as("SELECT version,success FROM _sqlx_migrations ORDER BY version")
-            .fetch_all(&mut *c)
-            .await
-            .map_err(|_| Failure::new("migration", "ledger"))?;
-    if rows.len() != MIGRATION_VERSION as usize
-        || rows
-            .iter()
-            .enumerate()
-            .any(|(index, (version, success))| *version != index as i64 + 1 || !*success)
+async fn authenticate_migration_ledger(
+    c: &mut SqliteConnection,
+    expected_versions: usize,
+) -> Result<(), Failure> {
+    let rows: Vec<(i64, String, bool, Vec<u8>)> = sqlx::query_as(
+        "SELECT version,description,success,checksum FROM _sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(&mut *c)
+    .await
+    .map_err(|_| Failure::new("migration", "ledger"))?;
+    let contract = crate::storage::migration_contract();
+    if expected_versions > contract.len()
+        || rows.len() != expected_versions
+        || rows.iter().zip(contract.iter()).any(
+            |((version, description, success, checksum), expected)| {
+                *version != expected.0
+                    || description != &expected.1
+                    || !*success
+                    || checksum != &expected.2
+            },
+        )
     {
         return Err(Failure::new("migration", "compatibility"));
     }
+    Ok(())
+}
+
+async fn authenticate_0014_schema(c: &mut SqliteConnection) -> Result<(), Failure> {
+    authenticate_migration_ledger(c, MIGRATION_VERSION as usize).await?;
     for name in [
         "isolated_owner_binding_remediation_witness",
         "isolated_owner_binding_remediation_receipts",
@@ -680,6 +695,38 @@ async fn receipt_repeat(
     Ok(Some(Outcome::AlreadyRemediated))
 }
 
+async fn fresh_business_reread(
+    database: &Path,
+    operation: &str,
+    args: &Args,
+    retained_business: &str,
+    retained_facts: &Facts,
+    boundary: &mut BoundaryCheck<'_>,
+) -> Result<(String, Option<Outcome>), Failure> {
+    let mut reread = open_live(database)
+        .await
+        .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
+    authenticate_0014_schema(&mut reread)
+        .await
+        .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
+    boundary(Boundary::AfterBusinessReread)
+        .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
+    let business = business_digest(&mut reread)
+        .await
+        .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
+    let receipt = receipt_repeat(
+        &mut reread,
+        operation,
+        args,
+        retained_business,
+        &business,
+        retained_facts,
+    )
+    .await
+    .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
+    Ok((business, receipt))
+}
+
 pub async fn remediate_paths(
     database: &Path,
     retained: &Path,
@@ -753,9 +800,18 @@ async fn remediate_paths_with_boundaries(
             .fetch_one(&pool)
             .await
             .map_err(|_| Failure::new("migration", "ledger"))?;
-    if latest > MIGRATION_VERSION || (latest == 13 && total != 13) || (latest == 14 && total != 14)
+    if !matches!(latest, 13 | 14)
+        || (latest == 13 && (total != 13 || applied != 0))
+        || (latest == 14 && (total != 14 || applied != 1))
     {
         return Err(Failure::new("migration", "compatibility"));
+    }
+    {
+        let mut ledger = pool
+            .acquire()
+            .await
+            .map_err(|_| Failure::new("database", "connect"))?;
+        authenticate_migration_ledger(&mut ledger, latest as usize).await?;
     }
     if applied == 0 {
         let mut live = pool
@@ -870,35 +926,34 @@ async fn remediate_paths_with_boundaries(
     )
     .await;
     if let Err(error) = result {
-        if sqlx::query("ROLLBACK").execute(&mut c).await.is_err() {
-            return Err(Failure::new("unknown-commit", "ambiguous"));
+        let rollback = sqlx::query("ROLLBACK").execute(&mut c).await;
+        drop(c);
+        let (durable, receipt) = fresh_business_reread(
+            database,
+            &operation,
+            args,
+            &retained_business,
+            &retained_facts,
+            boundary,
+        )
+        .await?;
+        if rollback.is_ok() && receipt.is_none() && durable == retained_business {
+            return Err(error);
         }
-        return Err(error);
+        return Err(Failure::new("unknown-commit", "ambiguous"));
     }
     boundary(Boundary::BeforeBusinessCommit)?;
     let commit = sqlx::query("COMMIT").execute(&mut c).await;
     drop(c);
-    let mut reread = open_live(database)
-        .await
-        .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
-    authenticate_0014_schema(&mut reread)
-        .await
-        .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
-    boundary(Boundary::AfterBusinessReread)
-        .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
-    let post = business_digest(&mut reread)
-        .await
-        .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
-    let receipt = receipt_repeat(
-        &mut reread,
+    let (post, receipt) = fresh_business_reread(
+        database,
         &operation,
         args,
         &retained_business,
-        &post,
         &retained_facts,
+        boundary,
     )
-    .await
-    .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
+    .await?;
     match receipt {
         Some(_) if commit.is_err() || commit_result_lost => Ok(Outcome::Adopted),
         Some(_) => Ok(Outcome::Remediated),
@@ -1394,7 +1449,7 @@ mod tests {
 
     #[tokio::test]
     async fn exact_schema_and_ledger_drift_are_rejected() {
-        for mutation in [0, 1, 2] {
+        for mutation in [0, 1, 2, 3, 4] {
             let (_root, database, retained, args) = fixture().await;
             let mut c = open(&database).await;
             match mutation {
@@ -1412,8 +1467,23 @@ mod tests {
                         .await
                         .unwrap();
                 }
-                _ => {
+                2 => {
                     sqlx::query("INSERT INTO _sqlx_migrations(version,description,installed_on,success,checksum,execution_time) SELECT 15,'hostile',installed_on,1,checksum,0 FROM _sqlx_migrations WHERE version=14").execute(&mut c).await.unwrap();
+                }
+                3 => {
+                    sqlx::query(
+                        "UPDATE _sqlx_migrations SET description='hostile' WHERE version=14",
+                    )
+                    .execute(&mut c)
+                    .await
+                    .unwrap();
+                }
+                _ => {
+                    sqlx::query("UPDATE _sqlx_migrations SET checksum=? WHERE version=14")
+                        .bind(vec![0_u8; 48])
+                        .execute(&mut c)
+                        .await
+                        .unwrap();
                 }
             }
             c.close().await.unwrap();
@@ -1471,6 +1541,68 @@ mod tests {
             assert_eq!(
                 remediate_paths(&database, &retained, &args, false).await,
                 Err(Failure::new("receipt", "mismatch"))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn successful_rollback_uses_exactly_one_fresh_reread() {
+        let (_root, database, retained, args) = fixture().await;
+        let mut c = open(&database).await;
+        sqlx::query("CREATE TRIGGER t050_reject_admission BEFORE UPDATE ON task_admissions BEGIN SELECT RAISE(ABORT, 'synthetic'); END")
+            .execute(&mut c).await.unwrap();
+        c.close().await.unwrap();
+        let mut rereads = 0;
+        let mut boundary = |point| {
+            if point == Boundary::AfterBusinessReread {
+                rereads += 1;
+            }
+            Ok(())
+        };
+        assert_eq!(
+            remediate_paths_with_boundaries(
+                &database,
+                &retained,
+                &args,
+                false,
+                false,
+                &mut boundary,
+            )
+            .await,
+            Err(Failure::new("cas", "admission"))
+        );
+        assert_eq!(rereads, 1);
+    }
+
+    #[tokio::test]
+    async fn rollback_failure_and_reread_failure_are_ambiguous() {
+        for rollback_aborts_transaction in [false, true] {
+            let (_root, database, retained, args) = fixture().await;
+            let mut c = open(&database).await;
+            let trigger = if rollback_aborts_transaction {
+                "CREATE TRIGGER t050_reject_admission BEFORE UPDATE ON task_admissions BEGIN SELECT RAISE(ROLLBACK, 'synthetic'); END"
+            } else {
+                "CREATE TRIGGER t050_reject_admission BEFORE UPDATE ON task_admissions BEGIN SELECT RAISE(ABORT, 'synthetic'); END"
+            };
+            sqlx::query(trigger).execute(&mut c).await.unwrap();
+            c.close().await.unwrap();
+            let mut boundary = |point| {
+                if !rollback_aborts_transaction && point == Boundary::AfterBusinessReread {
+                    return Err(Failure::new("postflight", "database-identity"));
+                }
+                Ok(())
+            };
+            assert_eq!(
+                remediate_paths_with_boundaries(
+                    &database,
+                    &retained,
+                    &args,
+                    false,
+                    false,
+                    &mut boundary,
+                )
+                .await,
+                Err(Failure::new("unknown-commit", "ambiguous"))
             );
         }
     }

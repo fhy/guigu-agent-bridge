@@ -149,6 +149,7 @@ mod repository;
 pub use cycle::{CycleHit, CycleKind, CycleLimits, DEFAULT_MAX_SUBTASKS, detect};
 pub use error::StorageError;
 pub use event_consumer::RepositoryEventConsumer;
+pub(crate) use pool::migration_contract;
 pub use pool::{DEFAULT_BUSY_TIMEOUT, MAX_CONNECTIONS, connect, migrate};
 pub use recovery::{
     RecoveryBlocker, RecoveryDiagnostic, RecoveryFixture, RecoveryPlan, RecoverySignals,
