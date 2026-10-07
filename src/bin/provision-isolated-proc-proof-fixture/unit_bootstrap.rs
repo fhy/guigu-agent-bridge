@@ -446,6 +446,28 @@ mod tests {
     }
 
     #[test]
+    fn retained_forensic_leaf_is_ignored_and_unchanged() {
+        let temp = parent();
+        let forensic = temp.path().join(super::super::unit_residue::FORENSIC_NAME);
+        std::fs::write(&forensic, b"retained-forensic-evidence").unwrap();
+        std::fs::set_permissions(&forensic, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = std::fs::metadata(&forensic).unwrap();
+        assert_eq!(
+            run_with_reload(temp.path(), || true),
+            Ok(Outcome::Installed)
+        );
+        let after = std::fs::metadata(&forensic).unwrap();
+        assert_eq!(
+            (before.dev(), before.ino(), before.mode()),
+            (after.dev(), after.ino(), after.mode())
+        );
+        assert_eq!(
+            std::fs::read(&forensic).unwrap(),
+            b"retained-forensic-evidence"
+        );
+    }
+
+    #[test]
     fn hostile_unit_and_temp_are_invariant() {
         for name in [UNIT_NAME, TEMP_NAME] {
             let temp = parent();

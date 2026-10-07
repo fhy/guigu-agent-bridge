@@ -6,6 +6,10 @@ mod orchestration;
 mod prepare_boundary;
 #[path = "provision-isolated-proc-proof-fixture/unit_bootstrap.rs"]
 mod unit_bootstrap;
+#[path = "provision-isolated-proc-proof-fixture/unit_residue.rs"]
+mod unit_residue;
+#[path = "provision-isolated-proc-proof-fixture/unit_residue_command.rs"]
+mod unit_residue_command;
 
 use guigu_agent_bridge::privileged_proc_proof::{
     FixturePaths, StageCause, provision_temp_fixture, stage_policy, teardown_temp_fixture,
@@ -265,6 +269,28 @@ fn main() {
                 Err(cause) => {
                     println!(
                         "production-bootstrap-isolated-unit result=rejected status=3 cause={} substage={}",
+                        cause.code(),
+                        cause.substage()
+                    );
+                    std::process::exit(3);
+                }
+            }
+        }
+        Some("production-remediate-isolated-unit-residue") => {
+            let expected = match (args.next(), args.next()) {
+                (Some(flag), value) if flag == "--expected-sha256" => value,
+                _ => None,
+            };
+            if args.next().is_some() || expected.is_none() {
+                std::process::exit(3);
+            }
+            match unit_residue_command::run_production(&expected.unwrap()) {
+                Ok(()) => println!(
+                    "production-remediate-isolated-unit-residue result=remediated status=0"
+                ),
+                Err(cause) => {
+                    println!(
+                        "production-remediate-isolated-unit-residue result=rejected status=3 cause={} substage={}",
                         cause.code(),
                         cause.substage()
                     );
