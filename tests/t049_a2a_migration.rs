@@ -6,6 +6,8 @@ use guigu_agent_bridge::{
 };
 use sqlx::{Row, migrate::Migrator};
 
+static FULL_MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
 struct TempDir(PathBuf);
 impl TempDir {
     fn new(label: &str) -> Self {
@@ -289,13 +291,26 @@ async fn sqlx_migrator_rolls_back_rebuild_and_ledger_then_clean_retry_succeeds()
     assert_eq!(versions, (1..=10).collect::<Vec<_>>());
     assert_integrity(&pool).await;
     migrate(&pool).await.unwrap();
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT MAX(version) FROM _sqlx_migrations")
-            .fetch_one(&pool)
-            .await
-            .unwrap(),
-        13
-    );
+    let ledger: Vec<(i64, String, bool, Vec<u8>)> = sqlx::query_as(
+        "SELECT version,description,success,checksum FROM _sqlx_migrations ORDER BY version",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    let expected: Vec<(i64, String, bool, Vec<u8>)> = FULL_MIGRATOR
+        .migrations
+        .iter()
+        .map(|migration| {
+            (
+                migration.version,
+                migration.description.to_string(),
+                true,
+                migration.checksum.to_vec(),
+            )
+        })
+        .collect();
+    assert_eq!(ledger, expected);
+    assert_eq!(ledger.last().map(|row| row.0), Some(14));
     assert_integrity(&pool).await;
     pool.close().await;
 }
