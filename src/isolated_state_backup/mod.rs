@@ -61,6 +61,69 @@ impl Failure {
     }
 }
 
+pub(crate) fn current_source_set_hex() -> Result<String, ()> {
+    Ok(backup::hex(backup::source_set(&Paths::production())?.hash))
+}
+
+pub(crate) async fn verify_owner_binding_backup(
+    snapshot: &str,
+    source_set: &str,
+) -> Result<std::fs::File, crate::owner_binding_remediation::Failure> {
+    let paths = Paths::production();
+    let output = backup::verify(paths.clone()).await.map_err(|_| {
+        crate::owner_binding_remediation::Failure {
+            cause: "backup",
+            substage: "manifest",
+        }
+    })?;
+    let expected_snapshot = format!("snapshot_sha256={snapshot}");
+    if !output
+        .split_ascii_whitespace()
+        .any(|value| value == expected_snapshot)
+    {
+        return Err(crate::owner_binding_remediation::Failure {
+            cause: "backup",
+            substage: "snapshot",
+        });
+    }
+    let namespace = fs::open_dir(&paths.namespace()).map_err(|_| {
+        crate::owner_binding_remediation::Failure {
+            cause: "backup",
+            substage: "namespace",
+        }
+    })?;
+    let manifest = backup::load_manifest(&namespace).map_err(|_| {
+        crate::owner_binding_remediation::Failure {
+            cause: "backup",
+            substage: "manifest",
+        }
+    })?;
+    if backup::hex(manifest.source_set_hash) != source_set {
+        return Err(crate::owner_binding_remediation::Failure {
+            cause: "backup",
+            substage: "source-binding",
+        });
+    }
+    let mut snapshot_file = fs::open_leaf(&namespace, codec::SNAPSHOT, false).map_err(|_| {
+        crate::owner_binding_remediation::Failure {
+            cause: "backup",
+            substage: "snapshot",
+        }
+    })?;
+    let (hash, identity) =
+        fs::hash(&mut snapshot_file).map_err(|_| crate::owner_binding_remediation::Failure {
+            cause: "backup",
+            substage: "snapshot",
+        })?;
+    if hash != manifest.snapshot_hash || !fs::same(identity, manifest.snapshot) {
+        return Err(crate::owner_binding_remediation::Failure {
+            cause: "backup",
+            substage: "replacement",
+        });
+    }
+    Ok(snapshot_file)
+}
+
 fn exact_hash(value: &OsString) -> Option<[u8; 32]> {
     let value = value.to_str()?;
     if value.len() != 64 || !value.bytes().all(|byte| byte.is_ascii_hexdigit()) {

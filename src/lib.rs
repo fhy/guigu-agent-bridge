@@ -22,6 +22,7 @@ pub mod offline_delivery;
 pub mod offline_preacceptance;
 pub mod offline_recovery;
 pub mod orphaned_preacceptance;
+pub mod owner_binding_remediation;
 pub mod privileged_proc_proof;
 pub mod readonly_tuple;
 pub mod readonly_tuple_diagnostics;
@@ -96,6 +97,20 @@ pub fn init_tracing() {
 /// Production entry point: initialize tracing, then run until an interrupt or
 /// termination signal.
 pub async fn run() -> Result<(), Error> {
+    let all_args = std::env::args_os().collect::<Vec<_>>();
+    if all_args.get(1).and_then(|value| value.to_str()) == Some("remediate-isolated-owner-bindings")
+    {
+        let parsed =
+            owner_binding_remediation::parse_args(&all_args[1..]).map_err(Error::OwnerBinding)?;
+        let outcome = owner_binding_remediation::run_production(&parsed)
+            .await
+            .map_err(Error::OwnerBinding)?;
+        println!(
+            "remediate-isolated-owner-bindings result={} status=0 cause=none substage=none",
+            outcome.code()
+        );
+        return Ok(());
+    }
     if let Some(output) = isolated_state_backup::dispatch(std::env::args_os().collect()).await {
         match output {
             Ok(line) => {

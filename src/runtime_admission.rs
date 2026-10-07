@@ -143,6 +143,7 @@ fn read_record(path: &Path) -> std::io::Result<Record> {
                 | "backup"
                 | "backup-verify"
                 | "restore"
+                | "owner-binding-remediation"
         )
         || record.pid == 0
         || record.starttime == 0

@@ -361,6 +361,10 @@ async fn eligible(c: &mut SqliteConnection) -> EligibilityResult<Facts> {
     })
 }
 
+pub(crate) async fn owner_binding_eligible(c: &mut SqliteConnection) -> Result<(), Error> {
+    eligible(c).await.map(|_| ()).map_err(|(error, _)| error)
+}
+
 async fn emit_eligibility_diagnostic(c: &mut SqliteConnection, rejected_cause: &'static str) {
     if std::env::var_os("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC").is_none()
         && std::env::var_os("T050_FIXTURE_MIGRATION_DIAGNOSTIC").is_none()
@@ -477,6 +481,20 @@ async fn snapshot(
     c: &mut SqliteConnection,
     projected: Option<(&Facts, &str)>,
 ) -> Result<String, Error> {
+    snapshot_with_schema(c, projected, true).await
+}
+
+pub(crate) async fn owner_binding_business_snapshot(
+    c: &mut SqliteConnection,
+) -> Result<String, Error> {
+    snapshot_with_schema(c, None, false).await
+}
+
+async fn snapshot_with_schema(
+    c: &mut SqliteConnection,
+    projected: Option<(&Facts, &str)>,
+    include_schema: bool,
+) -> Result<String, Error> {
     const TABLES: &[(&str, &str, usize)] = &[
         (
             "runtime_instances",
@@ -545,12 +563,17 @@ async fn snapshot(
         ),
     ];
     let mut hash = Sha256::new();
-    for pragma in ["PRAGMA schema_version", "PRAGMA user_version"] {
-        let value: i64 = sqlx::query_scalar(pragma)
-            .fetch_one(&mut *c)
-            .await
-            .map_err(|_| Error::Database)?;
-        hash.update(value.to_be_bytes());
+    if !include_schema {
+        hash.update(b"GGT050-OWNER-BINDING-BUSINESS-STATE-V1");
+    }
+    if include_schema {
+        for pragma in ["PRAGMA schema_version", "PRAGMA user_version"] {
+            let value: i64 = sqlx::query_scalar(pragma)
+                .fetch_one(&mut *c)
+                .await
+                .map_err(|_| Error::Database)?;
+            hash.update(value.to_be_bytes());
+        }
     }
     for (table, sql, width) in TABLES {
         hash.update((*table).as_bytes());

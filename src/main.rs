@@ -33,6 +33,13 @@ async fn main() -> std::process::ExitCode {
             println!("{} result={}", failure.command, failure.category);
             std::process::ExitCode::from(failure.status)
         }
+        Err(guigu_agent_bridge::Error::OwnerBinding(failure)) => {
+            println!(
+                "remediate-isolated-owner-bindings result=rejected status=3 cause={} substage={}",
+                failure.cause, failure.substage
+            );
+            std::process::ExitCode::from(3)
+        }
         Err(guigu_agent_bridge::Error::Diagnostic(causes)) => {
             let public = causes.public_causes();
             println!(
