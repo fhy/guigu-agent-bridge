@@ -643,6 +643,39 @@ async fn durable_fact_predicates_have_specific_fixed_diagnostics() {
     }
 }
 
+#[tokio::test]
+async fn eligibility_only_database_failure_uses_canonical_fixed_diagnostic() {
+    let fixture = Fixture::new_unprepared().await;
+    let pool = connect(&fixture.db).await.unwrap();
+    sqlx::query("DROP TABLE continuation_response_receipts")
+        .execute(&pool)
+        .await
+        .unwrap();
+    pool.close().await;
+    let tree = fixture_tree(&fixture.root);
+
+    let output = fixture
+        .prepare()
+        .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(3));
+    assert!(output.stderr.is_empty());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains(
+        "stage=eligibility cause=database-facts counts=owners=0,continuations=0,sessions=0,children=0,leases=0,admissions=0,work=0"
+    ));
+    assert!(!stdout.contains("prepare_stage=unknown"));
+    assert!(!stdout.contains("prepare_cause=unknown"));
+    assert!(!stdout.contains(fixture.root.to_str().unwrap()));
+    assert_eq!(fixture_tree(&fixture.root), tree);
+    assert!(!fixture.manifest.exists());
+    assert!(!fixture.evidence.exists());
+    assert!(!fixture.root.join(".t050-fixture-migration-marker").exists());
+    assert!(!fixture.root.join(".runtime-admission.lock").exists());
+}
+
 async fn assert_durable_diagnostic(sql: &'static [&'static str], cause: &'static str) {
     let fixture = Fixture::new_unprepared().await;
     let pool = connect(&fixture.db).await.unwrap();

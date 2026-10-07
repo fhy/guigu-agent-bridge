@@ -370,6 +370,12 @@ async fn emit_eligibility_diagnostic(c: &mut SqliteConnection, rejected_cause: &
     {
         return;
     }
+    if rejected_cause == "database-facts" {
+        println!(
+            "prepare-isolated-legacy-fixture-migration-manifest stage=eligibility cause=database-facts counts=owners=0,continuations=0,sessions=0,children=0,leases=0,admissions=0,work=0"
+        );
+        return;
+    }
     let counts = sqlx::query_as::<_, (i64, i64, i64, i64, i64, i64)>(
         "SELECT
          (SELECT count(*) FROM runtime_instances WHERE state IN ('active','stopping')),
