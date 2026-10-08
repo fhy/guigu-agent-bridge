@@ -154,12 +154,6 @@ impl OwnerBindingAnchor {
                 substage: "database-identity",
             }
         })?;
-        self.live_main = bound_leaf(&self.live_root, "state.db", false).map_err(|_| {
-            crate::owner_binding_remediation::Failure {
-                cause: "postflight",
-                substage: "database-identity",
-            }
-        })?;
         self.live_wal = optional_bound(&self.live_root, "state.db-wal", false).map_err(|_| {
             crate::owner_binding_remediation::Failure {
                 cause: "postflight",
