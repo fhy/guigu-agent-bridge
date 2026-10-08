@@ -300,6 +300,7 @@ fn run_with_reload_and_hook(
     parent_path: &Path,
     mut hook: impl FnMut(HookPoint, Option<libc::c_int>),
     mut reload: impl FnMut() -> bool,
+    mut visible: impl FnMut() -> bool,
     fault: Option<ArtifactStage>,
 ) -> Result<Outcome, Cause> {
     let parent = authenticated_parent(parent_path)?;
@@ -314,7 +315,7 @@ fn run_with_reload_and_hook(
         if !parent_still_bound(parent_path, &parent) {
             return Err(Cause::Artifact(ArtifactStage::ParentBinding));
         }
-        return if reload() {
+        return if reload() && visible() {
             Ok(Outcome::AlreadyPresent)
         } else {
             Err(Cause::Reload)
@@ -387,7 +388,7 @@ fn run_with_reload_and_hook(
         quarantine(&parent, UNIT_NAME, identity, true)?;
         return Err(Cause::Artifact(ArtifactStage::ParentBinding));
     }
-    if reload() {
+    if reload() && visible() {
         return Ok(Outcome::Installed);
     }
     quarantine(&parent, UNIT_NAME, identity, true)?;
@@ -400,22 +401,66 @@ fn run_with_reload_and_hook(
     Err(Cause::Reload)
 }
 
+#[cfg(test)]
 fn run_with_reload(parent_path: &Path, reload: impl FnMut() -> bool) -> Result<Outcome, Cause> {
-    run_with_reload_and_hook(parent_path, |_, _| {}, reload, None)
+    run_with_reload_and_hook(parent_path, |_, _| {}, reload, || true, None)
+}
+
+fn manager_visible(output: &std::process::Output) -> bool {
+    if !output.status.success() || !output.stderr.is_empty() {
+        return false;
+    }
+    let Ok(stdout) = std::str::from_utf8(&output.stdout) else {
+        return false;
+    };
+    let expected_fragment = format!("FragmentPath={UNIT_PARENT}/{UNIT_NAME}");
+    let mut lines = stdout.lines().collect::<Vec<_>>();
+    lines.sort_unstable();
+    lines
+        == [
+            "ActiveState=inactive",
+            expected_fragment.as_str(),
+            "LoadState=loaded",
+            "MainPID=0",
+            "SubState=dead",
+        ]
+}
+
+fn production_visible() -> bool {
+    Command::new("/usr/bin/systemctl")
+        .args([
+            "--user",
+            "show",
+            UNIT_NAME,
+            "--property=LoadState",
+            "--property=FragmentPath",
+            "--property=ActiveState",
+            "--property=SubState",
+            "--property=MainPID",
+        ])
+        .output()
+        .is_ok_and(|output| manager_visible(&output))
 }
 
 pub(super) fn run_production() -> Result<Outcome, Cause> {
-    run_with_reload(Path::new(UNIT_PARENT), || {
-        Command::new("/usr/bin/systemctl")
-            .args(["--user", "daemon-reload"])
-            .status()
-            .is_ok_and(|status| status.success())
-    })
+    run_with_reload_and_hook(
+        Path::new(UNIT_PARENT),
+        |_, _| {},
+        || {
+            Command::new("/usr/bin/systemctl")
+                .args(["--user", "daemon-reload"])
+                .status()
+                .is_ok_and(|status| status.success())
+        },
+        production_visible,
+        None,
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt as _;
 
     fn parent() -> tempfile::TempDir {
         let temp = tempfile::tempdir().unwrap();
@@ -443,6 +488,79 @@ mod tests {
             Ok(Outcome::AlreadyPresent)
         );
         assert_eq!(calls, 1);
+    }
+
+    fn manager_output(fragment: &str, load: &str, active: &str, sub: &str) -> std::process::Output {
+        std::process::Output {
+            status: std::process::ExitStatus::from_raw(0),
+            stdout: format!(
+                "LoadState={load}\nFragmentPath={fragment}\nActiveState={active}\nSubState={sub}\nMainPID=0\n"
+            )
+            .into_bytes(),
+            stderr: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn manager_visibility_requires_exact_path_and_inactive_tuple() {
+        let canonical = format!("{UNIT_PARENT}/{UNIT_NAME}");
+        assert!(manager_visible(&manager_output(
+            &canonical, "loaded", "inactive", "dead"
+        )));
+        for output in [
+            manager_output("", "not-found", "inactive", "dead"),
+            manager_output("/tmp/foreign.service", "loaded", "inactive", "dead"),
+            manager_output(&canonical, "loaded", "failed", "failed"),
+        ] {
+            assert!(!manager_visible(&output));
+        }
+        let mut noisy = manager_output(&canonical, "loaded", "inactive", "dead");
+        noisy.stderr = b"private detail".to_vec();
+        assert!(!manager_visible(&noisy));
+    }
+
+    #[test]
+    fn visibility_failure_rolls_back_install_but_preserves_existing_unit() {
+        let installed = parent();
+        let mut reloads = 0;
+        assert_eq!(
+            run_with_reload_and_hook(
+                installed.path(),
+                |_, _| {},
+                || {
+                    reloads += 1;
+                    true
+                },
+                || false,
+                None,
+            ),
+            Err(Cause::Reload)
+        );
+        assert_eq!(reloads, 2);
+        assert!(!installed.path().join(UNIT_NAME).exists());
+        assert!(!installed.path().join(TEMP_NAME).exists());
+        assert_eq!(
+            std::fs::read(installed.path().join(QUARANTINE_NAME)).unwrap(),
+            UNIT
+        );
+
+        let existing = parent();
+        std::fs::write(existing.path().join(UNIT_NAME), UNIT).unwrap();
+        std::fs::set_permissions(
+            existing.path().join(UNIT_NAME),
+            std::fs::Permissions::from_mode(0o644),
+        )
+        .unwrap();
+        assert_eq!(
+            run_with_reload_and_hook(existing.path(), |_, _| {}, || true, || false, None,),
+            Err(Cause::Reload)
+        );
+        assert_eq!(
+            std::fs::read(existing.path().join(UNIT_NAME)).unwrap(),
+            UNIT
+        );
+        assert!(!existing.path().join(TEMP_NAME).exists());
+        assert!(!existing.path().join(QUARANTINE_NAME).exists());
     }
 
     #[test]
@@ -599,6 +717,7 @@ mod tests {
                     reloaded = true;
                     true
                 },
+                || true,
                 None,
             ),
             Err(Cause::Artifact(ArtifactStage::ParentBinding))
@@ -621,6 +740,7 @@ mod tests {
                         std::fs::write(temp.path().join(UNIT_NAME), foreign).unwrap();
                     }
                 },
+                || true,
                 || true,
                 None,
             ),
@@ -648,6 +768,7 @@ mod tests {
                     reloaded = true;
                     true
                 },
+                || true,
                 None,
             ),
             Err(Cause::Artifact(ArtifactStage::Publish))
@@ -682,6 +803,7 @@ mod tests {
                     reloaded = true;
                     true
                 },
+                || true,
                 None,
             ),
             Err(Cause::Artifact(ArtifactStage::Write))
@@ -733,6 +855,7 @@ mod tests {
                         reloaded = true;
                         true
                     },
+                    || true,
                     Some(stage),
                 ),
                 Err(Cause::Artifact(stage))
