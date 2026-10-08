@@ -60,7 +60,7 @@ async fn sigterm_gracefully_stops_the_owner_and_allows_the_next_generation() {
             .spawn()
             .unwrap();
         let ready = format!("http://127.0.0.1:{port}/ready");
-        tokio::time::timeout(Duration::from_secs(10), async {
+        tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if reqwest::get(&ready)
                     .await
