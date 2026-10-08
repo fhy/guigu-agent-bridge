@@ -144,8 +144,9 @@ async fn synthetic_child_success_and_repeat_are_canonical() {
     pool.close().await;
     std::fs::copy(&database, &retained).unwrap();
     let digest = "01".repeat(32);
-    let invoke = || {
-        Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+    let invoke = |publication: Option<&str>| {
+        let mut command = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"));
+        command
             .args([
                 COMMAND,
                 "--expected-backup-sha256",
@@ -156,18 +157,34 @@ async fn synthetic_child_success_and_repeat_are_canonical() {
                 OBSERVED,
             ])
             .env("T050_OWNER_BINDING_TEST_DATABASE", &database)
-            .env("T050_OWNER_BINDING_TEST_RETAINED", &retained)
-            .output()
-            .unwrap()
+            .env("T050_OWNER_BINDING_TEST_RETAINED", &retained);
+        if let Some(publication) = publication {
+            command.env("T050_OWNER_BINDING_TEST_PUBLICATION_COMMIT", publication);
+        }
+        command.output().unwrap()
     };
-    let first = invoke();
+    let ambiguous = invoke(Some("success-absence"));
+    assert_eq!(ambiguous.status.code(), Some(3));
+    assert!(ambiguous.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(ambiguous.stdout).unwrap(),
+        "remediate-isolated-owner-bindings result=rejected status=3 cause=unknown-commit substage=ambiguous\n"
+    );
+    let not_committed = invoke(Some("error-absence"));
+    assert_eq!(not_committed.status.code(), Some(3));
+    assert!(not_committed.stderr.is_empty());
+    assert_eq!(
+        String::from_utf8(not_committed.stdout).unwrap(),
+        "remediate-isolated-owner-bindings result=rejected status=3 cause=unknown-commit substage=not-committed\n"
+    );
+    let first = invoke(Some("unavailable-complete"));
     assert_eq!(first.status.code(), Some(0));
     assert!(first.stderr.is_empty());
     assert_eq!(
         String::from_utf8(first.stdout).unwrap(),
         "remediate-isolated-owner-bindings result=remediated status=0 cause=none substage=none\n"
     );
-    let repeat = invoke();
+    let repeat = invoke(None);
     assert_eq!(repeat.status.code(), Some(0));
     assert!(repeat.stderr.is_empty());
     assert_eq!(

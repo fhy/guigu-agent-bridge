@@ -118,6 +118,10 @@ impl OwnerBindingAnchor {
         &self.snapshot.file
     }
 
+    pub(crate) fn live_fd(&self) -> &File {
+        &self.live_main.file
+    }
+
     fn same_live(parent: &File, name: &str, expected: &BoundLeaf) -> Result<(), ()> {
         let current = bound_leaf(parent, name, false)?;
         let held = fs::identity(&expected.file.metadata().map_err(|_| ())?)?;

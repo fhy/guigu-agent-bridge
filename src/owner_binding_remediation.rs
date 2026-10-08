@@ -179,6 +179,11 @@ struct Facts {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum Boundary {
     BeforePublication,
+    AfterPublicationBegin,
+    AfterWitnessDdl,
+    AfterReceiptDdl,
+    AfterLedgerInsert,
+    AfterWitnessInsert,
     BeforePublicationCommit,
     AfterPublicationReread,
     BeforeBusinessCommit,
@@ -565,6 +570,15 @@ async fn authenticate_0014_tables(c: &mut SqliteConnection) -> Result<(), Failur
             return Err(Failure::new("migration", "compatibility"));
         }
     }
+    let object_count: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM sqlite_schema WHERE name LIKE 'isolated_owner_binding_remediation_%'",
+    )
+    .fetch_one(&mut *c)
+    .await
+    .map_err(|_| Failure::new("migration", "compatibility"))?;
+    if object_count != 2 {
+        return Err(Failure::new("migration", "compatibility"));
+    }
     Ok(())
 }
 
@@ -576,7 +590,7 @@ async fn exact_legacy_absence(c: &mut SqliteConnection, business: &str) -> Resul
         return Ok(false);
     }
     let objects: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM sqlite_schema WHERE name IN ('isolated_owner_binding_remediation_witness','isolated_owner_binding_remediation_receipts')",
+        "SELECT count(*) FROM sqlite_schema WHERE name LIKE 'isolated_owner_binding_remediation_%'",
     )
     .fetch_one(&mut *c)
     .await
@@ -611,6 +625,82 @@ fn classify_publication(
         ) => Err(Failure::new("unknown-commit", "not-committed")),
         _ => Err(Failure::new("unknown-commit", "ambiguous")),
     }
+}
+
+async fn commit_publication(c: &mut SqliteConnection) -> CommitObservation {
+    #[cfg(debug_assertions)]
+    match std::env::var("T050_OWNER_BINDING_TEST_PUBLICATION_COMMIT").as_deref() {
+        Ok("success-absence") => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *c).await;
+            return CommitObservation::Success;
+        }
+        Ok("error-absence") => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut *c).await;
+            return CommitObservation::Error;
+        }
+        Ok("unavailable-complete") => {
+            let _ = sqlx::query("COMMIT").execute(&mut *c).await;
+            return CommitObservation::Unavailable;
+        }
+        _ => {}
+    }
+    if sqlx::query("COMMIT").execute(&mut *c).await.is_ok() {
+        CommitObservation::Success
+    } else {
+        CommitObservation::Error
+    }
+}
+
+async fn fresh_publication_reread(
+    database: &Path,
+    operation: &str,
+    args: &Args,
+    retained_business: &str,
+    boundary: &mut BoundaryCheck<'_>,
+) -> Result<(SqliteConnection, PublicationState), Failure> {
+    let mut reread = open_live(database)
+        .await
+        .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
+    boundary(Boundary::AfterPublicationReread)
+        .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
+    let receipt_count = sqlx::query_scalar::<_, i64>(
+        "SELECT count(*) FROM isolated_owner_binding_remediation_receipts",
+    )
+    .fetch_one(&mut reread)
+    .await;
+    let state = if exact_legacy_absence(&mut reread, retained_business)
+        .await
+        .unwrap_or(false)
+    {
+        PublicationState::LegacyAbsence
+    } else if authenticate_0014_schema(&mut reread).await.is_ok()
+        && exact_witness(&mut reread, operation, args, retained_business)
+            .await
+            .unwrap_or(false)
+        && business_digest(&mut reread).await.as_deref() == Ok(retained_business)
+        && matches!(receipt_count, Ok(0))
+    {
+        PublicationState::Complete
+    } else {
+        PublicationState::Other
+    };
+    Ok((reread, state))
+}
+
+async fn finish_publication_commit(
+    observation: CommitObservation,
+    old: SqliteConnection,
+    database: &Path,
+    operation: &str,
+    args: &Args,
+    retained_business: &str,
+    boundary: &mut BoundaryCheck<'_>,
+) -> Result<SqliteConnection, Failure> {
+    drop(old);
+    let (reread, state) =
+        fresh_publication_reread(database, operation, args, retained_business, boundary).await?;
+    classify_publication(observation, state)?;
+    Ok(reread)
 }
 
 async fn open_live(database: &Path) -> Result<SqliteConnection, Failure> {
@@ -851,6 +941,27 @@ async fn remediate_paths_with_boundaries(
     commit_result_lost: bool,
     boundary: &mut BoundaryCheck<'_>,
 ) -> Result<Outcome, Failure> {
+    remediate_paths_opening(
+        database,
+        database,
+        retained,
+        args,
+        legacy_source_matches,
+        commit_result_lost,
+        boundary,
+    )
+    .await
+}
+
+async fn remediate_paths_opening(
+    _database: &Path,
+    database_open_path: &Path,
+    retained: &Path,
+    args: &Args,
+    legacy_source_matches: bool,
+    commit_result_lost: bool,
+    boundary: &mut BoundaryCheck<'_>,
+) -> Result<Outcome, Failure> {
     let operation = operation_id(args);
     let mut retained_c = SqliteConnection::connect_with(
         &SqliteConnectOptions::new()
@@ -873,7 +984,7 @@ async fn remediate_paths_with_boundaries(
         .await
         .map_err(|_| Failure::new("backup", "snapshot"))?;
     boundary(Boundary::BeforePublication)?;
-    let mut c = open_live(database).await?;
+    let mut c = open_live(database_open_path).await?;
     let latest: i64 = sqlx::query_scalar("SELECT coalesce(max(version),0) FROM _sqlx_migrations")
         .fetch_one(&mut c)
         .await
@@ -881,6 +992,9 @@ async fn remediate_paths_with_boundaries(
     if latest == MIGRATION_VERSION - 1 {
         authenticate_migration_ledger(&mut c, (MIGRATION_VERSION - 1) as usize).await?;
         let live_business = business_digest(&mut c).await?;
+        if exact_legacy_absence(&mut c, &retained_business).await != Ok(true) {
+            return Err(Failure::new("migration", "compatibility"));
+        }
         if live_business != retained_business {
             return Err(Failure::new("backup", "source-binding"));
         }
@@ -892,12 +1006,29 @@ async fn remediate_paths_with_boundaries(
             .await
             .map_err(|_| Failure::new("migration", "busy"))?;
         let publication = async {
+            boundary(Boundary::AfterPublicationBegin)?;
             let migration = std::str::from_utf8(MIGRATION)
                 .map_err(|_| Failure::new("migration", "apply"))?;
-            sqlx::raw_sql(migration)
+            let mut statements = migration.split(";\n\n");
+            let witness_ddl = statements
+                .next()
+                .ok_or_else(|| Failure::new("migration", "apply"))?;
+            let receipt_ddl = statements
+                .next()
+                .ok_or_else(|| Failure::new("migration", "apply"))?;
+            if statements.next().is_some() {
+                return Err(Failure::new("migration", "apply"));
+            }
+            sqlx::raw_sql(witness_ddl)
                 .execute(&mut c)
                 .await
                 .map_err(|_| Failure::new("migration", "apply"))?;
+            boundary(Boundary::AfterWitnessDdl)?;
+            sqlx::raw_sql(receipt_ddl)
+                .execute(&mut c)
+                .await
+                .map_err(|_| Failure::new("migration", "apply"))?;
+            boundary(Boundary::AfterReceiptDdl)?;
             authenticate_0014_tables(&mut c).await?;
             let receipts: i64 = sqlx::query_scalar(
                 "SELECT count(*) FROM isolated_owner_binding_remediation_receipts",
@@ -923,6 +1054,7 @@ async fn remediate_paths_with_boundaries(
             if inserted.rows_affected() != 1 {
                 return Err(Failure::new("migration", "apply"));
             }
+            boundary(Boundary::AfterLedgerInsert)?;
             authenticate_migration_ledger(&mut c, MIGRATION_VERSION as usize).await?;
             let inserted = sqlx::query("INSERT INTO isolated_owner_binding_remediation_witness(singleton,contract_version,operation_id,backup_snapshot_sha256,backup_source_set_sha256,observed_live_source_set_sha256,migration_version,migration_checksum_digest,retained_pre0014_business_digest,migrated_pre_repair_business_digest,witness_digest) VALUES(1,2,?,?,?,?,14,?,?,?,?)")
                 .bind(&operation)
@@ -942,13 +1074,14 @@ async fn remediate_paths_with_boundaries(
             {
                 return Err(Failure::new("migration", "compatibility"));
             }
+            boundary(Boundary::AfterWitnessInsert)?;
             Ok::<(), Failure>(())
         }
         .await;
         if let Err(error) = publication {
             let rollback = sqlx::query("ROLLBACK").execute(&mut c).await;
             drop(c);
-            let mut reread = open_live(database)
+            let mut reread = open_live(database_open_path)
                 .await
                 .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
             boundary(Boundary::AfterPublicationReread)
@@ -963,7 +1096,7 @@ async fn remediate_paths_with_boundaries(
         if let Err(error) = boundary(Boundary::BeforePublicationCommit) {
             let rollback = sqlx::query("ROLLBACK").execute(&mut c).await;
             drop(c);
-            let mut reread = open_live(database)
+            let mut reread = open_live(database_open_path)
                 .await
                 .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
             boundary(Boundary::AfterPublicationReread)
@@ -975,41 +1108,17 @@ async fn remediate_paths_with_boundaries(
             }
             return Err(Failure::new("unknown-commit", "ambiguous"));
         }
-        let commit = sqlx::query("COMMIT").execute(&mut c).await;
-        let observation = if commit.is_ok() {
-            CommitObservation::Success
-        } else {
-            CommitObservation::Error
-        };
-        drop(c);
-        let mut reread = open_live(database)
-            .await
-            .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
-        boundary(Boundary::AfterPublicationReread)
-            .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
-        let receipt_count = sqlx::query_scalar::<_, i64>(
-            "SELECT count(*) FROM isolated_owner_binding_remediation_receipts",
+        let observation = commit_publication(&mut c).await;
+        c = finish_publication_commit(
+            observation,
+            c,
+            database_open_path,
+            &operation,
+            args,
+            &retained_business,
+            boundary,
         )
-        .fetch_one(&mut reread)
-        .await;
-        let state = if exact_legacy_absence(&mut reread, &retained_business)
-            .await
-            .unwrap_or(false)
-        {
-            PublicationState::LegacyAbsence
-        } else if authenticate_0014_schema(&mut reread).await.is_ok()
-            && exact_witness(&mut reread, &operation, args, &retained_business)
-                .await
-                .unwrap_or(false)
-            && business_digest(&mut reread).await.as_deref() == Ok(retained_business.as_str())
-            && matches!(receipt_count, Ok(0))
-        {
-            PublicationState::Complete
-        } else {
-            PublicationState::Other
-        };
-        classify_publication(observation, state)?;
-        c = reread;
+        .await?;
     } else if latest == MIGRATION_VERSION {
         authenticate_0014_schema(&mut c).await?;
         if !exact_witness(&mut c, &operation, args, &retained_business).await? {
@@ -1053,7 +1162,7 @@ async fn remediate_paths_with_boundaries(
         let rollback = sqlx::query("ROLLBACK").execute(&mut c).await;
         drop(c);
         let (durable, receipt) = fresh_business_reread(
-            database,
+            database_open_path,
             &operation,
             args,
             &retained_business,
@@ -1070,7 +1179,7 @@ async fn remediate_paths_with_boundaries(
     let commit = sqlx::query("COMMIT").execute(&mut c).await;
     drop(c);
     let (post, receipt) = fresh_business_reread(
-        database,
+        database_open_path,
         &operation,
         args,
         &retained_business,
@@ -1130,6 +1239,8 @@ pub async fn run_production(args: &Args) -> Result<Outcome, Failure> {
         "/proc/self/fd/{}",
         anchor.snapshot_fd().as_raw_fd()
     ));
+    let live_fd =
+        std::path::PathBuf::from(format!("/proc/self/fd/{}", anchor.live_fd().as_raw_fd()));
     let mut boundary = |point| {
         if point == Boundary::AfterPublicationReread {
             anchor.refresh_live_sidecars()?;
@@ -1145,8 +1256,9 @@ pub async fn run_production(args: &Args) -> Result<Outcome, Failure> {
         )
         .map_err(|_| Failure::new("runtime", "runtime-unknown"))
     };
-    remediate_paths_with_boundaries(
+    remediate_paths_opening(
         database,
+        &live_fd,
         &retained_fd,
         args,
         live_source_matches,
@@ -1482,6 +1594,11 @@ mod tests {
             seen,
             [
                 Boundary::BeforePublication,
+                Boundary::AfterPublicationBegin,
+                Boundary::AfterWitnessDdl,
+                Boundary::AfterReceiptDdl,
+                Boundary::AfterLedgerInsert,
+                Boundary::AfterWitnessInsert,
                 Boundary::BeforePublicationCommit,
                 Boundary::AfterPublicationReread,
                 Boundary::BeforeBusinessCommit,
@@ -1526,6 +1643,51 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(latest, 13);
+    }
+
+    #[tokio::test]
+    async fn aba_swap_restore_never_opens_or_mutates_foreign_inode() {
+        use std::os::fd::AsRawFd as _;
+
+        let (root, database, retained, args) = fixture().await;
+        let original = root.path().join("original.db");
+        let foreign = root.path().join("foreign.db");
+        let foreign_after = root.path().join("foreign-after.db");
+        std::fs::copy(&database, &foreign).unwrap();
+        let held = std::fs::File::open(&database).unwrap();
+        let held_path = std::path::PathBuf::from(format!("/proc/self/fd/{}", held.as_raw_fd()));
+        let mut boundary = |point| {
+            if point == Boundary::BeforePublication {
+                std::fs::rename(&database, &original).unwrap();
+                std::fs::rename(&foreign, &database).unwrap();
+            } else if point == Boundary::AfterPublicationBegin {
+                std::fs::rename(&database, &foreign_after).unwrap();
+                std::fs::rename(&original, &database).unwrap();
+                return Err(Failure::new("postflight", "database-identity"));
+            }
+            Ok(())
+        };
+        assert_eq!(
+            remediate_paths_opening(
+                &database,
+                &held_path,
+                &retained,
+                &args,
+                false,
+                false,
+                &mut boundary,
+            )
+            .await,
+            Err(Failure::new("postflight", "database-identity"))
+        );
+        let mut foreign_c = open(&foreign_after).await;
+        let latest: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
+            .fetch_one(&mut foreign_c)
+            .await
+            .unwrap();
+        let objects: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_schema WHERE name LIKE 'isolated_owner_binding_remediation_%'")
+            .fetch_one(&mut foreign_c).await.unwrap();
+        assert_eq!((latest, objects), (13, 0));
     }
 
     #[tokio::test]
@@ -1764,6 +1926,175 @@ mod tests {
                 classify_publication(observation, PublicationState::LegacyAbsence),
                 Err(Failure::new("unknown-commit", "not-committed"))
             );
+        }
+    }
+
+    #[tokio::test]
+    async fn publication_nine_cells_use_one_fresh_sqlite_reread_with_counts() {
+        for expected_state in [
+            PublicationState::LegacyAbsence,
+            PublicationState::Complete,
+            PublicationState::Other,
+        ] {
+            for observation in [
+                CommitObservation::Success,
+                CommitObservation::Error,
+                CommitObservation::Unavailable,
+            ] {
+                let (_root, database, retained, args) = fixture().await;
+                let operation = operation_id(&args);
+                let mut retained_c = open(&retained).await;
+                let retained_business = business_digest(&mut retained_c).await.unwrap();
+                if expected_state == PublicationState::Complete {
+                    remediate_paths(&database, &retained, &args, false)
+                        .await
+                        .unwrap();
+                    let mut c = open(&database).await;
+                    sqlx::query("DELETE FROM isolated_owner_binding_remediation_receipts")
+                        .execute(&mut c)
+                        .await
+                        .unwrap();
+                    sqlx::query("UPDATE execution_leases SET owner_token='owner-s'")
+                        .execute(&mut c)
+                        .await
+                        .unwrap();
+                    sqlx::query("UPDATE task_admissions SET runtime_instance='owner-s',revision=4,updated_at='2026-10-01T00:00:03.000000000Z'")
+                            .execute(&mut c).await.unwrap();
+                    c.close().await.unwrap();
+                } else if expected_state == PublicationState::Other {
+                    let pool = connect(&database).await.unwrap();
+                    migrate(&pool).await.unwrap();
+                    pool.close().await;
+                }
+                let mut fresh_opens = 0;
+                let mut boundary = |point| {
+                    if point == Boundary::AfterPublicationReread {
+                        fresh_opens += 1;
+                    }
+                    Ok(())
+                };
+                let old = open(&database).await;
+                let result = finish_publication_commit(
+                    observation,
+                    old,
+                    &database,
+                    &operation,
+                    &args,
+                    &retained_business,
+                    &mut boundary,
+                )
+                .await;
+                assert_eq!(fresh_opens, 1);
+                assert_eq!(
+                    result.map(|_| ()),
+                    match (observation, expected_state) {
+                        (_, PublicationState::Complete) => Ok(()),
+                        (
+                            CommitObservation::Error | CommitObservation::Unavailable,
+                            PublicationState::LegacyAbsence,
+                        ) => Err(Failure::new("unknown-commit", "not-committed")),
+                        _ => Err(Failure::new("unknown-commit", "ambiguous")),
+                    }
+                );
+                let mut reread = open(&database).await;
+                let counts: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT count(*) FROM isolated_owner_binding_remediation_witness),(SELECT count(*) FROM isolated_owner_binding_remediation_receipts),(SELECT count(*) FROM execution_leases WHERE owner_token='owner-a')")
+                    .fetch_one(&mut reread).await.unwrap_or((0,0,0));
+                assert_eq!(counts.1, 0);
+                assert_eq!(counts.2, 0);
+                assert_eq!(
+                    counts.0,
+                    i64::from(expected_state == PublicationState::Complete)
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn precommit_faults_rollback_every_partial_publication() {
+        for fault in [
+            Boundary::AfterPublicationBegin,
+            Boundary::AfterWitnessDdl,
+            Boundary::AfterReceiptDdl,
+            Boundary::AfterLedgerInsert,
+            Boundary::AfterWitnessInsert,
+            Boundary::BeforePublicationCommit,
+        ] {
+            let (_root, database, retained, args) = fixture().await;
+            let mut fresh_opens = 0;
+            let mut boundary = |point| {
+                if point == Boundary::AfterPublicationReread {
+                    fresh_opens += 1;
+                }
+                if point == fault {
+                    return Err(Failure::new("postflight", "database-identity"));
+                }
+                Ok(())
+            };
+            assert_eq!(
+                remediate_paths_with_boundaries(
+                    &database,
+                    &retained,
+                    &args,
+                    false,
+                    false,
+                    &mut boundary,
+                )
+                .await,
+                Err(Failure::new("postflight", "database-identity"))
+            );
+            assert_eq!(fresh_opens, 1);
+            let mut c = open(&database).await;
+            let latest: i64 = sqlx::query_scalar("SELECT max(version) FROM _sqlx_migrations")
+                .fetch_one(&mut c)
+                .await
+                .unwrap();
+            let objects: i64 = sqlx::query_scalar("SELECT count(*) FROM sqlite_schema WHERE name LIKE 'isolated_owner_binding_remediation_%'")
+                .fetch_one(&mut c).await.unwrap();
+            let owners: (String, String) = sqlx::query_as("SELECT (SELECT owner_token FROM execution_leases),(SELECT runtime_instance FROM task_admissions)")
+                .fetch_one(&mut c).await.unwrap();
+            assert_eq!((latest, objects), (13, 0));
+            assert_eq!(owners, ("owner-s".to_owned(), "owner-s".to_owned()));
+        }
+    }
+
+    #[tokio::test]
+    async fn hostile_durable_publication_shapes_never_enter_business_mutation() {
+        for hostile in 0..5 {
+            let (_root, database, retained, args) = fixture().await;
+            let pool = connect(&database).await.unwrap();
+            migrate(&pool).await.unwrap();
+            match hostile {
+                0 => {}
+                1 => {
+                    pool.execute("DROP TABLE isolated_owner_binding_remediation_receipts")
+                        .await
+                        .unwrap();
+                }
+                2 => {
+                    pool.execute("DELETE FROM _sqlx_migrations WHERE version=14")
+                        .await
+                        .unwrap();
+                }
+                3 => {
+                    pool.execute(
+                        "UPDATE _sqlx_migrations SET description='hostile' WHERE version=14",
+                    )
+                    .await
+                    .unwrap();
+                }
+                _ => {
+                    pool.execute("CREATE TABLE isolated_owner_binding_remediation_extra(value INTEGER) STRICT").await.unwrap();
+                }
+            };
+            pool.close().await;
+            assert_eq!(
+                remediate_paths(&database, &retained, &args, false).await,
+                Err(Failure::new("migration", "compatibility"))
+            );
+            let mut c = open(&database).await;
+            let owners: (String, String) = sqlx::query_as("SELECT (SELECT owner_token FROM execution_leases),(SELECT runtime_instance FROM task_admissions)")
+                .fetch_one(&mut c).await.unwrap();
+            assert_eq!(owners, ("owner-s".to_owned(), "owner-s".to_owned()));
         }
     }
 
