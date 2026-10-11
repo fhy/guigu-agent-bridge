@@ -1,6 +1,7 @@
 """Native A2A against the actual application and native ACP agent."""
 import json
 import sqlite3
+import time
 
 from app import http
 from materials import Refusal
@@ -14,6 +15,22 @@ def send_params(message="native-message", text="Reply exactly T050_N_NATIVE_OK. 
 def rows(database):
     with sqlite3.connect(database) as db:
         return db.execute("SELECT COUNT(*) FROM a2a_exchanges WHERE direction='inbound'").fetchone()[0]
+
+
+def wait_working(app, task, report, timeout=45):
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        status, snapshot = app.rpc("tasks/get", {"id": task})
+        if status != 200 or "result" not in snapshot:
+            raise Refusal("cancel-state")
+        state = snapshot["result"]["status"]
+        if state == "working":
+            report["cancel_observed_stage"] = "working"
+            return
+        if state != "submitted":
+            raise Refusal("cancel-task-finished-before-request")
+        time.sleep(0.1)
+    raise Refusal("cancel-working-timeout")
 
 
 def exercise(app, report):
@@ -65,6 +82,7 @@ def exercise(app, report):
     if status != 200:
         raise Refusal("cancel-send")
     canceled_id = submitted["result"]["id"]
+    wait_working(app, canceled_id, report)
     status, _ = app.rpc("tasks/cancel", {"id": canceled_id})
     if status != 200 or app.terminal(canceled_id)["status"] != "canceled":
         raise Refusal("cancel-active")

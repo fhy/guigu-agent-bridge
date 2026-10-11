@@ -1066,7 +1066,14 @@ impl TaskLifecycle for SqliteTaskLifecycle {
         event: &'a crate::models::TaskEvent,
     ) -> BusFuture<'a, Result<LifecycleResult, DispatchError>> {
         Box::pin(async move {
-            let mut tx = self.pool.begin().await.map_err(runtime_dispatch_error)?;
+            // Take the write lock before reading replay identity. A deferred WAL
+            // snapshot cannot be promoted while another writer is active, even
+            // with busy_timeout; that would fail-stop the worker on a valid event.
+            let mut tx = self
+                .pool
+                .begin_with("BEGIN IMMEDIATE")
+                .await
+                .map_err(runtime_dispatch_error)?;
             let replay: Option<i64> = sqlx::query_scalar(
                 "SELECT 1 FROM task_events WHERE event_id=? AND task_id=? AND seq=?",
             )

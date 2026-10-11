@@ -69,13 +69,17 @@ enabled = true
 }
 
 async fn rpc(runtime: &AppRuntime, method: &str, params: Value) -> Value {
+    rpc_id(runtime, method, params, "fixture-rpc").await
+}
+
+async fn rpc_id(runtime: &AppRuntime, method: &str, params: Value, id: &str) -> Value {
     let response = reqwest::Client::new()
         .post(format!(
             "http://{}/a2a/worker/rpc",
             runtime.a2a_addr().unwrap()
         ))
         .bearer_auth("fixture-sentinel")
-        .json(&json!({"jsonrpc":"2.0","id":"fixture-rpc","method":method,"params":params}))
+        .json(&json!({"jsonrpc":"2.0","id":id,"method":method,"params":params}))
         .send()
         .await
         .unwrap();
@@ -89,7 +93,7 @@ fn send() -> Value {
 }
 
 async fn terminal(runtime: &AppRuntime, task: &Value) -> Value {
-    tokio::time::timeout(Duration::from_secs(10), async {
+    tokio::time::timeout(Duration::from_secs(60), async {
         loop {
             let result = rpc(runtime, "tasks/get", json!({"id":task["id"]})).await;
             if !matches!(result["status"].as_str(), Some("submitted" | "working")) {
@@ -195,5 +199,28 @@ async fn streaming_deadline_commits_once_and_shutdown_reaps() {
         .unwrap();
     assert_eq!(disposition, "terminal");
     pool.close().await;
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn immediate_cancel_after_restart_keeps_worker_available() {
+    let fixture = Fixture {
+        root: tempfile::tempdir().unwrap(),
+        legacy: true,
+    };
+    let runtime = fixture.start().await;
+    let accepted = rpc(&runtime, "message/send", send()).await;
+    assert_eq!(terminal(&runtime, &accepted).await["status"], "completed");
+    runtime.shutdown().await.unwrap();
+    let runtime = fixture.start_scenario("chunks-then-hang", 2).await;
+    let mut next = send();
+    next["message"]["messageId"] = json!("cancel-message");
+    let accepted = rpc_id(&runtime, "message/send", next, "cancel-send").await;
+    rpc(&runtime, "tasks/cancel", json!({"id":accepted["id"]})).await;
+    assert_eq!(terminal(&runtime, &accepted).await["status"], "canceled");
+    let mut next = send();
+    next["message"]["messageId"] = json!("after-cancel");
+    let accepted = rpc_id(&runtime, "message/send", next, "after-cancel").await;
+    assert_eq!(terminal(&runtime, &accepted).await["status"], "failed");
     runtime.shutdown().await.unwrap();
 }

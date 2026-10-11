@@ -13,7 +13,7 @@ T050_N_BINARY=/path/to/current/guigu-agent-bridge python3 -m unittest discover -
 Run actual native A2A and conditional Matrix acceptance:
 
 ```sh
-python3 staging/t050_n/run.py --binary /path/to/current/guigu-agent-bridge --agent /path/to/qwen
+python3 staging/t050_n/run.py --binary /path/to/current/guigu-agent-bridge --agent /path/to/native-acp-agent
 ```
 
 The runner creates one private temporary directory under the user's `.cache` (not
@@ -23,11 +23,15 @@ The same private DB is reused for restart. Child output is suppressed; fixed res
 categories/counts are written to private `result.json`. That directory is deliberately
 retained as test evidence, not reported as zero residue. No old namespace is queried.
 
-Native ACP uses the installed real Qwen agent in safe/plan mode with Advisor disabled
-and a text-only prompt. Native agent per-session recording is left at its normal
+Native ACP uses the selected installed real agent (for example, Qwen or Codex ACP)
+and a text-only prompt. For Qwen, safe/plan mode and Advisor-disabled arguments are
+supplied automatically. Native agent per-session recording is left at its normal
 default; it may leave its own test-session evidence outside the runner directory.
 It is not a fake backend. This needs the agent's ordinary existing model authentication.
 Card, send, get, output, replay, conflict, cancel and restart are separate assertions.
+Active cancellation waits for an observed `working` task; submission alone is not
+labelled active execution. Queued cancellation and writer contention have separate
+real root HTTP/SQLite regression fixtures.
 
 Matrix privately consumes the four assigned staging EnvironmentFiles. A password
 permits one login for a fresh independent device. Without it, an existing staging

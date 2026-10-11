@@ -11,13 +11,42 @@ import sys
 import tempfile
 import time
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from app import Application, closed, port
 from materials import Refusal, classify, read_material
 from matrix_flow import MatrixFlow
 from owned import Owned, subreaper
 from acp_turn import exchange
+from native import wait_working
+
+
+class CancellationStageTests(unittest.TestCase):
+    def test_stage_is_observed_not_inferred_from_submission(self):
+        app = Mock()
+        app.rpc.side_effect = [(200, {"result": {"status": "submitted"}}),
+                               (200, {"result": {"status": "working"}})]
+        report = {}
+        with patch("native.time.sleep"):
+            wait_working(app, "test-task", report)
+        self.assertEqual(report, {"cancel_observed_stage": "working"})
+        self.assertEqual(app.rpc.call_count, 2)
+
+    def test_finished_task_does_not_claim_active_cancellation(self):
+        app = Mock()
+        app.rpc.return_value = (200, {"result": {"status": "completed"}})
+        report = {}
+        with self.assertRaisesRegex(Refusal, "finished-before-request"):
+            wait_working(app, "test-task", report)
+        self.assertEqual(report, {})
+
+    def test_timeout_does_not_issue_cancel_or_claim_working(self):
+        app = Mock()
+        report = {}
+        with self.assertRaisesRegex(Refusal, "working-timeout"):
+            wait_working(app, "test-task", report, timeout=0)
+        app.rpc.assert_not_called()
+        self.assertEqual(report, {})
 
 
 class LifecycleTests(unittest.TestCase):
