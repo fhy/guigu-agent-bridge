@@ -1386,9 +1386,7 @@ mod tests {
 
     #[tokio::test]
     async fn process_cli_success_repeat_rejection_and_late_multituple_rollback_are_redacted() {
-        let executable = std::env::var_os("CARGO_BIN_EXE_guigu-agent-bridge")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("target/debug/guigu-agent-bridge"));
+        let executable = crate::test_binary_path("guigu-agent-bridge");
         let path = initialized_path("cli").await;
         let tuple = fixture(&path, "cli").await;
         let database = path.to_str().unwrap().to_owned();

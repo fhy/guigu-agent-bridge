@@ -712,8 +712,7 @@ mod tests {
     async fn cli_process_emits_fixed_success_already_stopped_and_rejection() {
         let (path, pool) = fixture().await;
         pool.close().await;
-        let exe = std::env::var("CARGO_BIN_EXE_guigu-agent-bridge")
-            .unwrap_or_else(|_| "target/debug/guigu-agent-bridge".to_owned());
+        let exe = crate::test_binary_path("guigu-agent-bridge");
         let database = path.to_str().unwrap().to_owned();
         let run = |token: &'static str| {
             let exe = exe.clone();

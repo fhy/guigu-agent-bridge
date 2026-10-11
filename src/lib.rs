@@ -452,6 +452,31 @@ where
 }
 
 #[cfg(test)]
+pub(crate) fn test_binary_path(name: &str) -> std::path::PathBuf {
+    let variable = format!("CARGO_BIN_EXE_{name}");
+    resolve_test_binary(
+        name,
+        std::env::var_os(&variable),
+        std::env::var_os("CARGO_TARGET_DIR"),
+    )
+}
+
+#[cfg(test)]
+fn resolve_test_binary(
+    name: &str,
+    cargo_path: Option<std::ffi::OsString>,
+    target_dir: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    if let Some(path) = cargo_path {
+        return path.into();
+    }
+    if let Some(target) = target_dir {
+        return std::path::PathBuf::from(target).join("debug").join(name);
+    }
+    std::path::PathBuf::from("target/debug").join(name)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -508,5 +533,22 @@ mod tests {
     fn init_tracing_is_idempotent() {
         init_tracing();
         init_tracing();
+    }
+
+    #[test]
+    fn process_fixture_binary_binding_uses_hyphenated_cargo_name() {
+        let path = resolve_test_binary(
+            "guigu-agent-bridge",
+            Some("/shared/target/debug/guigu-agent-bridge".into()),
+            Some("/ignored/target".into()),
+        );
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/shared/target/debug/guigu-agent-bridge")
+        );
+        assert_eq!(
+            resolve_test_binary("guigu-agent-bridge", None, Some("/shared/target".into())),
+            std::path::PathBuf::from("/shared/target/debug/guigu-agent-bridge")
+        );
     }
 }
