@@ -1659,7 +1659,8 @@ mod tests {
         assert!(sidecars.revalidate(&database).is_err());
 
         let (_root, database, _wal, shm, sidecars) = sidecar_fixture();
-        std::fs::remove_file(&shm).unwrap();
+        // Keep the old inode allocated: immediate unlink/recreate may reuse it.
+        std::fs::rename(&shm, _root.path().join("original-shm")).unwrap();
         std::fs::write(&shm, b"replacement").unwrap();
         assert!(sidecars.revalidate(&database).is_err());
 

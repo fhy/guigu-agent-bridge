@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import selectors
 from pathlib import Path
 import signal
 import socket
@@ -16,6 +17,7 @@ from app import Application, closed, port
 from materials import Refusal, classify, read_material
 from matrix_flow import MatrixFlow
 from owned import Owned, subreaper
+from acp_turn import exchange
 
 
 class LifecycleTests(unittest.TestCase):
@@ -117,6 +119,42 @@ except KeyboardInterrupt:
                 app.start(timeout=0.001)
             self.assertIsNone(app.owner)
             self.assertTrue(app.cleanups)
+
+
+class DiagnosticTests(unittest.TestCase):
+    def test_split_marker_is_seen_without_exposing_peer_text(self):
+        subreaper()
+        script = ('import sys,json; req=json.loads(input()); '
+                  'chunks=["T050_N_","NATIVE_OK fixture-private-text"]; '
+                  '[print(json.dumps({"method":"session/update","params":{"update":'
+                  '{"sessionUpdate":"agent_message_chunk","content":{"text":text}}}}),flush=True) '
+                  'for text in chunks]; '
+                  'print(json.dumps({"id":req["id"],"result":{"stopReason":"end_turn"}}),flush=True)')
+        report = {"notifications": 0, "text_bytes": 0, "marker_seen": False,
+                  "stderr_categories": [], "text_categories": [],
+                  "method_classes": [], "update_classes": []}
+        with Owned([sys.executable, "-c", script], pipe=True, stderr_pipe=True) as owner:
+            with selectors.DefaultSelector() as selector:
+                selector.register(owner.child.stdout, selectors.EVENT_READ, "stdout")
+                selector.register(owner.child.stderr, selectors.EVENT_READ, "stderr")
+                exchange(owner, selector, 1, "session/prompt", {}, report, timeout=3)
+        self.assertTrue(report["marker_seen"])
+        self.assertNotIn("fixture-private-text", json.dumps(report))
+
+    def test_actual_gate_stage_keeps_evidence_private_and_child_umask_normal(self):
+        source = Path(__file__).with_name("gate.sh").read_text()
+        stage = source[source.index("stage() {"):source.index("\nstage build")]
+        with tempfile.TemporaryDirectory() as root:
+            environment = dict(os.environ, gate_evidence=root)
+            with Owned(["bash", "-c", "umask 077; gate_failed=0; " + stage +
+                        "\nstage mode bash -c 'umask'"], env=environment) as owner:
+                deadline = time.monotonic() + 5
+                while not owner.exited() and time.monotonic() < deadline:
+                    time.sleep(0.02)
+                self.assertTrue(owner.exited())
+                self.assertEqual(owner.stop()["exit"], 0)
+            self.assertEqual((Path(root) / "mode.log").read_text().strip(), "0022")
+            self.assertEqual((Path(root) / "mode.log").stat().st_mode & 0o777, 0o600)
 
 
 class MaterialTests(unittest.TestCase):

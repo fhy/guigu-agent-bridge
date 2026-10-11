@@ -8,12 +8,17 @@ import time
 
 from owned import Owned, subreaper
 
+TEXT_CATEGORIES = ("authentication", "unauthorized", "invalid_api_key", "401", "403", "429",
+                   "model_not_found", "not supported", "model", "rate limit", "billing",
+                   "credentials", "sign in", "login", "error", "timeout", "permission")
+
 
 def exchange(owner, selector, request_id, method, params, report, timeout=15):
     owner.child.stdin.write((json.dumps({"jsonrpc": "2.0", "id": request_id,
                              "method": method, "params": params}) + "\n").encode())
     owner.child.stdin.flush()
     pending = b""
+    text_tail = ""
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         ready = selector.select(timeout=0.2)
@@ -57,7 +62,12 @@ def exchange(owner, selector, request_id, method, params, report, timeout=15):
                         content = update.get("content", {})
                         text = content.get("text", "")
                         report["text_bytes"] += len(text.encode())
-                        report["marker_seen"] |= "T050_N_NATIVE_OK" in text
+                        observed = text_tail + text
+                        report["marker_seen"] |= "T050_N_NATIVE_OK" in observed
+                        for category in TEXT_CATEGORIES:
+                            if category in observed.lower() and category not in report["text_categories"]:
+                                report["text_categories"].append(category)
+                        text_tail = observed[-64:]
                     for update_class in ("available_commands_update", "agent_thought_chunk",
                                          "agent_message_chunk", "tool_call", "tool_call_update"):
                         if update.get("sessionUpdate") == update_class and update_class not in report["update_classes"]:
@@ -75,7 +85,7 @@ def turn(agent, observe=False):
     os.umask(0o077)
     report = {"stage": "initialize", "notifications": 0, "text_bytes": 0,
               "marker_seen": False, "prompts": 0, "stderr_categories": [],
-              "method_classes": [], "update_classes": []}
+              "method_classes": [], "update_classes": [], "text_categories": []}
     with tempfile.TemporaryDirectory(prefix="t050-n-native-turn-") as root:
         arguments = ["--acp", "--safe-mode", "--advisor", "off", "--approval-mode", "plan"] if os.path.basename(agent) == "qwen" else []
         auth_method = "openai" if arguments else "api-key"
@@ -87,7 +97,8 @@ def turn(agent, observe=False):
                 selector.register(owner.child.stderr, selectors.EVENT_READ, "stderr")
                 try:
                     exchange(owner, selector, 1, "initialize", {"protocolVersion": 1,
-                             "clientCapabilities": {}}, report)
+                             "clientCapabilities": {},
+                             "clientInfo": {"name": "t050-n-diagnostic", "version": "1"}}, report)
                     report["stage"] = "authenticate"
                     exchange(owner, selector, 2, "authenticate", {"methodId": auth_method}, report)
                     report["stage"] = "session"

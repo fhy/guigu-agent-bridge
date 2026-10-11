@@ -25,7 +25,8 @@ gate_failed=0
 stage() {
     local stage_name=$1
     shift
-    "$@" >"$gate_evidence/$stage_name.log" 2>&1
+    # Evidence stays private; approved old OS fixtures expect normal create modes.
+    (umask 022; "$@") >"$gate_evidence/$stage_name.log" 2>&1
     local stage_exit=$?
     printf '%s\n' "$stage_exit" >"$gate_evidence/$stage_name.exit"
     sync -f "$gate_evidence/$stage_name.exit"
