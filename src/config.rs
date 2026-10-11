@@ -65,6 +65,8 @@ pub struct BridgeConfig {
 /// Bounded continuation and execution-lease policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
+    /// Explicit standard ACP single-turn completion; strict taskResult is default.
+    pub legacy_acp_results: bool,
     pub allow_nonterminal_end_turn: bool,
     pub max_turns: u32,
     pub max_wall_seconds: u64,
@@ -339,6 +341,8 @@ struct RawBridge {
 #[serde(deny_unknown_fields)]
 struct RawRuntime {
     #[serde(default)]
+    legacy_acp_results: bool,
+    #[serde(default)]
     allow_nonterminal_end_turn: bool,
     #[serde(default = "default_max_turns")]
     max_turns: u32,
@@ -582,6 +586,7 @@ impl Default for RawBridge {
 impl Default for RawRuntime {
     fn default() -> Self {
         Self {
+            legacy_acp_results: false,
             allow_nonterminal_end_turn: false,
             max_turns: default_max_turns(),
             max_wall_seconds: default_max_wall(),
@@ -1126,6 +1131,12 @@ fn validate_capacity(field: &str, value: usize) -> Result<(), ConfigError> {
 }
 
 fn build_runtime(raw: RawRuntime) -> Result<RuntimeConfig, ConfigError> {
+    if raw.legacy_acp_results && raw.allow_nonterminal_end_turn {
+        return Err(validation(
+            "runtime.legacy_acp_results",
+            "conflicts with nonterminal end_turn",
+        ));
+    }
     if !(1..=64).contains(&raw.max_turns) {
         return Err(validation("runtime.max_turns", "must be in range 1..=64"));
     }
@@ -1164,6 +1175,7 @@ fn build_runtime(raw: RawRuntime) -> Result<RuntimeConfig, ConfigError> {
         ));
     }
     Ok(RuntimeConfig {
+        legacy_acp_results: raw.legacy_acp_results,
         allow_nonterminal_end_turn: raw.allow_nonterminal_end_turn,
         max_turns: raw.max_turns,
         max_wall_seconds: raw.max_wall_seconds,

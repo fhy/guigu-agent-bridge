@@ -248,6 +248,14 @@ impl AcpStructuredTurn {
         match completed {
             Ok(completed) => {
                 let response = AcpClient::decode_prompt_completion(completed)?;
+                if self.dispatcher.inner.legacy_results
+                    && response.stop_reason.is_end_turn()
+                    && response.task_result.is_none()
+                {
+                    return Ok(crate::acp::TurnResult::Completed {
+                        output: response.text,
+                    });
+                }
                 if self.dispatcher.inner.allow_nonterminal_end_turn
                     && response.stop_reason.is_end_turn()
                     && response.task_result.is_none()

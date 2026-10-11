@@ -86,6 +86,9 @@ fn main() {
                     "need-auth-agent" => {
                         json!([{"type": "agent", "id": "api-key", "name": "API Key"}])
                     }
+                    "need-auth-openai" => {
+                        json!([{"id": "openai", "name": "Native API Key"}])
+                    }
                     "auth-terminal" => {
                         json!([{"type": "terminal", "id": "api-key", "name": "API Key"}])
                     }
@@ -116,10 +119,12 @@ fn main() {
                 }
             }
             "authenticate" => {
-                if matches!(
-                    scenario.as_str(),
-                    "need-auth" | "need-auth-agent" | "auth-mixed" | "exit-after-auth"
-                ) && params.get("methodId").and_then(Value::as_str) == Some("api-key")
+                if (scenario == "need-auth-openai"
+                    && params.get("methodId").and_then(Value::as_str) == Some("openai"))
+                    || (matches!(
+                        scenario.as_str(),
+                        "need-auth" | "need-auth-agent" | "auth-mixed" | "exit-after-auth"
+                    ) && params.get("methodId").and_then(Value::as_str) == Some("api-key"))
                 {
                     respond(&id, json!({}));
                     if scenario == "exit-after-auth" {
@@ -163,12 +168,20 @@ fn main() {
                         .open(path)
                         .and_then(|mut file| file.write_all(b"resume\n"));
                 }
-                // Echo the requested id: the adapter requires that.
+                // Native resume response omits the new-session ID; legacy peers
+                // may echo it, in which case it must still match exactly.
                 let session_id = params
                     .get("sessionId")
                     .and_then(Value::as_str)
                     .unwrap_or("session-1");
-                respond(&id, json!({"sessionId": session_id}));
+                let result = match scenario.as_str() {
+                    "resume-native" => json!({}),
+                    "resume-foreign" => json!({"sessionId": "foreign-session"}),
+                    "resume-null" => json!({"sessionId": null}),
+                    "resume-array" => json!([]),
+                    _ => json!({"sessionId": session_id}),
+                };
+                respond(&id, result);
             }
             "session/prompt" => {
                 prompt_counter += 1;

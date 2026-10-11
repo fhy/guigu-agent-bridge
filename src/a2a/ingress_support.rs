@@ -3,13 +3,35 @@ use uuid::Uuid;
 
 use crate::{
     bus::BusError,
-    models::{TaskId, TaskStatus},
+    models::{TaskEvent, TaskEventPayload, TaskId, TaskStatus},
 };
 
 use super::{
     A2aError, ExchangeRecord, IngressCause, IngressStage, Retryability,
-    wire::{Part, TaskState},
+    wire::{Artifact, Part, TaskState},
 };
+
+pub(super) fn output_artifacts(row: &ExchangeRecord, event: Option<&TaskEvent>) -> Vec<Artifact> {
+    if row.content_cleaned {
+        return vec![];
+    }
+    let Some(TaskEvent {
+        status: TaskStatus::Completed,
+        payload: TaskEventPayload::Completed { output },
+        ..
+    }) = event
+    else {
+        return vec![];
+    };
+    vec![Artifact {
+        artifact_id: format!("{}:output", row.exchange_id),
+        name: Some("response".into()),
+        description: None,
+        parts: vec![Part::Text {
+            text: output.clone(),
+        }],
+    }]
+}
 
 pub(super) fn parse_task(row: &ExchangeRecord) -> Result<TaskId, A2aError> {
     row.internal_task_id

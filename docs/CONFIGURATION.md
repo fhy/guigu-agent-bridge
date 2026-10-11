@@ -1,5 +1,12 @@
 # Configuration Reference
 
+For a standard single-turn ACP agent without the bridge's structured `taskResult`
+extension, opt into `[runtime] legacy_acp_results = true`. This treats successful
+`end_turn` as terminal and returns streamed output; refusal and other stop reasons
+remain failures. The default is false (strict structured results). Do not combine
+it with `allow_nonterminal_end_turn`, which deliberately continues rather than
+completing such turns.
+
 Start from `config.example.toml`. Unknown or invalid values fail startup. Secret values
 use `{env:VARIABLE}` references; do not store access tokens in the file.
 

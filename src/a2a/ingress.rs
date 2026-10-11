@@ -357,9 +357,10 @@ impl A2aIngress {
                 .ok_or(A2aError::RecoveryNeeded)?,
             context_id: row.external_context_id.clone().unwrap_or_default(),
             status: event
+                .as_ref()
                 .map(|event| project(event.status))
                 .unwrap_or(TaskState::Submitted),
-            artifacts: vec![],
+            artifacts: output_artifacts(row, event.as_ref()),
             metadata: row.content_cleaned.then(|| json!({"contentExpired": true})),
         })
     }

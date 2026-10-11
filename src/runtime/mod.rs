@@ -1639,6 +1639,7 @@ impl LeasedAcpDispatcher {
         guard: &mut ExecutionGuard,
         state: &Continuation,
         cancel: &mut tokio::sync::mpsc::Receiver<SupervisorCommand>,
+        defer: bool,
     ) -> Result<TurnRun, DispatchError> {
         let mut turn = self
             .dispatcher
@@ -1648,10 +1649,12 @@ impl LeasedAcpDispatcher {
         let mut last_activity = self.clock.now();
         let wall_deadline =
             add(state.started_at, self.policy.max_wall_time).map_err(Self::execution_error)?;
-        let hard_deadline = request
-            .task
-            .deadline
-            .map_or(wall_deadline, |deadline| deadline.min(wall_deadline));
+        // Prepared execution delegates task-deadline finalization to the bus.
+        // Racing that same deadline here can reap before its cancellation command
+        // arrives, losing the capability needed to commit the timed-out event.
+        let task_deadline = (!defer).then_some(request.task.deadline).flatten();
+        let hard_deadline =
+            task_deadline.map_or(wall_deadline, |deadline| deadline.min(wall_deadline));
         loop {
             let now = self.clock.now();
             if now >= hard_deadline {
@@ -1740,7 +1743,8 @@ impl LeasedAcpDispatcher {
             .ok_or_else(|| Self::execution_error(RuntimeError::Malformed))?;
         loop {
             let now = self.clock.now();
-            if let Err(error) = self.policy.check(&state, now, request.task.deadline) {
+            let task_deadline = (!defer).then_some(request.task.deadline).flatten();
+            if let Err(error) = self.policy.check(&state, now, task_deadline) {
                 return self.exhaust(&mut guard, &state, error, defer).await;
             }
             let renewed = self
@@ -1760,7 +1764,9 @@ impl LeasedAcpDispatcher {
                 .await
                 .map_err(Self::execution_error)?;
             self.metrics.increment(Metric::TurnStarted);
-            let result = self.run_turn(request, &mut guard, &state, cancel).await;
+            let result = self
+                .run_turn(request, &mut guard, &state, cancel, defer)
+                .await;
             if let Ok(TurnRun::Cancelled(command)) = result {
                 let lease = guard.lease().clone();
                 guard.disarm();

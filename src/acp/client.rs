@@ -211,10 +211,9 @@ impl AcpClient {
 
     /// Re-bind an existing session.
     ///
-    /// The agent must answer with the session id that was asked for: a resume that
-    /// silently moves to another session would make the stored row and the live
-    /// conversation disagree, so it is reported as
-    /// [`AcpError::SessionId`] instead.
+    /// Resume is bound to the requested session by the correlated JSON-RPC reply.
+    /// Native ACP resume results may omit the new-session `sessionId` field. If
+    /// a peer additionally echoes it, a different or malformed identity is refused.
     ///
     /// # Errors
     ///
@@ -250,14 +249,22 @@ impl AcpClient {
                 self.limits.request_deadline,
             )
             .await?;
-        let result: SessionResult = decode(schema::METHOD_SESSION_RESUME, completed.result)?;
-        let returned = validate_session_id(result.session_id)?;
-        if returned != requested {
-            return Err(AcpError::SessionId {
-                detail: "resume answered with a different session id".to_owned(),
+        if !completed.result.is_object() {
+            return Err(AcpError::Schema {
+                method: schema::METHOD_SESSION_RESUME.to_owned(),
+                detail: "resume result must be an object".to_owned(),
             });
         }
-        Ok(returned)
+        if completed.result.get("sessionId").is_some() {
+            let result: SessionResult = decode(schema::METHOD_SESSION_RESUME, completed.result)?;
+            let returned = validate_session_id(result.session_id)?;
+            if returned != requested {
+                return Err(AcpError::SessionId {
+                    detail: "resume answered with a different session id".to_owned(),
+                });
+            }
+        }
+        Ok(requested)
     }
 
     /// Run one prompt turn to its terminal answer.

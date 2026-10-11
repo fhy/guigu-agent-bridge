@@ -1,81 +1,62 @@
-# T050-N standalone Linux staging graph
+# Direct staging acceptance runner
 
-This crate is not a production entrypoint. It does not import the old staging
-helper/provisioner dispatch, production constants, or Matrix startup. No live
-invocation is authorized by the existence of these executables.
+This is the simplified T050-N runner, not a namespace/ownership proof framework.
+Production startup and optional normal systemd deployment are unchanged. The old
+standalone proof crate and fixtures are removed. Python uses only the standard library.
 
-## Implementation analysis (before code)
+Run focused lifecycle tests with a current shared-target bridge binary:
 
-Normative inputs: independent namespace R2 design (`ec44ebee`) and Controller
-revocation decision `c296542` and retained-FD seam decision `c1a75c0`.
-Source base: `5876dc88`. All changes are additions
-inside this directory, in the exact module/test list approved by R2. Root source,
-Cargo files, build script, migrations, old staging graphs and production units are
-excluded. No historical runtime metadata is sampled.
+```sh
+T050_N_BINARY=/path/to/current/guigu-agent-bridge python3 -m unittest discover -s staging/t050_n -v
+```
 
-Call graph: provisioner -> typed contract -> retained namespace/lock -> descriptor
-publication -> journal receipt/reservation -> owned syscall/child supervisor ->
-typed manager/readiness -> helper; parent -> granted secret setup before runtime
-threads -> root `run_with_shutdown`. Root `run()` is never called. Root startup
-loads config, opens/migrates the confined DB and acquires its DB-local admission
-guard; its path operations require broker coverage, not a test-only assertion.
+Run actual native A2A and conditional Matrix acceptance:
 
-Dependencies match root locked versions. This crate has its own Cargo.lock and
-shares the approved build target. Build ownership is released before namespace
-ownership. The namespace flock is held through reservation, child lifecycle and
-final recording; helpers do not reacquire it. Never await a manager/child while
-holding the build lock. Journal reservations precede effects; missing acknowledgements
-remain unknown, not a retry. Signals, nonzero, early exit and deadlines preserve
-the original outcome separately from cleanup. Only retained-descriptor execution,
-certified pidfd ownership and complete receipts grant authority.
+```sh
+python3 staging/t050_n/run.py --binary /path/to/current/guigu-agent-bridge --agent /path/to/qwen
+```
 
-Publication uses anonymous inodes and descriptor-selected no-replace links, with
-file/parent fsync. Publication/recovery cannot recapture current replacements as
-original witnesses. Teardown never conditionally unlinks by name: durable revocation
-records retain original/replacement identities; every later tuple admission rejects
-revocation. A crash before that record is unknown-retained. Authority files remain
-private evidence; process/listener/scope retirement and publication-data retention
-are different outcomes.
+The runner creates one private temporary directory under the user's `.cache` (not
+world-writable `/tmp`, which the product's crypto-store guard rejects), uses free loopback ports, retains
+Popen handles immediately, and stops/reaps its own process group in finally paths.
+The same private DB is reused for restart. Child output is suppressed; fixed result
+categories/counts are written to private `result.json`. That directory is deliberately
+retained as test evidence, not reported as zero residue. No old namespace is queried.
 
-Validation: N01-N31 pure/fake/owned OS-process/private-FS cases only. No real
-credentials, service manager mutation, Matrix, native A2A or E2E. Unsupported
-kernel boundaries and incomplete trace fail closed. A command-issuance certificate
-is not a runtime certificate; each runtime certificate states its exact coverage.
+Native ACP uses the installed real Qwen agent in safe/plan mode with Advisor disabled
+and a text-only prompt. Native agent per-session recording is left at its normal
+default; it may leave its own test-session evidence outside the runner directory.
+It is not a fake backend. This needs the agent's ordinary existing model authentication.
+Card, send, get, output, replay, conflict, cancel and restart are separate assertions.
 
-Launcher analysis: `LaunchWitness` borrows original namespace/config/lock FDs and
-the current owner PID/start-ticks/image certificate. Admission rechecks them before
-fork. The child blocks on a private socket, while its creator captures pidfd/ticks
-and journals ownership; `grant` rechecks all witnesses and the retained image before
-allowing `execveat(AT_EMPTY_PATH)`. Missing/mismatched FD evidence cannot grant.
-Cancel/timeout/drop close the gate and stop/reap this original pidfd only. No root
-ACP API, production startup, linker interposition or pathname continuation changes.
-The staging adapter is explicit; it does not automatically weaken root Command calls.
+Matrix privately consumes the four assigned staging EnvironmentFiles. A password
+permits one login for a fresh independent device. Without it, an existing staging
+session can initialize a fresh store only if real whoami/key-query facts show a
+non-T046 device with no published keys. Existing keys are never replaced. Existing
+sender tokens can be used for the other three roles. Login failures are not retried.
+No password reset, canonical
+device key replacement, original store copy or old supplier invocation is used.
+The real private, non-federating room is intentionally unencrypted for this acceptance
+scope. All four joined memberships are checked; three senders exercise the application,
+then it restarts with the same DB/store and receives a new message. Remote room/session
+residue is reported, never hidden by deleting unrelated resources. After process exit,
+participants leave only the newly created room; room history and issued sessions/devices
+remain honest remote residue.
 
-## Reviewed-scope adapters and evidence limits
+If configured native providers are unavailable, `--matrix-transport-only` exercises
+real Matrix membership, three real senders, expected application timeout replies,
+same-state restart/dedup and a new post-restart reply. This is reported as a transport
+and expected-timeout cell, **not successful native/Matrix E2E**. Diagnostic helpers
+only emit fixed categories/counts/public endpoint metadata, never native response bodies.
 
-`BoundNamespace` owns the original allocation, authenticated publication, journal,
-operation reservation and staging child. Recovery packets are read-only and never
-reconstruct that owner. `reserve_staging_child` requires original opaque channel
-and provider descriptors; the child receives them as FD3/FD4 only after executable,
-namespace and PID witnesses are authenticated. Descriptor duplication does not read,
-copy or hash provider contents. Any observed descriptor/channel/admission mismatch
-poisons that authority even if the original name or metadata is restored later.
+After the candidate is stable and exact-clean, the assigned build owner can invoke
+`bash staging/t050_n/gate.sh` once with `T050_BUILD_LOCK` and `CARGO_TARGET_DIR` set
+to the approved global lock/shared target, and `RUSTC` set to the Rust 1.94 rustup
+shim. It records six independent exits, versions and non-secret image/lock hashes.
+It does not launch any live flow; per-stage logs are private. The former standalone
+crate is not part of this graph. The full gate includes `test-support` so the new
+HTTP/streaming regression fixture is exercised, using hyphenated Cargo binary bindings.
 
-The provisioner provides `--derive`, `--prepare` and read-only `--verify`. The helper
-checks a bounded non-secret verification packet, not an A2A success assertion.
-There is intentionally no pathname-exec fallback or implicit live command. The
-immutable-open syscall fixture has only one-open coverage; it is not a certificate
-for the root application's complete runtime or descendants. The explicit launcher
-does not interpose on production ACP. Native backend/card/send orchestration and
-full runtime syscall coverage have not been executed or certified by these tests.
-
-Focused validation uses the standalone manifest and shared target, Rust 1.94.0,
-`--locked --offline`; check/Clippy include all targets, tests are serial. The test
-targets are `contract_identity`, `publication_snapshot`, `ownership_process`,
-`readiness_manager`, `teardown_recovery`, `nonaccess`, plus namespace Host unit
-tests. `teardown_recovery` includes nine ownership fixtures a second time; counts
-must disclose that duplication. N20 resides in `publication_snapshot` to keep each
-approved new file within structural limits; its named assertions are unchanged.
-OS tests use original private synthetic FDs/processes and ephemeral sockets, not
-the staging ports or any live service manager. Durable revocation retains declared
-private publication/evidence residue; it never claims deletion or blanket residue zero.
+Do not run against production or touch T046/R23. A missing real credential is a precise
+external input, not a successful Matrix E2E. Fixture PASS, native PASS, Matrix PASS,
+recovery, refusal and cleanup are separate results. Do not blindly repeat a failed run.
