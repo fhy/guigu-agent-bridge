@@ -1716,8 +1716,10 @@ mod tests {
         growing.as_file().set_len(initial_size).unwrap();
         let mut growing_reader = growing.reopen().unwrap();
         let mut grew = false;
+        let mut observed_totals = Vec::new();
         assert!(
-            identity_content_hash_observed(&mut growing_reader, initial_size, |_, count| {
+            identity_content_hash_observed(&mut growing_reader, initial_size, |total, count| {
+                observed_totals.push(total);
                 if count != 0 && !grew {
                     let mut writer = std::fs::OpenOptions::new()
                         .append(true)
@@ -1732,6 +1734,10 @@ mod tests {
             .is_err()
         );
         assert!(grew);
+        assert_eq!(
+            observed_totals,
+            vec![IDENTITY_HASH_BUFFER_SIZE as u64, initial_size]
+        );
         assert_eq!(
             growing_reader.stream_position().unwrap(),
             initial_size + IDENTITY_HASH_BUFFER_SIZE as u64
