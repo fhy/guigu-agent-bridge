@@ -26,8 +26,8 @@ use guigu_agent_bridge::acp::{
 use guigu_agent_bridge::app::AcpDispatcherRouter;
 use guigu_agent_bridge::bus::{
     Bus, BusFuture, Clock, ConsumerError, DispatcherRegistry, EndpointRegistry, EventBroadcaster,
-    EventConsumer, EventSink, MemoryBus, MpscEventSink, TaskDispatcher, Worker, WorkerConfig,
-    derive_endpoint_id,
+    EventConsumer, EventSink, MemoryBus, MpscEventSink, TaskDispatcher, Timer, Worker,
+    WorkerConfig, derive_endpoint_id,
 };
 use guigu_agent_bridge::config::{Config, load_from_str_with_env};
 use guigu_agent_bridge::matrix::{
@@ -794,6 +794,21 @@ impl Harness {
                 ts()
             }
         });
+        struct ExecutionDeadlineTimer(std::sync::atomic::AtomicUsize);
+        impl Timer for ExecutionDeadlineTimer {
+            fn sleep_until(&self, deadline: DateTime<Utc>) -> BusFuture<'_, ()> {
+                let stage = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Box::pin(async move {
+                    // This fixture targets active execution, not IO-sensitive
+                    // delivery timing. Actual absolute deadlines are exercised
+                    // separately through AppRuntime's real HTTP fixture.
+                    if stage == 0 {
+                        std::future::pending::<()>().await;
+                    }
+                    tokio::time::sleep((deadline - ts()).to_std().unwrap_or_default()).await;
+                })
+            }
+        }
         let worker = Worker::builder(
             Arc::clone(&registry),
             tasks_rx,
@@ -804,6 +819,13 @@ impl Harness {
         .lifecycle(Arc::new(SqliteTaskLifecycle::new(pool.clone())))
         .config(WorkerConfig {
             cancellation: Some(cancellation),
+            // Match production's bus-owned deferred deadline. Scripted CP2
+            // tests still advance the injected clock synchronously themselves.
+            timer: (cp2_action == Cp2Action::None).then(|| {
+                Arc::new(ExecutionDeadlineTimer(std::sync::atomic::AtomicUsize::new(
+                    0,
+                ))) as Arc<dyn Timer>
+            }),
             ..WorkerConfig::default()
         })
         .build();
@@ -1183,14 +1205,12 @@ async fn active_chunks_do_not_extend_the_hard_deadline_and_the_child_is_reaped()
         )
         .await;
     let events = outcome.task_events(task.task_id);
-    assert_eq!(events.last().unwrap().status, TaskStatus::Failed);
-    assert!(
-        failed_payload(events.last().unwrap()).contains("deadline"),
-        "the earlier task deadline, not inactivity, wall time, or the ACP deadline, must end the turn"
-    );
+    assert_eq!(events.last().unwrap().status, TaskStatus::TimedOut);
+    assert!(matches!(&events.last().unwrap().payload,
+        TaskEventPayload::TimedOut { deadline } if Some(*deadline) == task.deadline));
     assert_eq!(
         continuations[0].state,
-        guigu_agent_bridge::runtime::ContinuationState::RecoveryNeeded
+        guigu_agent_bridge::runtime::ContinuationState::Terminal
     );
     assert!(
         backend_reaped,
@@ -1202,7 +1222,7 @@ async fn active_chunks_do_not_extend_the_hard_deadline_and_the_child_is_reaped()
             .fetch_one(&outcome.pool)
             .await
             .expect("uncertain delivery disposition");
-    assert_eq!(disposition, "outcome_unknown");
+    assert_eq!(disposition, "terminal");
     outcome.cleanup().await;
 }
 

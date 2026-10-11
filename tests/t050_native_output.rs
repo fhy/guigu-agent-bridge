@@ -224,3 +224,44 @@ async fn immediate_cancel_after_restart_keeps_worker_available() {
     assert_eq!(terminal(&runtime, &accepted).await["status"], "failed");
     runtime.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn prepared_cancel_waits_for_competing_writer() {
+    let fixture = Fixture {
+        root: tempfile::tempdir().unwrap(),
+        legacy: true,
+    };
+    let runtime = fixture.start_scenario("chunks-then-hang", 120).await;
+    let accepted = rpc(&runtime, "message/send", send()).await;
+    let pool = connect(fixture.root.path().join("state.db")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let running: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM task_continuations WHERE state='in_flight'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if running == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .unwrap();
+    let mut writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query("UPDATE tasks SET version=version")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    rpc(&runtime, "tasks/cancel", json!({"id":accepted["id"]})).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    writer.commit().await.unwrap();
+    assert_eq!(terminal(&runtime, &accepted).await["status"], "canceled");
+    let rows: (i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM task_events WHERE status='cancelled'),(SELECT COUNT(*) FROM execution_leases WHERE state='released')")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(rows, (1, 1));
+    pool.close().await;
+    runtime.shutdown().await.unwrap();
+}
