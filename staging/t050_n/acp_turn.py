@@ -74,7 +74,14 @@ def exchange(owner, selector, request_id, method, params, report, timeout=15):
                             report["update_classes"].append(update_class)
             elif message.get("id") == request_id:
                 if "error" in message:
-                    report["rpc_error_code"] = message["error"].get("code")
+                    code = message["error"].get("code")
+                    report["rpc_error_code"] = code if isinstance(code, int) and not isinstance(code, bool) else "wrong-type"
+                    text = message["error"].get("message", "")
+                    if isinstance(text, str):
+                        known = ("no rollout", "not found", "does not exist", "authentication",
+                                 "unsupported", "session", "model", "database", "invalid",
+                                 "workspace", "permission", "not a function")
+                        report["rpc_error_classes"] = [word for word in known if word in text.lower()]
                     raise RuntimeError("rpc-error")
                 return message["result"]
     raise RuntimeError("deadline")

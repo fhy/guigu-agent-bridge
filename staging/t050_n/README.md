@@ -32,12 +32,18 @@ Card, send, get, output, replay, conflict, cancel and restart are separate asser
 Active cancellation waits for an observed `working` task; submission alone is not
 labelled active execution. Queued cancellation and writer contention have separate
 real root HTTP/SQLite regression fixtures.
+Restart checks both an identical request (no new task) and a new request in the
+same conversation (actual native session resume and new model output).
 
 Matrix privately consumes the four assigned staging EnvironmentFiles. A password
 permits one login for a fresh independent device. Without it, an existing staging
 session can initialize a fresh store only if real whoami/key-query facts show a
 non-T046 device with no published keys. Existing keys are never replaced. Existing
 sender tokens can be used for the other three roles. Login failures are not retried.
+If this task already created a private SDK store for an existing staging device,
+pass `--owned-crypto-store /path/to/this-tasks-private-cache-tree/crypto`; never
+replace it with a fresh store while that device has published keys. The runner
+accepts only its own `t050-n-direct-*` cache directory, not any protected store.
 No password reset, canonical
 device key replacement, original store copy or old supplier invocation is used.
 The real private, non-federating room is intentionally unencrypted for this acceptance
@@ -52,6 +58,10 @@ real Matrix membership, three real senders, expected application timeout replies
 same-state restart/dedup and a new post-restart reply. This is reported as a transport
 and expected-timeout cell, **not successful native/Matrix E2E**. Diagnostic helpers
 only emit fixed categories/counts/public endpoint metadata, never native response bodies.
+`acp_restart.py` isolates real protocol new/prompt/stop/resume without Matrix; it
+keeps the session identity in memory and reports both owned-process cleanups.
+Fixed application error classes aid diagnosis but never substitute for actual
+request assertions or turn an earlier failed attempt into a success.
 
 After the candidate is stable and exact-clean, the assigned build owner can invoke
 `bash staging/t050_n/gate.sh` once with `T050_BUILD_LOCK` and `CARGO_TARGET_DIR` set

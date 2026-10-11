@@ -132,6 +132,17 @@ enabled = true
                          "matrix-device-key-upload-failed", "matrix-startup-timeout", "recovery-blocked"):
             if category.encode() in raw and category not in self.refusals:
                 self.refusals.append(category)
+        # Only fixed classes escape this private buffer; never publish backend
+        # error messages, command lines, frames or user content.
+        for needle, category in (("session storage failed", "acp-session-storage"),
+                                 ("agent rejected the request", "acp-agent-refusal"),
+                                 ("session/resume returned a malformed", "acp-resume-schema"),
+                                 ("initialize failed", "acp-initialize"),
+                                 ("session setup failed", "acp-session-setup"),
+                                 ("ACP transport is closed", "acp-transport-closed"),
+                                 ("delivery acknowledgement", "acp-delivery-ack")):
+            if needle.encode() in raw and category not in self.refusals:
+                self.refusals.append(category)
 
     def stop(self):
         if self.owner is not None:

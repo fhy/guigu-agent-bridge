@@ -18,6 +18,7 @@ from materials import Refusal, classify, read_material
 from matrix_flow import MatrixFlow
 from owned import Owned, subreaper
 from acp_turn import exchange
+from acp_restart import connection
 from native import wait_working
 
 
@@ -151,6 +152,51 @@ except KeyboardInterrupt:
 
 
 class DiagnosticTests(unittest.TestCase):
+    def test_restart_probe_retains_cleanup_and_no_session_output(self):
+        subreaper()
+        script = ('import sys,json; '
+                  '\nfor line in sys.stdin:\n'
+                  ' req=json.loads(line); method=req["method"]; '
+                  'result={"protocolVersion":1} if method=="initialize" else '
+                  '({"sessionId":"private-fixture-session"} if method=="session/new" else '
+                  '({"stopReason":"end_turn"} if method=="session/prompt" else {})); '
+                  'print(json.dumps({"id":req["id"],"result":result}),flush=True)')
+        report = {"prompts": 0}
+        with tempfile.TemporaryDirectory(prefix="t050-n-probe-") as root:
+            with patch("acp_restart.Owned", side_effect=lambda argv, **kw:
+                       Owned([sys.executable, "-c", script], **kw)):
+                session = connection("fixture", root, report)
+                connection("fixture", root, report, session)
+        self.assertEqual(report["resume"], "PASS")
+        self.assertEqual(len(report["cleanup"]), 2)
+        self.assertTrue(all(item["cleanup"] == "owned-group-reaped" for item in report["cleanup"]))
+        self.assertNotIn("private-fixture-session", json.dumps(report))
+
+    def test_rpc_error_is_fixed_class_and_never_peer_message(self):
+        subreaper()
+        script = ('import json; req=json.loads(input()); '
+                  'print(json.dumps({"id":req["id"],"error":{"code":-32603,'
+                  '"message":"session not found fixture-private-secret"}}),flush=True)')
+        report = {}
+        with Owned([sys.executable, "-c", script], pipe=True, stderr_pipe=True) as owner:
+            with selectors.DefaultSelector() as selector:
+                selector.register(owner.child.stdout, selectors.EVENT_READ, "stdout")
+                selector.register(owner.child.stderr, selectors.EVENT_READ, "stderr")
+                with self.assertRaisesRegex(RuntimeError, "rpc-error"):
+                    exchange(owner, selector, 1, "session/resume", {}, report, timeout=3)
+        self.assertEqual(report["rpc_error_code"], -32603)
+        self.assertEqual(report["rpc_error_classes"], ["not found", "session"])
+        self.assertNotIn("fixture-private-secret", json.dumps(report))
+
+    def test_application_diagnostic_is_fixed_class(self):
+        with tempfile.TemporaryDirectory(prefix="t050-n-diagnostic-") as root:
+            app = Application(root, "unused", "unused")
+            app.owner = Mock()
+            with patch("app.os.read", return_value=b"session storage failed: fixture-private-secret"):
+                app.drain()
+            self.assertEqual(app.refusals, ["acp-session-storage"])
+            self.assertNotIn("fixture-private-secret", json.dumps(app.refusals))
+
     def test_split_marker_is_seen_without_exposing_peer_text(self):
         subreaper()
         script = ('import sys,json; req=json.loads(input()); '

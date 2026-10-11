@@ -76,6 +76,14 @@ def exercise(app, report):
     if app.terminal(task)["status"] != "completed":
         raise Refusal("restart-get")
     report["restart_get"] = "PASS"
+    status, resumed = app.rpc("message/send", send_params("native-resumed"), "native-resumed")
+    if status != 200 or "result" not in resumed:
+        raise Refusal("restart-new-send")
+    completed = app.terminal(resumed["result"]["id"])
+    if (completed["status"] != "completed" or
+            "T050_N_NATIVE_OK" not in json.dumps(completed.get("artifacts", []))):
+        raise Refusal("restart-new-output")
+    report["restart_new_receive"] = "PASS"
     status, submitted = app.rpc("message/send", send_params(
         "native-cancel", "Write a long explanation of the number pi, without tools."),
         "native-cancel")
