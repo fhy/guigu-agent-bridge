@@ -794,17 +794,10 @@ impl Harness {
                 ts()
             }
         });
-        struct ExecutionDeadlineTimer(std::sync::atomic::AtomicUsize);
-        impl Timer for ExecutionDeadlineTimer {
+        struct FixedDeadlineTimer;
+        impl Timer for FixedDeadlineTimer {
             fn sleep_until(&self, deadline: DateTime<Utc>) -> BusFuture<'_, ()> {
-                let stage = self.0.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 Box::pin(async move {
-                    // This fixture targets active execution, not IO-sensitive
-                    // delivery timing. Actual absolute deadlines are exercised
-                    // separately through AppRuntime's real HTTP fixture.
-                    if stage == 0 {
-                        std::future::pending::<()>().await;
-                    }
                     tokio::time::sleep((deadline - ts()).to_std().unwrap_or_default()).await;
                 })
             }
@@ -821,11 +814,8 @@ impl Harness {
             cancellation: Some(cancellation),
             // Match production's bus-owned deferred deadline. Scripted CP2
             // tests still advance the injected clock synchronously themselves.
-            timer: (cp2_action == Cp2Action::None).then(|| {
-                Arc::new(ExecutionDeadlineTimer(std::sync::atomic::AtomicUsize::new(
-                    0,
-                ))) as Arc<dyn Timer>
-            }),
+            timer: (cp2_action == Cp2Action::None)
+                .then(|| Arc::new(FixedDeadlineTimer) as Arc<dyn Timer>),
             ..WorkerConfig::default()
         })
         .build();

@@ -74,6 +74,9 @@ fn main() {
 
         match method {
             "initialize" => {
+                if scenario == "delayed-initialize" {
+                    std::thread::sleep(std::time::Duration::from_secs(2));
+                }
                 let version = if scenario == "bad-protocol-version" {
                     99
                 } else {

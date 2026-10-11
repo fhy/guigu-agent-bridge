@@ -136,6 +136,15 @@ async fn legacy_stream_output_replay_restart_and_expired_suppression() {
             .unwrap(),
         1
     );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT COUNT(*) FROM projection_outbox WHERE transport='matrix'"
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        0
+    );
     sqlx::query("UPDATE a2a_exchanges SET cleanup_state='cleaned', content_bytes=0")
         .execute(&pool)
         .await
@@ -263,5 +272,57 @@ async fn prepared_cancel_waits_for_competing_writer() {
         .fetch_one(&pool).await.unwrap();
     assert_eq!(rows, (1, 1));
     pool.close().await;
+    runtime.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn cancellation_during_delivery_closes_lease_before_restart() {
+    interrupted_delivery_closes_before_restart(true).await;
+}
+
+#[tokio::test]
+async fn deadline_during_delivery_closes_lease_before_restart() {
+    interrupted_delivery_closes_before_restart(false).await;
+}
+
+async fn interrupted_delivery_closes_before_restart(cancel: bool) {
+    let fixture = Fixture {
+        root: tempfile::tempdir().unwrap(),
+        legacy: true,
+    };
+    let runtime = fixture
+        .start_scenario("delayed-initialize", if cancel { 120 } else { 1 })
+        .await;
+    let accepted = rpc(&runtime, "message/send", send()).await;
+    let pool = connect(fixture.root.path().join("state.db")).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let prepared: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM delivery_dispositions WHERE state='prepared'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if prepared == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
+    if cancel {
+        rpc(&runtime, "tasks/cancel", json!({"id":accepted["id"]})).await;
+    }
+    assert_eq!(
+        terminal(&runtime, &accepted).await["status"],
+        if cancel { "canceled" } else { "failed" }
+    );
+    let rows: (i64, i64, i64) = sqlx::query_as("SELECT (SELECT COUNT(*) FROM execution_leases WHERE state IN ('active','recovery_needed')),(SELECT COUNT(*) FROM delivery_dispositions WHERE state!='terminal'),(SELECT COUNT(*) FROM deliveries WHERE acknowledged_at IS NULL)")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(rows, (0, 0, 0));
+    pool.close().await;
+    runtime.shutdown().await.unwrap();
+    let runtime = fixture.start().await;
     runtime.shutdown().await.unwrap();
 }

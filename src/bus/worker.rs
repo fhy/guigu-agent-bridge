@@ -148,6 +148,10 @@
 //!   future is raced against [`Timer::sleep_until`], so a `deliver` or `execute`
 //!   that never resolves cannot block the worker forever. The losing future is
 //!   dropped — the worker spawns no task and calls no `abort()`.
+//!   The crate-owned prepared delivery is the exception: its independently
+//!   bounded ACP/SQLite startup must settle before CP-2 reap/finalization, because
+//!   dropping it between durable lease acquisition and owner installation would
+//!   orphan side effects. Execution is still raced and reaped before terminal.
 //! - The `select!` is `biased`: **stage result > cancellation > deadline**. A
 //!   stage result that is already available is the authoritative fact and is
 //!   never overwritten by a signal that arrived in the same poll; cancellation is
@@ -1277,44 +1281,64 @@ impl Worker {
                 return self.fail_task(task_id, seq, error.to_string()).await;
             }
 
-            // Stage one, raced: a `deliver` that never resolves is abandoned by
-            // the timeout/cancellation boundary instead of blocking the worker.
+            // Legacy delivery is raced. Prepared delivery owns durable side
+            // effects, so retain it through its bounded startup before CP2 can
+            // reap/finalize; dropping it would orphan a lease before its owner
+            // and cancellation channel have been installed.
             if let (Some(lifecycle), Some(lease)) = (&self.lifecycle, &queue_lease)
                 && let Err(error) = lifecycle.renew_queue_lease(&task, lease).await
             {
                 return self.fail_task(task_id, seq, error.to_string()).await;
             }
-            match self
-                .race(
-                    task_id,
-                    deadline,
-                    &mut cancel_rx,
-                    dispatcher.deliver(request.clone()),
-                )
-                .await
-            {
+            let delivery = dispatcher.deliver(request.clone());
+            let delivered = if dispatcher.supports_prepared() {
+                Raced::Done(delivery.await)
+            } else {
+                self.race(task_id, deadline, &mut cancel_rx, delivery).await
+            };
+            match delivered {
                 Raced::Done(Ok(())) => {}
                 Raced::Done(Err(err)) => {
                     if dispatcher.supports_prepared() {
+                        let (status, payload) = if let Some(reason) = self.cancel_reason(task_id) {
+                            (
+                                TaskStatus::Cancelled,
+                                TaskEventPayload::Cancelled { reason },
+                            )
+                        } else if let Some(deadline) = self.expired(deadline) {
+                            (
+                                TaskStatus::TimedOut,
+                                TaskEventPayload::TimedOut { deadline },
+                            )
+                        } else {
+                            (
+                                TaskStatus::Failed,
+                                TaskEventPayload::Failed {
+                                    error: err.to_string(),
+                                },
+                            )
+                        };
                         let event = TaskEvent {
                             id: EventId::generate(),
                             task_id,
                             seq,
-                            status: TaskStatus::Failed,
+                            status,
                             timestamp: self.clock.now(),
-                            payload: TaskEventPayload::Failed {
-                                error: err.to_string(),
-                            },
+                            payload,
                         };
                         dispatcher
-                            .finalize_delivery_failure(request.clone(), event)
+                            .finalize_delivery_failure(request.clone(), event.clone())
                             .await
                             .map_err(|_| WorkerError::EventWrite {
                                 task_id,
                                 seq,
                                 error: BusError::TaskChannelClosed,
                             })?;
-                        return Ok(());
+                        let result = self.emit(event, task_id, seq).await;
+                        if let Some(cancellation) = &self.config.cancellation {
+                            cancellation.retire(task_id);
+                        }
+                        return result;
                     }
                     match self
                         .refused(task_id, attempt, &err, deadline, &mut cancel_rx)

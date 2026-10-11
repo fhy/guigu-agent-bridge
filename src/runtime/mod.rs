@@ -2172,6 +2172,17 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&request.task.task_id)
                 .ok_or(DispatchError::RecoveryNeeded)?;
+            if !self.dispatcher.shutdown_reaped().await {
+                let _ = self
+                    .store
+                    .release(
+                        &pending.lease,
+                        ReleaseDisposition::RecoveryNeeded,
+                        self.clock.now(),
+                    )
+                    .await;
+                return Err(DispatchError::RecoveryNeeded);
+            }
             self.store
                 .begin_continuation(
                     &pending.lease,

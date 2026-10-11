@@ -736,13 +736,17 @@ impl ReliabilityStore {
         sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,1,'queued',?,?)")
             .bind(event.id.to_string()).bind(task.task_id.to_string()).bind(&at).bind(payload)
             .execute(&mut *tx).await?;
+        // A2A context IDs are transport receipt identities, not Matrix rooms.
+        // Keep the receipt intact without creating cross-transport projections.
+        let matrix_context = context
+            .filter(|value| matches!(value.transport.as_str(), "matrix" | "matrix-workflow"));
         sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,reply_room,reply_thread_root,reply_event_id,monitor_room,monitor_generation,render_version,created_at,updated_at) VALUES(?,'enqueued',0,?,?,?,?,?,?,'v1',?,?)")
             .bind(task.task_id.to_string()).bind(runtime_instance)
-            .bind(context.map(|value| value.room_id.as_str()))
-            .bind(context.and_then(|value| value.thread_root.as_deref()))
-            .bind(context.map(|value| value.reply_event_id.as_str()))
-            .bind(context.and_then(|value| value.monitor_room.as_deref()))
-            .bind(context.map(|value| i64::try_from(value.monitor_generation).unwrap_or(i64::MAX)))
+            .bind(matrix_context.map(|value| value.room_id.as_str()))
+            .bind(matrix_context.and_then(|value| value.thread_root.as_deref()))
+            .bind(matrix_context.map(|value| value.reply_event_id.as_str()))
+            .bind(matrix_context.and_then(|value| value.monitor_room.as_deref()))
+            .bind(matrix_context.map(|value| i64::try_from(value.monitor_generation).unwrap_or(i64::MAX)))
             .bind(&at).bind(&at)
             .execute(&mut *tx).await?;
         if let Some(context) = context {
