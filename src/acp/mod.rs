@@ -60,6 +60,14 @@ pub mod client;
 pub mod error;
 pub mod framing;
 pub mod jsonrpc;
+pub(crate) mod output;
+mod output_files;
+pub(crate) mod output_policy;
+#[cfg(test)]
+mod output_process_rows;
+mod output_stream;
+#[cfg(test)]
+mod output_tests;
 pub mod result;
 pub mod schema;
 pub mod session;

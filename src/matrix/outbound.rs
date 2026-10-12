@@ -5,6 +5,28 @@ use crate::observer::{MAX_BODY_BYTES, MonitorSender, ObserverFuture, ObserverMes
 
 use super::{MatrixClient, MatrixSender, ReplyContext, ReplyFuture};
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(dead_code)]
+pub(crate) enum DurableSendError {
+    Retryable,
+    Permanent,
+    UnknownCommit,
+}
+
+pub(crate) type DurableSendFuture<'a> =
+    std::pin::Pin<Box<dyn std::future::Future<Output = Result<(), DurableSendError>> + Send + 'a>>;
+
+pub(crate) trait DurableMatrixSender: Send + Sync {
+    fn send_durable<'a>(
+        &'a self,
+        room_id: &'a str,
+        thread_root: Option<&'a str>,
+        reply_event_id: Option<&'a str>,
+        body: &'a str,
+        txn_id: &'a str,
+    ) -> DurableSendFuture<'a>;
+}
+
 pub trait MatrixOutboxSender: Send + Sync {
     fn send_stable<'a>(
         &'a self,
@@ -97,6 +119,52 @@ impl MatrixOutboxSender for SdkMatrixSender {
                 .with_transaction_id(txn_id)
                 .await
                 .map_err(|_| super::ReplyError)?;
+            Ok(())
+        })
+    }
+}
+
+impl DurableMatrixSender for SdkMatrixSender {
+    fn send_durable<'a>(
+        &'a self,
+        room_id: &'a str,
+        thread_root: Option<&'a str>,
+        reply_event_id: Option<&'a str>,
+        body: &'a str,
+        txn_id: &'a str,
+    ) -> DurableSendFuture<'a> {
+        Box::pin(async move {
+            let room_id: OwnedRoomId = room_id.parse().map_err(|_| DurableSendError::Permanent)?;
+            let thread_root = thread_root
+                .map(str::parse::<OwnedEventId>)
+                .transpose()
+                .map_err(|_| DurableSendError::Permanent)?;
+            let reply_event_id = reply_event_id
+                .map(str::parse::<OwnedEventId>)
+                .transpose()
+                .map_err(|_| DurableSendError::Permanent)?;
+            let room = self
+                .client
+                .inner
+                .get_room(&room_id)
+                .ok_or(DurableSendError::Permanent)?;
+            let relation = match (thread_root, reply_event_id) {
+                (Some(root), Some(reply)) => Some(
+                    json!({"rel_type":"m.thread","event_id":root,"is_falling_back":false,"m.in_reply_to":{"event_id":reply}}),
+                ),
+                (None, Some(reply)) => Some(json!({"m.in_reply_to":{"event_id":reply}})),
+                (Some(_), None) => return Err(DurableSendError::Permanent),
+                (None, None) => None,
+            };
+            let mut content = json!({"msgtype":"m.text","body":body});
+            if let Some(relation) = relation {
+                content["m.relates_to"] = relation;
+            }
+            let txn_id: &TransactionId = txn_id.into();
+            room.send_raw("m.room.message", content)
+                .with_transaction_id(txn_id)
+                .await
+                .map_err(|_| DurableSendError::UnknownCommit)?;
             Ok(())
         })
     }

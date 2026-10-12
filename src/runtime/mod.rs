@@ -2569,6 +2569,51 @@ async fn insert_terminal_projection(
     body: &str,
     now: DateTime<Utc>,
 ) -> Result<(), RuntimeError> {
+    if projection == "terminal_reply"
+        && let crate::models::TaskEventPayload::Completed { .. } = &event.payload
+    {
+        let existing=sqlx::query("SELECT set_id,room_id,thread_root,reply_event_id,render_version,state FROM acp_output_sets WHERE task_id=? AND state IN ('prepared','sealed','delivering','delivered','partial','cleaning','cleaned') ORDER BY turn DESC LIMIT 1")
+            .bind(event.task_id.to_string()).fetch_optional(&mut **tx).await?;
+        if let Some(existing) = existing {
+            if existing.try_get::<String, _>("room_id")? != room
+                || existing
+                    .try_get::<Option<String>, _>("thread_root")?
+                    .as_deref()
+                    != thread
+                || existing
+                    .try_get::<Option<String>, _>("reply_event_id")?
+                    .as_deref()
+                    != reply
+                || existing.try_get::<String, _>("render_version")? != render_version
+            {
+                return Err(RuntimeError::Malformed);
+            }
+            if existing.try_get::<String, _>("state")? == "prepared" {
+                let changed=sqlx::query("UPDATE acp_output_sets SET state='sealed',updated_at=? WHERE set_id=? AND state='prepared'").bind(ts(now)).bind(existing.try_get::<String,_>("set_id")?).execute(&mut **tx).await?;
+                if changed.rows_affected() != 1 {
+                    return Err(RuntimeError::Malformed);
+                }
+            }
+            return Ok(());
+        }
+        let set_id = Uuid::new_v5(
+            &TERMINAL_OUTBOX_NAMESPACE,
+            format!("acp-output\0{}", event.id).as_bytes(),
+        )
+        .to_string();
+        let inserted = sqlx::query("INSERT INTO acp_output_sets(set_id,task_id,attempt,turn,runtime_fence,room_id,thread_root,reply_event_id,render_version,state,created_at,updated_at) SELECT ?,c.task_id,d.attempt,c.completed_turns,c.runtime_generation,?,?,?,?, 'assembling',?,? FROM task_continuations c JOIN deliveries d ON d.delivery_id=c.delivery_id WHERE c.task_id=? ON CONFLICT(task_id,attempt,turn) DO NOTHING")
+            .bind(&set_id).bind(room).bind(thread).bind(reply).bind(render_version)
+            .bind(ts(now)).bind(ts(now)).bind(event.task_id.to_string())
+            .execute(&mut **tx).await?;
+        if inserted.rows_affected() != 1 {
+            let existing: Option<String> = sqlx::query_scalar("SELECT set_id FROM acp_output_sets WHERE task_id=? AND state IN ('assembling','sealed','delivering','delivered','partial','cleaning','cleaned') ORDER BY turn DESC LIMIT 1")
+                .bind(event.task_id.to_string()).fetch_optional(&mut **tx).await?;
+            if existing.as_deref() != Some(set_id.as_str()) {
+                return Err(RuntimeError::Malformed);
+            }
+        }
+        return Ok(());
+    }
     let stable_txn_id = Uuid::new_v5(
         &TERMINAL_OUTBOX_NAMESPACE,
         format!("task_event\0{}\0{projection}", event.id).as_bytes(),

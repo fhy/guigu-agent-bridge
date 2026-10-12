@@ -1046,17 +1046,23 @@ async fn structured_continue_reuses_the_real_session_and_delivery_until_complete
     .fetch_all(&outcome.pool)
     .await
     .expect("terminal projection siblings");
-    assert_eq!(projections.len(), 2);
+    assert_eq!(projections.len(), 1);
     assert_eq!(projections[0].0, "observer");
     assert_eq!(projections[0].1, "!monitor:example");
     assert_eq!(projections[0].2, None);
     assert_eq!(projections[0].3, None);
     assert!(projections[0].4.contains("status=completed"));
-    assert_eq!(projections[1].0, "terminal_reply");
-    assert_eq!(projections[1].1, "!reply:example");
-    assert_eq!(projections[1].2.as_deref(), Some("$thread"));
-    assert_eq!(projections[1].3.as_deref(), Some("$event"));
-    assert_eq!(projections[1].4, "Hello, world");
+    let durable: (String, String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT state,room_id,thread_root,reply_event_id FROM acp_output_sets WHERE task_id=?",
+    )
+    .bind(task.task_id.to_string())
+    .fetch_one(&outcome.pool)
+    .await
+    .expect("durable terminal output");
+    assert_eq!(durable.0, "assembling");
+    assert_eq!(durable.1, "!reply:example");
+    assert_eq!(durable.2.as_deref(), Some("$thread"));
+    assert_eq!(durable.3.as_deref(), Some("$event"));
     outcome.cleanup().await;
 }
 

@@ -141,6 +141,8 @@ pub(crate) mod codec;
 mod cycle;
 mod error;
 mod event_consumer;
+mod output_delivery;
+mod output_spool;
 mod pool;
 mod recovery;
 mod reliability;
@@ -149,6 +151,11 @@ mod repository;
 pub use cycle::{CycleHit, CycleKind, CycleLimits, DEFAULT_MAX_SUBTASKS, detect};
 pub use error::StorageError;
 pub use event_consumer::RepositoryEventConsumer;
+#[cfg(test)]
+pub(crate) use output_spool::OutputSetInput;
+pub(crate) use output_spool::{
+    DeliveryPart, OutputSegment, OutputSpoolStore, OutputStoreError, PendingDelivery,
+};
 pub(crate) use pool::migration_contract;
 pub use pool::{DEFAULT_BUSY_TIMEOUT, MAX_CONNECTIONS, connect, migrate};
 pub use recovery::{

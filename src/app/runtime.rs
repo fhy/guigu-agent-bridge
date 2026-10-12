@@ -129,6 +129,7 @@ pub struct AppRuntime {
     worker: Option<tokio::task::JoinHandle<Result<(), crate::bus::WorkerError>>>,
     broadcaster: Option<tokio::task::JoinHandle<()>>,
     outbox: Option<crate::app::OutboxDrainHandle>,
+    output_drain: Option<crate::app::output_drain::OutputSetDrainHandle>,
     acp: Option<Arc<AcpDispatcherRouter>>,
     a2a: Option<A2aServerHandle>,
     a2a_cleanup: Option<CleanupHandle>,
@@ -370,6 +371,32 @@ impl AppRuntime {
         let repository = Arc::new(SqliteRepository::new(pool.clone()));
         let repository_trait: Arc<dyn Repository> = repository.clone();
         let sessions = SqliteSessionStore::new(pool.clone());
+        let output_policy = crate::acp::output_policy::DurableOutputPolicy::derive(
+            &config.bridge.database,
+            config.runtime.max_output_bytes,
+        )
+        .map_err(|_| AppError::Assembly("durable output policy failed"))?;
+        let output_store =
+            crate::storage::OutputSpoolStore::new(pool.clone(), output_policy.process_quota_bytes)
+                .map_err(|_| AppError::Assembly("durable output store failed"))?;
+        let output_spool =
+            crate::acp::output::DurableOutputSpool::new(output_policy, output_store.clone());
+        output_spool
+            .prepare_root()
+            .map_err(|_| AppError::Assembly("durable output root failed"))?;
+        output_spool
+            .recover_assembling(&runtime_instance)
+            .await
+            .map_err(|_| AppError::Assembly("durable output recovery failed"))?;
+        let recovery_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        output_spool
+            .recover_cleanup(&recovery_at)
+            .await
+            .map_err(|_| AppError::Assembly("durable output cleanup recovery failed"))?;
+        output_store
+            .verify_quota()
+            .await
+            .map_err(|_| AppError::Assembly("durable output quota mismatch"))?;
         let runtime_store = SqliteRuntimeStore::new(pool.clone());
         let registry = Arc::new(EndpointRegistry::from_config(&config));
         sync_agents(repository_trait.as_ref(), &registry).await?;
@@ -377,7 +404,6 @@ impl AppRuntime {
         // T022 durable queue recovery is part of startup, before any worker is
         // assembled. Ambiguous send-start rows become recovery_needed; only
         // pre-send rows are returned to queued by the storage CAS.
-        let recovery_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         reliability
             .recover_orphaned_queues(&recovery_at)
             .await
@@ -460,6 +486,7 @@ impl AppRuntime {
             worker: None,
             broadcaster: None,
             outbox: None,
+            output_drain: None,
             acp: None,
             a2a: None,
             a2a_cleanup: None,
@@ -584,6 +611,7 @@ impl AppRuntime {
                 .repository(repository_trait.clone())
                 .reliability(reliability.clone())
                 .legacy_results(config.runtime.legacy_acp_results)
+                .durable_output(output_spool.clone(), runtime_instance.clone())
                 .allow_nonterminal_end_turn(config.runtime.allow_nonterminal_end_turn)
                 .build()
                 .map_err(AppError::Assembly)?;
@@ -709,13 +737,22 @@ impl AppRuntime {
 
         let persistence: Arc<dyn EventConsumer> =
             Arc::new(RepositoryEventConsumer::new(repository_trait.clone()));
-        let siblings: Vec<Arc<dyn EventConsumer>> = if config.transports.a2a.enabled {
+        let mut siblings: Vec<Arc<dyn EventConsumer>> = if config.transports.a2a.enabled {
             vec![Arc::new(crate::a2a::A2aTerminalProjection::new(
                 A2aStore::new(pool.clone()),
             ))]
         } else {
             Vec::new()
         };
+        if config.transports.matrix.enabled {
+            siblings.push(Arc::new(
+                crate::app::output_projection::DurableOutputProjection::new(
+                    output_store.clone(),
+                    output_spool.clone(),
+                    runtime_instance.clone(),
+                ),
+            ));
+        }
 
         let matrix = if let Some((client, initial_response)) = matrix_client {
             let sdk = Arc::new(SdkMatrixSender::new(client.clone()));
@@ -780,8 +817,15 @@ impl AppRuntime {
                 ));
             }
             let outbox_sender: Arc<dyn crate::matrix::MatrixOutboxSender> = sdk.clone();
+            let durable_sender: Arc<dyn crate::matrix::DurableMatrixSender> = sdk.clone();
             let outbox = crate::app::OutboxDrain::new(reliability.clone(), outbox_sender, 64);
             let outbox_owner = outbox.clone().start(Duration::from_secs(1));
+            let output_owner = crate::app::output_drain::OutputSetDrain::new(
+                output_store.clone(),
+                output_spool.clone(),
+                durable_sender,
+            )
+            .start(Duration::from_secs(1));
             let replies = Arc::new(ReplyRegistry::default());
 
             runtime.health_state.matrix().transition(
@@ -830,6 +874,7 @@ impl AppRuntime {
             runtime.matrix_sync = Some(sync_handle);
             runtime.ingress = Some(ingress);
             runtime.outbox = Some(outbox_owner);
+            runtime.output_drain = Some(output_owner);
         }
 
         let projection: Arc<dyn EventConsumer> = Arc::new(PersistenceFirstProjection::new(
@@ -1001,6 +1046,11 @@ impl AppRuntime {
             && outbox.shutdown().await.is_err()
         {
             shutdown_error.get_or_insert(AppError::Assembly("outbox owner join failed"));
+        }
+        if let Some(output) = self.output_drain.take()
+            && output.shutdown().await.is_err()
+        {
+            shutdown_error.get_or_insert(AppError::Assembly("durable output owner join failed"));
         }
         self.gateway.take();
         if let Some(health) = self.health.take()

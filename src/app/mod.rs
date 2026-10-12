@@ -6,6 +6,8 @@ pub mod gateway_handoff;
 mod health;
 mod ingress;
 mod outbox;
+pub(crate) mod output_drain;
+pub(crate) mod output_projection;
 mod projection;
 mod reload;
 mod retry;
