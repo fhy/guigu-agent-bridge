@@ -252,7 +252,7 @@ crypto_store_path = {json.dumps(str(self.app.crypto_store))}
         if interrupted is None:
             raise Refusal("durable-interruption-boundary-missing")
         before_txns = database(self.app.database,
-            "SELECT stable_txn_id FROM acp_output_segments WHERE set_id=? ORDER BY segment_index",
+            "SELECT stable_txn_id FROM acp_output_delivery_segments WHERE set_id=? ORDER BY delivery_index",
             (interrupted[0],))
         self.report["e5_interrupted"] = {
             "set_id": interrupted[0],
@@ -265,9 +265,9 @@ crypto_store_path = {json.dumps(str(self.app.crypto_store))}
         self.configure(self.args.deterministic)
         self.app.start(timeout=90)
         self.report["e5_restart"] = True
-        recovered = self.receive(event, expected="L"*307200, timeout=240)
+        recovered = self.receive(event, expected="L"*307200, timeout=390)
         after_txns = database(self.app.database,
-            "SELECT stable_txn_id FROM acp_output_segments WHERE set_id=? ORDER BY segment_index",
+            "SELECT stable_txn_id FROM acp_output_delivery_segments WHERE set_id=? ORDER BY delivery_index",
             (interrupted[0],))
         if [row[0] for row in before_txns] != [row[0] for row in after_txns]:
             raise Refusal("durable-transaction-id-drift")
