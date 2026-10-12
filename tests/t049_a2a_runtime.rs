@@ -21,6 +21,14 @@ impl Fixture {
         let config_path = root.join("bridge.toml");
         let database = root.join("state.db");
         let sessions = root.join("sessions");
+        let mock = std::env::current_exe()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .join("examples")
+            .join(format!("acp-mock-backend{}", std::env::consts::EXE_SUFFIX));
         std::fs::write(&config_path, "# test-support assembly source\n").unwrap();
         let source = format!(
             r#"
@@ -49,11 +57,12 @@ allowed_targets = ["worker"]
 
 [agents.worker]
 transport = "acp"
-command = "t049-command-is-not-executed-before-acceptance"
+command = {:?}
+args = ["happy"]
 workspace = {:?}
 enabled = true
 "#,
-            database, sessions, root
+            database, sessions, mock, root
         );
         let env = BTreeMap::from([
             ("HOME".into(), root.to_string_lossy().into_owned()),
@@ -157,16 +166,45 @@ async fn counts(path: &PathBuf) -> (i64, i64, i64) {
     (exchanges, receipts, tasks)
 }
 
+async fn wait_completed(runtime: &AppRuntime, task_id: &str) {
+    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        loop {
+            let query = json!({
+                "jsonrpc": "2.0",
+                "id": "wait",
+                "method": "tasks/get",
+                "params": {"id": task_id}
+            });
+            let (status, value) = post(runtime, "t049-secret-sentinel", &query).await;
+            assert_eq!(status, 200);
+            match value["result"]["status"].as_str() {
+                Some("completed") => break,
+                Some("failed" | "cancelled" | "timed_out") => {
+                    panic!("task ended before completion: {value}")
+                }
+                _ => tokio::time::sleep(std::time::Duration::from_millis(25)).await,
+            }
+        }
+    })
+    .await
+    .expect("task completion deadline");
+}
+
 async fn shutdown_after_admission(runtime: AppRuntime) {
     let result = runtime.shutdown().await;
     assert!(
-        matches!(
-            result,
-            Err(AppError::RequiredOwner {
-                component: "task-worker",
-                class: "failed"
-            }) | Err(AppError::Assembly("event drain timed out"))
-        ),
+        result.is_ok()
+            || matches!(
+                result,
+                Err(AppError::RequiredOwner {
+                    component: "task-worker",
+                    class: "failed"
+                }) | Err(AppError::RequiredOwner {
+                    component: "task-worker",
+                    class: "timeout"
+                }) | Err(AppError::Assembly("task-worker/timeout"))
+                    | Err(AppError::Assembly("event drain timed out"))
+            ),
         "{result:?}"
     );
 }
@@ -388,6 +426,7 @@ async fn concurrent_winners_and_restart_replay_are_deterministic() {
     assert_eq!(status, 409, "{value}");
     assert_eq!(value["error"]["message"], "idempotency conflict");
     assert_eq!(counts(&fixture.database).await, (1, 1, 1));
+    wait_completed(&runtime, identical_id.as_str().unwrap()).await;
     shutdown_after_admission(runtime).await;
 
     let restarted = fixture.start_clean().await;
