@@ -185,6 +185,7 @@ impl AcpDispatcherBuilder {
                 repository,
                 reliability,
                 durable_output,
+                session_gate: tokio::sync::Mutex::new(()),
                 client: Mutex::new(None),
                 legacy_results,
                 allow_nonterminal_end_turn,
@@ -219,6 +220,7 @@ struct DispatcherInner {
     repository: Arc<dyn Repository>,
     reliability: Option<crate::storage::ReliabilityStore>,
     durable_output: Option<(crate::acp::output::DurableOutputSpool, String)>,
+    session_gate: tokio::sync::Mutex<()>,
     /// The negotiated backend, if one is running.
     ///
     /// The lock exists only to clone or replace an `Arc`; it is never held across
@@ -495,6 +497,11 @@ impl AcpDispatcher {
                 })?;
         }
         let client = self.ensure_client(request.target).await?;
+        // Matrix can deliver multiple first messages for one conversation in
+        // parallel. Serialize the session lookup/new-session/upsert boundary so
+        // two workers cannot both POST session/new and race the live-session
+        // unique index. The lock is not held during prompt or output delivery.
+        let _session_guard = self.inner.session_gate.lock().await;
 
         let existing = self
             .inner
@@ -507,6 +514,15 @@ impl AcpDispatcher {
                 client.backend_id(),
             )
             .await?;
+        let existing = match existing {
+            Some(session) => Some(session),
+            None => {
+                self.inner
+                    .store
+                    .live_session(endpoint, conversation, &self.inner.cwd)
+                    .await?
+            }
+        };
         let session_id = match existing {
             Some(stored) => {
                 // A live session is re-confirmed with the agent rather than assumed:
