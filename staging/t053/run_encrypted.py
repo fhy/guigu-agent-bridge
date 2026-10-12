@@ -217,7 +217,9 @@ crypto_store_path = {json.dumps(str(self.app.crypto_store))}
         for role in range(1, 4):
             label = "T053_REAL_MODEL_"+str(role)
             event = self.send(role, label)
-            self.report.setdefault("model_replies", []).append(self.receive(event, label))
+            expected = "T053_POST_RESTART" if self.args.agent == self.args.deterministic else None
+            self.report.setdefault("model_replies", []).append(
+                self.receive(event, None if expected else label, expected=expected))
         self.report["model_prompts"] = 3
         before = database(self.app.database, "SELECT COUNT(*) FROM tasks")[0][0]
         self.app.stop()
