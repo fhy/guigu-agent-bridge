@@ -84,6 +84,37 @@ pub enum MatrixPhase {
     Stopped,
 }
 
+/// Redacted status for each independent Matrix startup prerequisite.
+///
+/// `NotAttemptedRecoveryBlocked` is intentionally distinct from an attempted
+/// failure: the recovery gate returns before any Matrix client or network work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatrixStartupAttempt {
+    NotAttempted,
+    NotAttemptedRecoveryBlocked,
+    Succeeded,
+    Failed(MatrixFailure),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MatrixStartupDiagnostics {
+    pub authentication: MatrixStartupAttempt,
+    pub store_binding: MatrixStartupAttempt,
+    pub e2ee_initialization: MatrixStartupAttempt,
+    pub server_device_key_proof: MatrixStartupAttempt,
+}
+
+impl Default for MatrixStartupDiagnostics {
+    fn default() -> Self {
+        Self {
+            authentication: MatrixStartupAttempt::NotAttempted,
+            store_binding: MatrixStartupAttempt::NotAttempted,
+            e2ee_initialization: MatrixStartupAttempt::NotAttempted,
+            server_device_key_proof: MatrixStartupAttempt::NotAttempted,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MatrixReadiness {
     generation: u64,
@@ -93,6 +124,7 @@ struct MatrixReadiness {
 #[derive(Debug)]
 pub struct MatrixReadinessOwner {
     state: Mutex<MatrixReadiness>,
+    diagnostics: Mutex<MatrixStartupDiagnostics>,
     missing_room_keys: AtomicU64,
 }
 
@@ -103,6 +135,7 @@ impl MatrixReadinessOwner {
                 generation: 0,
                 phase: MatrixPhase::Disabled,
             }),
+            diagnostics: Mutex::new(MatrixStartupDiagnostics::default()),
             missing_room_keys: AtomicU64::new(0),
         }
     }
@@ -114,6 +147,8 @@ impl MatrixReadinessOwner {
             .checked_add(1)
             .expect("Matrix readiness generation exhausted");
         state.phase = MatrixPhase::Preflight;
+        *self.diagnostics.lock().unwrap_or_else(|p| p.into_inner()) =
+            MatrixStartupDiagnostics::default();
         state.generation
     }
 
@@ -131,6 +166,54 @@ impl MatrixReadinessOwner {
 
     pub fn phase(&self) -> MatrixPhase {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).phase
+    }
+
+    pub fn startup_diagnostics(&self) -> MatrixStartupDiagnostics {
+        *self.diagnostics.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    pub fn mark_recovery_blocked(&self) {
+        *self.diagnostics.lock().unwrap_or_else(|p| p.into_inner()) = MatrixStartupDiagnostics {
+            authentication: MatrixStartupAttempt::NotAttemptedRecoveryBlocked,
+            store_binding: MatrixStartupAttempt::NotAttemptedRecoveryBlocked,
+            e2ee_initialization: MatrixStartupAttempt::NotAttemptedRecoveryBlocked,
+            server_device_key_proof: MatrixStartupAttempt::NotAttemptedRecoveryBlocked,
+        };
+    }
+
+    pub fn mark_authentication_succeeded(&self) {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .authentication = MatrixStartupAttempt::Succeeded;
+    }
+
+    pub fn mark_store_binding_succeeded(&self) {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .store_binding = MatrixStartupAttempt::Succeeded;
+    }
+
+    pub fn mark_key_proof_succeeded(&self) {
+        let mut diagnostics = self.diagnostics.lock().unwrap_or_else(|p| p.into_inner());
+        diagnostics.e2ee_initialization = MatrixStartupAttempt::Succeeded;
+        diagnostics.server_device_key_proof = MatrixStartupAttempt::Succeeded;
+    }
+
+    pub fn mark_restore_failure(&self, identity_matched: bool, reason: MatrixFailure) {
+        let mut diagnostics = self.diagnostics.lock().unwrap_or_else(|p| p.into_inner());
+        if identity_matched {
+            diagnostics.store_binding = MatrixStartupAttempt::Failed(reason);
+        } else {
+            diagnostics.authentication = MatrixStartupAttempt::Failed(reason);
+        }
+    }
+
+    pub fn mark_key_proof_failure(&self, reason: MatrixFailure) {
+        let mut diagnostics = self.diagnostics.lock().unwrap_or_else(|p| p.into_inner());
+        diagnostics.e2ee_initialization = MatrixStartupAttempt::Failed(reason);
+        diagnostics.server_device_key_proof = MatrixStartupAttempt::Failed(reason);
     }
 
     pub fn fail_required_task(&self) {
@@ -488,7 +571,53 @@ async fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std:
 
 #[cfg(test)]
 mod matrix_readiness_tests {
-    use super::{MatrixFailure, MatrixPhase, MatrixReadinessOwner};
+    use super::{MatrixFailure, MatrixPhase, MatrixReadinessOwner, MatrixStartupAttempt};
+
+    #[test]
+    fn recovery_blocked_marks_each_matrix_gate_not_attempted() {
+        let owner = MatrixReadinessOwner::new();
+        let generation = owner.begin();
+
+        owner.mark_recovery_blocked();
+        assert!(owner.transition(
+            generation,
+            &[MatrixPhase::Preflight],
+            MatrixPhase::RecoveryBlocked
+        ));
+
+        let diagnostics = owner.startup_diagnostics();
+        let blocked = MatrixStartupAttempt::NotAttemptedRecoveryBlocked;
+        assert_eq!(diagnostics.authentication, blocked);
+        assert_eq!(diagnostics.store_binding, blocked);
+        assert_eq!(diagnostics.e2ee_initialization, blocked);
+        assert_eq!(diagnostics.server_device_key_proof, blocked);
+    }
+
+    #[test]
+    fn attempted_matrix_failure_is_distinct_from_recovery_block() {
+        let owner = MatrixReadinessOwner::new();
+        let generation = owner.begin();
+        owner.mark_restore_failure(false, MatrixFailure::Authentication);
+        assert!(owner.transition(
+            generation,
+            &[MatrixPhase::Preflight],
+            MatrixPhase::Failed(MatrixFailure::Authentication)
+        ));
+
+        let diagnostics = owner.startup_diagnostics();
+        assert_eq!(
+            diagnostics.authentication,
+            MatrixStartupAttempt::Failed(MatrixFailure::Authentication)
+        );
+        assert_eq!(
+            diagnostics.store_binding,
+            MatrixStartupAttempt::NotAttempted
+        );
+        assert_ne!(
+            diagnostics.authentication,
+            MatrixStartupAttempt::NotAttemptedRecoveryBlocked
+        );
+    }
 
     #[test]
     fn old_generation_cannot_publish_ready_after_supersession() {

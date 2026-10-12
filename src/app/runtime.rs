@@ -229,6 +229,7 @@ impl AppRuntime {
         };
         if recovery_blocked {
             if let Some(generation) = matrix_generation {
+                runtime.health_state.matrix().mark_recovery_blocked();
                 runtime.health_state.matrix().transition(
                     generation,
                     &[MatrixPhase::Preflight],
@@ -248,8 +249,11 @@ impl AppRuntime {
         // assembly gate. No ACP, bus, gateway, outbox or task owner exists before it.
         let matrix_client = if let Some(generation) = matrix_generation {
             let identity_health = Arc::clone(&runtime.health_state);
+            let mut identity_matched = false;
             let client =
                 match MatrixClient::restore_with_identity(&config.transports.matrix, || {
+                    identity_matched = true;
+                    identity_health.matrix().mark_authentication_succeeded();
                     identity_health.matrix().transition(
                         generation,
                         &[MatrixPhase::Preflight],
@@ -260,6 +264,9 @@ impl AppRuntime {
                 {
                     Ok(client) => client,
                     Err(error) => {
+                        identity_health
+                            .matrix()
+                            .mark_restore_failure(identity_matched, matrix_failure(&error));
                         runtime.health_state.matrix().transition(
                             generation,
                             &[MatrixPhase::Preflight, MatrixPhase::IdentityMatched],
@@ -280,6 +287,7 @@ impl AppRuntime {
                 &[MatrixPhase::IdentityMatched],
                 MatrixPhase::StoreBound,
             );
+            runtime.health_state.matrix().mark_store_binding_succeeded();
             let proof =
                 tokio::time::timeout(Duration::from_secs(30), client.initialize_and_prove()).await;
             let proof_error = match proof {
@@ -288,6 +296,7 @@ impl AppRuntime {
                 Err(_) => Some(MatrixFailure::Timeout),
             };
             if let Some(reason) = proof_error {
+                runtime.health_state.matrix().mark_key_proof_failure(reason);
                 runtime.health_state.matrix().transition(
                     generation,
                     &[MatrixPhase::StoreBound],
@@ -307,6 +316,7 @@ impl AppRuntime {
                 &[MatrixPhase::StoreBound],
                 MatrixPhase::KeyProved,
             );
+            runtime.health_state.matrix().mark_key_proof_succeeded();
             Some(client)
         } else {
             None
