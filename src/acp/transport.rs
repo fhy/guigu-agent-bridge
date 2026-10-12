@@ -725,18 +725,14 @@ async fn accumulate(
     let Some(text) = content.as_text() else {
         return Ok(());
     };
-    let mut overflowed = Vec::new();
     for (id, entry) in pending.iter_mut() {
         if entry.session.as_deref() != Some(notification.session_id.as_str()) {
             continue;
         }
-        if let Some(updates) = &entry.updates
-            && updates
-                .try_send(TurnUpdate::AgentMessageChunk(text.to_owned()))
-                .is_err()
-        {
-            overflowed.push(*id);
-            continue;
+        if let Some(updates) = &entry.updates {
+            // Display updates are lossy; terminal response and durable output
+            // remain authoritative when a consumer is slower than the agent.
+            let _ = updates.try_send(TurnUpdate::AgentMessageChunk(text.to_owned()));
         }
         if let Some(durable) = &entry.durable_updates {
             durable
@@ -752,11 +748,6 @@ async fn accumulate(
         } else if !entry.output_truncated {
             entry.output.push_str(TRUNCATION_MARKER);
             entry.output_truncated = true;
-        }
-    }
-    for id in overflowed {
-        if let Some(entry) = pending.remove(&id) {
-            let _ = entry.responder.send(Err(AcpError::StreamBackpressure));
         }
     }
     Ok(())
