@@ -212,11 +212,21 @@ crypto_store_path = {json.dumps(str(self.app.crypto_store))}
         self.report["post_restart"] = self.receive(event, "T053_POST_RESTART")
         event = self.send(1, "T053_LONG", "T053_LONG")
         self.report["long_output"] = self.receive(event, expected="L"*307200)
+        deadline = time.monotonic() + 30
+        while time.monotonic() < deadline:
+            rows = database(self.app.database,
+                "SELECT total_bytes,segment_count,acknowledged_cursor,state FROM acp_output_sets ORDER BY created_at")
+            if rows and rows[-1][3] == "cleaned":
+                break
+            time.sleep(0.25)
         self.report["durable_rows"] = database(self.app.database,
             "SELECT total_bytes,segment_count,acknowledged_cursor,state FROM acp_output_sets ORDER BY created_at")
+        if not self.report["durable_rows"] or self.report["durable_rows"][-1][3] != "cleaned":
+            raise Refusal("durable-drain-not-cleaned")
         # Observer commands use the same encrypted room and actual admin handler.
         self.send(3, "T053_STATUS", "/status")
-        self.report["health"] = http(f"http://127.0.0.1:{self.app.health}/health")[0]
+        self.report["health_endpoint"] = "/ready"
+        self.report["health"] = http(f"http://127.0.0.1:{self.app.health}/ready")[0]
         self.report["readiness"] = http(f"http://127.0.0.1:{self.app.health}/ready")[0]
         self.report["application_sends"] = self.count
 
