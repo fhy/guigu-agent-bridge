@@ -243,7 +243,9 @@ crypto_store_path = {json.dumps(str(self.app.crypto_store))}
                 "SELECT set_id,segment_count,acknowledged_cursor,state FROM acp_output_sets ORDER BY created_at")
             if rows:
                 candidate = rows[-1]
-                if candidate[1] > 1 and 0 < candidate[2] < candidate[1] and candidate[3] in ("delivering", "partial"):
+                if (candidate[1] is not None and candidate[2] is not None
+                        and candidate[1] > 1 and 0 < candidate[2] < candidate[1]
+                        and candidate[3] in ("delivering", "partial")):
                     interrupted = candidate
                     break
             time.sleep(0.1)
