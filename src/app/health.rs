@@ -94,12 +94,14 @@ pub enum MatrixStartupAttempt {
     NotAttemptedRecoveryBlocked,
     Succeeded,
     Failed(MatrixFailure),
+    Unknown(MatrixFailure),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MatrixStartupDiagnostics {
     pub authentication: MatrixStartupAttempt,
     pub store_binding: MatrixStartupAttempt,
+    pub session_restore: MatrixStartupAttempt,
     pub e2ee_initialization: MatrixStartupAttempt,
     pub server_device_key_proof: MatrixStartupAttempt,
 }
@@ -109,6 +111,7 @@ impl Default for MatrixStartupDiagnostics {
         Self {
             authentication: MatrixStartupAttempt::NotAttempted,
             store_binding: MatrixStartupAttempt::NotAttempted,
+            session_restore: MatrixStartupAttempt::NotAttempted,
             e2ee_initialization: MatrixStartupAttempt::NotAttempted,
             server_device_key_proof: MatrixStartupAttempt::NotAttempted,
         }
@@ -176,6 +179,7 @@ impl MatrixReadinessOwner {
         *self.diagnostics.lock().unwrap_or_else(|p| p.into_inner()) = MatrixStartupDiagnostics {
             authentication: MatrixStartupAttempt::NotAttemptedRecoveryBlocked,
             store_binding: MatrixStartupAttempt::NotAttemptedRecoveryBlocked,
+            session_restore: MatrixStartupAttempt::NotAttemptedRecoveryBlocked,
             e2ee_initialization: MatrixStartupAttempt::NotAttemptedRecoveryBlocked,
             server_device_key_proof: MatrixStartupAttempt::NotAttemptedRecoveryBlocked,
         };
@@ -195,25 +199,67 @@ impl MatrixReadinessOwner {
             .store_binding = MatrixStartupAttempt::Succeeded;
     }
 
+    pub fn mark_session_restore_succeeded(&self) {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .session_restore = MatrixStartupAttempt::Succeeded;
+    }
+
     pub fn mark_key_proof_succeeded(&self) {
         let mut diagnostics = self.diagnostics.lock().unwrap_or_else(|p| p.into_inner());
-        diagnostics.e2ee_initialization = MatrixStartupAttempt::Succeeded;
         diagnostics.server_device_key_proof = MatrixStartupAttempt::Succeeded;
     }
 
-    pub fn mark_restore_failure(&self, identity_matched: bool, reason: MatrixFailure) {
+    pub fn mark_e2ee_succeeded(&self) {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .e2ee_initialization = MatrixStartupAttempt::Succeeded;
+    }
+
+    pub fn mark_restore_failure(
+        &self,
+        identity_matched: bool,
+        store_bound: bool,
+        reason: MatrixFailure,
+    ) {
         let mut diagnostics = self.diagnostics.lock().unwrap_or_else(|p| p.into_inner());
-        if identity_matched {
+        if store_bound {
+            diagnostics.session_restore = MatrixStartupAttempt::Failed(reason);
+        } else if identity_matched {
             diagnostics.store_binding = MatrixStartupAttempt::Failed(reason);
         } else {
             diagnostics.authentication = MatrixStartupAttempt::Failed(reason);
         }
     }
 
+    pub fn mark_e2ee_failure(&self, reason: MatrixFailure) {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .e2ee_initialization = MatrixStartupAttempt::Failed(reason);
+    }
+
+    pub fn mark_e2ee_timeout(&self) {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .e2ee_initialization = MatrixStartupAttempt::Unknown(MatrixFailure::Timeout);
+    }
+
     pub fn mark_key_proof_failure(&self, reason: MatrixFailure) {
-        let mut diagnostics = self.diagnostics.lock().unwrap_or_else(|p| p.into_inner());
-        diagnostics.e2ee_initialization = MatrixStartupAttempt::Failed(reason);
-        diagnostics.server_device_key_proof = MatrixStartupAttempt::Failed(reason);
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .server_device_key_proof = MatrixStartupAttempt::Failed(reason);
+    }
+
+    pub fn mark_key_proof_timeout(&self) {
+        self.diagnostics
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .server_device_key_proof = MatrixStartupAttempt::Unknown(MatrixFailure::Timeout);
     }
 
     pub fn fail_required_task(&self) {
@@ -597,7 +643,7 @@ mod matrix_readiness_tests {
     fn attempted_matrix_failure_is_distinct_from_recovery_block() {
         let owner = MatrixReadinessOwner::new();
         let generation = owner.begin();
-        owner.mark_restore_failure(false, MatrixFailure::Authentication);
+        owner.mark_restore_failure(false, false, MatrixFailure::Authentication);
         assert!(owner.transition(
             generation,
             &[MatrixPhase::Preflight],
@@ -616,6 +662,61 @@ mod matrix_readiness_tests {
         assert_ne!(
             diagnostics.authentication,
             MatrixStartupAttempt::NotAttemptedRecoveryBlocked
+        );
+    }
+
+    #[test]
+    fn startup_failure_attribution_keeps_later_gates_unattempted() {
+        let owner = MatrixReadinessOwner::new();
+        owner.begin();
+        owner.mark_e2ee_failure(MatrixFailure::CryptoInitialization);
+        let diagnostics = owner.startup_diagnostics();
+        assert_eq!(
+            diagnostics.e2ee_initialization,
+            MatrixStartupAttempt::Failed(MatrixFailure::CryptoInitialization)
+        );
+        assert_eq!(
+            diagnostics.server_device_key_proof,
+            MatrixStartupAttempt::NotAttempted
+        );
+
+        owner.mark_e2ee_succeeded();
+        owner.mark_key_proof_failure(MatrixFailure::DeviceKeyUpload);
+        let diagnostics = owner.startup_diagnostics();
+        assert_eq!(
+            diagnostics.e2ee_initialization,
+            MatrixStartupAttempt::Succeeded
+        );
+        assert_eq!(
+            diagnostics.server_device_key_proof,
+            MatrixStartupAttempt::Failed(MatrixFailure::DeviceKeyUpload)
+        );
+    }
+
+    #[test]
+    fn timeout_and_session_restore_have_separate_boundaries() {
+        let owner = MatrixReadinessOwner::new();
+        owner.begin();
+        owner.mark_e2ee_timeout();
+        let diagnostics = owner.startup_diagnostics();
+        assert_eq!(
+            diagnostics.e2ee_initialization,
+            MatrixStartupAttempt::Unknown(MatrixFailure::Timeout)
+        );
+        assert_eq!(
+            diagnostics.server_device_key_proof,
+            MatrixStartupAttempt::NotAttempted
+        );
+
+        owner.mark_store_binding_succeeded();
+        owner.mark_restore_failure(true, true, MatrixFailure::Authentication);
+        assert_eq!(
+            owner.startup_diagnostics().session_restore,
+            MatrixStartupAttempt::Failed(MatrixFailure::Authentication)
+        );
+        assert_eq!(
+            owner.startup_diagnostics().store_binding,
+            MatrixStartupAttempt::Succeeded
         );
     }
 

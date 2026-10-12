@@ -250,8 +250,10 @@ impl AppRuntime {
         let matrix_client = if let Some(generation) = matrix_generation {
             let identity_health = Arc::clone(&runtime.health_state);
             let mut identity_matched = false;
-            let client =
-                match MatrixClient::restore_with_identity(&config.transports.matrix, || {
+            let mut store_bound = false;
+            let client = match MatrixClient::restore_with_identity(
+                &config.transports.matrix,
+                || {
                     identity_matched = true;
                     identity_health.matrix().mark_authentication_succeeded();
                     identity_health.matrix().transition(
@@ -259,64 +261,130 @@ impl AppRuntime {
                         &[MatrixPhase::Preflight],
                         MatrixPhase::IdentityMatched,
                     );
-                })
-                .await
-                {
-                    Ok(client) => client,
-                    Err(error) => {
-                        identity_health
-                            .matrix()
-                            .mark_restore_failure(identity_matched, matrix_failure(&error));
-                        runtime.health_state.matrix().transition(
-                            generation,
-                            &[MatrixPhase::Preflight, MatrixPhase::IdentityMatched],
-                            MatrixPhase::Failed(matrix_failure(&error)),
-                        );
-                        tracing::warn!(
-                            category = matrix_failure(&error).as_log_str(),
-                            "Matrix startup is health-only"
-                        );
-                        runtime.health =
-                            start_health(config.bridge.health_bind, &runtime.health_state).await?;
-                        runtime.health_state.set_owner(OwnerState::Running);
-                        return Ok(runtime);
-                    }
-                };
+                },
+                || {
+                    store_bound = true;
+                    identity_health.matrix().mark_store_binding_succeeded();
+                },
+                || {
+                    identity_health.matrix().mark_session_restore_succeeded();
+                },
+            )
+            .await
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    identity_health.matrix().mark_restore_failure(
+                        identity_matched,
+                        store_bound,
+                        matrix_failure(&error),
+                    );
+                    runtime.health_state.matrix().transition(
+                        generation,
+                        &[MatrixPhase::Preflight, MatrixPhase::IdentityMatched],
+                        MatrixPhase::Failed(matrix_failure(&error)),
+                    );
+                    tracing::warn!(
+                        category = matrix_failure(&error).as_log_str(),
+                        "Matrix startup is health-only"
+                    );
+                    runtime.health =
+                        start_health(config.bridge.health_bind, &runtime.health_state).await?;
+                    runtime.health_state.set_owner(OwnerState::Running);
+                    return Ok(runtime);
+                }
+            };
             runtime.health_state.matrix().transition(
                 generation,
                 &[MatrixPhase::IdentityMatched],
                 MatrixPhase::StoreBound,
             );
-            runtime.health_state.matrix().mark_store_binding_succeeded();
+            let e2ee =
+                tokio::time::timeout(Duration::from_secs(30), client.initialize_e2ee()).await;
+            match e2ee {
+                Ok(Ok(())) => {
+                    runtime.health_state.matrix().mark_e2ee_succeeded();
+                }
+                Ok(Err(error)) => {
+                    let reason = matrix_failure(&error);
+                    runtime.health_state.matrix().mark_e2ee_failure(reason);
+                    runtime.health_state.matrix().transition(
+                        generation,
+                        &[MatrixPhase::StoreBound],
+                        MatrixPhase::Failed(reason),
+                    );
+                    tracing::warn!(
+                        category = reason.as_log_str(),
+                        "Matrix startup is health-only"
+                    );
+                    runtime.health =
+                        start_health(config.bridge.health_bind, &runtime.health_state).await?;
+                    runtime.health_state.set_owner(OwnerState::Running);
+                    return Ok(runtime);
+                }
+                Err(_) => {
+                    let reason = MatrixFailure::Timeout;
+                    runtime.health_state.matrix().mark_e2ee_timeout();
+                    runtime.health_state.matrix().transition(
+                        generation,
+                        &[MatrixPhase::StoreBound],
+                        MatrixPhase::Failed(reason),
+                    );
+                    tracing::warn!(
+                        category = reason.as_log_str(),
+                        "Matrix startup is health-only"
+                    );
+                    runtime.health =
+                        start_health(config.bridge.health_bind, &runtime.health_state).await?;
+                    runtime.health_state.set_owner(OwnerState::Running);
+                    return Ok(runtime);
+                }
+            }
             let proof =
-                tokio::time::timeout(Duration::from_secs(30), client.initialize_and_prove()).await;
-            let proof_error = match proof {
-                Ok(Ok(())) => None,
-                Ok(Err(error)) => Some(matrix_failure(&error)),
-                Err(_) => Some(MatrixFailure::Timeout),
-            };
-            if let Some(reason) = proof_error {
-                runtime.health_state.matrix().mark_key_proof_failure(reason);
-                runtime.health_state.matrix().transition(
-                    generation,
-                    &[MatrixPhase::StoreBound],
-                    MatrixPhase::Failed(reason),
-                );
-                tracing::warn!(
-                    category = reason.as_log_str(),
-                    "Matrix startup is health-only"
-                );
-                runtime.health =
-                    start_health(config.bridge.health_bind, &runtime.health_state).await?;
-                runtime.health_state.set_owner(OwnerState::Running);
-                return Ok(runtime);
+                tokio::time::timeout(Duration::from_secs(30), client.prove_server_device_key())
+                    .await;
+            match proof {
+                Ok(Ok(())) => runtime.health_state.matrix().mark_key_proof_succeeded(),
+                Ok(Err(error)) => {
+                    let reason = matrix_failure(&error);
+                    runtime.health_state.matrix().mark_key_proof_failure(reason);
+                    runtime.health_state.matrix().transition(
+                        generation,
+                        &[MatrixPhase::StoreBound],
+                        MatrixPhase::Failed(reason),
+                    );
+                    tracing::warn!(
+                        category = reason.as_log_str(),
+                        "Matrix startup is health-only"
+                    );
+                    runtime.health =
+                        start_health(config.bridge.health_bind, &runtime.health_state).await?;
+                    runtime.health_state.set_owner(OwnerState::Running);
+                    return Ok(runtime);
+                }
+                Err(_) => {
+                    let reason = MatrixFailure::Timeout;
+                    runtime.health_state.matrix().mark_key_proof_timeout();
+                    runtime.health_state.matrix().transition(
+                        generation,
+                        &[MatrixPhase::StoreBound],
+                        MatrixPhase::Failed(reason),
+                    );
+                    tracing::warn!(
+                        category = reason.as_log_str(),
+                        "Matrix startup is health-only"
+                    );
+                    runtime.health =
+                        start_health(config.bridge.health_bind, &runtime.health_state).await?;
+                    runtime.health_state.set_owner(OwnerState::Running);
+                    return Ok(runtime);
+                }
             }
             runtime.health_state.matrix().transition(
                 generation,
                 &[MatrixPhase::StoreBound],
                 MatrixPhase::KeyProved,
             );
-            runtime.health_state.matrix().mark_key_proof_succeeded();
             Some(client)
         } else {
             None

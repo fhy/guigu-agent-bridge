@@ -36,12 +36,14 @@ impl MatrixClient {
 
     /// Build a persistent E2EE client and restore the configured access-token session.
     pub async fn restore(config: &MatrixTransportConfig) -> Result<Self, MatrixError> {
-        Self::restore_with_identity(config, || {}).await
+        Self::restore_with_identity(config, || {}, || {}, || {}).await
     }
 
     pub(crate) async fn restore_with_identity(
         config: &MatrixTransportConfig,
         identity_matched: impl FnOnce(),
+        store_bound: impl FnOnce(),
+        session_restored: impl FnOnce(),
     ) -> Result<Self, MatrixError> {
         let user_id: OwnedUserId = config
             .user_id
@@ -91,6 +93,7 @@ impl MatrixClient {
             device_id.as_str(),
         )?;
         validate_store_databases(store)?;
+        store_bound();
         let inner = Client::builder()
             .homeserver_url(&config.homeserver)
             .sqlite_store(store, None)
@@ -102,6 +105,7 @@ impl MatrixClient {
             .restore_session(session(config, user_id, device_id))
             .await
             .map_err(|_| MatrixError::Authentication)?;
+        session_restored();
         Ok(Self {
             inner,
             user_id: config.user_id.clone(),
@@ -161,12 +165,12 @@ impl MatrixClient {
         Ok(())
     }
 
-    pub(crate) async fn initialize_and_prove(&self) -> Result<(), MatrixError> {
+    pub(crate) async fn initialize_e2ee(&self) -> Result<(), MatrixError> {
         self.inner
             .sync_once(SyncSettings::new().timeout(std::time::Duration::from_secs(10)))
             .await
-            .map_err(|_| MatrixError::CryptoInitialization)?;
-        self.prove_server_device_key().await
+            .map(|_| ())
+            .map_err(|_| MatrixError::CryptoInitialization)
     }
 }
 

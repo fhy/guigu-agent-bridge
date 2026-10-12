@@ -622,12 +622,17 @@ async fn startup_recovery_backlog_blocks_readiness_without_spawning_acp() {
     let config_path = temp.0.join("bridge.toml");
     let database = temp.0.join("state.db");
     let sessions = temp.0.join("sessions");
+    let crypto_store = temp.0.join("matrix-crypto");
+    unsafe {
+        std::env::set_var("T055_DUMMY_MATRIX_TOKEN", "dummy-nonsecret");
+    }
     std::fs::write(
         &config_path,
         format!(
-            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\n\n[agents.worker]\ntransport = \"acp\"\ncommand = \"definitely-not-started\"\nworkspace = \"/tmp\"\nenabled = true\n",
+            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\n\n[transports.matrix]\nenabled = true\nhomeserver = \"https://matrix.invalid\"\nuser_id = \"@observer:matrix.invalid\"\ndevice_id = \"TEST_DEVICE\"\naccess_token = \"{{env:T055_DUMMY_MATRIX_TOKEN}}\"\ncrypto_store_path = {:?}\ndevice_trusted = true\n\n[agents.worker]\ntransport = \"acp\"\ncommand = \"definitely-not-started\"\nworkspace = \"/tmp\"\nenabled = true\n",
             database.to_string_lossy(),
-            sessions.to_string_lossy()
+            sessions.to_string_lossy(),
+            crypto_store.to_string_lossy()
         ),
     )
     .unwrap();
@@ -667,7 +672,17 @@ async fn startup_recovery_backlog_blocks_readiness_without_spawning_acp() {
         runtime.health_state().snapshot().await.diagnostic,
         Some("recovery-blocked")
     );
+    let diagnostics = runtime.health_state().matrix().startup_diagnostics();
+    let blocked = guigu_agent_bridge::app::MatrixStartupAttempt::NotAttemptedRecoveryBlocked;
+    assert_eq!(diagnostics.authentication, blocked);
+    assert_eq!(diagnostics.store_binding, blocked);
+    assert_eq!(diagnostics.session_restore, blocked);
+    assert_eq!(diagnostics.e2ee_initialization, blocked);
+    assert_eq!(diagnostics.server_device_key_proof, blocked);
     runtime.shutdown().await.unwrap();
+    unsafe {
+        std::env::remove_var("T055_DUMMY_MATRIX_TOKEN");
+    }
 }
 
 #[tokio::test]
