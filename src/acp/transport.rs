@@ -725,7 +725,7 @@ async fn accumulate(
     let Some(text) = content.as_text() else {
         return Ok(());
     };
-    for (id, entry) in pending.iter_mut() {
+    for entry in pending.values_mut() {
         if entry.session.as_deref() != Some(notification.session_id.as_str()) {
             continue;
         }
