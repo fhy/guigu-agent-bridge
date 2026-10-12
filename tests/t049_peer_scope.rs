@@ -58,6 +58,9 @@ enabled = true
             ("T049_A".into(), "peer-a-token".into()),
             ("T049_B".into(), "peer-b-token".into()),
         ]);
+        // The actual startup guard authenticates the config file even when the
+        // test constructor receives an already parsed Config.
+        std::fs::write(&config_path, &source).unwrap();
         Self {
             root,
             config_path,
