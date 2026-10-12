@@ -854,4 +854,29 @@ mod tests {
 
         assert!(pending.is_empty());
     }
+
+    #[tokio::test]
+    async fn durable_display_overflow_keeps_terminal_and_durable_lanes_alive() {
+        let (responder, _reply) = oneshot::channel();
+        let (updates, mut update_rx) = mpsc::channel(1);
+        updates.try_send(TurnUpdate::AgentMessageChunk("occupied".into())).unwrap();
+        let (durable, mut durable_rx) = mpsc::channel(1);
+        let mut pending = HashMap::from([(9, Pending {
+            responder,
+            phase: Phase::Prompt,
+            session: Some("s".into()),
+            output: String::new(),
+            output_truncated: false,
+            updates: Some(updates),
+            durable_updates: Some(durable),
+        })]);
+        accumulate(
+            &serde_json::json!({"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"durable"}}}),
+            &mut pending,
+            &TransportLimits::default(),
+        ).await.unwrap();
+        assert!(pending.contains_key(&9));
+        assert_eq!(durable_rx.recv().await.as_deref(), Some("durable"));
+        assert_eq!(update_rx.try_recv().unwrap(), TurnUpdate::AgentMessageChunk("occupied".into()));
+    }
 }
