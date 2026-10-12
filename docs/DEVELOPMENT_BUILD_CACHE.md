@@ -1,76 +1,56 @@
 # Local Rust Build Cache
 
-This guide configures disposable developer build outputs only. It does not change
-Rust/MSRV requirements, CI, release gates, runtime services, or published artifacts.
+This guide preserves shared-cache and single-build-owner practices. The reusable
+[Rust build guidance](language-specific/RUST_BUILD_CACHE.md) records the selected
+toolchain, target and cache inputs. It does not change runtime services, MSRV,
+published artifacts or the task's accepted verification requirements.
 
-## Toolchain and gates
+## Toolchain and evidence
 
-- The project MSRV remains Rust 1.94.0 (`Cargo.toml` is authoritative).
-- Fast local feedback: `cargo +1.94.0 check --locked` and focused tests.
-- Review-ready code must still pass all four gates on the exact candidate:
-  `cargo +1.94.0 fmt --check`, `cargo +1.94.0 check --locked`,
-  `cargo +1.94.0 clippy --locked --all-targets --all-features -- -D warnings`,
-  and `cargo +1.94.0 test --locked --all-targets`.
-- Release work additionally follows the release specification, including locked
-  package and publish dry-run checks. Caching never substitutes for those gates.
+`Cargo.toml` is authoritative for Rust/MSRV. Use the task's locked toolchain and
+features for focused checks and stable-candidate validation. Record each command
+and exit; do not turn a failed gate into PASS by relabelling later focused results.
+Reuse accepted evidence only when the relevant source, dependencies, features,
+toolchain and invocation inputs are unchanged. Documentation-only changes need
+document checks, not a repeat full compilation or live E2E.
 
-## Local cache layout
+## Shared target and ownership
 
-On this Linux developer host, sccache is installed in Cargo's user bin directory.
-The user-level `~/.cargo/config.toml` selects it as `rustc-wrapper`. Each checkout
-has an ignored, untracked `.cargo/config.toml` pointing `target-dir` at a separate
-directory below `~/.cache/cargo-target/`. The repository and published package do
-not contain host paths or these settings.
+The Project Controller assigns one Rust build owner. Record the approved shared
+target, build lock, effective Cargo configuration and sccache/incremental settings
+before building. All active worktrees use that shared target unless an independent
+target is explicitly assigned. Task parallelism does not authorize parallel full
+gates or a new worktree-local target tree.
 
-The per-checkout settings disable Cargo incremental compilation. Rust incremental
-outputs contain session-local state that prevents sccache from reusing those Rust
-invocations across target directories. Disabling it improves cross-target reuse;
-editing a crate within the same target may do more work than with incremental
-compilation. Cold-to-warm and cross-target measurements vary by machine and must
-not be treated as build-time guarantees.
+Local settings may use `CARGO_TARGET_DIR`, a Cargo configuration `target-dir`, and
+`rustc-wrapper` for sccache. Do not commit machine-specific paths. Cargo metadata
+reports the effective path; explicit CLI `--target-dir` must also be recorded.
+Keep warm shared dependencies and candidate images across tasks. Incremental
+compilation and sccache are performance choices, not substitutes for validation.
 
-Suggested local budgets:
+## Disk pressure and cleanup
 
-| Cache | Soft budget | Hard/eviction policy |
-|---|---:|---|
-| Each project target | 20 GiB | Review size before removing only that project's target directory |
-| sccache | 10 GiB | sccache's own bounded LRU eviction; inspect stats before changing it |
+There is no fixed 20 GiB target cap. Before a full gate, inspect the filesystem
+containing the shared target. Available space below 30 GiB or usage at or above
+85% triggers resource cleanup under the build lock, with no build running.
+Prefer abandoned independent targets and expired temporary outputs; preserve
+active candidate binaries and shared dependencies. Do not routinely run
+`cargo clean` after a task, review or documentation change.
 
-Check usage without changing data:
+Never treat runtime databases, WAL/SHM, crypto stores, credentials, sessions,
+logs or retained operation evidence as cache. Age alone does not prove a test
+directory can be deleted. Fixture cleanup must identify resources created by
+the test and respect task retention/exclusions; it is separate from build-cache
+maintenance. This guide intentionally supplies no blanket recursive-delete script.
 
-```bash
-du -sh "$HOME/.cache/cargo-target/guigu-agent-bridge" \
-  "$HOME/.cache/cargo-target/guigu" "$HOME/.cache/sccache" 2>/dev/null
-sccache --show-stats
-df -h "$HOME"
-```
+## Local settings and rollback
 
-## Safe cleanup
+An optional `SCCACHE_CACHE_SIZE` in the user/CI environment can bound sccache's
+own LRU cache; the wrapper configuration alone does not set this budget.
+Inspect `sccache --show-stats` before changing it. This is separate from the
+shared Cargo target's disk-pressure rule and does not require cache deletion.
 
-First stop builds that use the selected checkout. To rebuild only one project's
-artifacts, verify the exact canonical path and then remove only that target:
-
-```bash
-target="$HOME/.cache/cargo-target/guigu-agent-bridge"
-test "$(realpath -m -- "$target")" = "$HOME/.cache/cargo-target/guigu-agent-bridge"
-printf 'Target to remove: %s\n' "$target"
-rm -rf -- "$target"
-```
-
-Use the exact corresponding `.../guigu` path for the guigu project. Do not replace
-the variable with a broad directory, glob, `~`, or `/`. To evict sccache entries,
-use its own bounded cache control (`sccache --show-stats` and, when necessary,
-`sccache --zero-stats` only resets counters; it does not delete cache data). Do not
-delete Cargo registry/git downloads, databases, WAL/SHM files, crypto stores,
-credentials, logs, sessions, or another worktree's files. Do not run `cargo clean`
-against active projects.
-
-## Rollback
-
-The per-checkout `.cargo/config.toml` files are local and ignored. To restore Cargo's
-default target location for one checkout, stop its builds and remove only that
-checkout's local `.cargo/config.toml`; to disable the wrapper, remove only the
-`[build] rustc-wrapper` entry from `~/.cargo/config.toml`, preserving any unrelated
-settings. Keep target contents unless there is a separate, explicit cleanup need.
-Uninstalling sccache is optional and is not needed to roll back: removing the wrapper
-entry makes Cargo invoke rustc directly. No Observer/systemd action is needed.
+To revert local performance settings, stop that checkout's builds and remove
+only its local target/wrapper setting, preserving other configuration. Keep
+target contents unless a separately scoped cleanup is necessary. No service,
+Observer, credential or runtime operation is needed to change build settings.
