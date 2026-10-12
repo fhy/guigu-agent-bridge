@@ -219,7 +219,7 @@ mod tests {
         let temp = Temp(root.clone());
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
         sqlx::raw_sql("CREATE TABLE tasks(task_id TEXT PRIMARY KEY) STRICT; INSERT INTO tasks VALUES('task');").execute(&pool).await.unwrap();
-        sqlx::raw_sql(include_str!("../../migrations/0012_durable_acp_output.sql"))
+        sqlx::raw_sql(include_str!("../../migrations/0015_durable_acp_output.sql"))
             .execute(&pool)
             .await
             .unwrap();

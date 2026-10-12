@@ -44,7 +44,7 @@ async fn fixture(limit: u64) -> (Temp, DurableOutputSpool, OutputSpoolStore, Sql
     .execute(&pool)
     .await
     .unwrap();
-    sqlx::raw_sql(include_str!("../../migrations/0012_durable_acp_output.sql"))
+    sqlx::raw_sql(include_str!("../../migrations/0015_durable_acp_output.sql"))
         .execute(&pool)
         .await
         .unwrap();
