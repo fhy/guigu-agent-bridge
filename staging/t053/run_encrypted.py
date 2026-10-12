@@ -187,6 +187,10 @@ crypto_store_path = {json.dumps(str(self.app.crypto_store))}
         self.setup()
         self.app.start(timeout=90)
         self.report["initial_ready"] = True
+        # Readiness is the process/HTTP predicate; allow one bounded encrypted
+        # sync cycle to import the room state and megolm session before the first
+        # sender request. This is not an unbounded retry.
+        time.sleep(8)
         for role in range(1, 4):
             label = "T053_REAL_MODEL_"+str(role)
             event = self.send(role, label)
