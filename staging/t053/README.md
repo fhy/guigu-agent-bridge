@@ -11,6 +11,11 @@ performed. The helper accepts only bounded JSON commands and emits redacted fact
 `run_encrypted.py` is the bounded final flow: creates one invite-only encrypted
 room, checks `m.room.encryption` and four memberships, sends three account inputs,
 receives decrypted replies, restarts the same application/SDK state, replays the
-same transactions, and requires a fresh encrypted post-restart reply. Durable
-300 KiB ACP coverage is separately driven by the real `acp-mock-backend` through
-ordinary application wiring; it is never claimed from the Matrix smoke alone.
+same transactions, and requires a fresh encrypted post-restart reply. The long
+output row now stops only after a durable set has a non-zero acknowledged cursor
+and remaining segments, records the stable transaction IDs, restarts the same
+state, and proves the remaining encrypted parts drain without transaction drift.
+Observer `/status` and `/trace` replies are also collected through the encrypted
+SDK path and asserted separately from `/ready` health/readiness. Durable 300 KiB
+ACP coverage is driven by the real `acp-mock-backend` through ordinary application
+wiring; it is never claimed from a plaintext or synthetic Matrix response.

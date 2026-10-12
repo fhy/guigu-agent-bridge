@@ -730,15 +730,14 @@ async fn accumulate(
         if entry.session.as_deref() != Some(notification.session_id.as_str()) {
             continue;
         }
-        if let Some(updates) = &entry.updates {
-            if updates
+        if let Some(updates) = &entry.updates
+            && updates
                 .try_send(TurnUpdate::AgentMessageChunk(text.to_owned()))
                 .is_err()
-                && entry.durable_updates.is_none()
-            {
-                overflowed.push(*id);
-                continue;
-            }
+            && entry.durable_updates.is_none()
+        {
+            overflowed.push(*id);
+            continue;
         }
         if let Some(durable) = &entry.durable_updates {
             durable
@@ -859,17 +858,22 @@ mod tests {
     async fn durable_display_overflow_keeps_terminal_and_durable_lanes_alive() {
         let (responder, _reply) = oneshot::channel();
         let (updates, mut update_rx) = mpsc::channel(1);
-        updates.try_send(TurnUpdate::AgentMessageChunk("occupied".into())).unwrap();
+        updates
+            .try_send(TurnUpdate::AgentMessageChunk("occupied".into()))
+            .unwrap();
         let (durable, mut durable_rx) = mpsc::channel(1);
-        let mut pending = HashMap::from([(9, Pending {
-            responder,
-            phase: Phase::Prompt,
-            session: Some("s".into()),
-            output: String::new(),
-            output_truncated: false,
-            updates: Some(updates),
-            durable_updates: Some(durable),
-        })]);
+        let mut pending = HashMap::from([(
+            9,
+            Pending {
+                responder,
+                phase: Phase::Prompt,
+                session: Some("s".into()),
+                output: String::new(),
+                output_truncated: false,
+                updates: Some(updates),
+                durable_updates: Some(durable),
+            },
+        )]);
         accumulate(
             &serde_json::json!({"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"durable"}}}),
             &mut pending,
@@ -877,6 +881,9 @@ mod tests {
         ).await.unwrap();
         assert!(pending.contains_key(&9));
         assert_eq!(durable_rx.recv().await.as_deref(), Some("durable"));
-        assert_eq!(update_rx.try_recv().unwrap(), TurnUpdate::AgentMessageChunk("occupied".into()));
+        assert_eq!(
+            update_rx.try_recv().unwrap(),
+            TurnUpdate::AgentMessageChunk("occupied".into())
+        );
     }
 }

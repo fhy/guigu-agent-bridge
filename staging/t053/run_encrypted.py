@@ -161,7 +161,7 @@ crypto_store_path = {json.dumps(str(self.app.crypto_store))}
         self.sent[label] = (role, event, transaction, body)
         return event
 
-    def receive(self, event, label=None, timeout=185, expected=None):
+    def receive(self, event, label=None, timeout=185, expected=None, expected_prefix=None):
         deadline = time.monotonic()+timeout
         parts = {}
         while time.monotonic() < deadline:
@@ -174,14 +174,37 @@ crypto_store_path = {json.dumps(str(self.app.crypto_store))}
                     if value.get("reply") == event:
                         parts[value["event"]] = value["body"]
             text = "".join(parts.values())
-            if (expected is not None and text == expected) or (label is not None and label in text):
+            prefix_ok = expected_prefix is not None and text.startswith(expected_prefix)
+            if (expected is not None and text == expected) or (label is not None and label in text) or prefix_ok:
                 for reply in parts:
                     raw = self.api("/rooms/"+urllib.parse.quote(self.room, safe="")+"/event/"+urllib.parse.quote(reply, safe=""))
                     if raw.get("type") != "m.room.encrypted":
                         raise Refusal("plaintext-server-reply")
-                return {"parts":len(parts), "bytes":len(text.encode()), "sha256":hashlib.sha256(text.encode()).hexdigest()}
+                encrypted = all(self.received[item].get("encrypted") for item in parts)
+                return {"parts":len(parts), "bytes":len(text.encode()),
+                        "sha256":hashlib.sha256(text.encode()).hexdigest(),
+                        "text":text if expected_prefix is not None else None,
+                        "encrypted":encrypted}
             time.sleep(0.1)
         raise Refusal("encrypted-receive-timeout")
+
+    def observer(self, command, label):
+        """Send and decrypt one admin response, keeping Observer evidence separate."""
+        task = database(self.app.database,
+            "SELECT task_id FROM tasks ORDER BY rowid DESC LIMIT 1")
+        if not task or not task[0][0]:
+            raise Refusal("observer-task-missing")
+        body = f"{command} {task[0][0]}"
+        event = self.send(3, label, body)
+        observed = self.receive(event, expected_prefix=f"command={command[1:]}")
+        if not observed.get("encrypted"):
+            raise Refusal("observer-response-not-encrypted")
+        self.report.setdefault("observer", []).append({
+            "command": command,
+            "task_id": task[0][0],
+            "reply": observed,
+        })
+        return observed
 
     def exercise(self):
         self.setup()
@@ -210,8 +233,42 @@ crypto_store_path = {json.dumps(str(self.app.crypto_store))}
         self.report["replay_dedup"] = True
         event = self.send(2, "T053_POST_RESTART", "T053_SHORT")
         self.report["post_restart"] = self.receive(event, "T053_POST_RESTART")
-        event = self.send(1, "T053_LONG", "T053_LONG")
-        self.report["long_output"] = self.receive(event, expected="L"*307200)
+        event = self.send(1, "T053_INTERRUPTED_LONG", "T053_LONG")
+        interrupted = None
+        deadline = time.monotonic() + 45
+        while time.monotonic() < deadline:
+            rows = database(self.app.database,
+                "SELECT set_id,segment_count,acknowledged_cursor,state FROM acp_output_sets ORDER BY created_at")
+            if rows:
+                candidate = rows[-1]
+                if candidate[1] > 1 and 0 < candidate[2] < candidate[1] and candidate[3] in ("delivering", "partial"):
+                    interrupted = candidate
+                    break
+            time.sleep(0.1)
+        if interrupted is None:
+            raise Refusal("durable-interruption-boundary-missing")
+        before_txns = database(self.app.database,
+            "SELECT stable_txn_id FROM acp_output_segments WHERE set_id=? ORDER BY segment_index",
+            (interrupted[0],))
+        self.report["e5_interrupted"] = {
+            "set_id": interrupted[0],
+            "segment_count": interrupted[1],
+            "acknowledged_cursor": interrupted[2],
+            "state": interrupted[3],
+            "stable_txns_before_restart": [row[0] for row in before_txns],
+        }
+        self.app.stop()
+        self.configure(self.args.deterministic)
+        self.app.start(timeout=90)
+        self.report["e5_restart"] = True
+        recovered = self.receive(event, expected="L"*307200, timeout=240)
+        after_txns = database(self.app.database,
+            "SELECT stable_txn_id FROM acp_output_segments WHERE set_id=? ORDER BY segment_index",
+            (interrupted[0],))
+        if [row[0] for row in before_txns] != [row[0] for row in after_txns]:
+            raise Refusal("durable-transaction-id-drift")
+        self.report["e5_recovered"] = recovered
+        self.report["long_output"] = recovered
         deadline = time.monotonic() + 30
         while time.monotonic() < deadline:
             rows = database(self.app.database,
@@ -224,7 +281,9 @@ crypto_store_path = {json.dumps(str(self.app.crypto_store))}
         if not self.report["durable_rows"] or self.report["durable_rows"][-1][3] != "cleaned":
             raise Refusal("durable-drain-not-cleaned")
         # Observer commands use the same encrypted room and actual admin handler.
-        self.send(3, "T053_STATUS", "/status")
+        self.observer("/status", "T053_STATUS")
+        self.observer("/trace", "T053_TRACE")
+        self.observer("/status", "T053_LIFECYCLE")
         self.report["health_endpoint"] = "/ready"
         self.report["health"] = http(f"http://127.0.0.1:{self.app.health}/ready")[0]
         self.report["readiness"] = http(f"http://127.0.0.1:{self.app.health}/ready")[0]

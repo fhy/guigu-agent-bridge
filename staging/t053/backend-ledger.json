@@ -1,0 +1,62 @@
+{
+  "schema": "t053-backend-ledger/v1",
+  "candidate": "see immutable handoff exact commit",
+  "toolchain": "rustc 1.94.0",
+  "runner": "staging/t053/run_encrypted.py",
+  "entries": [
+    {
+      "backend": "native-acp-mock",
+      "version": "worker/acp-mock-backend@0.1.0",
+      "entrypoint": "examples/acp-mock-backend",
+      "source_or_image": "candidate-built shared-target executable",
+      "config": "staging/t053 deterministic ACP configuration",
+      "features": ["test-support"],
+      "ordinary": "verified via existing dispatcher evidence",
+      "stream": "verified by durable output focused rows; non-durable overflow contract restored",
+      "resume": "E5 required on encrypted runner; no claim until interrupted capture is attached",
+      "cancel": "verified via existing ACP cancellation rows",
+      "timeout": "verified via existing ACP deadline rows",
+      "exit": "verified via existing owned-child cleanup rows"
+    },
+    {
+      "backend": "CodeBuddy",
+      "version": "external prerequisite not available in this staging run",
+      "entrypoint": "not invoked",
+      "source_or_image": "not applicable",
+      "config": "not applicable",
+      "features": [],
+      "ordinary": "not_tested_external",
+      "stream": "not_tested_external",
+      "resume": "not_tested_external",
+      "cancel": "not_tested_external",
+      "timeout": "not_tested_external",
+      "exit": "not_tested_external"
+    },
+    {
+      "backend": "Qwen",
+      "version": "external prerequisite not available in this staging run",
+      "entrypoint": "not invoked",
+      "source_or_image": "not applicable",
+      "config": "not applicable",
+      "features": [],
+      "ordinary": "not_tested_external",
+      "stream": "not_tested_external",
+      "resume": "not_tested_external",
+      "cancel": "not_tested_external",
+      "timeout": "not_tested_external",
+      "exit": "not_tested_external"
+    }
+  ],
+  "session_race_regression": {
+    "fixture": "tests/acp_dispatcher.rs::a_second_task_in_one_conversation_reuses_its_session",
+    "command": "cargo +1.94.0 test --locked --offline --features test-support --test acp_dispatcher a_second_task_in_one_conversation_reuses_its_session -- --test-threads=1",
+    "assertion": "one persisted live session and no duplicate accepted delivery",
+    "backend_identity_drift": "live_session compatibility hash gates reuse; mismatch is refused"
+  },
+  "reliability_51t7_39x": {
+    "classification": "historical unresolved timeout",
+    "evidence": "original run timing/state and durable facts retained in prior handoff",
+    "later_success_is_not_fix": true,
+    "disposition": "no causal proof that a later successful run repairs the original timeout; classify as unresolved unless a matching timing/state/backend capture is attached"
+  }
+}
