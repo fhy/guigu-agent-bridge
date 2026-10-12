@@ -214,6 +214,14 @@ crypto_store_path = {json.dumps(str(self.app.crypto_store))}
         # sync cycle to import the room state and megolm session before the first
         # sender request. This is not an unbounded retry.
         time.sleep(8)
+        # Fresh recipient stores need a bounded post-application sync to import
+        # the room/session material before the first encrypted reply. Keep this
+        # inside the reviewed runner's fixed budget; it does not retry sends or
+        # mutate login/session state.
+        for _ in range(4):
+            for recipient in self.recipients:
+                recipient.command(self.room)
+            time.sleep(1)
         for role in range(1, 4):
             label = "T053_REAL_MODEL_"+str(role)
             event = self.send(role, label)
