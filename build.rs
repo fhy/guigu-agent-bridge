@@ -1,38 +1,17 @@
-use std::{env, fs, path::PathBuf, process::Command};
+use std::{
+    env, fs,
+    path::{Path, PathBuf},
+    process::Command,
+};
 
 use sha2::{Digest, Sha256};
 
 fn main() {
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rerun-if-changed=src");
+    println!("cargo:rerun-if-changed=.git");
     println!("cargo:rerun-if-env-changed=RUSTC");
-    let git_head = Command::new("git")
-        .args(["rev-parse", "--git-path", "HEAD"])
-        .output()
-        .expect("git path is required for T050 artifact identity");
-    assert!(git_head.status.success(), "cannot resolve git HEAD path");
-    println!(
-        "cargo:rerun-if-changed={}",
-        String::from_utf8(git_head.stdout).unwrap().trim()
-    );
-    let head = Command::new("git")
-        .args(["rev-parse", "--verify", "HEAD"])
-        .output()
-        .expect("git is required for T050 artifact identity");
-    assert!(head.status.success(), "cannot resolve source commit");
-    let hex = String::from_utf8(head.stdout).expect("commit is ASCII");
-    let hex = hex.trim();
-    assert_eq!(hex.len(), 40, "T050 requires a SHA-1 git object id");
-    let mut source = [0u8; 20];
-    for (index, byte) in source.iter_mut().enumerate() {
-        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
-    }
-    let dirty = Command::new("git")
-        .args(["status", "--porcelain", "--untracked-files=no"])
-        .output()
-        .expect("git status is required for T050 artifact identity");
-    assert!(dirty.status.success(), "cannot inspect source state");
-    let source_dirty = !dirty.stdout.is_empty();
+    let (source, source_dirty) = source_identity(Path::new("."));
     let lock_hash = Sha256::digest(fs::read("Cargo.lock").expect("Cargo.lock"));
     let rustc = env::var("RUSTC").unwrap_or_else(|_| "rustc".to_owned());
     let rustc_output = Command::new(rustc).arg("-vV").output().expect("rustc -vV");
@@ -63,4 +42,45 @@ fn main() {
         ),
     )
     .expect("write T050 build identity");
+}
+
+pub(crate) fn source_identity(root: &Path) -> ([u8; 20], bool) {
+    // Packages have no checkout identity. Never borrow an enclosing repository or
+    // promote .cargo_vcs_info.json (a provenance hint) into artifact authority.
+    if !root.join(".git").exists() {
+        println!(
+            "cargo:warning=source checkout identity unavailable; legacy artifact admission disabled"
+        );
+        return ([0; 20], true);
+    }
+    let git_head = Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--git-path", "HEAD"])
+        .output()
+        .expect("git path is required for T050 artifact identity");
+    assert!(git_head.status.success(), "cannot resolve git HEAD path");
+    println!(
+        "cargo:rerun-if-changed={}",
+        String::from_utf8(git_head.stdout).unwrap().trim()
+    );
+    let head = Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()
+        .expect("git is required for T050 artifact identity");
+    assert!(head.status.success(), "cannot resolve source commit");
+    let hex = String::from_utf8(head.stdout).expect("commit is ASCII");
+    let hex = hex.trim();
+    assert_eq!(hex.len(), 40, "T050 requires a SHA-1 git object id");
+    let mut source = [0u8; 20];
+    for (index, byte) in source.iter_mut().enumerate() {
+        *byte = u8::from_str_radix(&hex[index * 2..index * 2 + 2], 16).unwrap();
+    }
+    let dirty = Command::new("git")
+        .current_dir(root)
+        .args(["status", "--porcelain", "--untracked-files=no"])
+        .output()
+        .expect("git status is required for T050 artifact identity");
+    assert!(dirty.status.success(), "cannot inspect source state");
+    (source, !dirty.stdout.is_empty())
 }

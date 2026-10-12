@@ -1,4 +1,14 @@
-# v0.2.1 Release Checklist
+# Release Checklist
+
+## Current local candidate: v0.2.12
+
+Version `0.2.12` is prepared locally, not published or deployed. See
+[candidate notes](RELEASE-0.2.12.md) for package portability and accepted evidence
+limits. Registry publication, tag creation and production rollout require separate
+decisions. The historical v0.2.1 checklist below remains historical guidance, not
+proof of current deployment readiness.
+
+## Historical v0.2.1 checklist
 
 This document prepares replacement of `opencode-chat-bridge` by
 `guigu-agent-bridge`. It does not authorize a push, tag, database migration, or

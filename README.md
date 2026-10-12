@@ -8,6 +8,10 @@
 
 ## 快速开始
 
+当前源码版本为本地、尚未发布的 `0.2.12` 候选；以下 registry 安装示例仍保留
+历史 `0.2.10` 引用，不代表 `0.2.12` 已可从 registry 安装。候选范围与验证限制见
+[0.2.12 候选说明](docs/RELEASE-0.2.12.md)。
+
 ```bash
 cargo install guigu-agent-bridge --version 0.2.10
 install -m 600 config.example.toml "$HOME/.config/guigu-agent-bridge.toml"
@@ -30,6 +34,7 @@ guigu-agent-bridge "$HOME/.config/guigu-agent-bridge.toml"
 - [0.2.9 候选说明](docs/RELEASE-0.2.9.md)
 - [0.2.10 候选说明](docs/RELEASE-0.2.10.md)
 - [0.2.11 本地候选说明](docs/RELEASE-0.2.11.md)
+- [0.2.12 本地候选说明](docs/RELEASE-0.2.12.md)
 - [产品与边界](docs/PRODUCT.md)
 - [用户指南](docs/USER_GUIDE.md)
 - [配置参考](docs/CONFIGURATION.md)
