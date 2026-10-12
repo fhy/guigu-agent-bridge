@@ -36,6 +36,22 @@ use super::{
     ProjectionMetrics, ReloadController, ReloadError, ReplyRegistry,
 };
 
+const MATRIX_INITIALIZATION_BUDGET: Duration = Duration::from_secs(30);
+
+/// Both Matrix startup phases consume this deadline; a later phase never
+/// receives a fresh budget, and an exhausted budget never polls its operation.
+async fn within_matrix_deadline<T>(
+    deadline: tokio::time::Instant,
+    operation: impl Future<Output = T>,
+) -> Result<T, MatrixFailure> {
+    if tokio::time::Instant::now() >= deadline {
+        return Err(MatrixFailure::Timeout);
+    }
+    tokio::time::timeout_at(deadline, operation)
+        .await
+        .map_err(|_| MatrixFailure::Timeout)
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
     #[error("application configuration failed")]
@@ -299,8 +315,8 @@ impl AppRuntime {
                 &[MatrixPhase::IdentityMatched],
                 MatrixPhase::StoreBound,
             );
-            let e2ee =
-                tokio::time::timeout(Duration::from_secs(30), client.initialize_e2ee()).await;
+            let deadline = tokio::time::Instant::now() + MATRIX_INITIALIZATION_BUDGET;
+            let e2ee = within_matrix_deadline(deadline, client.initialize_e2ee()).await;
             match e2ee {
                 Ok(Ok(())) => {
                     runtime.health_state.matrix().mark_e2ee_succeeded();
@@ -340,9 +356,7 @@ impl AppRuntime {
                     return Ok(runtime);
                 }
             }
-            let proof =
-                tokio::time::timeout(Duration::from_secs(30), client.prove_server_device_key())
-                    .await;
+            let proof = within_matrix_deadline(deadline, client.prove_server_device_key()).await;
             match proof {
                 Ok(Ok(())) => runtime.health_state.matrix().mark_key_proof_succeeded(),
                 Ok(Err(error)) => {
@@ -933,11 +947,45 @@ mod assembly_tests {
         matchers::{method, path_regex},
     };
 
-    use super::AppRuntime;
+    use super::{AppRuntime, MATRIX_INITIALIZATION_BUDGET, within_matrix_deadline};
     use crate::{
         config::load_from_str_with_env,
         storage::{ReliabilityStore, connect, migrate},
     };
+
+    #[tokio::test]
+    async fn matrix_initialization_and_proof_share_one_total_budget() {
+        use std::time::Duration;
+        use tokio::time::{Instant, sleep};
+
+        assert_eq!(MATRIX_INITIALIZATION_BUDGET, Duration::from_secs(30));
+        // Scale only the duration, not the production deadline wrapper.
+        let budget = Duration::from_millis(200);
+        let start = Instant::now();
+        let deadline = start + budget;
+        within_matrix_deadline(deadline, sleep(Duration::from_millis(120)))
+            .await
+            .unwrap();
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            remaining < budget / 2,
+            "initialization must consume proof budget"
+        );
+
+        assert_eq!(
+            // Each phase fits a fresh 200ms timer, but together they do not.
+            within_matrix_deadline(deadline, sleep(Duration::from_millis(120))).await,
+            Err(crate::app::MatrixFailure::Timeout)
+        );
+        assert!(Instant::now() >= deadline);
+        // Once consumed, the same budget cannot start any subsequent operation.
+        let mut polled = false;
+        assert_eq!(
+            within_matrix_deadline(deadline, async { polled = true }).await,
+            Err(crate::app::MatrixFailure::Timeout)
+        );
+        assert!(!polled);
+    }
 
     #[derive(Clone, Copy)]
     enum FailureCase {
