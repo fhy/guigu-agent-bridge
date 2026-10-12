@@ -38,18 +38,26 @@ use super::{
 
 const MATRIX_INITIALIZATION_BUDGET: Duration = Duration::from_secs(30);
 
+#[derive(Debug, PartialEq, Eq)]
+enum DeadlineOutcome<T> {
+    NotAttempted,
+    TimedOut,
+    Completed(T),
+}
+
 /// Both Matrix startup phases consume this deadline; a later phase never
 /// receives a fresh budget, and an exhausted budget never polls its operation.
 async fn within_matrix_deadline<T>(
     deadline: tokio::time::Instant,
     operation: impl Future<Output = T>,
-) -> Result<T, MatrixFailure> {
+) -> DeadlineOutcome<T> {
     if tokio::time::Instant::now() >= deadline {
-        return Err(MatrixFailure::Timeout);
+        return DeadlineOutcome::NotAttempted;
     }
-    tokio::time::timeout_at(deadline, operation)
-        .await
-        .map_err(|_| MatrixFailure::Timeout)
+    match tokio::time::timeout_at(deadline, operation).await {
+        Ok(value) => DeadlineOutcome::Completed(value),
+        Err(_) => DeadlineOutcome::TimedOut,
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -318,10 +326,10 @@ impl AppRuntime {
             let deadline = tokio::time::Instant::now() + MATRIX_INITIALIZATION_BUDGET;
             let e2ee = within_matrix_deadline(deadline, client.initialize_e2ee()).await;
             match e2ee {
-                Ok(Ok(())) => {
+                DeadlineOutcome::Completed(Ok(())) => {
                     runtime.health_state.matrix().mark_e2ee_succeeded();
                 }
-                Ok(Err(error)) => {
+                DeadlineOutcome::Completed(Err(error)) => {
                     let reason = matrix_failure(&error);
                     runtime.health_state.matrix().mark_e2ee_failure(reason);
                     runtime.health_state.matrix().transition(
@@ -338,9 +346,25 @@ impl AppRuntime {
                     runtime.health_state.set_owner(OwnerState::Running);
                     return Ok(runtime);
                 }
-                Err(_) => {
+                DeadlineOutcome::TimedOut => {
                     let reason = MatrixFailure::Timeout;
                     runtime.health_state.matrix().mark_e2ee_timeout();
+                    runtime.health_state.matrix().transition(
+                        generation,
+                        &[MatrixPhase::StoreBound],
+                        MatrixPhase::Failed(reason),
+                    );
+                    tracing::warn!(
+                        category = reason.as_log_str(),
+                        "Matrix startup is health-only"
+                    );
+                    runtime.health =
+                        start_health(config.bridge.health_bind, &runtime.health_state).await?;
+                    runtime.health_state.set_owner(OwnerState::Running);
+                    return Ok(runtime);
+                }
+                DeadlineOutcome::NotAttempted => {
+                    let reason = MatrixFailure::Timeout;
                     runtime.health_state.matrix().transition(
                         generation,
                         &[MatrixPhase::StoreBound],
@@ -358,8 +382,10 @@ impl AppRuntime {
             }
             let proof = within_matrix_deadline(deadline, client.prove_server_device_key()).await;
             match proof {
-                Ok(Ok(())) => runtime.health_state.matrix().mark_key_proof_succeeded(),
-                Ok(Err(error)) => {
+                DeadlineOutcome::Completed(Ok(())) => {
+                    runtime.health_state.matrix().mark_key_proof_succeeded()
+                }
+                DeadlineOutcome::Completed(Err(error)) => {
                     let reason = matrix_failure(&error);
                     runtime.health_state.matrix().mark_key_proof_failure(reason);
                     runtime.health_state.matrix().transition(
@@ -376,9 +402,25 @@ impl AppRuntime {
                     runtime.health_state.set_owner(OwnerState::Running);
                     return Ok(runtime);
                 }
-                Err(_) => {
+                DeadlineOutcome::TimedOut => {
                     let reason = MatrixFailure::Timeout;
                     runtime.health_state.matrix().mark_key_proof_timeout();
+                    runtime.health_state.matrix().transition(
+                        generation,
+                        &[MatrixPhase::StoreBound],
+                        MatrixPhase::Failed(reason),
+                    );
+                    tracing::warn!(
+                        category = reason.as_log_str(),
+                        "Matrix startup is health-only"
+                    );
+                    runtime.health =
+                        start_health(config.bridge.health_bind, &runtime.health_state).await?;
+                    runtime.health_state.set_owner(OwnerState::Running);
+                    return Ok(runtime);
+                }
+                DeadlineOutcome::NotAttempted => {
+                    let reason = MatrixFailure::Timeout;
                     runtime.health_state.matrix().transition(
                         generation,
                         &[MatrixPhase::StoreBound],
@@ -947,7 +989,9 @@ mod assembly_tests {
         matchers::{method, path_regex},
     };
 
-    use super::{AppRuntime, MATRIX_INITIALIZATION_BUDGET, within_matrix_deadline};
+    use super::{
+        AppRuntime, DeadlineOutcome, MATRIX_INITIALIZATION_BUDGET, within_matrix_deadline,
+    };
     use crate::{
         config::load_from_str_with_env,
         storage::{ReliabilityStore, connect, migrate},
@@ -963,9 +1007,10 @@ mod assembly_tests {
         let budget = Duration::from_millis(200);
         let start = Instant::now();
         let deadline = start + budget;
-        within_matrix_deadline(deadline, sleep(Duration::from_millis(120)))
-            .await
-            .unwrap();
+        assert_eq!(
+            within_matrix_deadline(deadline, sleep(Duration::from_millis(120))).await,
+            DeadlineOutcome::Completed(())
+        );
         let remaining = deadline.saturating_duration_since(Instant::now());
         assert!(
             remaining < budget / 2,
@@ -975,14 +1020,14 @@ mod assembly_tests {
         assert_eq!(
             // Each phase fits a fresh 200ms timer, but together they do not.
             within_matrix_deadline(deadline, sleep(Duration::from_millis(120))).await,
-            Err(crate::app::MatrixFailure::Timeout)
+            DeadlineOutcome::TimedOut
         );
         assert!(Instant::now() >= deadline);
         // Once consumed, the same budget cannot start any subsequent operation.
         let mut polled = false;
         assert_eq!(
             within_matrix_deadline(deadline, async { polled = true }).await,
-            Err(crate::app::MatrixFailure::Timeout)
+            DeadlineOutcome::NotAttempted
         );
         assert!(!polled);
     }
