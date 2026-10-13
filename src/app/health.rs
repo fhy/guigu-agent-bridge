@@ -292,6 +292,10 @@ impl MatrixReadinessOwner {
     pub fn missing_room_keys(&self) -> u64 {
         self.missing_room_keys.load(Ordering::Relaxed)
     }
+
+    fn diagnostics(&self) -> MatrixStartupDiagnostics {
+        self.startup_diagnostics()
+    }
 }
 
 fn legal_matrix_transition(from: MatrixPhase, to: MatrixPhase) -> bool {
@@ -398,6 +402,16 @@ impl HealthState {
         }
     }
 
+    fn liveness_counts(&self, required: &Mutex<Vec<Arc<AtomicBool>>>) -> (usize, usize) {
+        let values = required.lock().unwrap_or_else(|p| p.into_inner());
+        let total = values.len();
+        let alive = values
+            .iter()
+            .filter(|value| value.load(Ordering::Acquire))
+            .count();
+        (total, alive)
+    }
+
     pub async fn snapshot(&self) -> HealthSnapshot {
         let owner = self.owner();
         let owners_running = self
@@ -472,7 +486,175 @@ impl HealthState {
         ] {
             body.push_str(&format!("guigu_runtime_{name} {value}\n"));
         }
+        let (required_total, required_alive) = self.liveness_counts(&self.required);
+        let (matrix_required_total, matrix_required_alive) =
+            self.liveness_counts(&self.matrix_required);
+        body.push_str(&format!(
+            "guigu_readiness_owner_state{{state=\"{}\"}} 1\n",
+            owner_state_name(self.owner())
+        ));
+        body.push_str(&format!(
+            "guigu_readiness_matrix_phase{{phase=\"{}\"}} 1\n",
+            matrix_phase_name(self.matrix.phase())
+        ));
+        if let Some(reason) = matrix_phase_reason(self.matrix.phase()) {
+            body.push_str(&format!(
+                "guigu_readiness_matrix_phase_failure{{reason=\"{reason}\"}} 1\n"
+            ));
+        }
+        body.push_str(&format!(
+            "guigu_readiness_adapter_ready {}\n",
+            u8::from(self.adapter_ready.load(Ordering::Acquire))
+        ));
+        body.push_str(&format!(
+            "guigu_readiness_recovery_blocked {}\n",
+            u8::from(self.recovery_blocked.load(Ordering::Acquire))
+        ));
+        body.push_str(&format!(
+            "guigu_readiness_required_total {required_total}\n"
+        ));
+        body.push_str(&format!(
+            "guigu_readiness_required_alive {required_alive}\n"
+        ));
+        body.push_str(&format!(
+            "guigu_readiness_matrix_required_total {matrix_required_total}\n"
+        ));
+        body.push_str(&format!(
+            "guigu_readiness_matrix_required_alive {matrix_required_alive}\n"
+        ));
+        let diagnostics = self.matrix.diagnostics();
+        body.push_str(&format!(
+            "guigu_readiness_matrix_startup{{phase=\"{}\",authentication=\"{}\",store_binding=\"{}\",session_restore=\"{}\",e2ee_initialization=\"{}\",server_device_key_proof=\"{}\"}} 1\n",
+            matrix_phase_name(self.matrix.phase()),
+            startup_attempt_name(diagnostics.authentication),
+            startup_attempt_name(diagnostics.store_binding),
+            startup_attempt_name(diagnostics.session_restore),
+            startup_attempt_name(diagnostics.e2ee_initialization),
+            startup_attempt_name(diagnostics.server_device_key_proof),
+        ));
+        for (stage, attempt) in [
+            ("authentication", diagnostics.authentication),
+            ("store-binding", diagnostics.store_binding),
+            ("session-restore", diagnostics.session_restore),
+            ("e2ee-initialization", diagnostics.e2ee_initialization),
+            (
+                "server-device-key-proof",
+                diagnostics.server_device_key_proof,
+            ),
+        ] {
+            if let Some(reason) = startup_attempt_reason(attempt) {
+                body.push_str(&format!(
+                    "guigu_readiness_matrix_failure{{stage=\"{stage}\",reason=\"{reason}\"}} 1\n"
+                ));
+            }
+        }
+        let blockers = readiness_blockers(
+            self.owner(),
+            self.adapter_ready.load(Ordering::Acquire),
+            self.recovery_blocked.load(Ordering::Acquire),
+            required_total,
+            required_alive,
+            self.matrix.phase(),
+        );
+        for blocker in blockers {
+            body.push_str(&format!(
+                "guigu_readiness_blocker{{predicate=\"{blocker}\"}} 1\n"
+            ));
+        }
         body
+    }
+}
+
+fn readiness_blockers(
+    owner: OwnerState,
+    adapter_ready: bool,
+    recovery_blocked: bool,
+    required_total: usize,
+    required_alive: usize,
+    matrix_phase: MatrixPhase,
+) -> Vec<&'static str> {
+    let mut blockers = Vec::new();
+    if recovery_blocked {
+        blockers.push("recovery-blocked");
+    }
+    if owner != OwnerState::Running {
+        blockers.push("owner-not-running");
+    }
+    if !adapter_ready {
+        blockers.push("adapter-not-ready");
+    }
+    if required_alive != required_total {
+        blockers.push("required-child-not-alive");
+    }
+    if !matches!(matrix_phase, MatrixPhase::Disabled | MatrixPhase::Ready) {
+        blockers.push("matrix-phase-not-ready");
+    }
+    if blockers.is_empty() {
+        blockers.push("none");
+    }
+    blockers
+}
+
+fn owner_state_name(state: OwnerState) -> &'static str {
+    match state {
+        OwnerState::Starting => "starting",
+        OwnerState::Running => "running",
+        OwnerState::Stopping => "stopping",
+        OwnerState::Stopped => "stopped",
+        OwnerState::Failed => "failed",
+    }
+}
+
+fn matrix_phase_name(phase: MatrixPhase) -> &'static str {
+    match phase {
+        MatrixPhase::Disabled => "disabled",
+        MatrixPhase::Preflight => "preflight",
+        MatrixPhase::IdentityMatched => "identity-matched",
+        MatrixPhase::StoreBound => "store-bound",
+        MatrixPhase::KeyProved => "key-proved",
+        MatrixPhase::Registering => "registering",
+        MatrixPhase::Ready => "ready",
+        MatrixPhase::Failed(_) => "failed",
+        MatrixPhase::RecoveryBlocked => "recovery-blocked",
+        MatrixPhase::ShuttingDown => "shutting-down",
+        MatrixPhase::Stopped => "stopped",
+    }
+}
+
+fn matrix_phase_reason(phase: MatrixPhase) -> Option<&'static str> {
+    match phase {
+        MatrixPhase::Failed(reason) => Some(reason.as_log_str()),
+        MatrixPhase::Disabled
+        | MatrixPhase::Preflight
+        | MatrixPhase::IdentityMatched
+        | MatrixPhase::StoreBound
+        | MatrixPhase::KeyProved
+        | MatrixPhase::Registering
+        | MatrixPhase::Ready
+        | MatrixPhase::RecoveryBlocked
+        | MatrixPhase::ShuttingDown
+        | MatrixPhase::Stopped => None,
+    }
+}
+
+fn startup_attempt_name(attempt: MatrixStartupAttempt) -> &'static str {
+    match attempt {
+        MatrixStartupAttempt::NotAttempted => "not-attempted",
+        MatrixStartupAttempt::NotAttemptedRecoveryBlocked => "not-attempted-recovery-blocked",
+        MatrixStartupAttempt::Succeeded => "succeeded",
+        MatrixStartupAttempt::Failed(_) => "failed",
+        MatrixStartupAttempt::Unknown(_) => "unknown",
+    }
+}
+
+fn startup_attempt_reason(attempt: MatrixStartupAttempt) -> Option<&'static str> {
+    match attempt {
+        MatrixStartupAttempt::Failed(reason) | MatrixStartupAttempt::Unknown(reason) => {
+            Some(reason.as_log_str())
+        }
+        MatrixStartupAttempt::NotAttempted
+        | MatrixStartupAttempt::NotAttemptedRecoveryBlocked
+        | MatrixStartupAttempt::Succeeded => None,
     }
 }
 
@@ -617,7 +799,70 @@ async fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std:
 
 #[cfg(test)]
 mod matrix_readiness_tests {
-    use super::{MatrixFailure, MatrixPhase, MatrixReadinessOwner, MatrixStartupAttempt};
+    use super::{
+        MatrixFailure, MatrixPhase, MatrixReadinessOwner, MatrixStartupAttempt, OwnerState,
+        readiness_blockers,
+    };
+
+    #[test]
+    fn readiness_blockers_are_empty_for_healthy_ready_state() {
+        assert_eq!(
+            readiness_blockers(OwnerState::Running, true, false, 2, 2, MatrixPhase::Ready),
+            vec!["none"]
+        );
+    }
+
+    #[test]
+    fn readiness_blockers_identify_matrix_phase_without_changing_semantics() {
+        assert_eq!(
+            readiness_blockers(
+                OwnerState::Running,
+                true,
+                false,
+                0,
+                0,
+                MatrixPhase::Failed(MatrixFailure::DeviceKeyUpload),
+            ),
+            vec!["matrix-phase-not-ready"]
+        );
+    }
+
+    #[test]
+    fn readiness_blockers_identify_dead_required_child() {
+        assert_eq!(
+            readiness_blockers(OwnerState::Running, true, false, 2, 1, MatrixPhase::Ready),
+            vec!["required-child-not-alive"]
+        );
+    }
+
+    #[test]
+    fn readiness_blockers_identify_recovery_block() {
+        assert_eq!(
+            readiness_blockers(OwnerState::Running, false, true, 0, 0, MatrixPhase::Ready),
+            vec!["recovery-blocked", "adapter-not-ready"]
+        );
+    }
+
+    #[test]
+    fn missing_room_key_telemetry_is_not_a_readiness_blocker() {
+        let owner = MatrixReadinessOwner::new();
+        let generation = owner.begin();
+        for (from, to) in [
+            (MatrixPhase::Preflight, MatrixPhase::IdentityMatched),
+            (MatrixPhase::IdentityMatched, MatrixPhase::StoreBound),
+            (MatrixPhase::StoreBound, MatrixPhase::KeyProved),
+            (MatrixPhase::KeyProved, MatrixPhase::Registering),
+            (MatrixPhase::Registering, MatrixPhase::Ready),
+        ] {
+            assert!(owner.transition(generation, &[from], to));
+        }
+        owner.record_missing_room_key();
+        assert_eq!(owner.missing_room_keys(), 1);
+        assert_eq!(
+            readiness_blockers(OwnerState::Running, true, false, 0, 0, owner.phase()),
+            vec!["none"]
+        );
+    }
 
     #[test]
     fn recovery_blocked_marks_each_matrix_gate_not_attempted() {
