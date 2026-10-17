@@ -1474,6 +1474,18 @@ enabled = true
             FailureCase::KeyProof => "matrix-device-key-upload-failed",
         };
         assert_eq!(snapshot.diagnostic, Some(expected));
+        let predicate = runtime
+            .health_state
+            .redacted_predicate_snapshot()
+            .expect("matrix predicate snapshot");
+        assert!(predicate.listener_available);
+        assert!(!predicate.recovery_blocked);
+        assert_eq!(predicate.matrix_category, "failed");
+        assert!(!predicate.ready);
+        let debug = format!("{predicate:?}");
+        for forbidden in ["fixture", "token", "room", "device", "message", "task"] {
+            assert!(!debug.to_ascii_lowercase().contains(forbidden));
+        }
 
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         stream
@@ -1595,6 +1607,24 @@ enabled = true
                 class: "storage"
             })
         ));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
+    async fn healthy_readiness_snapshot_is_redacted_and_ready() {
+        let (runtime, root) = runtime_fixture().await;
+        let snapshot = runtime.health_state.snapshot().await;
+        assert_eq!(snapshot.readiness, crate::runtime::Readiness::Ready);
+        let predicate = runtime
+            .health_state
+            .redacted_predicate_snapshot()
+            .expect("healthy predicate snapshot");
+        assert!(predicate.ready);
+        assert!(predicate.worker_ready);
+        assert_eq!(predicate.matrix_category, "disabled");
+        let debug = format!("{predicate:?}");
+        assert!(!debug.contains("token"));
+        runtime.shutdown().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }
 

@@ -96,6 +96,18 @@ pub enum MatrixPhase {
     Stopped,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct RedactedReadinessSnapshot {
+    pub listener_available: bool,
+    pub recovery_blocked: bool,
+    pub matrix_category: &'static str,
+    pub owner: OwnerState,
+    pub adapter_ready: bool,
+    pub worker_ready: bool,
+    pub ready: bool,
+    pub live: bool,
+}
+
 #[derive(Debug, Clone, Copy)]
 struct MatrixReadiness {
     generation: u64,
@@ -212,6 +224,7 @@ pub struct HealthState {
     required: Mutex<Vec<Arc<AtomicBool>>>,
     matrix_required: Mutex<Vec<Arc<AtomicBool>>>,
     matrix: MatrixReadinessOwner,
+    last_predicate: Mutex<Option<RedactedReadinessSnapshot>>,
 }
 
 impl HealthState {
@@ -233,6 +246,7 @@ impl HealthState {
             required: Mutex::new(Vec::new()),
             matrix_required: Mutex::new(Vec::new()),
             matrix: MatrixReadinessOwner::new(),
+            last_predicate: Mutex::new(None),
         }
     }
 
@@ -284,6 +298,14 @@ impl HealthState {
 
     pub fn matrix(&self) -> &MatrixReadinessOwner {
         &self.matrix
+    }
+
+    #[allow(dead_code)]
+    pub(crate) fn redacted_predicate_snapshot(&self) -> Option<RedactedReadinessSnapshot> {
+        self.last_predicate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .clone()
     }
 
     pub fn register_matrix_required(&self, alive: Arc<AtomicBool>) {
@@ -360,16 +382,30 @@ impl HealthState {
                 _ => "in-progress",
             },
         };
+        let predicate = RedactedReadinessSnapshot {
+            listener_available: self.listener_available.load(Ordering::Acquire),
+            recovery_blocked: self.recovery_blocked.load(Ordering::Acquire),
+            matrix_category,
+            owner,
+            adapter_ready: self.adapter_ready.load(Ordering::Acquire),
+            worker_ready: owners_running,
+            ready: snapshot.readiness == Readiness::Ready,
+            live: snapshot.live,
+        };
+        *self
+            .last_predicate
+            .lock()
+            .unwrap_or_else(|p| p.into_inner()) = Some(predicate.clone());
         tracing::info!(
             category = "readiness-predicate-snapshot",
-            listener_available = self.listener_available.load(Ordering::Acquire),
-            recovery_blocked = self.recovery_blocked.load(Ordering::Acquire),
-            matrix_category,
-            owner = ?owner,
-            adapter_ready = self.adapter_ready.load(Ordering::Acquire),
-            worker_ready = owners_running,
-            ready = snapshot.readiness == Readiness::Ready,
-            live = snapshot.live,
+            listener_available = predicate.listener_available,
+            recovery_blocked = predicate.recovery_blocked,
+            matrix_category = predicate.matrix_category,
+            owner = ?predicate.owner,
+            adapter_ready = predicate.adapter_ready,
+            worker_ready = predicate.worker_ready,
+            ready = predicate.ready,
+            live = predicate.live,
             emission = "redacted-readiness-predicate-snapshot"
         );
         snapshot
