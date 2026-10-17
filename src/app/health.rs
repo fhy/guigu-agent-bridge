@@ -97,7 +97,7 @@ pub enum MatrixPhase {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RedactedReadinessSnapshot {
+pub struct RedactedReadinessSnapshot {
     pub listener_available: bool,
     pub recovery_blocked: bool,
     pub matrix_category: &'static str,
@@ -300,8 +300,7 @@ impl HealthState {
         &self.matrix
     }
 
-    #[allow(dead_code)]
-    pub(crate) fn redacted_predicate_snapshot(&self) -> Option<RedactedReadinessSnapshot> {
+    pub fn redacted_predicate_snapshot(&self) -> Option<RedactedReadinessSnapshot> {
         self.last_predicate
             .lock()
             .unwrap_or_else(|p| p.into_inner())

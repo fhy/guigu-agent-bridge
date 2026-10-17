@@ -965,7 +965,7 @@ async fn startup_recovery_backlog_blocks_readiness_without_spawning_acp() {
     std::fs::write(
         &config_path,
         format!(
-            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\n\n[agents.worker]\ntransport = \"acp\"\ncommand = \"definitely-not-started\"\nworkspace = \"/tmp\"\nenabled = true\n",
+            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nhealth_bind = \"127.0.0.1:19292\"\n\n[agents.worker]\ntransport = \"acp\"\ncommand = \"definitely-not-started\"\nworkspace = \"/tmp\"\nenabled = true\n",
             database.to_string_lossy(),
             sessions.to_string_lossy()
         ),
@@ -999,14 +999,36 @@ async fn startup_recovery_backlog_blocks_readiness_without_spawning_acp() {
     pool.close().await;
 
     let runtime = AppRuntime::start(&config_path).await.unwrap();
+    let health = runtime.health_state();
+    let listener_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        if tokio::net::TcpStream::connect("127.0.0.1:19292")
+            .await
+            .is_ok()
+        {
+            break;
+        }
+        assert!(tokio::time::Instant::now() < listener_deadline);
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+    let snapshot = health.snapshot().await;
     assert_eq!(
-        runtime.health_state().snapshot().await.readiness,
+        snapshot.readiness,
         guigu_agent_bridge::runtime::Readiness::RecoveryBlocked
     );
-    assert_eq!(
-        runtime.health_state().snapshot().await.diagnostic,
-        Some("recovery-blocked")
-    );
+    assert_eq!(snapshot.diagnostic, Some("recovery-blocked"));
+    let predicate = health
+        .redacted_predicate_snapshot()
+        .expect("recovery predicate snapshot");
+    assert!(predicate.listener_available);
+    assert!(predicate.recovery_blocked);
+    assert!(!predicate.ready);
+    assert!(!predicate.adapter_ready);
+    assert!(predicate.worker_ready);
+    let debug = format!("{predicate:?}").to_ascii_lowercase();
+    for forbidden in ["token", "room", "device", "message", "task", "fixture"] {
+        assert!(!debug.contains(forbidden), "forbidden field: {forbidden}");
+    }
     assert!(
         tokio::net::TcpListener::bind("127.0.0.1:9292")
             .await
