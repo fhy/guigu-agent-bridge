@@ -1,0 +1,39 @@
+schema_version = 1
+
+# Non-candidate template. Freeze only an external governance copy after review.
+[identity]
+target_version = "vX.Y.Z"
+package_name = "guigu-agent-bridge"
+base_version = "vX.Y.Z"
+base_commit = ""
+candidate_commit = ""
+source_tree_hash = ""
+cargo_lock_sha256 = ""
+expected_tag = "vX.Y.Z"
+package_filename = "guigu-agent-bridge-X.Y.Z.crate"
+package_sha256 = ""
+package_entries = 0
+binary_filename = "guigu-agent-bridge"
+binary_sha256 = ""
+binary_profile = "release"
+rollback_version = "vX.Y.Z"
+rollback_commit = ""
+rollback_package_sha256 = ""
+rollback_binary_sha256 = ""
+freeze_state = "draft"
+freeze_authority = "bridge-coordinator"
+digest_algorithm = "sha256"
+
+[[capabilities]]
+id = "replace-me"
+kind = "cli"
+requiring_task = "T000"
+source_commit = ""
+source_path = "src/bin/example.rs"
+gate = "example_process"
+evidence = "exact-binary"
+result = "PASS"
+argv = ["--version"]
+expected_status = 0
+expected_stdout = ""
+expected_stderr = ""

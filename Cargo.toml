@@ -27,6 +27,7 @@ include = [
     "/docs/CONFIGURATION.md",
     "/docs/PRODUCT.md",
     "/docs/RELEASE.md",
+    "/docs/RELEASE_CHECKLIST.md",
     "/docs/RELEASE-0.2.0.md",
     "/docs/RELEASE-0.2.1.md",
     "/docs/RELEASE-0.2.2.md",
@@ -46,6 +47,7 @@ include = [
     "/examples/**",
     "/migrations/**",
     "/src/**",
+    "/release/**",
 ]
 
 [features]

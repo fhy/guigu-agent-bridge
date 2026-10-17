@@ -1,5 +1,20 @@
 # Release Manifest And Deployment Capability Closure
 
+## Enforced V1 Contract
+
+Candidate manifests live outside the public tree they identify. After the final public
+commit, exact locked binary/package builds and independent staging review, the
+Coordinator freezes `release-manifest-v1.toml` in governance. The public schema and
+non-candidate template are under `release/`; `verify-release-manifest` checks candidate
+commit/tree/ancestry, clean checkout, lockfile, package metadata/archive count,
+binary/package hashes, capability provenance and exact CLI probes.
+
+Post-publication observations never amend the frozen manifest. Canonical
+`release-evidence-v1` records are keyed by manifest digest and phase. Installation
+atomically contains both candidate and installed binary facts. Exact repeats are
+idempotent and differing repeats fail as `evidence-conflict` without overwrite. See
+`docs/RELEASE_CHECKLIST.md` for the authorization order.
+
 Use this manifest for every release that will be used by a production change.
 The release is not deployable until every required capability is present in the
 tested candidate binary and in the published artifact.
