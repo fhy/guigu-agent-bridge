@@ -1212,7 +1212,7 @@ where
 
 #[cfg(test)]
 mod assembly_tests {
-    use std::{collections::BTreeMap, sync::Arc};
+    use std::{collections::BTreeMap, sync::Arc, time::Duration};
 
     use serde_json::json;
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1248,15 +1248,19 @@ mod assembly_tests {
             .await;
         Mock::given(method("GET"))
             .and(path_regex(r"/_matrix/client/.*/account/whoami"))
-            .respond_with(ResponseTemplate::new(200).set_body_json(json!({
-                "user_id": if matches!(case, FailureCase::Authentication) {
-                    "@other:example.test"
-                } else {
-                    "@bridge:example.test"
-                },
-                "device_id": "BRIDGE",
-                "is_guest": false
-            })))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .set_body_json(json!({
+                        "user_id": if matches!(case, FailureCase::Authentication) {
+                            "@other:example.test"
+                        } else {
+                            "@bridge:example.test"
+                        },
+                        "device_id": "BRIDGE",
+                        "is_guest": false
+                    })),
+            )
             .mount(&server)
             .await;
         if matches!(case, FailureCase::KeyProof) {
@@ -1318,13 +1322,16 @@ mod assembly_tests {
             }
         }
         let database = root.join("state.db");
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let health_port = probe.local_addr().unwrap().port();
+        drop(probe);
         let config_path = root.join("bridge.toml");
         let text = format!(
             r#"
 [bridge]
 database = {database:?}
 session_root = {sessions:?}
-health_bind = "127.0.0.1:0"
+health_bind = "127.0.0.1:{health_port}"
 
 [transports.matrix]
 enabled = true
@@ -1346,6 +1353,7 @@ enabled = true
             homeserver = server.uri(),
             store = store.to_string_lossy(),
             root = root.to_string_lossy(),
+            health_port = health_port,
         );
         std::fs::write(&config_path, &text).unwrap();
         let config = load_from_str_with_env(
@@ -1367,7 +1375,7 @@ enabled = true
                 .unwrap()
         );
 
-        let runtime = AppRuntime::build(
+        let build = AppRuntime::build(
             config_path,
             config,
             pool,
@@ -1375,9 +1383,30 @@ enabled = true
             instance,
             true,
             Arc::new(crate::a2a::NoFault),
-        )
-        .await
-        .unwrap();
+        );
+        tokio::pin!(build);
+        let address = format!("127.0.0.1:{health_port}");
+        let mut listener_observed = false;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(4);
+        let runtime = loop {
+            tokio::select! {
+                result = &mut build => break result.unwrap(),
+                _ = tokio::time::sleep(Duration::from_millis(25)) => {
+                    if tokio::net::TcpStream::connect(&address).await.is_ok() {
+                        listener_observed = true;
+                        break build.await.unwrap();
+                    }
+                }
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "health listener did not start before Matrix proof"
+            );
+        };
+        assert!(
+            listener_observed,
+            "Matrix proof completed before listener probe"
+        );
         assert!(runtime.bus.is_none());
         assert!(runtime.worker.is_none());
         assert!(runtime.broadcaster.is_none());
@@ -1397,7 +1426,6 @@ enabled = true
         };
         assert_eq!(snapshot.diagnostic, Some(expected));
 
-        let address = runtime.health.as_ref().unwrap().local_addr();
         let mut stream = tokio::net::TcpStream::connect(address).await.unwrap();
         stream
             .write_all(b"GET /ready HTTP/1.1\r\nHost: localhost\r\n\r\n")
