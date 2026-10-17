@@ -1197,6 +1197,7 @@ async fn start_health(
     match address {
         Some(address) => match HealthServer::start(address, Arc::clone(state)).await {
             Ok(server) => {
+                state.set_listener_available(true);
                 tracing::info!(category = "health-listener", phase = "bind", %started_at, elapsed_ms = timer.elapsed().as_millis() as u64, emission = "health-listener-bind-ok");
                 Ok(Some(server))
             }

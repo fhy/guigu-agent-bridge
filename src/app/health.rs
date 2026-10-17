@@ -205,6 +205,7 @@ pub struct HealthState {
     projections: Arc<ProjectionMetrics>,
     owner: AtomicU8,
     adapter_ready: AtomicBool,
+    listener_available: AtomicBool,
     recovery_blocked: AtomicBool,
     recovery_diagnostic: Mutex<Option<String>>,
     insecure_a2a_peers: AtomicU64,
@@ -225,6 +226,7 @@ impl HealthState {
             projections,
             owner: AtomicU8::new(OwnerState::Starting as u8),
             adapter_ready: AtomicBool::new(false),
+            listener_available: AtomicBool::new(false),
             recovery_blocked: AtomicBool::new(false),
             recovery_diagnostic: Mutex::new(None),
             insecure_a2a_peers: AtomicU64::new(0),
@@ -240,6 +242,10 @@ impl HealthState {
 
     pub fn set_adapter_ready(&self, ready: bool) {
         self.adapter_ready.store(ready, Ordering::Release);
+    }
+
+    pub fn set_listener_available(&self, available: bool) {
+        self.listener_available.store(available, Ordering::Release);
     }
 
     pub fn set_recovery_blocked(&self, blocked: bool) {
@@ -344,6 +350,28 @@ impl HealthState {
             }
         }
         snapshot.live = !matches!(owner, OwnerState::Stopped | OwnerState::Failed);
+        let matrix_category = match snapshot.diagnostic {
+            Some(value) if value.starts_with("matrix-") => "failed",
+            _ => match matrix_phase {
+                MatrixPhase::Disabled => "disabled",
+                MatrixPhase::Ready => "ready",
+                MatrixPhase::RecoveryBlocked => "recovery-blocked",
+                MatrixPhase::Failed(_) => "failed",
+                _ => "in-progress",
+            },
+        };
+        tracing::info!(
+            category = "readiness-predicate-snapshot",
+            listener_available = self.listener_available.load(Ordering::Acquire),
+            recovery_blocked = self.recovery_blocked.load(Ordering::Acquire),
+            matrix_category,
+            owner = ?owner,
+            adapter_ready = self.adapter_ready.load(Ordering::Acquire),
+            worker_ready = owners_running,
+            ready = snapshot.readiness == Readiness::Ready,
+            live = snapshot.live,
+            emission = "redacted-readiness-predicate-snapshot"
+        );
         snapshot
     }
 
