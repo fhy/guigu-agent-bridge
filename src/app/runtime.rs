@@ -3,7 +3,7 @@ use std::{
     future::Future,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
-    time::Duration,
+    time::{Duration, Instant},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -380,6 +380,16 @@ impl AppRuntime {
             Arc::clone(&projection_metrics),
         ));
         let health = start_health(config.bridge.health_bind, &health_state).await?;
+        tracing::info!(
+            category = "health-listener",
+            phase = "bound",
+            emission = "health-listener-bound"
+        );
+        tracing::info!(
+            category = "startup-recovery",
+            phase = "begin",
+            emission = "startup-recovery-begin"
+        );
         let output_policy = crate::acp::output_policy::DurableOutputPolicy::derive(
             &config.bridge.database,
             config.runtime.max_output_bytes,
@@ -397,6 +407,11 @@ impl AppRuntime {
             .recover_assembling(&runtime_instance)
             .await
             .map_err(|_| AppError::Assembly("durable output recovery failed"))?;
+        tracing::info!(
+            category = "startup-recovery",
+            phase = "output-assembling",
+            emission = "startup-recovery-output-assembling"
+        );
         let recovery_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         output_spool
             .recover_cleanup(&recovery_at)
@@ -406,8 +421,18 @@ impl AppRuntime {
             .verify_quota()
             .await
             .map_err(|_| AppError::Assembly("durable output quota mismatch"))?;
+        tracing::info!(
+            category = "startup-recovery",
+            phase = "output-complete",
+            emission = "startup-recovery-output-complete"
+        );
         let registry = Arc::new(EndpointRegistry::from_config(&config));
         sync_agents(repository_trait.as_ref(), &registry).await?;
+        tracing::info!(
+            category = "startup-recovery",
+            phase = "agents-synced",
+            emission = "startup-recovery-agents-synced"
+        );
 
         // T022 durable queue recovery is part of startup, before any worker is
         // assembled. Ambiguous send-start rows become recovery_needed; only
@@ -416,6 +441,11 @@ impl AppRuntime {
             .recover_orphaned_queues(&recovery_at)
             .await
             .map_err(|_| AppError::Runtime)?;
+        tracing::info!(
+            category = "startup-recovery",
+            phase = "queues-recovered",
+            emission = "startup-recovery-queues-recovered"
+        );
 
         let mut recovery = plan_recovery(repository_trait.as_ref()).await?;
         let mut admission_recovery = reliability
@@ -450,6 +480,12 @@ impl AppRuntime {
         tracing::info!(category = "t050-recovery", emission = %recovery_diagnostic.line());
         eprintln!("{}", recovery_diagnostic.line());
         let recovery_blocked = recovery_diagnostic.blocker.is_some();
+        tracing::info!(
+            category = "startup-recovery",
+            phase = "classified",
+            blocked = recovery_blocked,
+            emission = "startup-recovery-classified"
+        );
 
         let reload = Arc::new(ReloadController::new(
             config.clone(),
@@ -1155,12 +1191,24 @@ async fn start_health(
     address: Option<std::net::SocketAddr>,
     state: &Arc<HealthState>,
 ) -> Result<Option<HealthServer>, AppError> {
+    let started_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+    let timer = Instant::now();
+    tracing::info!(category = "health-listener", phase = "start", %started_at, emission = "health-listener-start");
     match address {
-        Some(address) => HealthServer::start(address, Arc::clone(state))
-            .await
-            .map(Some)
-            .map_err(AppError::Health),
-        None => Ok(None),
+        Some(address) => match HealthServer::start(address, Arc::clone(state)).await {
+            Ok(server) => {
+                tracing::info!(category = "health-listener", phase = "bind", %started_at, elapsed_ms = timer.elapsed().as_millis() as u64, emission = "health-listener-bind-ok");
+                Ok(Some(server))
+            }
+            Err(error) => {
+                tracing::warn!(category = "health-listener", phase = "bind", %started_at, elapsed_ms = timer.elapsed().as_millis() as u64, emission = "health-listener-bind-failed");
+                Err(AppError::Health(error))
+            }
+        },
+        None => {
+            tracing::info!(category = "health-listener", phase = "disabled", %started_at, emission = "health-listener-disabled");
+            Ok(None)
+        }
     }
 }
 
