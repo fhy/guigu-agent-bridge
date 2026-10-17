@@ -497,6 +497,11 @@ impl AppRuntime {
             runtime_instance: owns_runtime.then_some(runtime_instance.clone()),
             first_failure: Arc::clone(&first_failure),
         };
+        // Bind the loopback health listener before Matrix restore/proof.  Health
+        // remains false until the existing state predicates transition, but the
+        // endpoint is observable while startup is blocked on external/runtime
+        // prerequisites.
+        runtime.health = start_health(config.bridge.health_bind, &runtime.health_state).await?;
         if recovery_blocked {
             if let Some(generation) = matrix_generation {
                 runtime.health_state.matrix().transition(
@@ -509,7 +514,6 @@ impl AppRuntime {
                 category = "recovery-blocked",
                 "runtime startup is health-only"
             );
-            runtime.health = start_health(config.bridge.health_bind, &runtime.health_state).await?;
             runtime.health_state.set_owner(OwnerState::Running);
             return Ok(runtime);
         }
@@ -539,8 +543,6 @@ impl AppRuntime {
                             category = matrix_failure(&error).as_log_str(),
                             "Matrix startup is health-only"
                         );
-                        runtime.health =
-                            start_health(config.bridge.health_bind, &runtime.health_state).await?;
                         runtime.health_state.set_owner(OwnerState::Running);
                         return Ok(runtime);
                     }
@@ -567,8 +569,6 @@ impl AppRuntime {
                     category = reason.as_log_str(),
                     "Matrix startup is health-only"
                 );
-                runtime.health =
-                    start_health(config.bridge.health_bind, &runtime.health_state).await?;
                 runtime.health_state.set_owner(OwnerState::Running);
                 return Ok(runtime);
             }
@@ -803,8 +803,6 @@ impl AppRuntime {
         } else {
             None
         };
-
-        runtime.health = start_health(config.bridge.health_bind, &runtime.health_state).await?;
 
         if let Some((sdk, sync, gateway)) = matrix {
             let generation = matrix_generation.expect("enabled Matrix has a generation");
