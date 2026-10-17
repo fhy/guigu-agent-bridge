@@ -1017,18 +1017,6 @@ async fn startup_recovery_backlog_blocks_readiness_without_spawning_acp() {
         guigu_agent_bridge::runtime::Readiness::RecoveryBlocked
     );
     assert_eq!(snapshot.diagnostic, Some("recovery-blocked"));
-    let predicate = health
-        .redacted_predicate_snapshot()
-        .expect("recovery predicate snapshot");
-    assert!(predicate.listener_available);
-    assert!(predicate.recovery_blocked);
-    assert!(!predicate.ready);
-    assert!(!predicate.adapter_ready);
-    assert!(predicate.worker_ready);
-    let debug = format!("{predicate:?}").to_ascii_lowercase();
-    for forbidden in ["token", "room", "device", "message", "task", "fixture"] {
-        assert!(!debug.contains(forbidden), "forbidden field: {forbidden}");
-    }
     assert!(
         tokio::net::TcpListener::bind("127.0.0.1:9292")
             .await

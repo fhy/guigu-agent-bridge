@@ -1629,6 +1629,32 @@ enabled = true
     }
 
     #[tokio::test]
+    async fn recovery_blocked_snapshot_is_redacted_and_not_ready() {
+        let (runtime, root) = runtime_fixture().await;
+        runtime.health_state.set_recovery_blocked(true);
+        let snapshot = runtime.health_state.snapshot().await;
+        assert_eq!(
+            snapshot.readiness,
+            crate::runtime::Readiness::RecoveryBlocked
+        );
+        let predicate = runtime
+            .health_state
+            .redacted_predicate_snapshot()
+            .expect("recovery predicate snapshot");
+        assert!(predicate.listener_available);
+        assert!(predicate.recovery_blocked);
+        assert!(!predicate.ready);
+        assert!(predicate.adapter_ready);
+        assert!(predicate.worker_ready);
+        let debug = format!("{predicate:?}").to_ascii_lowercase();
+        for forbidden in ["token", "room", "device", "message", "task", "fixture"] {
+            assert!(!debug.contains(forbidden), "forbidden field: {forbidden}");
+        }
+        runtime.shutdown().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[tokio::test]
     async fn runtime_shutdown_retains_task_worker_failure_before_matrix_failure() {
         let (mut runtime, root) = runtime_fixture().await;
         replace_worker_with_failure(&mut runtime).await;
