@@ -371,6 +371,15 @@ impl AppRuntime {
         let repository = Arc::new(SqliteRepository::new(pool.clone()));
         let repository_trait: Arc<dyn Repository> = repository.clone();
         let sessions = SqliteSessionStore::new(pool.clone());
+        let runtime_store = SqliteRuntimeStore::new(pool.clone());
+        let metrics = Arc::new(RuntimeMetrics::default());
+        let projection_metrics = Arc::new(ProjectionMetrics::default());
+        let health_state = Arc::new(HealthState::new(
+            runtime_store.clone(),
+            Arc::clone(&metrics),
+            Arc::clone(&projection_metrics),
+        ));
+        let health = start_health(config.bridge.health_bind, &health_state).await?;
         let output_policy = crate::acp::output_policy::DurableOutputPolicy::derive(
             &config.bridge.database,
             config.runtime.max_output_bytes,
@@ -397,7 +406,6 @@ impl AppRuntime {
             .verify_quota()
             .await
             .map_err(|_| AppError::Assembly("durable output quota mismatch"))?;
-        let runtime_store = SqliteRuntimeStore::new(pool.clone());
         let registry = Arc::new(EndpointRegistry::from_config(&config));
         sync_agents(repository_trait.as_ref(), &registry).await?;
 
@@ -447,14 +455,7 @@ impl AppRuntime {
             config.clone(),
             Arc::new(FileConfigSource::new(path)),
         )?);
-        let metrics = Arc::new(RuntimeMetrics::default());
         metrics.set_gauges(counts);
-        let projection_metrics = Arc::new(ProjectionMetrics::default());
-        let health_state = Arc::new(HealthState::new(
-            runtime_store.clone(),
-            Arc::clone(&metrics),
-            Arc::clone(&projection_metrics),
-        ));
         let matrix_generation = config
             .transports
             .matrix
@@ -479,7 +480,7 @@ impl AppRuntime {
             pool: Some(pool.clone()),
             reload,
             health_state,
-            health: None,
+            health,
             matrix_sync: None,
             ingress: None,
             bus: None,
@@ -501,7 +502,6 @@ impl AppRuntime {
         // remains false until the existing state predicates transition, but the
         // endpoint is observable while startup is blocked on external/runtime
         // prerequisites.
-        runtime.health = start_health(config.bridge.health_bind, &runtime.health_state).await?;
         if recovery_blocked {
             if let Some(generation) = matrix_generation {
                 runtime.health_state.matrix().transition(
