@@ -300,6 +300,7 @@ impl HealthState {
         &self.matrix
     }
 
+    #[allow(dead_code)]
     pub(crate) fn redacted_predicate_snapshot(&self) -> Option<RedactedReadinessSnapshot> {
         self.last_predicate
             .lock()
