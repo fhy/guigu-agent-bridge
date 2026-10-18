@@ -303,7 +303,7 @@ impl AppRuntime {
                     OwnerLiveness::Stale => {
                         stale_count += 1;
                         proven_stale = true;
-                        if crate::offline_recovery::recover_stale_runtime(
+                        if crate::offline_recovery::recover_proven_stale_runtime(
                             &config.bridge.database,
                             &token,
                             &fingerprint,
