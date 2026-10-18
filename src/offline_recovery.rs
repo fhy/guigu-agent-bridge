@@ -35,6 +35,7 @@ pub enum RecoveryOutcome {
 /// A narrowly scoped, fail-closed recovery transition for a durable ambiguous
 /// runtime.  This is intentionally crate-private: normal startup must continue
 /// to block until a caller has supplied an explicit stale-owner proof.
+#[allow(dead_code)]
 pub(crate) async fn recover_proven_stale_runtime(
     database: impl AsRef<Path>,
     owner_token: &str,
@@ -222,12 +223,6 @@ pub async fn recover_stale_runtime(
 ) -> Result<RecoveryOutcome, RecoveryError> {
     if owner_token.is_empty() || fingerprint.is_empty() || now.is_empty() {
         return Err(RecoveryError::InvalidArguments);
-    }
-    // Real callers provide an RFC3339 bounded clock.  Route that path through
-    // the stricter stale-owner CAS; legacy fixtures using symbolic timestamps
-    // retain their historical parser/error behaviour.
-    if now.parse::<DateTime<Utc>>().is_ok() {
-        return recover_proven_stale_runtime(database, owner_token, fingerprint, now).await;
     }
     let options = SqliteConnectOptions::new()
         .filename(database.as_ref())
