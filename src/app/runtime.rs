@@ -1684,4 +1684,71 @@ enabled = true
         ));
         std::fs::remove_dir_all(root).unwrap();
     }
+
+    #[tokio::test]
+    async fn recovery_blocked_startup_fixture_terminates_before_any_service_creation() {
+        let root = std::env::temp_dir().join(format!("t083-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir_all(&root).unwrap();
+        let database = root.join("state.db");
+        let sessions = root.join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let probe = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let health_port = probe.local_addr().unwrap().port();
+        drop(probe);
+        let config_text = format!(
+            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nhealth_bind = \"127.0.0.1:{}\"\n\n[transports.matrix]\nenabled = false\n\n[agents.worker]\ntransport = \"acp\"\ncommand = \"must-not-start\"\nworkspace = {:?}\nenabled = true\n",
+            database, sessions, health_port, root
+        );
+        let config = load_from_str_with_env(&config_text, &BTreeMap::new()).unwrap();
+        let pool = connect(&database).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let conversation = "00000000-0000-7000-8000-000000000001";
+        let task = "00000000-0000-7000-8000-000000000002";
+        let worker_endpoint = crate::bus::derive_endpoint_id("worker");
+        let delivery = "00000000-0000-7000-8000-000000000003";
+        sqlx::query("INSERT INTO conversations(conversation_id,participants_json) VALUES(?,'[]')")
+            .bind(conversation)
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,address_json,capabilities_json) VALUES(?,'worker','acp',1,NULL,'[]')")
+            .bind(worker_endpoint.to_string()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,deadline,version) VALUES(?,?,?, ?,?,'fixture',1,0,0,NULL,0)")
+            .bind(task).bind(task).bind("sender").bind("worker").bind(conversation)
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES(?,?,1,?,'2026-10-18T00:00:00Z')")
+            .bind(delivery).bind(task).bind(worker_endpoint.to_string()).execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES(?,?,?,1,'active','2026-10-18T00:00:00Z','2026-10-18T00:00:00Z','2999-01-01T00:00:00Z')")
+            .bind("fixture-resource").bind(task).bind("fixture-owner")
+            .execute(&pool).await.unwrap();
+        let reliability = ReliabilityStore::new(pool.clone());
+        let runtime_instance = uuid::Uuid::now_v7().to_string();
+        reliability
+            .begin_runtime(&runtime_instance, "pid:fixture", "2026-10-18T00:00:00Z")
+            .await
+            .unwrap();
+        let result = AppRuntime::build(
+            root.join("bridge.toml"),
+            config,
+            pool.clone(),
+            reliability,
+            runtime_instance,
+            true,
+            Arc::new(crate::a2a::NoFault),
+        )
+        .await;
+        assert!(matches!(result, Err(AppError::Runtime)));
+        assert!(
+            tokio::net::TcpStream::connect(("127.0.0.1", health_port))
+                .await
+                .is_err()
+        );
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), tokio::fs::read_dir(&sessions))
+                .await
+                .is_ok()
+        );
+        pool.close().await;
+        std::fs::remove_dir_all(root).unwrap();
+    }
 }
