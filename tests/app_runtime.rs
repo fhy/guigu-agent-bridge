@@ -1103,31 +1103,15 @@ async fn startup_recovery_backlog_blocks_readiness_without_spawning_acp() {
         .unwrap();
     pool.close().await;
 
-    let runtime = AppRuntime::start(&config_path).await.unwrap();
-    let health = runtime.health_state();
-    let listener_deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-    loop {
-        if tokio::net::TcpStream::connect("127.0.0.1:19292")
-            .await
-            .is_ok()
-        {
-            break;
-        }
-        assert!(tokio::time::Instant::now() < listener_deadline);
-        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-    }
-    let snapshot = health.snapshot().await;
-    assert_eq!(
-        snapshot.readiness,
-        guigu_agent_bridge::runtime::Readiness::RecoveryBlocked
-    );
-    assert_eq!(snapshot.diagnostic, Some("recovery-blocked"));
+    assert!(matches!(
+        AppRuntime::start(&config_path).await,
+        Err(guigu_agent_bridge::app::AppError::Runtime)
+    ));
     assert!(
-        tokio::net::TcpListener::bind("127.0.0.1:9292")
+        tokio::net::TcpListener::bind("127.0.0.1:19292")
             .await
             .is_ok()
     );
-    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]
