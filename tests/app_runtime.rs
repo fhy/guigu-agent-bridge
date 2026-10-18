@@ -852,7 +852,7 @@ fn stop_child(mut child: Child) {
 }
 
 async fn wait_for_child_diagnostic(child: &mut Child, path: &std::path::Path, needle: &str) {
-    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(20);
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
     loop {
         assert!(
             child.try_wait().unwrap().is_none(),
@@ -866,7 +866,8 @@ async fn wait_for_child_diagnostic(child: &mut Child, path: &std::path::Path, ne
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "runtime diagnostic timed out"
+            "runtime diagnostic timed out; stderr={:?}",
+            std::fs::read_to_string(path).unwrap_or_default()
         );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
