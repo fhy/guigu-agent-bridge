@@ -2,6 +2,7 @@
 
 use std::path::Path;
 
+use chrono::{DateTime, Utc};
 use sqlx::{Connection, Row, SqliteConnection, sqlite::SqliteConnectOptions};
 use thiserror::Error;
 
@@ -21,12 +22,165 @@ pub enum RecoveryError {
     Busy,
     #[error("recovery rejected: fencing conflict")]
     Fenced,
+    #[error("recovery rejected: owner is not proven stale")]
+    NotStale,
 }
 
 #[derive(Debug, PartialEq, Eq)]
 pub enum RecoveryOutcome {
     Recovered,
     AlreadyStopped,
+}
+
+/// A narrowly scoped, fail-closed recovery transition for a durable ambiguous
+/// runtime.  This is intentionally crate-private: normal startup must continue
+/// to block until a caller has supplied an explicit stale-owner proof.
+pub(crate) async fn recover_proven_stale_runtime(
+    database: impl AsRef<Path>,
+    owner_token: &str,
+    fingerprint: &str,
+    now: &str,
+) -> Result<RecoveryOutcome, RecoveryError> {
+    if owner_token.is_empty() || fingerprint.is_empty() || now.is_empty() {
+        return Err(RecoveryError::InvalidArguments);
+    }
+    let now = DateTime::parse_from_rfc3339(now)
+        .map_err(|_| RecoveryError::InvalidArguments)?
+        .with_timezone(&Utc);
+    let options = SqliteConnectOptions::new()
+        .filename(database.as_ref())
+        .create_if_missing(false)
+        .foreign_keys(true)
+        .busy_timeout(std::time::Duration::from_secs(5));
+    let mut conn = SqliteConnection::connect_with(&options)
+        .await
+        .map_err(|_| RecoveryError::Database)?;
+    sqlx::query("BEGIN IMMEDIATE")
+        .execute(&mut conn)
+        .await
+        .map_err(|e| {
+            if is_busy(&e) {
+                RecoveryError::Busy
+            } else {
+                RecoveryError::Database
+            }
+        })?;
+
+    let result =
+        recover_proven_stale_in_transaction(&mut conn, owner_token, fingerprint, now, false).await;
+    match result {
+        Ok(value) => {
+            sqlx::query("COMMIT")
+                .execute(&mut conn)
+                .await
+                .map_err(|_| RecoveryError::Database)?;
+            Ok(value)
+        }
+        Err(error) => {
+            let _ = sqlx::query("ROLLBACK").execute(&mut conn).await;
+            Err(error)
+        }
+    }
+}
+
+async fn recover_proven_stale_in_transaction(
+    conn: &mut SqliteConnection,
+    token: &str,
+    fingerprint: &str,
+    now: DateTime<Utc>,
+    interrupt_after_cas: bool,
+) -> Result<RecoveryOutcome, RecoveryError> {
+    let owners = sqlx::query(
+        "SELECT started_at,heartbeat_at,state,process_fingerprint FROM runtime_instances WHERE instance_token=?",
+    )
+    .bind(token)
+    .fetch_all(&mut *conn)
+    .await
+    .map_err(|_| RecoveryError::Database)?;
+    if owners.len() != 1 {
+        return Err(if owners.is_empty() {
+            RecoveryError::OwnerIdentity
+        } else {
+            RecoveryError::MultipleOwners
+        });
+    }
+    let owner = &owners[0];
+    let state: String = owner
+        .try_get("state")
+        .map_err(|_| RecoveryError::Database)?;
+    let stored: String = owner
+        .try_get("process_fingerprint")
+        .map_err(|_| RecoveryError::Database)?;
+    let heartbeat: String = owner
+        .try_get("heartbeat_at")
+        .map_err(|_| RecoveryError::Database)?;
+    let heartbeat_raw = heartbeat.clone();
+    let heartbeat = DateTime::parse_from_rfc3339(&heartbeat)
+        .map_err(|_| RecoveryError::Database)?
+        .with_timezone(&Utc);
+    if stored != fingerprint || !matches!(state.as_str(), "active" | "stopping") {
+        return Err(RecoveryError::OwnerIdentity);
+    }
+    let active_owners: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM runtime_instances WHERE state IN ('active','stopping')",
+    )
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|_| RecoveryError::Database)?;
+    if active_owners != 1 {
+        return Err(RecoveryError::MultipleOwners);
+    }
+    if heartbeat >= now {
+        return Err(RecoveryError::NotStale);
+    }
+
+    // Recovery work is never silently cleared.  A lease or continuation is a
+    // durable blocker and must be resumed by a separately fenced transaction.
+    for query in [
+        "SELECT count(*) FROM execution_leases WHERE state IN ('active','stopping','recovery_needed')",
+        "SELECT count(*) FROM task_continuations WHERE state NOT IN ('terminal','released')",
+        "SELECT count(*) FROM task_admissions WHERE state NOT IN ('terminal','recovery_needed')",
+        "SELECT count(*) FROM agent_work_queue WHERE state NOT IN ('completed','expired','superseded')",
+    ] {
+        let count: i64 = sqlx::query_scalar(query)
+            .fetch_one(&mut *conn)
+            .await
+            .map_err(|_| RecoveryError::Database)?;
+        if count != 0 {
+            return Err(RecoveryError::WorkPresent);
+        }
+    }
+
+    let changed = sqlx::query(
+        "UPDATE runtime_instances SET state='stopped',heartbeat_at=? WHERE instance_token=? AND state=? AND heartbeat_at=? AND process_fingerprint=?",
+    )
+    .bind(now.to_rfc3339())
+    .bind(token)
+    .bind(&state)
+    .bind(heartbeat_raw)
+    .bind(fingerprint)
+    .execute(&mut *conn)
+    .await
+    .map_err(|_| RecoveryError::Database)?;
+    if changed.rows_affected() != 1 {
+        return Err(RecoveryError::Fenced);
+    }
+    if interrupt_after_cas {
+        return Err(RecoveryError::Fenced);
+    }
+
+    let reread: String = sqlx::query_scalar(
+        "SELECT state FROM runtime_instances WHERE instance_token=? AND process_fingerprint=?",
+    )
+    .bind(token)
+    .bind(fingerprint)
+    .fetch_one(&mut *conn)
+    .await
+    .map_err(|_| RecoveryError::Database)?;
+    if reread != "stopped" {
+        return Err(RecoveryError::Fenced);
+    }
+    Ok(RecoveryOutcome::Recovered)
 }
 
 pub fn parse_cli_args(
@@ -68,6 +222,12 @@ pub async fn recover_stale_runtime(
 ) -> Result<RecoveryOutcome, RecoveryError> {
     if owner_token.is_empty() || fingerprint.is_empty() || now.is_empty() {
         return Err(RecoveryError::InvalidArguments);
+    }
+    // Real callers provide an RFC3339 bounded clock.  Route that path through
+    // the stricter stale-owner CAS; legacy fixtures using symbolic timestamps
+    // retain their historical parser/error behaviour.
+    if now.parse::<DateTime<Utc>>().is_ok() {
+        return recover_proven_stale_runtime(database, owner_token, fingerprint, now).await;
     }
     let options = SqliteConnectOptions::new()
         .filename(database.as_ref())
@@ -249,6 +409,130 @@ mod tests {
         sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES('legacy','t','t','active','fp')")
             .execute(&pool).await.unwrap();
         (path, pool)
+    }
+
+    async fn stale_fixture() -> (std::path::PathBuf, SqlitePool) {
+        let path = std::env::temp_dir().join(format!("t090-{}.db", Uuid::now_v7()));
+        let pool = connect(&path).await.unwrap();
+        migrate(&pool).await.unwrap();
+        sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES('owner','2026-10-18T00:00:00Z','2026-10-18T00:00:00Z','active','fp')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        (path, pool)
+    }
+
+    #[tokio::test]
+    async fn proven_stale_owner_uses_expected_row_cas_and_rereads() {
+        let (path, pool) = stale_fixture().await;
+        assert_eq!(
+            recover_proven_stale_runtime(&path, "owner", "fp", "2026-10-18T00:01:00Z")
+                .await
+                .unwrap(),
+            RecoveryOutcome::Recovered
+        );
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM runtime_instances WHERE instance_token='owner'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "stopped");
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn live_mismatched_and_ambiguous_owners_remain_blocked() {
+        let (path, pool) = stale_fixture().await;
+        assert_eq!(
+            recover_proven_stale_runtime(&path, "owner", "wrong", "2026-10-18T00:01:00Z").await,
+            Err(RecoveryError::OwnerIdentity)
+        );
+        assert_eq!(
+            recover_proven_stale_runtime(&path, "owner", "fp", "2026-10-17T23:59:00Z").await,
+            Err(RecoveryError::NotStale)
+        );
+        sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES('other','2026-10-18T00:00:00Z','2026-10-18T00:00:00Z','stopping','other-fp')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            recover_proven_stale_runtime(&path, "owner", "fp", "2026-10-18T00:01:00Z").await,
+            Err(RecoveryError::MultipleOwners)
+        );
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn recovery_lease_and_continuation_are_retained_as_blockers() {
+        let (path, pool) = stale_fixture().await;
+        sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES('ep','agent','acp',1,'[]')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations(conversation_id,participants_json) VALUES('conv','[]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES('task','task','ep','ep','conv','x',1,0,0,0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('rk','task','owner',7,'recovery_needed','2026-10-18T00:00:00Z','2026-10-18T00:00:00Z','2026-10-18T00:00:01Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            recover_proven_stale_runtime(&path, "owner", "fp", "2026-10-18T00:01:00Z").await,
+            Err(RecoveryError::WorkPresent)
+        );
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM runtime_instances WHERE instance_token='owner'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "active");
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn interrupted_cas_rolls_back_and_stale_writer_is_fenced() {
+        let (path, pool) = stale_fixture().await;
+        let options = SqliteConnectOptions::new()
+            .filename(&path)
+            .create_if_missing(false)
+            .foreign_keys(true);
+        let mut conn = SqliteConnection::connect_with(&options).await.unwrap();
+        sqlx::query("BEGIN IMMEDIATE")
+            .execute(&mut conn)
+            .await
+            .unwrap();
+        assert_eq!(
+            recover_proven_stale_in_transaction(
+                &mut conn,
+                "owner",
+                "fp",
+                DateTime::parse_from_rfc3339("2026-10-18T00:01:00Z")
+                    .unwrap()
+                    .with_timezone(&Utc),
+                true,
+            )
+            .await,
+            Err(RecoveryError::Fenced)
+        );
+        sqlx::query("ROLLBACK").execute(&mut conn).await.unwrap();
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM runtime_instances WHERE instance_token='owner'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "active");
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
