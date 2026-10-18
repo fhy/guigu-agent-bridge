@@ -12,7 +12,7 @@ use guigu_agent_bridge::{
     app::{
         AppRuntime, ConfigSource, HealthServer, HealthState, MatrixIngress, OwnerState,
         PersistenceFirstProjection, PersistingBus, ProjectionMetrics, ReloadController,
-        ReloadOutcome, ReplyRegistry,
+        ReloadOutcome, ReplyRegistry, TerminalReplyConsumer,
     },
     bus::{
         AdmissionContext, Bus, BusError, BusFuture, Cancellation, Clock, EndpointRegistry,
@@ -501,6 +501,111 @@ async fn matrix_ingress_reads_back_unknown_commit_before_changed_routing_and_per
             "$event:example".into(),
             1
         )
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn healthy_message_round_trip_admits_completes_and_sends_reply() {
+    let temp = TempDir::new();
+    let pool = connect(temp.0.join("state.db")).await.unwrap();
+    migrate(&pool).await.unwrap();
+    let repository = Arc::new(SqliteRepository::new(pool.clone()));
+    let mut initial = config("");
+    initial.transports.matrix.enabled = true;
+    initial
+        .transports
+        .matrix
+        .allowed_users
+        .push("@alice:example".into());
+    initial
+        .transports
+        .matrix
+        .routes
+        .rooms
+        .insert("!room:example".into(), "worker".into());
+    let registry = Arc::new(EndpointRegistry::from_config(&initial));
+    sync_agents(repository.as_ref(), &registry).await.unwrap();
+    let conversation = Conversation {
+        id: ConversationId::generate(),
+        participants: vec![],
+        external_ref: None,
+    };
+    repository.insert_conversation(&conversation).await.unwrap();
+    let reliability = ReliabilityStore::new(pool.clone());
+    reliability
+        .begin_runtime("runtime-round-trip", "fp", "2026-09-18T00:00:00Z")
+        .await
+        .unwrap();
+    let (sink, mut events) = guigu_agent_bridge::bus::MpscEventSink::new(4);
+    let (bus, mut tasks) = PersistingBus::new(
+        Arc::clone(&registry),
+        4,
+        Arc::new(sink),
+        repository.as_ref().clone(),
+        Clock::fixed("2026-09-18T00:00:00Z".parse().unwrap()),
+    );
+    let admission: Arc<dyn DurableMatrixAdmission> =
+        Arc::new(bus.with_reliability(reliability, "runtime-round-trip".into()));
+    let sender = Arc::new(RecordingMatrixSender::default());
+    let replies = Arc::new(ReplyRegistry::default());
+    let reload = Arc::new(
+        ReloadController::new(
+            initial.clone(),
+            Arc::new(MutableSource(Mutex::new(initial))),
+        )
+        .unwrap(),
+    );
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let ingress = MatrixIngress::new(
+        rx,
+        repository.clone(),
+        registry,
+        admission,
+        sender.clone(),
+        reload,
+        Cancellation::new(),
+        Arc::new(CommandLedger::new(8)),
+        replies.clone(),
+        8,
+    )
+    .start();
+    tx.send(InboundMatrixEvent {
+        event_id: "$round-trip:example".into(),
+        room_id: "!room:example".into(),
+        thread_root: Some("$root:example".into()),
+        sender: "@alice:example".into(),
+        body: "run".into(),
+    })
+    .await
+    .unwrap();
+    let task = tasks.recv().await.unwrap();
+    assert_eq!(events.recv().await.unwrap().task_id, task.task_id);
+    ingress.shutdown().await;
+    let terminal = TaskEvent {
+        id: EventId::generate(),
+        task_id: task.task_id,
+        seq: 2,
+        status: TaskStatus::Completed,
+        timestamp: "2026-09-18T00:00:01Z".parse().unwrap(),
+        payload: TaskEventPayload::Completed {
+            output: "done".into(),
+        },
+    };
+    TerminalReplyConsumer::new(sender.clone(), replies)
+        .consume(&terminal)
+        .await
+        .unwrap();
+    assert_eq!(
+        sender.0.lock().unwrap().as_slice(),
+        &[(
+            ReplyContext {
+                room_id: "!room:example".into(),
+                thread_root: Some("$root:example".into()),
+                event_id: "$round-trip:example".into()
+            },
+            "done".into()
+        )]
     );
     pool.close().await;
 }
