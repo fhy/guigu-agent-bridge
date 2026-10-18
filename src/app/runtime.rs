@@ -147,6 +147,11 @@ struct RequiredOwnerFailure {
     class: &'static str,
 }
 
+#[inline]
+fn recovery_allows_service_assembly(recovery_blocked: bool) -> bool {
+    !recovery_blocked
+}
+
 fn retain_failure(slot: &Arc<Mutex<Option<RequiredOwnerFailure>>>, failure: RequiredOwnerFailure) {
     let mut value = slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
     value.get_or_insert(failure);
@@ -379,12 +384,6 @@ impl AppRuntime {
             Arc::clone(&metrics),
             Arc::clone(&projection_metrics),
         ));
-        let health = start_health(config.bridge.health_bind, &health_state).await?;
-        tracing::info!(
-            category = "health-listener",
-            phase = "bound",
-            emission = "health-listener-bound"
-        );
         tracing::info!(
             category = "startup-recovery",
             phase = "begin",
@@ -516,7 +515,7 @@ impl AppRuntime {
             pool: Some(pool.clone()),
             reload,
             health_state,
-            health,
+            health: None,
             matrix_sync: None,
             ingress: None,
             bus: None,
@@ -538,7 +537,7 @@ impl AppRuntime {
         // remains false until the existing state predicates transition, but the
         // endpoint is observable while startup is blocked on external/runtime
         // prerequisites.
-        if recovery_blocked {
+        if !recovery_allows_service_assembly(recovery_blocked) {
             if let Some(generation) = matrix_generation {
                 runtime.health_state.matrix().transition(
                     generation,
@@ -548,11 +547,21 @@ impl AppRuntime {
             }
             tracing::warn!(
                 category = "recovery-blocked",
-                "runtime startup is health-only"
+                action = "startup-terminated",
+                emission = "recovery-blocked-startup-terminated"
             );
-            runtime.health_state.set_owner(OwnerState::Running);
-            return Ok(runtime);
+            return Err(AppError::Runtime);
         }
+
+        // Only a recovery-safe runtime may expose the health listener.  The
+        // recovery-blocked path above terminates before any listener, Matrix
+        // ingress, ACP dispatcher, or worker can be assembled.
+        runtime.health = start_health(config.bridge.health_bind, &runtime.health_state).await?;
+        tracing::info!(
+            category = "health-listener",
+            phase = "bound",
+            emission = "health-listener-bound"
+        );
 
         // Matrix authentication, store binding and fresh device-key proof are the
         // assembly gate. No ACP, bus, gateway, outbox or task owner exists before it.
@@ -1652,6 +1661,12 @@ enabled = true
         }
         runtime.shutdown().await.unwrap();
         std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn recovery_blocked_startup_gate_terminates_before_listener_ingress_or_acp() {
+        assert!(!super::recovery_allows_service_assembly(true));
+        assert!(super::recovery_allows_service_assembly(false));
     }
 
     #[tokio::test]
