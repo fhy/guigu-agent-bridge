@@ -125,6 +125,10 @@ impl AcpClient {
                 let _ = transport.shutdown().await;
                 return Err(AcpError::TransportClosed);
             }
+            if reservation.identity.is_none() {
+                let _ = transport.shutdown().await;
+                return Err(AcpError::TransportClosed);
+            }
         }
         let params = encode(schema::METHOD_INITIALIZE, &InitializeParams::new())?;
         let completed = transport

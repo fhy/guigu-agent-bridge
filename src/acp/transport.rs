@@ -111,6 +111,7 @@ enum SpawnPhase {
 pub(crate) struct SpawnReservation {
     gate: AcpSpawnGate,
     registered: bool,
+    pub(crate) identity: Option<String>,
 }
 
 impl AcpSpawnGate {
@@ -135,12 +136,28 @@ impl AcpSpawnGate {
         Some(SpawnReservation {
             gate: self.clone(),
             registered: false,
+            identity: None,
         })
     }
     pub(crate) fn register_child(reservation: &mut SpawnReservation, pid: u32) -> bool {
         if pid == 0 {
             return false;
         }
+        let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok();
+        let starttime = stat
+            .as_deref()
+            .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| rest.to_owned()))
+            .and_then(|s| s.split_whitespace().nth(19).map(str::to_owned));
+        let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+            .ok()
+            .map(|path| path.to_string_lossy().into_owned());
+        let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup")).ok();
+        let (Some(starttime), Some(exe), Some(cgroup)) = (starttime, exe, cgroup) else {
+            return false;
+        };
+        reservation.identity = Some(format!(
+            "pid={pid};starttime={starttime};exe={exe};cgroup={cgroup}"
+        ));
         reservation.registered = true;
         true
     }
