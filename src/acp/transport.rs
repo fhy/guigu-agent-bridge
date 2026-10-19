@@ -196,7 +196,7 @@ impl AcpSpawnGate {
     }
     pub(crate) fn rescan_children(&self) -> Result<String, &'static str> {
         let state = self.state.0.lock().map_err(|_| "malformed")?;
-        if state.children.len() > 64 {
+        if state.children.len() > 256 {
             return Err("overflow");
         }
         let mut out = Vec::with_capacity(state.children.len());
@@ -218,6 +218,19 @@ impl AcpSpawnGate {
                 .into_owned();
             let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
                 .map_err(|_| "inaccessible")?;
+            let cgroup_path = cgroup
+                .lines()
+                .find_map(|line| line.rsplit_once(':').map(|(_, path)| path.trim()))
+                .ok_or("malformed")?;
+            let procs_path = format!("/sys/fs/cgroup{cgroup_path}/cgroup.procs");
+            let members = std::fs::read_to_string(procs_path).map_err(|_| "inaccessible")?;
+            let member_ids: Vec<&str> = members.split_whitespace().collect();
+            if member_ids.len() > 256 {
+                return Err("overflow");
+            }
+            if !member_ids.iter().any(|member| *member == pid.to_string()) {
+                return Err("raced_changed");
+            }
             let expected_start = identity
                 .split(';')
                 .find_map(|v| v.strip_prefix("starttime="))
@@ -228,7 +241,7 @@ impl AcpSpawnGate {
             {
                 return Err("raced_changed");
             }
-            out.push(identity.clone());
+            out.push(format!("{identity};members={}", member_ids.join(",")));
         }
         Ok(format!(
             "{{\"outcome\":\"complete\",\"children\":[{}]}}",
