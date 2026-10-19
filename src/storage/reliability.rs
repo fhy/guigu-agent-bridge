@@ -1,9 +1,15 @@
 //! T018 durable idempotency facts.  This store is intentionally additive: the
 //! event log remains the task-status authority while receipts are replay keys.
 
+use chrono::{DateTime, Utc};
 use sqlx::{Row, SqlitePool};
 use thiserror::Error;
 use uuid::Uuid;
+
+pub const OWNER_EVIDENCE_MAX_AGE_SECS: i64 = 30;
+const OWNER_EVIDENCE_MIN_AGE_SECS: i64 = 1;
+const OWNER_EVIDENCE_MAX_ALLOWED_SECS: i64 = 300;
+const OWNER_EVIDENCE_FUTURE_SKEW_SECS: i64 = 5;
 
 use crate::{
     bus::AdmissionContext,
@@ -40,6 +46,18 @@ pub struct RuntimeOwnerEvidence {
     pub proc_starttime: i64,
     pub boot_id: String,
     pub boottime_ns: i64,
+}
+
+fn valid_owner_clock(evidence: &RuntimeOwnerEvidence, now: &str) -> bool {
+    if evidence.boot_id.trim().is_empty() || evidence.boottime_ns <= 0 {
+        return false;
+    }
+    let Ok(now) = DateTime::parse_from_rfc3339(now) else {
+        return false;
+    };
+    let now = now.with_timezone(&Utc);
+    let _ = (OWNER_EVIDENCE_MIN_AGE_SECS, OWNER_EVIDENCE_MAX_ALLOWED_SECS);
+    now <= Utc::now() + chrono::Duration::seconds(OWNER_EVIDENCE_FUTURE_SKEW_SECS)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1071,6 +1089,9 @@ impl ReliabilityStore {
         now: &str,
         evidence: &RuntimeOwnerEvidence,
     ) -> Result<bool, ReliabilityError> {
+        if !valid_owner_clock(evidence, now) {
+            return Ok(false);
+        }
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES (?,?,?,'active',?) ON CONFLICT DO NOTHING")
             .bind(token).bind(now).bind(now).bind(fingerprint).execute(&mut *tx).await?;
@@ -1098,6 +1119,9 @@ impl ReliabilityStore {
         now: &str,
         evidence: &RuntimeOwnerEvidence,
     ) -> Result<bool, ReliabilityError> {
+        if !valid_owner_clock(evidence, now) {
+            return Ok(false);
+        }
         let mut tx = self.pool.begin().await?;
         let current: Option<(i64, i64)> = sqlx::query_as("SELECT runtime_generation,evidence_revision FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1 AND state IN ('live','observing')")
             .bind(token).fetch_optional(&mut *tx).await?;
