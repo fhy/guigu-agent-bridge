@@ -128,6 +128,7 @@ pub struct AppRuntime {
     bus: Option<Arc<dyn crate::bus::Bus>>,
     worker: Option<tokio::task::JoinHandle<Result<(), crate::bus::WorkerError>>>,
     broadcaster: Option<tokio::task::JoinHandle<()>>,
+    heartbeat: Option<tokio::task::JoinHandle<()>>,
     outbox: Option<crate::app::OutboxDrainHandle>,
     output_drain: Option<crate::app::output_drain::OutputSetDrainHandle>,
     acp: Option<Arc<AcpDispatcherRouter>>,
@@ -547,6 +548,7 @@ impl AppRuntime {
             bus: None,
             worker: None,
             broadcaster: None,
+            heartbeat: None,
             outbox: None,
             output_drain: None,
             acp: None,
@@ -559,6 +561,50 @@ impl AppRuntime {
             runtime_instance: owns_runtime.then_some(runtime_instance.clone()),
             first_failure: Arc::clone(&first_failure),
         };
+        if owns_runtime {
+            let heartbeat_store = reliability.clone();
+            let heartbeat_token = runtime_instance.clone();
+            runtime.heartbeat = Some(tokio::spawn(async move {
+                let mut tick = tokio::time::interval(Duration::from_secs(10));
+                loop {
+                    tick.tick().await;
+                    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+                    let evidence = crate::storage::RuntimeOwnerEvidence {
+                        pid: i64::from(std::process::id()),
+                        proc_starttime: std::fs::read_to_string("/proc/self/stat")
+                            .ok()
+                            .and_then(|s| s.rsplit_once(") ").map(|(_, r)| r.to_owned()))
+                            .and_then(|s| s.split_whitespace().nth(19).and_then(|v| v.parse().ok()))
+                            .unwrap_or(0),
+                        boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                            .unwrap_or_default()
+                            .trim()
+                            .to_owned(),
+                        boottime_ns: std::fs::read_to_string("/proc/uptime")
+                            .ok()
+                            .and_then(|s| {
+                                s.split_whitespace()
+                                    .next()
+                                    .and_then(|v| v.parse::<f64>().ok())
+                            })
+                            .map(|v| (v * 1_000_000_000.0) as i64)
+                            .unwrap_or(0),
+                    };
+                    if !heartbeat_store
+                        .publish_owner_heartbeat(
+                            &heartbeat_token,
+                            &heartbeat_token,
+                            &now,
+                            &evidence,
+                        )
+                        .await
+                        .unwrap_or(false)
+                    {
+                        break;
+                    }
+                }
+            }));
+        }
         // Bind the loopback health listener before Matrix restore/proof.  Health
         // remains false until the existing state predicates transition, but the
         // endpoint is observable while startup is blocked on external/runtime
@@ -1052,6 +1098,10 @@ impl AppRuntime {
             }
         }
         self.reload.stop().await;
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+            let _ = heartbeat.await;
+        }
         if let Some(sync) = self.matrix_sync.take()
             && let Err(error) = sync.shutdown_bounded(self.shutdown_timeout).await
         {
