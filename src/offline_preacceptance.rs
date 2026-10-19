@@ -979,8 +979,16 @@ mod tests {
                         .fetch_one(&pool)
                         .await
                         .unwrap();
+                let continuation_delivery = tuple.delivery_id.clone();
                 sqlx::query("INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes) VALUES(?,?,?,7,1,?,1,0,0,'sentinel','t','t','t',0)")
-                    .bind(&tuple.task_id).bind(resource).bind(&tuple.delivery_id).bind(case.strip_prefix("continuation:").unwrap()).execute(&pool).await.unwrap();
+                    .bind(&tuple.task_id).bind(resource).bind(continuation_delivery).bind(case.strip_prefix("continuation:").unwrap()).execute(&pool).await.unwrap();
+                if case == "continuation:recovery_needed" {
+                    sqlx::query("UPDATE task_continuations SET runtime_generation='other-generation' WHERE task_id=?")
+                        .bind(&tuple.task_id)
+                        .execute(&pool)
+                        .await
+                        .unwrap();
+                }
             }
             "disposition:missing" => {
                 sqlx::query("DELETE FROM delivery_dispositions WHERE delivery_id=?")
