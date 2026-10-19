@@ -716,6 +716,12 @@ fn admit_ready(
 /// [`TaskId`] and a sequence number — never an address, command or credential.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WorkerError {
+    /// Prepared execution committed an unknown outcome. The durable runtime
+    /// owns the recovery-needed lease/continuation; do not append terminal
+    /// task state or stop the worker loop.
+    #[error("execution outcome requires recovery for task {task_id} at seq {seq}")]
+    RecoveryNeeded { task_id: TaskId, seq: u64 },
+
     /// The event stream is closed; no further transition can be recorded.
     ///
     /// The worker stops, drops the task receiver, and later submissions report
@@ -1129,7 +1135,11 @@ impl Worker {
             // in-flight `process` call; T005 is serial by design and has no
             // limiter, semaphore or rejection path.
             match self.queue.pop() {
-                Some(task) => self.process(task).await?,
+                Some(task) => match self.process(task).await {
+                    Ok(()) => {}
+                    Err(WorkerError::RecoveryNeeded { .. }) => continue,
+                    Err(error) => return Err(error),
+                },
                 None if closed => return Ok(()),
                 // 3. Nothing to do: wait for either a task or a close.
                 None => match self.tasks.recv().await {
@@ -1443,6 +1453,9 @@ impl Worker {
                         return self.finalize_prepared(task_id, seq, prepared).await;
                     }
                     Raced::Done(Err(error)) => {
+                        if matches!(error, DispatchError::RecoveryNeeded) {
+                            return Err(WorkerError::RecoveryNeeded { task_id, seq });
+                        }
                         return self.fail_task(task_id, seq, error.to_string()).await;
                     }
                     Raced::Cancelled(reason) => {

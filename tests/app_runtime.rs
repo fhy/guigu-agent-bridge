@@ -27,9 +27,6 @@ use guigu_agent_bridge::{
         AgentTask, Conversation, ConversationId, EventId, Priority, TaskEvent, TaskEventPayload,
         TaskId, TaskStatus,
     },
-    offline_preacceptance::{
-        PreAcceptanceOutcome, PreAcceptanceTuple, recover as recover_preacceptance,
-    },
     runtime::{RuntimeMetrics, SqliteRuntimeStore},
     storage::{ReliabilityStore, Repository, SqliteRepository, connect, migrate, sync_agents},
 };
@@ -1116,69 +1113,6 @@ async fn startup_recovery_backlog_blocks_readiness_without_spawning_acp() {
             .await
             .is_ok()
     );
-}
-
-#[tokio::test]
-async fn startup_recovery_blocker_requires_fenced_terminal_proof() {
-    let temp = TempDir::new();
-    let config_path = temp.0.join("bridge.toml");
-    let database = temp.0.join("state.db");
-    let sessions = temp.0.join("sessions");
-    std::fs::write(
-        &config_path,
-        format!(
-            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nhealth_bind = \"127.0.0.1:19293\"\n",
-            database.to_string_lossy(),
-            sessions.to_string_lossy()
-        ),
-    )
-    .unwrap();
-    let pool = connect(&database).await.unwrap();
-    migrate(&pool).await.unwrap();
-    let endpoint = uuid::Uuid::now_v7().to_string();
-    let conversation = uuid::Uuid::now_v7().to_string();
-    let task = uuid::Uuid::now_v7().to_string();
-    let delivery = uuid::Uuid::now_v7().to_string();
-    sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES(?,?, 'acp',1,'[]')").bind(&endpoint).bind(uuid::Uuid::now_v7().to_string()).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO conversations(conversation_id,participants_json) VALUES(?,'[]')")
-        .bind(&conversation)
-        .execute(&pool)
-        .await
-        .unwrap();
-    sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES(?,?,?,?,?,'startup blocker',1,0,0,0)").bind(&task).bind(&task).bind(&endpoint).bind(&endpoint).bind(&conversation).execute(&pool).await.unwrap();
-    let dispatched = serde_json::to_string(&TaskEventPayload::Dispatched {
-        delivery_id: delivery.parse().unwrap(),
-        attempt: 1,
-    })
-    .unwrap();
-    sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,1,'dispatched','2026-10-18T00:00:00Z',?)").bind(uuid::Uuid::now_v7().to_string()).bind(&task).bind(dispatched).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,created_at,updated_at) VALUES(?,'dispatching',4,NULL,'t','t')").bind(&task).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES(?,?,1,?,'2026-10-18T00:00:00Z')").bind(&delivery).bind(&task).bind(&endpoint).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state,reason_code) VALUES(?,?,1,'prepared','before')").bind(&delivery).bind(&task).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('startup-resource',?,?,7,'recovery_needed','t','t','2099-01-01T00:00:00Z')").bind(&task).bind("owner").execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes) VALUES(?,?,?,7,3,'recovery_needed',2,1,0,'resume','t','t','t',0)").bind(&task).bind("startup-resource").bind(&delivery).execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES('old-owner','t','2026-10-17T23:00:00Z','active','pid:4294967295')").execute(&pool).await.unwrap();
-    pool.close().await;
-
-    assert!(matches!(
-        AppRuntime::start(&config_path).await,
-        Err(guigu_agent_bridge::app::AppError::Runtime)
-    ));
-    assert_eq!(
-        recover_preacceptance(
-            &database,
-            &[PreAcceptanceTuple {
-                delivery_id: delivery.clone(),
-                task_id: task.clone(),
-                attempt: 1
-            }],
-            "2026-10-18T00:01:00Z"
-        )
-        .await,
-        Ok(PreAcceptanceOutcome::Recovered { count: 1 })
-    );
-    let runtime = AppRuntime::start(&config_path).await.unwrap();
-    runtime.shutdown().await.unwrap();
 }
 
 #[tokio::test]

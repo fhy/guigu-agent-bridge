@@ -5,8 +5,6 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
-const CONTINUATION_RUNTIME_GENERATION: &str = "generation.v1:strict";
-
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PreAcceptanceError {
     #[error("pre-acceptance recovery rejected: invalid arguments")]
@@ -416,7 +414,7 @@ async fn validate(
     {
         return Err(PreAcceptanceError::NotEligible);
     }
-    let l = sqlx::query("SELECT resource_key,fence,state FROM execution_leases WHERE task_id=?")
+    let l = sqlx::query("SELECT state FROM execution_leases WHERE task_id=?")
         .bind(&t.task_id)
         .fetch_optional(&mut *c)
         .await
@@ -447,30 +445,8 @@ async fn validate(
         .fetch_one(&mut *c)
         .await
         .map_err(|_| PreAcceptanceError::Database)?;
-    if q != 0 {
+    if q != 0 || cont != 0 {
         return Err(PreAcceptanceError::NotEligible);
-    }
-    if cont != 0 {
-        let resource: String = l
-            .try_get("resource_key")
-            .map_err(|_| PreAcceptanceError::Database)?;
-        let fence: i64 = l
-            .try_get("fence")
-            .map_err(|_| PreAcceptanceError::Database)?;
-        let bound: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM task_continuations WHERE task_id=? AND resource_key=? AND delivery_id=? AND lease_fence=? AND runtime_generation=? AND revision>=1 AND state='recovery_needed'",
-        )
-        .bind(&t.task_id)
-        .bind(resource)
-        .bind(&t.delivery_id)
-        .bind(fence)
-        .bind(CONTINUATION_RUNTIME_GENERATION)
-        .fetch_one(&mut *c)
-        .await
-        .map_err(|_| PreAcceptanceError::Database)?;
-        if cont != 1 || bound != 1 {
-            return Err(PreAcceptanceError::NotEligible);
-        }
     }
     Ok(true)
 }
@@ -596,19 +572,12 @@ async fn validate_closed(
             .fetch_one(&mut *c)
             .await
             .map_err(|_| PreAcceptanceError::Database)?;
-    let nonterminal_continuation: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM task_continuations WHERE task_id=? AND state!='terminal'",
-    )
-    .bind(&t.task_id)
-    .fetch_one(&mut *c)
-    .await
-    .map_err(|_| PreAcceptanceError::Database)?;
     Ok(admission.as_deref() == Some("terminal")
         && ack_matches_event
         && lease.as_deref() == Some("released")
         && lease_count == 1
         && queue == 0
-        && (continuation == 0 || (continuation == 1 && nonterminal_continuation == 0)))
+        && continuation == 0)
 }
 
 async fn close_one(
@@ -645,17 +614,6 @@ async fn close_one_inner(
     let expires_at: String = l
         .try_get("expires_at")
         .map_err(|_| PreAcceptanceError::Database)?;
-    let continuation_revision: Option<i64> = sqlx::query_scalar(
-        "SELECT revision FROM task_continuations WHERE task_id=? AND resource_key=? AND delivery_id=? AND lease_fence=? AND runtime_generation=? AND state='recovery_needed'",
-    )
-    .bind(&t.task_id)
-    .bind(&resource)
-    .bind(&t.delivery_id)
-    .bind(fence)
-    .bind(CONTINUATION_RUNTIME_GENERATION)
-    .fetch_optional(&mut *c)
-    .await
-    .map_err(|_| PreAcceptanceError::Database)?;
     let task_version: i64 = sqlx::query_scalar("SELECT version FROM tasks WHERE task_id=?")
         .bind(&t.task_id)
         .fetch_one(&mut *c)
@@ -710,7 +668,6 @@ async fn close_one_inner(
             owner: &token,
             fence,
             expires_at: &expires_at,
-            continuation_revision,
         },
     )
     .await
@@ -979,16 +936,8 @@ mod tests {
                         .fetch_one(&pool)
                         .await
                         .unwrap();
-                let continuation_delivery = tuple.delivery_id.clone();
                 sqlx::query("INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes) VALUES(?,?,?,7,1,?,1,0,0,'sentinel','t','t','t',0)")
-                    .bind(&tuple.task_id).bind(resource).bind(continuation_delivery).bind(case.strip_prefix("continuation:").unwrap()).execute(&pool).await.unwrap();
-                if case == "continuation:recovery_needed" {
-                    sqlx::query("UPDATE task_continuations SET runtime_generation='other-generation' WHERE task_id=?")
-                        .bind(&tuple.task_id)
-                        .execute(&pool)
-                        .await
-                        .unwrap();
-                }
+                    .bind(&tuple.task_id).bind(resource).bind(&tuple.delivery_id).bind(case.strip_prefix("continuation:").unwrap()).execute(&pool).await.unwrap();
             }
             "disposition:missing" => {
                 sqlx::query("DELETE FROM delivery_dispositions WHERE delivery_id=?")
@@ -1164,13 +1113,6 @@ mod tests {
         sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES(?,?,1,?,'2026-01-01T00:00:00Z')").bind(&delivery).bind(&task).bind(&endpoint).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state,reason_code) VALUES(?,?,1,'prepared','before')").bind(&delivery).bind(&task).execute(&pool).await.unwrap();
         sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES(?,?,?,7,'recovery_needed','t','t','2099-01-01T00:00:00Z')").bind(resource).bind(&task).bind("owner").execute(&pool).await.unwrap();
-        sqlx::query("INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes) VALUES(?,?,?,7,3,'recovery_needed',2,1,0,'resume','t','t','t',0)")
-            .bind(&task)
-            .bind(resource)
-            .bind(&delivery)
-            .execute(&pool)
-            .await
-            .unwrap();
         pool.close().await;
         let tuple = PreAcceptanceTuple {
             delivery_id: delivery.clone(),
@@ -1182,15 +1124,13 @@ mod tests {
             Ok(PreAcceptanceOutcome::Recovered { count: 1 })
         );
         let after = crate::storage::connect(&path).await.unwrap();
-        let snapshot: (String, i64, String, String, String, String, String, i64) = sqlx::query_as("SELECT t.text,t.version,a.state,d.acknowledged_at,p.state,l.state,c.state,c.revision FROM tasks t JOIN task_admissions a ON a.task_id=t.task_id JOIN deliveries d ON d.task_id=t.task_id JOIN delivery_dispositions p ON p.task_id=t.task_id JOIN execution_leases l ON l.task_id=t.task_id JOIN task_continuations c ON c.task_id=t.task_id WHERE t.task_id=?").bind(&task).fetch_one(&after).await.unwrap();
+        let snapshot: (String, i64, String, String, String, String) = sqlx::query_as("SELECT t.text,t.version,a.state,d.acknowledged_at,p.state,l.state FROM tasks t JOIN task_admissions a ON a.task_id=t.task_id JOIN deliveries d ON d.task_id=t.task_id JOIN delivery_dispositions p ON p.task_id=t.task_id JOIN execution_leases l ON l.task_id=t.task_id WHERE t.task_id=?").bind(&task).fetch_one(&after).await.unwrap();
         assert_eq!(snapshot.0, "secret sentinel");
         assert_eq!(snapshot.1, 1);
         assert_eq!(snapshot.2, "terminal");
         assert!(!snapshot.3.is_empty());
         assert_eq!(snapshot.4, "terminal");
         assert_eq!(snapshot.5, "released");
-        assert_eq!(snapshot.6, "terminal");
-        assert_eq!(snapshot.7, 4);
         let terminal: (i64, Option<String>, Option<String>, Option<String>, i64, String, String) = sqlx::query_as(
             "SELECT a.revision,p.reason_code,p.session_id,p.child_fingerprint,t.version,l.state,l.expires_at FROM task_admissions a JOIN delivery_dispositions p ON p.task_id=a.task_id JOIN tasks t ON t.task_id=a.task_id JOIN execution_leases l ON l.task_id=t.task_id WHERE a.task_id=?",
         ).bind(&task).fetch_one(&after).await.unwrap();

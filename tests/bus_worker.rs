@@ -284,6 +284,35 @@ impl TaskDispatcher for ScriptedDispatcher {
     }
 }
 
+struct PreparedRecoveryDispatcher;
+
+impl TaskDispatcher for PreparedRecoveryDispatcher {
+    fn deliver<'a>(
+        &'a self,
+        _request: DispatchRequest<'a>,
+    ) -> BusFuture<'a, Result<(), DispatchError>> {
+        Box::pin(async { Ok(()) })
+    }
+
+    fn execute<'a>(
+        &'a self,
+        _request: DispatchRequest<'a>,
+    ) -> BusFuture<'a, Result<DispatchOutcome, DispatchError>> {
+        Box::pin(async { Err(DispatchError::RecoveryNeeded) })
+    }
+
+    fn supports_prepared(&self) -> bool {
+        true
+    }
+
+    fn execute_prepared<'a>(
+        &'a self,
+        _request: DispatchRequest<'a>,
+    ) -> BusFuture<'a, Result<guigu_agent_bridge::bus::PreparedExecution, DispatchError>> {
+        Box::pin(async { Err(DispatchError::RecoveryNeeded) })
+    }
+}
+
 /// Coerce a concrete double into the trait object the worker holds, keeping the
 /// concrete handle for assertions.
 fn as_dispatcher<S: TaskDispatcher + 'static>(dispatcher: &Arc<S>) -> Arc<dyn TaskDispatcher> {
@@ -786,6 +815,44 @@ async fn execution_error_fails_at_seq_four_after_running() {
     );
     // `execute` runs only after `deliver` was accepted.
     assert_eq!(dispatcher.stages(), ["deliver", "execute"]);
+}
+
+#[tokio::test]
+async fn prepared_recovery_error_does_not_emit_terminal_failed() {
+    let dispatcher = Arc::new(PreparedRecoveryDispatcher);
+    let mut wiring = wiring(&load(CONFIG), 4, 16);
+    let tasks_rx = take_tasks_rx(&mut wiring.tasks_rx);
+    let recording = Arc::new(RecordingConsumer::default());
+    let broadcaster = EventBroadcaster::new(wiring.events_rx, vec![as_consumer(&recording)]);
+    let worker = Worker::with_dispatcher(
+        Arc::clone(&wiring.registry),
+        tasks_rx,
+        Arc::clone(&wiring.sink),
+        fixed_clock(),
+        TransportType::Acp,
+        as_dispatcher(&dispatcher),
+    );
+    wiring
+        .bus
+        .submit(root_task(worker_endpoint(), 5))
+        .await
+        .unwrap();
+    drop(wiring.bus);
+    drop(wiring.sink);
+    worker
+        .run()
+        .await
+        .expect("recovery-needed is fail-stop for this task only");
+    broadcaster.run().await;
+    let events = recording.events();
+    assert_eq!(
+        statuses(&events),
+        [
+            TaskStatus::Queued,
+            TaskStatus::Dispatched,
+            TaskStatus::Running
+        ]
+    );
 }
 
 #[tokio::test]

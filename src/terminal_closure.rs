@@ -31,7 +31,6 @@ pub(crate) enum LeaseMode<'a> {
         owner: &'a str,
         fence: i64,
         expires_at: &'a str,
-        continuation_revision: Option<i64>,
     },
 }
 
@@ -168,46 +167,8 @@ pub(crate) async fn apply(
     let lease = match lease_mode {
         LeaseMode::LiveActive { owner, fence, now } => sqlx::query("UPDATE execution_leases SET state='released',heartbeat_at=?,expires_at=? WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
             .bind(now).bind(now).bind(context.resource_key).bind(context.task_id).bind(owner).bind(fence).bind(now).execute(&mut *c).await?,
-        LeaseMode::OfflineRecoveryNeeded {
-            owner,
-            fence,
-            expires_at,
-            continuation_revision,
-        } => {
-            // A recovery-needed terminal closure must settle the continuation
-            // bound to the same resource and lease fence in this transaction.
-            // Otherwise releasing the lease leaves a durable nonterminal row,
-            // causing every subsequent startup to remain recovery-blocked.
-            let continuation_count: i64 = sqlx::query_scalar(
-                "SELECT count(*) FROM task_continuations WHERE task_id=?",
-            )
-            .bind(context.task_id)
-            .fetch_one(&mut *c)
-            .await?;
-            if continuation_count > 0 {
-                let delivery_id = match context.delivery {
-                    DeliveryBinding::OfflineExact { delivery_id, .. } => delivery_id,
-                    DeliveryBinding::LiveContinuation => return Err(ClosureError::Fenced),
-                };
-                let revision = continuation_revision.ok_or(ClosureError::Fenced)?;
-                let continuation = sqlx::query(
-                    "UPDATE task_continuations SET state='terminal',revision=revision+1,heartbeat_at=? WHERE task_id=? AND resource_key=? AND delivery_id=? AND lease_fence=? AND revision=? AND runtime_generation='generation.v1:strict' AND state='recovery_needed'",
-                )
-                .bind(context.now)
-                .bind(context.task_id)
-                .bind(context.resource_key)
-                .bind(delivery_id)
-                .bind(fence)
-                .bind(revision)
-                .execute(&mut *c)
-                .await?;
-                if continuation.rows_affected() != 1 {
-                    return Err(ClosureError::Fenced);
-                }
-            }
-            sqlx::query("UPDATE execution_leases SET state='released',heartbeat_at=? WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='recovery_needed' AND expires_at=?")
-                .bind(context.now).bind(context.resource_key).bind(context.task_id).bind(owner).bind(fence).bind(expires_at).execute(&mut *c).await?
-        }
+        LeaseMode::OfflineRecoveryNeeded { owner, fence, expires_at } => sqlx::query("UPDATE execution_leases SET state='released',heartbeat_at=? WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='recovery_needed' AND expires_at=?")
+            .bind(context.now).bind(context.resource_key).bind(context.task_id).bind(owner).bind(fence).bind(expires_at).execute(&mut *c).await?,
     };
     if lease.rows_affected() != 1 {
         return Err(ClosureError::Fenced);
