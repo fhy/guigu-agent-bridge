@@ -1159,7 +1159,27 @@ impl ReliabilityStore {
             tx.rollback().await?;
             return Ok(false);
         }
-        let current: (i64, i64) = sqlx::query_as("SELECT runtime_generation,evidence_revision FROM runtime_owner_evidence WHERE instance_token=? ORDER BY evidence_revision DESC LIMIT 1").bind(token).fetch_one(&mut *tx).await?;
+        let current: (i64, i64, String) = sqlx::query_as("SELECT runtime_generation,evidence_revision,captured_at FROM runtime_owner_evidence WHERE instance_token=? ORDER BY evidence_revision DESC LIMIT 1").bind(token).fetch_one(&mut *tx).await?;
+        let captured = DateTime::parse_from_rfc3339(&current.2)
+            .ok()
+            .map(|v| v.with_timezone(&Utc));
+        let observed = DateTime::parse_from_rfc3339(now)
+            .ok()
+            .map(|v| v.with_timezone(&Utc));
+        let Some((captured, observed)) = captured.zip(observed) else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        let age = (observed - captured).num_seconds();
+        if !(0..=OWNER_EVIDENCE_MAX_AGE_SECS).contains(&age) {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM runtime_owner_evidence WHERE instance_token=? AND runtime_generation=?").bind(token).bind(current.0).fetch_one(&mut *tx).await?;
+        if count != current.1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
         sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current) SELECT instance_token,runtime_generation,?,'reaped',pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,?, ?, 'closed_joined',0,'complete_zero_escaped',?,1 FROM runtime_owner_evidence WHERE instance_token=? AND evidence_revision=?")
             .bind(current.1 + 1).bind(now).bind(barrier_epoch).bind(child_snapshot).bind(token).bind(current.1).execute(&mut *tx).await?;
         let stopped = sqlx::query("UPDATE runtime_instances SET state='stopped',heartbeat_at=? WHERE instance_token=? AND state='stopping'").bind(now).bind(token).execute(&mut *tx).await?;
