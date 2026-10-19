@@ -183,6 +183,29 @@ async fn leased_worker_preserves_unknown_after_accepted_acp_crash() {
     assert_eq!(recovery_leases, 1);
     let plan = plan_recovery(outcome.repository.as_ref()).await.unwrap();
     assert!(plan.unfinished.contains(&task.task_id));
+    let config_path =
+        std::env::temp_dir().join(format!("guigu-t092-startup-{}.toml", uuid::Uuid::now_v7()));
+    let health_port = 19300 + (u16::from(uuid::Uuid::now_v7().as_bytes()[0]) % 100);
+    std::fs::write(
+        &config_path,
+        format!(
+            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nhealth_bind = \"127.0.0.1:{}\"\n\n[agents.worker]\ntransport = \"acp\"\ncommand = \"definitely-not-started\"\nworkspace = \"/tmp\"\nenabled = true\n",
+            outcome.path.to_string_lossy(),
+            std::env::temp_dir().to_string_lossy(),
+            health_port
+        ),
+    )
+    .expect("write disposable startup config");
+    assert!(matches!(
+        guigu_agent_bridge::app::AppRuntime::start(&config_path).await,
+        Err(guigu_agent_bridge::app::AppError::Runtime)
+    ));
+    assert!(
+        tokio::net::TcpListener::bind(format!("127.0.0.1:{health_port}"))
+            .await
+            .is_ok()
+    );
+    let _ = std::fs::remove_file(config_path);
     outcome.cleanup().await;
     let _ = std::fs::remove_file(marker);
 }
