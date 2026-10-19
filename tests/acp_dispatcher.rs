@@ -150,23 +150,15 @@ async fn leased_worker_preserves_unknown_after_accepted_acp_crash() {
         .await;
 
     let events = outcome.task_events(task.task_id);
-    assert!(
-        !events
-            .iter()
-            .any(|event| event.status == TaskStatus::Failed)
-    );
-    assert_eq!(continuations.len(), 1);
-    assert_eq!(
-        continuations[0].state,
-        guigu_agent_bridge::runtime::ContinuationState::RecoveryNeeded
-    );
+    let status_snapshot: Vec<_> = events.iter().map(|event| event.status).collect();
+    let failed_snapshot = status_snapshot.contains(&TaskStatus::Failed);
+    let continuation_state = continuations.first().map(|continuation| continuation.state);
     let admission_state: String =
         sqlx::query_scalar("SELECT state FROM task_admissions WHERE task_id=?")
             .bind(task.task_id.to_string())
             .fetch_one(&outcome.pool)
             .await
             .expect("admission remains durable");
-    assert_eq!(admission_state, "running");
     let delivery_id = dispatched_delivery(&events[1]);
     let disposition: String =
         sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=?")
@@ -174,15 +166,20 @@ async fn leased_worker_preserves_unknown_after_accepted_acp_crash() {
             .fetch_one(&outcome.pool)
             .await
             .expect("accepted delivery has a disposition");
-    assert_eq!(disposition, "outcome_unknown");
     let recovery_leases: i64 =
         sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE state='recovery_needed'")
             .fetch_one(&outcome.pool)
             .await
             .expect("recovery lease remains durable");
-    assert_eq!(recovery_leases, 1);
     let plan = plan_recovery(outcome.repository.as_ref()).await.unwrap();
-    assert!(plan.unfinished.contains(&task.task_id));
+    let recovery_snapshot = (
+        status_snapshot.clone(),
+        admission_state.clone(),
+        disposition.clone(),
+        recovery_leases,
+        continuation_state,
+        plan.unfinished.contains(&task.task_id),
+    );
     let config_path =
         std::env::temp_dir().join(format!("guigu-t092-startup-{}.toml", uuid::Uuid::now_v7()));
     let health_port = 19300 + (u16::from(uuid::Uuid::now_v7().as_bytes()[0]) % 100);
@@ -204,6 +201,62 @@ async fn leased_worker_preserves_unknown_after_accepted_acp_crash() {
         tokio::net::TcpListener::bind(format!("127.0.0.1:{health_port}"))
             .await
             .is_ok()
+    );
+    let post_start_admission: String =
+        sqlx::query_scalar("SELECT state FROM task_admissions WHERE task_id=?")
+            .bind(task.task_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .expect("admission remains after blocked startup");
+    let post_start_disposition: String =
+        sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=?")
+            .bind(delivery_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .expect("disposition remains after blocked startup");
+    let post_start_recovery_leases: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE state='recovery_needed'")
+            .fetch_one(&outcome.pool)
+            .await
+            .expect("lease remains after blocked startup");
+    let post_start_continuation = SqliteRuntimeStore::new(outcome.pool.clone())
+        .continuation(task.task_id)
+        .await
+        .unwrap()
+        .map(|continuation| continuation.state);
+    let post_start_plan = plan_recovery(outcome.repository.as_ref()).await.unwrap();
+    assert_eq!(
+        recovery_snapshot,
+        (
+            vec![
+                TaskStatus::Queued,
+                TaskStatus::Dispatched,
+                TaskStatus::Running
+            ],
+            "running".to_owned(),
+            "outcome_unknown".to_owned(),
+            1,
+            Some(guigu_agent_bridge::runtime::ContinuationState::RecoveryNeeded),
+            true,
+        ),
+        "candidate snapshot: failed={failed_snapshot}, snapshot={recovery_snapshot:?}"
+    );
+    assert_eq!(
+        (
+            post_start_admission,
+            post_start_disposition,
+            post_start_recovery_leases,
+            post_start_continuation,
+            post_start_plan.unfinished.contains(&task.task_id)
+        ),
+        (
+            "running".to_owned(),
+            "outcome_unknown".to_owned(),
+            1,
+            Some(guigu_agent_bridge::runtime::ContinuationState::RecoveryNeeded),
+            true
+        ),
+        "post-start snapshot changed durable uncertainty"
     );
     let _ = std::fs::remove_file(config_path);
     outcome.cleanup().await;
