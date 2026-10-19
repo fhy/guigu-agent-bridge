@@ -64,6 +64,14 @@ fn valid_owner_clock(evidence: &RuntimeOwnerEvidence, now: &str) -> bool {
     now <= Utc::now() + chrono::Duration::seconds(OWNER_EVIDENCE_FUTURE_SKEW_SECS)
 }
 
+fn boot_identity_matches(expected: &str, observed: &str) -> bool {
+    !expected.is_empty() && expected == observed
+}
+
+fn boottime_monotonic(previous: i64, observed: i64) -> bool {
+    previous > 0 && observed >= previous
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueReservation {
     pub queue_id: String,
@@ -1326,5 +1334,26 @@ mod reap_pause_tests {
             boottime_ns: 1,
         };
         assert!(!valid_owner_clock(&evidence, "not-a-timestamp"));
+    }
+
+    #[test]
+    fn owner_clock_rejects_future_skew_and_boot_mismatch() {
+        let evidence = RuntimeOwnerEvidence {
+            pid: 1,
+            proc_starttime: 1,
+            boot_id: "boot".into(),
+            boottime_ns: 1,
+        };
+        assert!(!valid_owner_clock(
+            &evidence,
+            &(Utc::now() + chrono::Duration::seconds(30)).to_rfc3339()
+        ));
+        assert!(!boot_identity_matches("boot-a", "boot-b"));
+    }
+
+    #[test]
+    fn owner_clock_rejects_monotonic_rollback() {
+        assert!(!boottime_monotonic(20, 19));
+        assert!(boottime_monotonic(20, 20));
     }
 }
