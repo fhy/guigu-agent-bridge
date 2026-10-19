@@ -5,6 +5,8 @@ use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 use thiserror::Error;
 
+const CONTINUATION_RUNTIME_GENERATION: &str = "generation.v1:strict";
+
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum PreAcceptanceError {
     #[error("pre-acceptance recovery rejected: invalid arguments")]
@@ -456,11 +458,13 @@ async fn validate(
             .try_get("fence")
             .map_err(|_| PreAcceptanceError::Database)?;
         let bound: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM task_continuations WHERE task_id=? AND resource_key=? AND lease_fence=? AND state='recovery_needed'",
+            "SELECT count(*) FROM task_continuations WHERE task_id=? AND resource_key=? AND delivery_id=? AND lease_fence=? AND runtime_generation=? AND revision>=1 AND state='recovery_needed'",
         )
         .bind(&t.task_id)
         .bind(resource)
+        .bind(&t.delivery_id)
         .bind(fence)
+        .bind(CONTINUATION_RUNTIME_GENERATION)
         .fetch_one(&mut *c)
         .await
         .map_err(|_| PreAcceptanceError::Database)?;
@@ -641,6 +645,17 @@ async fn close_one_inner(
     let expires_at: String = l
         .try_get("expires_at")
         .map_err(|_| PreAcceptanceError::Database)?;
+    let continuation_revision: Option<i64> = sqlx::query_scalar(
+        "SELECT revision FROM task_continuations WHERE task_id=? AND resource_key=? AND delivery_id=? AND lease_fence=? AND runtime_generation=? AND state='recovery_needed'",
+    )
+    .bind(&t.task_id)
+    .bind(&resource)
+    .bind(&t.delivery_id)
+    .bind(fence)
+    .bind(CONTINUATION_RUNTIME_GENERATION)
+    .fetch_optional(&mut *c)
+    .await
+    .map_err(|_| PreAcceptanceError::Database)?;
     let task_version: i64 = sqlx::query_scalar("SELECT version FROM tasks WHERE task_id=?")
         .bind(&t.task_id)
         .fetch_one(&mut *c)
@@ -695,6 +710,7 @@ async fn close_one_inner(
             owner: &token,
             fence,
             expires_at: &expires_at,
+            continuation_revision,
         },
     )
     .await
