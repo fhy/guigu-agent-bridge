@@ -1121,6 +1121,9 @@ impl ReliabilityStore {
         barrier_epoch: i64,
         child_snapshot: &str,
     ) -> Result<bool, ReliabilityError> {
+        if child_snapshot.trim().is_empty() || child_snapshot.trim() == "[]" {
+            return Ok(false);
+        }
         let mut tx = self.pool.begin().await?;
         let result = sqlx::query("UPDATE runtime_owner_evidence SET is_current=0 WHERE instance_token=? AND is_current=1 AND state IN ('live','scan_pending') AND barrier_state='closed_joined' AND in_flight_spawns=0 AND barrier_epoch=?")
             .bind(token).bind(barrier_epoch).execute(&mut *tx).await?;
