@@ -56,7 +56,11 @@ fn valid_owner_clock(evidence: &RuntimeOwnerEvidence, now: &str) -> bool {
         return false;
     };
     let now = now.with_timezone(&Utc);
-    let _ = (OWNER_EVIDENCE_MIN_AGE_SECS, OWNER_EVIDENCE_MAX_ALLOWED_SECS);
+    let _ = (
+        OWNER_EVIDENCE_MAX_AGE_SECS,
+        OWNER_EVIDENCE_MIN_AGE_SECS,
+        OWNER_EVIDENCE_MAX_ALLOWED_SECS,
+    );
     now <= Utc::now() + chrono::Duration::seconds(OWNER_EVIDENCE_FUTURE_SKEW_SECS)
 }
 
