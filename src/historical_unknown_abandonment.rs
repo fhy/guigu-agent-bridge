@@ -131,7 +131,16 @@ pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> 
     if exists != 1 {
         return Err(AbandonmentError::Schema);
     }
-    let eligible = "SELECT t.version,a.revision,a.state,d.state,d.reason_code,v.attempt,l.state,l.owner_token,l.fence,c.revision,c.state,c.runtime_generation FROM tasks t JOIN task_admissions a ON a.task_id=t.task_id JOIN deliveries v ON v.task_id=t.task_id AND v.delivery_id=? JOIN delivery_dispositions d ON d.delivery_id=v.delivery_id JOIN execution_leases l ON l.task_id=t.task_id AND l.resource_key=? JOIN task_continuations c ON c.task_id=t.task_id WHERE t.task_id=? AND v.attempt=d.attempt AND t.version=? AND c.revision=? AND c.runtime_generation=? AND l.owner_token=? AND l.fence=? AND l.state='recovery_needed' AND c.state='recovery_needed' AND d.state='outcome_unknown'";
+    let active: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM runtime_instances WHERE state IN ('active','stopping')",
+    )
+    .fetch_one(&mut c)
+    .await
+    .map_err(|_| AbandonmentError::Database)?;
+    if active != 0 {
+        return Err(AbandonmentError::Conflict);
+    }
+    let eligible = "SELECT t.version,a.revision,a.state,d.state,d.reason_code,v.attempt,l.state,l.owner_token,l.fence,c.revision,c.state,c.runtime_generation FROM tasks t JOIN task_admissions a ON a.task_id=t.task_id JOIN runtime_instances r ON r.instance_token=a.runtime_instance JOIN deliveries v ON v.task_id=t.task_id AND v.delivery_id=? JOIN delivery_dispositions d ON d.delivery_id=v.delivery_id JOIN execution_leases l ON l.task_id=t.task_id AND l.resource_key=? JOIN task_continuations c ON c.task_id=t.task_id WHERE t.task_id=? AND r.state='stopped' AND v.attempt=d.attempt AND t.version=? AND c.revision=? AND c.runtime_generation=? AND l.owner_token=? AND l.fence=? AND l.state='recovery_needed' AND c.state='recovery_needed' AND d.state='outcome_unknown'";
     let row = sqlx::query(eligible)
         .bind(&req.delivery_id)
         .bind(&req.resource_key)
@@ -153,7 +162,7 @@ pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> 
         Mode::Verify => Ok("verify read-only"),
         Mode::Apply => {
             if guard.as_ref().and_then(|g| g.revalidate().ok()).is_none() {
-                return Err(AbandonmentError::CommittedVerification);
+                return Err(AbandonmentError::Conflict);
             }
             let mut tx = c
                 .begin_with("BEGIN IMMEDIATE")
@@ -162,7 +171,7 @@ pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> 
             let audit=sqlx::query("INSERT INTO historical_unknown_abandonments(decision_id,task_id,delivery_id,resource_key,owner_token,fence,before_task_version,before_admission_revision,before_continuation_revision,before_generation,post_continuation_revision,disposition,reason,policy_ref,authorization_ref,not_replayed,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,?, 'manual_abandonment',?,?,?,1,datetime('now') WHERE NOT EXISTS (SELECT 1 FROM historical_unknown_abandonments WHERE task_id=? AND delivery_id=? AND resource_key=?)")
    .bind(&req.decision_id).bind(&req.task_id).bind(&req.delivery_id).bind(&req.resource_key).bind(&req.owner_token).bind(req.fence).bind(before_task).bind(before_adm).bind(before_cont).bind(&req.generation).bind(before_cont+1).bind(&req.reason).bind(&req.policy_ref).bind(&req.authorization_ref).bind(&req.task_id).bind(&req.delivery_id).bind(&req.resource_key).execute(&mut *tx).await.map_err(|_|AbandonmentError::Database)?;
             if audit.rows_affected() != 1 {
-                return Err(AbandonmentError::Conflict);
+                return Err(AbandonmentError::CommittedVerification);
             }
             let l=sqlx::query("UPDATE execution_leases SET state='released',heartbeat_at=datetime('now') WHERE task_id=? AND resource_key=? AND owner_token=? AND fence=? AND state='recovery_needed'").bind(&req.task_id).bind(&req.resource_key).bind(&req.owner_token).bind(req.fence).execute(&mut *tx).await.map_err(|_|AbandonmentError::Database)?;
             let k=sqlx::query("UPDATE task_continuations SET state='terminal',revision=revision+1,heartbeat_at=datetime('now') WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='recovery_needed'").bind(&req.task_id).bind(&req.resource_key).bind(req.fence).bind(req.revision).bind(&req.generation).execute(&mut *tx).await.map_err(|_|AbandonmentError::Database)?;
