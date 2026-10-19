@@ -35,7 +35,7 @@ use crate::acp::schema::{
     self, AuthenticateParams, AuthenticateResult, InitializeParams, InitializeResult,
     NewSessionParams, PromptResult, ResumeSessionParams, SessionResult, StopReason,
 };
-use crate::acp::transport::{AcpTransport, TransportLimits};
+use crate::acp::transport::{AcpSpawnGate, AcpTransport, TransportLimits};
 use crate::acp::{MAX_SESSION_ID_BYTES, bounded};
 use crate::models::EndpointAddress;
 
@@ -102,6 +102,20 @@ impl AcpClient {
         cwd: Option<&Path>,
         limits: AcpLimits,
     ) -> Result<Self, AcpError> {
+        Self::connect_with_gate(address, agent_id, cwd, limits, None).await
+    }
+
+    pub(crate) async fn connect_with_gate(
+        address: &EndpointAddress,
+        agent_id: &str,
+        cwd: Option<&Path>,
+        limits: AcpLimits,
+        gate: Option<&AcpSpawnGate>,
+    ) -> Result<Self, AcpError> {
+        let _reservation = gate.and_then(AcpSpawnGate::reserve);
+        if gate.is_some() && _reservation.is_none() {
+            return Err(AcpError::TransportClosed);
+        }
         let transport = Arc::new(AcpTransport::spawn(address, cwd, limits.transport)?);
         let params = encode(schema::METHOD_INITIALIZE, &InitializeParams::new())?;
         let completed = transport

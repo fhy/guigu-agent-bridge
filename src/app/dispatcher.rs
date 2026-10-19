@@ -13,13 +13,27 @@ use crate::{
 /// Routes the single ACP transport slot to endpoint-specific leased dispatchers.
 pub struct AcpDispatcherRouter {
     endpoints: HashMap<EndpointId, Arc<LeasedAcpDispatcher>>,
+    spawn_gate: crate::acp::AcpSpawnGate,
 }
 
 impl crate::matrix::sealed::ReapIssuer for AcpDispatcherRouter {}
 
 impl AcpDispatcherRouter {
     pub fn new(endpoints: HashMap<EndpointId, Arc<LeasedAcpDispatcher>>) -> Self {
-        Self { endpoints }
+        Self {
+            endpoints,
+            spawn_gate: crate::acp::AcpSpawnGate::new(),
+        }
+    }
+
+    pub(crate) fn with_gate(
+        endpoints: HashMap<EndpointId, Arc<LeasedAcpDispatcher>>,
+        spawn_gate: crate::acp::AcpSpawnGate,
+    ) -> Self {
+        Self {
+            endpoints,
+            spawn_gate,
+        }
     }
 
     fn endpoint(
@@ -34,6 +48,8 @@ impl AcpDispatcherRouter {
     }
 
     pub async fn shutdown(&self) {
+        self.spawn_gate.close_and_join().await;
+        debug_assert!(self.spawn_gate.is_closed_joined());
         for dispatcher in self.endpoints.values() {
             dispatcher.shutdown().await;
         }

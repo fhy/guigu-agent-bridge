@@ -631,6 +631,7 @@ impl AppRuntime {
         };
 
         let mut endpoint_dispatchers = HashMap::new();
+        let spawn_gate = crate::acp::AcpSpawnGate::new();
         for (agent_id, declared) in &config.agents {
             if !declared.enabled || declared.transport != TransportType::Acp {
                 continue;
@@ -658,6 +659,7 @@ impl AppRuntime {
                 .legacy_results(config.runtime.legacy_acp_results)
                 .durable_output(output_spool.clone(), runtime_instance.clone())
                 .allow_nonterminal_end_turn(config.runtime.allow_nonterminal_end_turn)
+                .spawn_gate(spawn_gate.clone())
                 .build()
                 .map_err(AppError::Assembly)?;
             let workspace =
@@ -678,7 +680,10 @@ impl AppRuntime {
                 )),
             );
         }
-        let acp = Arc::new(AcpDispatcherRouter::new(endpoint_dispatchers));
+        let acp = Arc::new(AcpDispatcherRouter::with_gate(
+            endpoint_dispatchers,
+            spawn_gate,
+        ));
         let mut dispatchers = DispatcherRegistry::new().with(TransportType::Acp, acp.clone());
         if config.transports.a2a.enabled {
             let a2a = crate::a2a::assembly::dispatchers(&config, pool.clone())

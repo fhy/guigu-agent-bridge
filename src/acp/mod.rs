@@ -83,6 +83,7 @@ pub use jsonrpc::{JsonRpcErrorObject, JsonRpcMessage, ProtocolError, RequestId};
 pub use result::{TurnResult, WireTurnResult};
 pub use schema::PROTOCOL_VERSION;
 pub use session::{MAX_SESSION_ID_BYTES, SessionState, SqliteSessionStore, StoredSession};
+pub(crate) use transport::AcpSpawnGate;
 pub use transport::{AcpTransport, AcpTurnHandle, CompletedRequest, TransportLimits, TurnUpdate};
 
 /// How much of any single self-authored detail string is retained.

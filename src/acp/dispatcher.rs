@@ -43,6 +43,7 @@ use std::sync::{Arc, Mutex};
 use crate::acp::client::{AcpClient, AcpLimits};
 use crate::acp::error::{AcpError, Phase};
 use crate::acp::session::{SessionState, SqliteSessionStore, StoredSession};
+use crate::acp::transport::AcpSpawnGate;
 use crate::acp::{bounded, client};
 use crate::bus::RegisteredEndpoint;
 use crate::bus::{
@@ -66,6 +67,7 @@ pub struct AcpDispatcherBuilder {
     durable_output: Option<(crate::acp::output::DurableOutputSpool, String)>,
     legacy_results: bool,
     allow_nonterminal_end_turn: bool,
+    spawn_gate: Option<AcpSpawnGate>,
 }
 
 impl Default for AcpDispatcherBuilder {
@@ -88,6 +90,7 @@ impl AcpDispatcherBuilder {
             durable_output: None,
             legacy_results: false,
             allow_nonterminal_end_turn: false,
+            spawn_gate: None,
         }
     }
 
@@ -150,6 +153,11 @@ impl AcpDispatcherBuilder {
         self
     }
 
+    pub(crate) fn spawn_gate(mut self, gate: AcpSpawnGate) -> Self {
+        self.spawn_gate = Some(gate);
+        self
+    }
+
     /// The configured dispatcher.
     ///
     /// # Errors
@@ -167,6 +175,7 @@ impl AcpDispatcherBuilder {
             durable_output,
             legacy_results,
             allow_nonterminal_end_turn,
+            spawn_gate,
         } = self;
         let cwd = cwd.ok_or("a working directory is required")?;
         let cwd = cwd
@@ -189,6 +198,7 @@ impl AcpDispatcherBuilder {
                 client: Mutex::new(None),
                 legacy_results,
                 allow_nonterminal_end_turn,
+                spawn_gate,
             }),
         })
     }
@@ -230,6 +240,7 @@ struct DispatcherInner {
     client: Mutex<Option<Arc<AcpClient>>>,
     legacy_results: bool,
     allow_nonterminal_end_turn: bool,
+    spawn_gate: Option<AcpSpawnGate>,
 }
 
 pub struct AcpStructuredTurn {
@@ -742,11 +753,12 @@ impl AcpDispatcher {
             phase: Phase::Spawn,
         })?;
         let client = Arc::new(
-            AcpClient::connect(
+            AcpClient::connect_with_gate(
                 address,
                 target.agent_id(),
                 Some(std::path::Path::new(&self.inner.cwd)),
                 self.inner.limits,
+                self.inner.spawn_gate.as_ref(),
             )
             .await?,
         );

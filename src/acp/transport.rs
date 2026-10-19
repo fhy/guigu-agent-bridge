@@ -58,6 +58,7 @@ use std::time::Duration;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command};
+use tokio::sync::Notify;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 
@@ -85,6 +86,86 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 
 /// The default bound on a graceful shutdown.
 pub const DEFAULT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
+
+/// Runtime-owned gate for ACP child creation. Standalone transport callers may
+/// continue using `spawn`; production assembly supplies this gate through the
+/// dispatcher adapter.
+#[derive(Clone, Debug)]
+pub(crate) struct AcpSpawnGate {
+    state: Arc<(Mutex<SpawnState>, Notify)>,
+}
+
+#[derive(Debug)]
+struct SpawnState {
+    phase: SpawnPhase,
+    in_flight: usize,
+    epoch: u64,
+}
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SpawnPhase {
+    Open,
+    Closing,
+    ClosedJoined,
+}
+
+pub(crate) struct SpawnReservation {
+    gate: AcpSpawnGate,
+}
+
+impl AcpSpawnGate {
+    pub(crate) fn new() -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(SpawnState {
+                    phase: SpawnPhase::Open,
+                    in_flight: 0,
+                    epoch: 0,
+                }),
+                Notify::new(),
+            )),
+        }
+    }
+    pub(crate) fn reserve(&self) -> Option<SpawnReservation> {
+        let mut state = self.state.0.lock().ok()?;
+        if state.phase != SpawnPhase::Open {
+            return None;
+        }
+        state.in_flight += 1;
+        Some(SpawnReservation { gate: self.clone() })
+    }
+    pub(crate) async fn close_and_join(&self) {
+        {
+            let mut state = self.state.0.lock().expect("spawn gate poisoned");
+            state.phase = SpawnPhase::Closing;
+        }
+        loop {
+            let notified = self.state.1.notified();
+            if self.state.0.lock().expect("spawn gate poisoned").in_flight == 0 {
+                break;
+            }
+            notified.await;
+        }
+        let mut state = self.state.0.lock().expect("spawn gate poisoned");
+        state.phase = SpawnPhase::ClosedJoined;
+        state.epoch = state.epoch.saturating_add(1);
+    }
+    pub(crate) fn is_closed_joined(&self) -> bool {
+        self.state
+            .0
+            .lock()
+            .map(|s| s.phase == SpawnPhase::ClosedJoined)
+            .unwrap_or(false)
+    }
+}
+
+impl Drop for SpawnReservation {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.gate.state.0.lock() {
+            state.in_flight = state.in_flight.saturating_sub(1);
+        }
+        self.gate.state.1.notify_waiters();
+    }
+}
 
 /// Bounds the transport enforces while it runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
