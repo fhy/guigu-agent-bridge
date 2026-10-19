@@ -156,6 +156,9 @@ impl AcpSpawnGate {
             .map(|s| s.phase == SpawnPhase::ClosedJoined)
             .unwrap_or(false)
     }
+    pub(crate) fn epoch(&self) -> i64 {
+        self.state.0.lock().map(|s| s.epoch as i64).unwrap_or(-1)
+    }
 }
 
 impl Drop for SpawnReservation {

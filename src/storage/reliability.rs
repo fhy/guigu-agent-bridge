@@ -1091,6 +1091,55 @@ impl ReliabilityStore {
         Ok(result.rows_affected() == 1)
     }
 
+    pub async fn publish_owner_heartbeat(
+        &self,
+        token: &str,
+        fingerprint: &str,
+        now: &str,
+        evidence: &RuntimeOwnerEvidence,
+    ) -> Result<bool, ReliabilityError> {
+        let mut tx = self.pool.begin().await?;
+        let current: Option<(i64, i64)> = sqlx::query_as("SELECT runtime_generation,evidence_revision FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1 AND state IN ('live','observing')")
+            .bind(token).fetch_optional(&mut *tx).await?;
+        let Some((generation, revision)) = current else {
+            tx.rollback().await?;
+            return Ok(false);
+        };
+        sqlx::query("UPDATE runtime_owner_evidence SET is_current=0 WHERE instance_token=? AND runtime_generation=? AND is_current=1")
+            .bind(token).bind(generation).execute(&mut *tx).await?;
+        sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current) VALUES(?,?,?,'live',?,?,?,?,?,?,0,'open',0,'complete_zero_escaped','{}',1)")
+            .bind(token).bind(generation).bind(revision + 1).bind(evidence.pid).bind(evidence.proc_starttime).bind(fingerprint)
+            .bind(&evidence.boot_id).bind(evidence.boottime_ns).bind(now).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    pub async fn publish_runtime_reaped(
+        &self,
+        token: &str,
+        now: &str,
+        barrier_epoch: i64,
+        child_snapshot: &str,
+    ) -> Result<bool, ReliabilityError> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query("UPDATE runtime_owner_evidence SET is_current=0 WHERE instance_token=? AND is_current=1 AND state IN ('live','scan_pending') AND barrier_state='closed_joined' AND in_flight_spawns=0 AND barrier_epoch=?")
+            .bind(token).bind(barrier_epoch).execute(&mut *tx).await?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        let current: (i64, i64) = sqlx::query_as("SELECT runtime_generation,evidence_revision FROM runtime_owner_evidence WHERE instance_token=? ORDER BY evidence_revision DESC LIMIT 1").bind(token).fetch_one(&mut *tx).await?;
+        sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current) SELECT instance_token,runtime_generation,?,'reaped',pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,?, ?, 'closed_joined',0,'complete_zero_escaped',?,1 FROM runtime_owner_evidence WHERE instance_token=? AND evidence_revision=?")
+            .bind(current.1 + 1).bind(now).bind(barrier_epoch).bind(child_snapshot).bind(token).bind(current.1).execute(&mut *tx).await?;
+        let stopped = sqlx::query("UPDATE runtime_instances SET state='stopped',heartbeat_at=? WHERE instance_token=? AND state='stopping'").bind(now).bind(token).execute(&mut *tx).await?;
+        if stopped.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        tx.commit().await?;
+        Ok(true)
+    }
+
     pub async fn stopping_runtime(&self, token: &str, now: &str) -> Result<bool, ReliabilityError> {
         let result=sqlx::query("UPDATE runtime_instances SET state='stopping',heartbeat_at=? WHERE instance_token=? AND state='active'")
             .bind(now).bind(token).execute(&self.pool).await?;

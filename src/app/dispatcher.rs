@@ -54,6 +54,11 @@ impl AcpDispatcherRouter {
             dispatcher.shutdown().await;
         }
     }
+
+    pub(crate) async fn shutdown_with_epoch(&self) -> i64 {
+        self.shutdown().await;
+        self.spawn_gate.epoch()
+    }
 }
 
 impl ReapControl for AcpDispatcherRouter {

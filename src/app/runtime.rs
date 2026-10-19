@@ -1108,8 +1108,9 @@ impl AppRuntime {
                 }
             }
         }
+        let mut acp_epoch = None;
         if let Some(acp) = self.acp.take() {
-            acp.shutdown().await;
+            acp_epoch = Some(acp.shutdown_with_epoch().await);
         }
         if let Some(cleanup) = self.gateway_cleanup.take()
             && cleanup.shutdown().await.is_err()
@@ -1135,7 +1136,14 @@ impl AppRuntime {
         self.health_state.set_owner(OwnerState::Stopped);
         if let Some(token) = self.runtime_instance.take() {
             let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-            match self.reliability.stop_runtime(&token, &now).await {
+            let result = if let Some(epoch) = acp_epoch {
+                self.reliability
+                    .publish_runtime_reaped(&token, &now, epoch, "[]")
+                    .await
+            } else {
+                self.reliability.stop_runtime(&token, &now).await
+            };
+            match result {
                 Ok(true) => {}
                 Ok(false) if shutdown_error.is_none() => shutdown_error = Some(AppError::Runtime),
                 Err(_) if shutdown_error.is_none() => shutdown_error = Some(AppError::Runtime),
