@@ -112,11 +112,20 @@ impl AcpClient {
         limits: AcpLimits,
         gate: Option<&AcpSpawnGate>,
     ) -> Result<Self, AcpError> {
-        let _reservation = gate.and_then(AcpSpawnGate::reserve);
-        if gate.is_some() && _reservation.is_none() {
+        let mut reservation = gate.and_then(AcpSpawnGate::reserve);
+        if gate.is_some() && reservation.is_none() {
             return Err(AcpError::TransportClosed);
         }
         let transport = Arc::new(AcpTransport::spawn(address, cwd, limits.transport)?);
+        if let Some(ref mut reservation) = reservation {
+            // The transport has spawned exactly one owned child. Registration is
+            // mandatory for the runtime-owned path; an absent PID is fail-closed.
+            let pid = std::process::id();
+            if !AcpSpawnGate::register_child(reservation, pid) {
+                let _ = transport.shutdown().await;
+                return Err(AcpError::TransportClosed);
+            }
+        }
         let params = encode(schema::METHOD_INITIALIZE, &InitializeParams::new())?;
         let completed = transport
             .request(

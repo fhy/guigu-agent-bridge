@@ -110,6 +110,7 @@ enum SpawnPhase {
 
 pub(crate) struct SpawnReservation {
     gate: AcpSpawnGate,
+    registered: bool,
 }
 
 impl AcpSpawnGate {
@@ -131,7 +132,17 @@ impl AcpSpawnGate {
             return None;
         }
         state.in_flight += 1;
-        Some(SpawnReservation { gate: self.clone() })
+        Some(SpawnReservation {
+            gate: self.clone(),
+            registered: false,
+        })
+    }
+    pub(crate) fn register_child(reservation: &mut SpawnReservation, pid: u32) -> bool {
+        if pid == 0 {
+            return false;
+        }
+        reservation.registered = true;
+        true
     }
     pub(crate) async fn close_and_join(&self) {
         {
@@ -163,6 +174,9 @@ impl AcpSpawnGate {
 
 impl Drop for SpawnReservation {
     fn drop(&mut self) {
+        if !self.registered {
+            self.gate.state.1.notify_waiters();
+        }
         if let Ok(mut state) = self.gate.state.0.lock() {
             state.in_flight = state.in_flight.saturating_sub(1);
         }
