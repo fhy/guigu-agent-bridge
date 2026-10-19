@@ -200,6 +200,16 @@ impl AcpSpawnGate {
             return Err("overflow");
         }
         let mut out = Vec::with_capacity(state.children.len());
+        let expected_members: std::collections::HashSet<String> = state
+            .children
+            .iter()
+            .filter_map(|identity| {
+                identity
+                    .strip_prefix("pid=")
+                    .and_then(|s| s.split(';').next())
+                    .map(str::to_owned)
+            })
+            .collect();
         for identity in &state.children {
             let pid = identity
                 .strip_prefix("pid=")
@@ -228,7 +238,10 @@ impl AcpSpawnGate {
             if member_ids.len() > 256 {
                 return Err("overflow");
             }
-            if !member_ids.iter().any(|member| *member == pid.to_string()) {
+            if !member_ids
+                .iter()
+                .all(|member| expected_members.contains(*member))
+            {
                 return Err("raced_changed");
             }
             let expected_start = identity
