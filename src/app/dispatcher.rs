@@ -55,9 +55,9 @@ impl AcpDispatcherRouter {
         }
     }
 
-    pub(crate) async fn shutdown_with_epoch(&self) -> i64 {
+    pub(crate) async fn shutdown_with_epoch(&self) -> (i64, String) {
         self.shutdown().await;
-        self.spawn_gate.epoch()
+        (self.spawn_gate.epoch(), self.spawn_gate.child_snapshot())
     }
 }
 

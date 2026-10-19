@@ -1108,9 +1108,9 @@ impl AppRuntime {
                 }
             }
         }
-        let mut acp_epoch = None;
+        let mut acp_shutdown = None;
         if let Some(acp) = self.acp.take() {
-            acp_epoch = Some(acp.shutdown_with_epoch().await);
+            acp_shutdown = Some(acp.shutdown_with_epoch().await);
         }
         if let Some(cleanup) = self.gateway_cleanup.take()
             && cleanup.shutdown().await.is_err()
@@ -1136,9 +1136,9 @@ impl AppRuntime {
         self.health_state.set_owner(OwnerState::Stopped);
         if let Some(token) = self.runtime_instance.take() {
             let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-            let result = if let Some(epoch) = acp_epoch {
+            let result = if let Some((epoch, snapshot)) = acp_shutdown {
                 self.reliability
-                    .publish_runtime_reaped(&token, &now, epoch, "[]")
+                    .publish_runtime_reaped(&token, &now, epoch, &snapshot)
                     .await
             } else {
                 self.reliability.stop_runtime(&token, &now).await

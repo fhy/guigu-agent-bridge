@@ -100,6 +100,7 @@ struct SpawnState {
     phase: SpawnPhase,
     in_flight: usize,
     epoch: u64,
+    children: Vec<String>,
 }
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SpawnPhase {
@@ -122,6 +123,7 @@ impl AcpSpawnGate {
                     phase: SpawnPhase::Open,
                     in_flight: 0,
                     epoch: 0,
+                    children: Vec::new(),
                 }),
                 Notify::new(),
             )),
@@ -158,6 +160,11 @@ impl AcpSpawnGate {
         reservation.identity = Some(format!(
             "pid={pid};starttime={starttime};exe={exe};cgroup={cgroup}"
         ));
+        if let Ok(mut state) = reservation.gate.state.0.lock() {
+            state
+                .children
+                .push(reservation.identity.clone().unwrap_or_default());
+        }
         reservation.registered = true;
         true
     }
@@ -186,6 +193,22 @@ impl AcpSpawnGate {
     }
     pub(crate) fn epoch(&self) -> i64 {
         self.state.0.lock().map(|s| s.epoch as i64).unwrap_or(-1)
+    }
+    pub(crate) fn child_snapshot(&self) -> String {
+        self.state
+            .0
+            .lock()
+            .map(|s| {
+                format!(
+                    "[{}]",
+                    s.children
+                        .iter()
+                        .map(|v| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")))
+                        .collect::<Vec<_>>()
+                        .join(",")
+                )
+            })
+            .unwrap_or_default()
     }
 }
 
