@@ -1305,4 +1305,26 @@ mod reap_pause_tests {
             "paused"
         );
     }
+
+    #[test]
+    fn owner_clock_rejects_missing_boot_or_monotonic_sample() {
+        let evidence = RuntimeOwnerEvidence {
+            pid: 1,
+            proc_starttime: 1,
+            boot_id: String::new(),
+            boottime_ns: 0,
+        };
+        assert!(!valid_owner_clock(&evidence, "2026-10-19T00:00:00Z"));
+    }
+
+    #[test]
+    fn owner_clock_rejects_malformed_timestamp() {
+        let evidence = RuntimeOwnerEvidence {
+            pid: 1,
+            proc_starttime: 1,
+            boot_id: "boot".into(),
+            boottime_ns: 1,
+        };
+        assert!(!valid_owner_clock(&evidence, "not-a-timestamp"));
+    }
 }
