@@ -171,13 +171,13 @@ pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> 
             let audit=sqlx::query("INSERT INTO historical_unknown_abandonments(decision_id,task_id,delivery_id,resource_key,owner_token,fence,before_task_version,before_admission_revision,before_continuation_revision,before_generation,post_continuation_revision,disposition,reason,policy_ref,authorization_ref,not_replayed,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,?, 'manual_abandonment',?,?,?,1,datetime('now') WHERE NOT EXISTS (SELECT 1 FROM historical_unknown_abandonments WHERE task_id=? AND delivery_id=? AND resource_key=?)")
    .bind(&req.decision_id).bind(&req.task_id).bind(&req.delivery_id).bind(&req.resource_key).bind(&req.owner_token).bind(req.fence).bind(before_task).bind(before_adm).bind(before_cont).bind(&req.generation).bind(before_cont+1).bind(&req.reason).bind(&req.policy_ref).bind(&req.authorization_ref).bind(&req.task_id).bind(&req.delivery_id).bind(&req.resource_key).execute(&mut *tx).await.map_err(|_|AbandonmentError::Database)?;
             if audit.rows_affected() != 1 {
-                return Err(AbandonmentError::CommittedVerification);
+                return Err(AbandonmentError::Conflict);
             }
             let l=sqlx::query("UPDATE execution_leases SET state='released',heartbeat_at=datetime('now') WHERE task_id=? AND resource_key=? AND owner_token=? AND fence=? AND state='recovery_needed'").bind(&req.task_id).bind(&req.resource_key).bind(&req.owner_token).bind(req.fence).execute(&mut *tx).await.map_err(|_|AbandonmentError::Database)?;
             let k=sqlx::query("UPDATE task_continuations SET state='terminal',revision=revision+1,heartbeat_at=datetime('now') WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='recovery_needed'").bind(&req.task_id).bind(&req.resource_key).bind(req.fence).bind(req.revision).bind(&req.generation).execute(&mut *tx).await.map_err(|_|AbandonmentError::Database)?;
             let d=sqlx::query("UPDATE delivery_dispositions SET state='terminal',reason_code='manual_abandonment' WHERE task_id=? AND delivery_id=? AND attempt=? AND state='outcome_unknown'").bind(&req.task_id).bind(&req.delivery_id).bind(row.get::<i64,_>(5)).execute(&mut *tx).await.map_err(|_|AbandonmentError::Database)?;
             if l.rows_affected() != 1 || k.rows_affected() != 1 || d.rows_affected() != 1 {
-                return Err(AbandonmentError::Conflict);
+                return Err(AbandonmentError::CommittedVerification);
             }
             tx.commit().await.map_err(|_| AbandonmentError::Database)?;
             if guard.as_ref().and_then(|g| g.revalidate().ok()).is_none() {
