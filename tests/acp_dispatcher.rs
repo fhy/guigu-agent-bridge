@@ -181,6 +181,7 @@ async fn leased_worker_preserves_unknown_after_accepted_acp_crash() {
         plan.unfinished.contains(&task.task_id),
     );
     let row_snapshot_before = recovery_snapshot(&outcome.pool, task.task_id).await;
+    println!("candidate pre-start recovery snapshot: {row_snapshot_before:?}");
     let config_path =
         std::env::temp_dir().join(format!("guigu-t092-startup-{}.toml", uuid::Uuid::now_v7()));
     let health_port = 19300 + (u16::from(uuid::Uuid::now_v7().as_bytes()[0]) % 100);
@@ -227,6 +228,7 @@ async fn leased_worker_preserves_unknown_after_accepted_acp_crash() {
         .map(|continuation| continuation.state);
     let post_start_plan = plan_recovery(outcome.repository.as_ref()).await.unwrap();
     let row_snapshot_after = recovery_snapshot(&outcome.pool, task.task_id).await;
+    println!("candidate post-start recovery snapshot: {row_snapshot_after:?}");
     assert_eq!(
         summary_snapshot,
         (
@@ -1017,9 +1019,11 @@ struct RecoverySnapshot {
     events: Vec<(String, i64, String)>,
     admission: (String, i64),
     delivery: (String, i64, bool),
-    disposition: (String, String),
-    lease: (String, i64, String),
-    continuation: (String, i64, i64, String),
+    disposition: (String, String, String, i64),
+    lease: (String, String, i64, String),
+    continuation: (String, String, i64, i64, String),
+    receipts: i64,
+    outbox: i64,
 }
 
 async fn recovery_snapshot(pool: &SqlitePool, task_id: TaskId) -> RecoverySnapshot {
@@ -1052,32 +1056,49 @@ async fn recovery_snapshot(pool: &SqlitePool, task_id: TaskId) -> RecoverySnapsh
     .await
     .map(|row| (row.get(0), row.get(1), row.get(2)))
     .unwrap();
-    let disposition =
-        sqlx::query("SELECT state,reason_code FROM delivery_dispositions WHERE task_id=?")
-            .bind(task_id.to_string())
-            .fetch_one(pool)
-            .await
-            .map(|row| {
-                (
-                    row.get(0),
-                    row.get::<Option<String>, _>(1).unwrap_or_default(),
-                )
-            })
-            .unwrap();
-    let lease =
-        sqlx::query("SELECT resource_key,fence,state FROM execution_leases WHERE task_id=?")
-            .bind(task_id.to_string())
-            .fetch_one(pool)
-            .await
-            .map(|row| (row.get(0), row.get(1), row.get(2)))
-            .unwrap();
-    let continuation = sqlx::query(
-        "SELECT resource_key,lease_fence,revision,state FROM task_continuations WHERE task_id=?",
+    let disposition = sqlx::query(
+        "SELECT delivery_id,state,reason_code,attempt FROM delivery_dispositions WHERE task_id=?",
+    )
+    .bind(task_id.to_string())
+    .fetch_one(pool)
+    .await
+    .map(|row| {
+        (
+            row.get(0),
+            row.get(1),
+            row.get::<Option<String>, _>(2).unwrap_or_default(),
+            row.get(3),
+        )
+    })
+    .unwrap();
+    let lease = sqlx::query(
+        "SELECT resource_key,owner_token,fence,state FROM execution_leases WHERE task_id=?",
     )
     .bind(task_id.to_string())
     .fetch_one(pool)
     .await
     .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+    .unwrap();
+    let continuation = sqlx::query(
+        "SELECT resource_key,delivery_id,lease_fence,revision,state,runtime_generation FROM task_continuations WHERE task_id=?",
+    )
+    .bind(task_id.to_string())
+    .fetch_one(pool)
+    .await
+    .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
+    .unwrap();
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM continuation_response_receipts WHERE task_id=?")
+            .bind(task_id.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let outbox: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM projection_outbox WHERE source_kind='task_event' AND source_id IN (SELECT event_id FROM task_events WHERE task_id=?)",
+    )
+    .bind(task_id.to_string())
+    .fetch_one(pool)
+    .await
     .unwrap();
     RecoverySnapshot {
         task_version,
@@ -1087,6 +1108,8 @@ async fn recovery_snapshot(pool: &SqlitePool, task_id: TaskId) -> RecoverySnapsh
         disposition,
         lease,
         continuation,
+        receipts,
+        outbox,
     }
 }
 
