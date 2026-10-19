@@ -1101,4 +1101,32 @@ mod tests {
         assert!(gate.is_closed_joined());
         assert!(gate.reserve().is_none());
     }
+
+    #[tokio::test]
+    async fn runtime_gate_tracks_real_local_child_and_rescan_fails_closed_after_exit() {
+        let gate = AcpSpawnGate::new();
+        let mut reservation = gate.reserve().expect("reservation");
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 1"])
+            .spawn()
+            .expect("local child");
+        let pid = child.id().expect("pid");
+        assert!(AcpSpawnGate::register_child(&mut reservation, pid));
+        assert!(
+            reservation
+                .identity
+                .as_deref()
+                .unwrap()
+                .contains("starttime=")
+        );
+        assert!(reservation.identity.as_deref().unwrap().contains("cgroup="));
+        drop(reservation);
+        gate.close_and_join().await;
+        assert!(gate.is_closed_joined());
+        assert!(gate.reserve().is_none());
+        let _pre_exit = gate.rescan_children();
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        assert!(gate.rescan_children().is_err());
+    }
 }
