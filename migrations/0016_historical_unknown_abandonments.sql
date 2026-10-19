@@ -1,0 +1,20 @@
+CREATE TABLE historical_unknown_abandonments (
+    decision_id TEXT PRIMARY KEY NOT NULL,
+    task_id TEXT NOT NULL REFERENCES tasks(task_id),
+    delivery_id TEXT NOT NULL REFERENCES deliveries(delivery_id),
+    resource_key TEXT NOT NULL,
+    owner_token TEXT NOT NULL,
+    fence INTEGER NOT NULL,
+    before_task_version INTEGER NOT NULL,
+    before_admission_revision INTEGER NOT NULL,
+    before_continuation_revision INTEGER NOT NULL,
+    before_generation TEXT NOT NULL,
+    post_continuation_revision INTEGER NOT NULL,
+    disposition TEXT NOT NULL CHECK (disposition='manual_abandonment'),
+    reason TEXT NOT NULL,
+    policy_ref TEXT NOT NULL,
+    authorization_ref TEXT NOT NULL,
+    not_replayed INTEGER NOT NULL CHECK (not_replayed=1),
+    created_at TEXT NOT NULL,
+    UNIQUE(task_id, delivery_id, resource_key)
+) STRICT;

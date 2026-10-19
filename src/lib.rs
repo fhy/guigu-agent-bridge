@@ -11,6 +11,7 @@ pub mod bus;
 pub mod config;
 pub mod error;
 pub mod gateway;
+pub(crate) mod historical_unknown_abandonment;
 pub mod isolated_fixture_migration;
 pub mod isolated_state_backup;
 pub mod lease_owner_diagnostics;
@@ -98,6 +99,26 @@ pub fn init_tracing() {
 /// termination signal.
 pub async fn run() -> Result<(), Error> {
     let all_args = std::env::args_os().collect::<Vec<_>>();
+    if all_args.get(1).and_then(|v| v.to_str()) == Some("historical-unknown-abandon") {
+        let req = historical_unknown_abandonment::parse_args(&all_args[1..]).map_err(|_| {
+            Error::Cli(error::CliFailure {
+                command: "historical-unknown-abandon",
+                category: "invalid-arguments",
+                status: 2,
+            })
+        })?;
+        let result = historical_unknown_abandonment::run(req)
+            .await
+            .map_err(|_| {
+                Error::Cli(error::CliFailure {
+                    command: "historical-unknown-abandon",
+                    category: "conflicting",
+                    status: 6,
+                })
+            })?;
+        println!("historical-unknown-abandon result={result}");
+        return Ok(());
+    }
     if all_args.get(1).and_then(|value| value.to_str()) == Some("--version") {
         if all_args.len() != 2 {
             return Err(Error::Cli(error::CliFailure {
