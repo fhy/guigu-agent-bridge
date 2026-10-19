@@ -177,11 +177,11 @@ pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> 
             let k=sqlx::query("UPDATE task_continuations SET state='terminal',revision=revision+1,heartbeat_at=datetime('now') WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='recovery_needed'").bind(&req.task_id).bind(&req.resource_key).bind(req.fence).bind(req.revision).bind(&req.generation).execute(&mut *tx).await.map_err(|_|AbandonmentError::Database)?;
             let d=sqlx::query("UPDATE delivery_dispositions SET state='terminal',reason_code='manual_abandonment' WHERE task_id=? AND delivery_id=? AND attempt=? AND state='outcome_unknown'").bind(&req.task_id).bind(&req.delivery_id).bind(row.get::<i64,_>(5)).execute(&mut *tx).await.map_err(|_|AbandonmentError::Database)?;
             if l.rows_affected() != 1 || k.rows_affected() != 1 || d.rows_affected() != 1 {
-                return Err(AbandonmentError::CommittedVerification);
+                return Err(AbandonmentError::Conflict);
             }
             tx.commit().await.map_err(|_| AbandonmentError::Database)?;
             if guard.as_ref().and_then(|g| g.revalidate().ok()).is_none() {
-                return Err(AbandonmentError::Conflict);
+                return Err(AbandonmentError::CommittedVerification);
             }
             Ok("applied")
         }
