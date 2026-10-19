@@ -17,6 +17,7 @@ pub(crate) enum AbandonmentError {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Request {
     pub database: PathBuf,
+    pub config: PathBuf,
     pub mode: Mode,
     pub decision_id: String,
     pub task_id: String,
@@ -72,6 +73,7 @@ pub(crate) fn parse_args(args: &[std::ffi::OsString]) -> Result<Request, Abandon
     }
     Ok(Request {
         database: PathBuf::from(req!("database")),
+        config: PathBuf::from(req!("config")),
         mode,
         decision_id: req!("decision-id"),
         task_id: req!("task-id"),
@@ -104,6 +106,14 @@ async fn connect(path: &Path) -> Result<SqliteConnection, AbandonmentError> {
 }
 
 pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> {
+    let guard = if matches!(req.mode, Mode::Apply) {
+        Some(
+            crate::runtime_admission::Guard::acquire(&req.database, &req.config, "reconcile")
+                .map_err(|_| AbandonmentError::Conflict)?,
+        )
+    } else {
+        None
+    };
     let mut c = connect(&req.database).await?;
     if !matches!(req.mode, Mode::Apply) {
         sqlx::query("PRAGMA query_only=ON")
@@ -136,6 +146,9 @@ pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> 
         Mode::DryRun => Ok("dry-run eligible"),
         Mode::Verify => Ok("verify read-only"),
         Mode::Apply => {
+            if guard.as_ref().and_then(|g| g.revalidate().ok()).is_none() {
+                return Err(AbandonmentError::Conflict);
+            }
             let mut tx = c
                 .begin_with("BEGIN IMMEDIATE")
                 .await
@@ -152,6 +165,9 @@ pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> 
                 return Err(AbandonmentError::Conflict);
             }
             tx.commit().await.map_err(|_| AbandonmentError::Database)?;
+            if guard.as_ref().and_then(|g| g.revalidate().ok()).is_none() {
+                return Err(AbandonmentError::Conflict);
+            }
             Ok("applied")
         }
     }
