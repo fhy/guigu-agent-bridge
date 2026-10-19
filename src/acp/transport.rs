@@ -1085,4 +1085,20 @@ mod tests {
             TurnUpdate::AgentMessageChunk("occupied".into())
         );
     }
+
+    #[tokio::test]
+    async fn runtime_spawn_gate_drains_and_rejects_after_close() {
+        let gate = AcpSpawnGate::new();
+        let reservation = gate.reserve().expect("open gate reserves");
+        let join = {
+            let gate = gate.clone();
+            tokio::spawn(async move { gate.close_and_join().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!gate.is_closed_joined());
+        drop(reservation);
+        join.await.unwrap();
+        assert!(gate.is_closed_joined());
+        assert!(gate.reserve().is_none());
+    }
 }
