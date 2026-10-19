@@ -34,6 +34,14 @@ pub struct WorkflowAuthorization<'a> {
     pub expected_revision: i64,
 }
 
+#[derive(Debug, Clone)]
+pub struct RuntimeOwnerEvidence {
+    pub pid: i64,
+    pub proc_starttime: i64,
+    pub boot_id: String,
+    pub boottime_ns: i64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueReservation {
     pub queue_id: String,
@@ -1053,6 +1061,28 @@ impl ReliabilityStore {
         let result=sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES (?,?,?,'active',?) ON CONFLICT DO NOTHING")
             .bind(token).bind(now).bind(now).bind(fingerprint).execute(&self.pool).await?;
         Ok(result.rows_affected() == 1)
+    }
+
+    /// Atomically publishes the runtime row and generation-one owner evidence.
+    pub async fn begin_runtime_with_evidence(
+        &self,
+        token: &str,
+        fingerprint: &str,
+        now: &str,
+        evidence: &RuntimeOwnerEvidence,
+    ) -> Result<bool, ReliabilityError> {
+        let mut tx = self.pool.begin().await?;
+        let result = sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES (?,?,?,'active',?) ON CONFLICT DO NOTHING")
+            .bind(token).bind(now).bind(now).bind(fingerprint).execute(&mut *tx).await?;
+        if result.rows_affected() != 1 {
+            tx.rollback().await?;
+            return Ok(false);
+        }
+        sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current) VALUES(?,1,1,'live',?,?,?,?,?,?,0,'open',0,'complete_zero_escaped','{}',1)")
+            .bind(token).bind(evidence.pid).bind(evidence.proc_starttime).bind(fingerprint)
+            .bind(&evidence.boot_id).bind(evidence.boottime_ns).bind(now).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
     }
 
     pub async fn stop_runtime(&self, token: &str, now: &str) -> Result<bool, ReliabilityError> {

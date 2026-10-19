@@ -164,6 +164,7 @@ pub use recovery::{
 };
 pub use reliability::{
     AdmissionRecovery, PendingProjection, QueueReservation, ReceiptOutcome, ReliabilityError,
-    ReliabilityStore, RetryTaskInput, WorkflowAdmission, WorkflowAuthorization,
+    ReliabilityStore, RetryTaskInput, RuntimeOwnerEvidence, WorkflowAdmission,
+    WorkflowAuthorization,
 };
 pub use repository::{AckOutcome, Delivery, Repository, SqliteRepository, StorageFuture};

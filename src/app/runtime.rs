@@ -267,8 +267,34 @@ impl AppRuntime {
         let runtime_instance = uuid::Uuid::now_v7().to_string();
         let process_fingerprint = format!("pid:{}", std::process::id());
         let startup_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        let evidence = crate::storage::RuntimeOwnerEvidence {
+            pid: i64::from(std::process::id()),
+            proc_starttime: std::fs::read_to_string("/proc/self/stat")
+                .ok()
+                .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| rest.to_owned()))
+                .and_then(|s| s.split_whitespace().nth(19).and_then(|v| v.parse().ok()))
+                .ok_or(AppError::Runtime)?,
+            boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+                .unwrap_or_else(|_| "unknown".to_owned())
+                .trim()
+                .to_owned(),
+            boottime_ns: std::fs::read_to_string("/proc/uptime")
+                .ok()
+                .and_then(|s| {
+                    s.split_whitespace()
+                        .next()
+                        .and_then(|v| v.parse::<f64>().ok())
+                })
+                .map(|v| (v * 1_000_000_000.0) as i64)
+                .ok_or(AppError::Runtime)?,
+        };
         let mut owns_runtime = reliability
-            .begin_runtime(&runtime_instance, &process_fingerprint, &startup_at)
+            .begin_runtime_with_evidence(
+                &runtime_instance,
+                &process_fingerprint,
+                &startup_at,
+                &evidence,
+            )
             .await
             .map_err(|_| AppError::Runtime)?;
         if !owns_runtime {
