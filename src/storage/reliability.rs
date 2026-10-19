@@ -1314,6 +1314,69 @@ mod reap_pause_tests {
         );
     }
 
+    #[tokio::test]
+    async fn owner_evidence_start_heartbeat_and_finalizer_path() {
+        let path = std::env::temp_dir().join(format!("t096-owner-{}.db", Uuid::now_v7()));
+        let pool = connect(path.clone()).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let store = ReliabilityStore::new(pool.clone());
+        let token = Uuid::now_v7().to_string();
+        let now = Utc::now().to_rfc3339();
+        let evidence = RuntimeOwnerEvidence {
+            pid: 1,
+            proc_starttime: 1,
+            boot_id: "boot".into(),
+            boottime_ns: 1,
+        };
+        assert!(
+            store
+                .begin_runtime_with_evidence(&token, "fp", &now, &evidence)
+                .await
+                .unwrap()
+        );
+        let later = Utc::now().to_rfc3339();
+        assert!(
+            store
+                .publish_owner_heartbeat(
+                    &token,
+                    "fp",
+                    &later,
+                    &RuntimeOwnerEvidence {
+                        boottime_ns: 2,
+                        ..evidence
+                    }
+                )
+                .await
+                .unwrap()
+        );
+        sqlx::query("UPDATE runtime_owner_evidence SET barrier_state='closed_joined' WHERE instance_token=? AND is_current=1").bind(&token).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE runtime_instances SET state='stopping' WHERE instance_token=?")
+            .bind(&token)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            store
+                .publish_runtime_reaped(
+                    &token,
+                    &later,
+                    0,
+                    "{\"outcome\":\"complete\",\"children\":[]}"
+                )
+                .await
+                .unwrap()
+        );
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM runtime_instances WHERE instance_token=?")
+                .bind(&token)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "stopped");
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
     #[test]
     fn owner_clock_rejects_missing_boot_or_monotonic_sample() {
         let evidence = RuntimeOwnerEvidence {
