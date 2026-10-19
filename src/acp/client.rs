@@ -480,6 +480,8 @@ fn validate_session_id(session_id: String) -> Result<String, AcpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::transport::AcpSpawnGate;
+    use crate::models::EndpointAddress;
 
     #[test]
     fn a_backend_id_carries_the_agents_own_name_and_version() {
@@ -524,5 +526,30 @@ mod tests {
             validate_session_id("x".repeat(MAX_SESSION_ID_BYTES + 1)),
             Err(AcpError::SessionId { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn gated_client_handshake_uses_real_local_child() {
+        let script = r#"while IFS= read -r line; do case "$line" in *initialize*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"fixture","version":"1"}}}';; esac; done"#;
+        let gate = AcpSpawnGate::new();
+        let address = EndpointAddress::Acp {
+            command: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+        };
+        let client = AcpClient::connect_with_gate(
+            &address,
+            "fixture",
+            None,
+            AcpLimits::default(),
+            Some(&gate),
+        )
+        .await
+        .expect("handshake");
+        assert!(client.is_alive());
+        assert!(!gate.is_closed_joined());
+        gate.close_and_join().await;
+        assert!(gate.is_closed_joined());
+        assert!(gate.reserve().is_none());
+        let _ = client.shutdown().await;
     }
 }
