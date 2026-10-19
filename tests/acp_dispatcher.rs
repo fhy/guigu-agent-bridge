@@ -137,6 +137,56 @@ async fn a_crashed_prompt_is_resumed_without_replaying_the_accepted_delivery() {
     let _ = std::fs::remove_file(marker);
 }
 
+#[tokio::test]
+async fn leased_worker_preserves_unknown_after_accepted_acp_crash() {
+    let marker =
+        std::env::temp_dir().join(format!("guigu-acp-unknown-{}.log", uuid::Uuid::now_v7()));
+    std::fs::write(&marker, "resume\n").expect("seed only the disposable mock marker");
+    let scenario = format!("crash-prompt-once:{}", marker.display());
+    let harness = Harness::new_reliable("unknown-worker", &scenario, default_limits(), true).await;
+    let task = harness.task("accepted crash remains unknown");
+    let (outcome, continuations, _) = harness
+        .run_leased(vec![task.clone()], default_policy(), Cp2Action::None)
+        .await;
+
+    let events = outcome.task_events(task.task_id);
+    assert!(
+        !events
+            .iter()
+            .any(|event| event.status == TaskStatus::Failed)
+    );
+    assert_eq!(continuations.len(), 1);
+    assert_eq!(
+        continuations[0].state,
+        guigu_agent_bridge::runtime::ContinuationState::RecoveryNeeded
+    );
+    let admission_state: String =
+        sqlx::query_scalar("SELECT state FROM task_admissions WHERE task_id=?")
+            .bind(task.task_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .expect("admission remains durable");
+    assert_eq!(admission_state, "running");
+    let delivery_id = dispatched_delivery(&events[1]);
+    let disposition: String =
+        sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=?")
+            .bind(delivery_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .expect("accepted delivery has a disposition");
+    assert_eq!(disposition, "outcome_unknown");
+    let recovery_leases: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE state='recovery_needed'")
+            .fetch_one(&outcome.pool)
+            .await
+            .expect("recovery lease remains durable");
+    assert_eq!(recovery_leases, 1);
+    let plan = plan_recovery(outcome.repository.as_ref()).await.unwrap();
+    assert!(plan.unfinished.contains(&task.task_id));
+    outcome.cleanup().await;
+    let _ = std::fs::remove_file(marker);
+}
+
 fn remove_db_files(path: &Path) {
     for suffix in ["", "-wal", "-shm"] {
         let mut candidate = path.as_os_str().to_owned();
