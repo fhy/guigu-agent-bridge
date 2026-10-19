@@ -1021,7 +1021,7 @@ struct RecoverySnapshot {
     delivery: (String, i64, bool),
     disposition: (String, String, String, i64),
     lease: (String, String, i64, String),
-    continuation: (String, String, i64, i64, String),
+    continuation: (String, String, i64, i64, String, String),
     receipts: i64,
     outbox: i64,
 }
@@ -1085,7 +1085,16 @@ async fn recovery_snapshot(pool: &SqlitePool, task_id: TaskId) -> RecoverySnapsh
     .bind(task_id.to_string())
     .fetch_one(pool)
     .await
-    .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
+    .map(|row| {
+        (
+            row.get(0),
+            row.get(1),
+            row.get(2),
+            row.get(3),
+            row.get(4),
+            row.get(5),
+        )
+    })
     .unwrap();
     let receipts: i64 =
         sqlx::query_scalar("SELECT count(*) FROM continuation_response_receipts WHERE task_id=?")
