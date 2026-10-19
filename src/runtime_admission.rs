@@ -138,6 +138,7 @@ fn read_record(path: &Path) -> std::io::Result<Record> {
             record.kind.as_str(),
             "startup"
                 | "reconcile"
+                | "manual-abandonment"
                 | "fixture-prepare"
                 | "fixture-migrate"
                 | "backup"
@@ -282,7 +283,9 @@ impl Guard {
                 "backup" => 3,
                 "backup-verify" => 4,
                 "restore" => 5,
-                "reconcile" => return Err(std::io::Error::other("unsupported proof mode")),
+                "reconcile" | "manual-abandonment" => {
+                    return Err(std::io::Error::other("unsupported proof mode"));
+                }
                 _ => return Err(std::io::Error::other("invalid admission mode")),
             },
             pid: record.pid,
@@ -362,7 +365,9 @@ pub fn verify_proof_binding(path: &Path, expected: ProofBinding) -> std::io::Res
         "backup" => 3,
         "backup-verify" => 4,
         "restore" => 5,
-        "reconcile" => return Err(std::io::Error::other("unsupported proof mode")),
+        "reconcile" | "manual-abandonment" => {
+            return Err(std::io::Error::other("unsupported proof mode"));
+        }
         _ => return Err(std::io::Error::other("invalid admission mode")),
     };
     if *nonce.as_bytes() != expected.nonce

@@ -12,6 +12,8 @@ pub(crate) enum AbandonmentError {
     Conflict,
     #[error("database failure")]
     Database,
+    #[error("commit completed but post-commit guard verification failed")]
+    CommittedVerification,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -108,8 +110,12 @@ async fn connect(path: &Path) -> Result<SqliteConnection, AbandonmentError> {
 pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> {
     let guard = if matches!(req.mode, Mode::Apply) {
         Some(
-            crate::runtime_admission::Guard::acquire(&req.database, &req.config, "reconcile")
-                .map_err(|_| AbandonmentError::Conflict)?,
+            crate::runtime_admission::Guard::acquire(
+                &req.database,
+                &req.config,
+                "manual-abandonment",
+            )
+            .map_err(|_| AbandonmentError::Conflict)?,
         )
     } else {
         None
@@ -147,7 +153,7 @@ pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> 
         Mode::Verify => Ok("verify read-only"),
         Mode::Apply => {
             if guard.as_ref().and_then(|g| g.revalidate().ok()).is_none() {
-                return Err(AbandonmentError::Conflict);
+                return Err(AbandonmentError::CommittedVerification);
             }
             let mut tx = c
                 .begin_with("BEGIN IMMEDIATE")
