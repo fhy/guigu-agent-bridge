@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use tokio::sync::mpsc;
 
 use guigu_agent_bridge::acp::{
@@ -172,7 +172,7 @@ async fn leased_worker_preserves_unknown_after_accepted_acp_crash() {
             .await
             .expect("recovery lease remains durable");
     let plan = plan_recovery(outcome.repository.as_ref()).await.unwrap();
-    let recovery_snapshot = (
+    let summary_snapshot = (
         status_snapshot.clone(),
         admission_state.clone(),
         disposition.clone(),
@@ -180,6 +180,7 @@ async fn leased_worker_preserves_unknown_after_accepted_acp_crash() {
         continuation_state,
         plan.unfinished.contains(&task.task_id),
     );
+    let row_snapshot_before = recovery_snapshot(&outcome.pool, task.task_id).await;
     let config_path =
         std::env::temp_dir().join(format!("guigu-t092-startup-{}.toml", uuid::Uuid::now_v7()));
     let health_port = 19300 + (u16::from(uuid::Uuid::now_v7().as_bytes()[0]) % 100);
@@ -225,8 +226,9 @@ async fn leased_worker_preserves_unknown_after_accepted_acp_crash() {
         .unwrap()
         .map(|continuation| continuation.state);
     let post_start_plan = plan_recovery(outcome.repository.as_ref()).await.unwrap();
+    let row_snapshot_after = recovery_snapshot(&outcome.pool, task.task_id).await;
     assert_eq!(
-        recovery_snapshot,
+        summary_snapshot,
         (
             vec![
                 TaskStatus::Queued,
@@ -239,7 +241,7 @@ async fn leased_worker_preserves_unknown_after_accepted_acp_crash() {
             Some(guigu_agent_bridge::runtime::ContinuationState::RecoveryNeeded),
             true,
         ),
-        "candidate snapshot: failed={failed_snapshot}, snapshot={recovery_snapshot:?}"
+        "candidate snapshot: failed={failed_snapshot}, summary={summary_snapshot:?}, rows_before={row_snapshot_before:?}, rows_after={row_snapshot_after:?}"
     );
     assert_eq!(
         (
@@ -257,6 +259,10 @@ async fn leased_worker_preserves_unknown_after_accepted_acp_crash() {
             true
         ),
         "post-start snapshot changed durable uncertainty"
+    );
+    assert_eq!(
+        row_snapshot_after, row_snapshot_before,
+        "post-start row-level snapshot changed durable uncertainty"
     );
     let _ = std::fs::remove_file(config_path);
     outcome.cleanup().await;
@@ -1002,6 +1008,85 @@ fn failed_payload(event: &TaskEvent) -> String {
     match &event.payload {
         TaskEventPayload::Failed { error } => error.clone(),
         other => panic!("expected a Failed payload, got {other:?}"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoverySnapshot {
+    task_version: i64,
+    events: Vec<(String, i64, String)>,
+    admission: (String, i64),
+    delivery: (String, i64, bool),
+    disposition: (String, String),
+    lease: (String, i64, String),
+    continuation: (String, i64, i64, String),
+}
+
+async fn recovery_snapshot(pool: &SqlitePool, task_id: TaskId) -> RecoverySnapshot {
+    let task_version: i64 = sqlx::query_scalar("SELECT version FROM tasks WHERE task_id=?")
+        .bind(task_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let rows =
+        sqlx::query("SELECT event_id,seq,status FROM task_events WHERE task_id=? ORDER BY seq")
+            .bind(task_id.to_string())
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    let events = rows
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    let admission = sqlx::query("SELECT state,revision FROM task_admissions WHERE task_id=?")
+        .bind(task_id.to_string())
+        .fetch_one(pool)
+        .await
+        .map(|row| (row.get(0), row.get(1)))
+        .unwrap();
+    let delivery = sqlx::query(
+        "SELECT delivery_id,attempt,acknowledged_at IS NOT NULL FROM deliveries WHERE task_id=?",
+    )
+    .bind(task_id.to_string())
+    .fetch_one(pool)
+    .await
+    .map(|row| (row.get(0), row.get(1), row.get(2)))
+    .unwrap();
+    let disposition =
+        sqlx::query("SELECT state,reason_code FROM delivery_dispositions WHERE task_id=?")
+            .bind(task_id.to_string())
+            .fetch_one(pool)
+            .await
+            .map(|row| {
+                (
+                    row.get(0),
+                    row.get::<Option<String>, _>(1).unwrap_or_default(),
+                )
+            })
+            .unwrap();
+    let lease =
+        sqlx::query("SELECT resource_key,fence,state FROM execution_leases WHERE task_id=?")
+            .bind(task_id.to_string())
+            .fetch_one(pool)
+            .await
+            .map(|row| (row.get(0), row.get(1), row.get(2)))
+            .unwrap();
+    let continuation = sqlx::query(
+        "SELECT resource_key,lease_fence,revision,state FROM task_continuations WHERE task_id=?",
+    )
+    .bind(task_id.to_string())
+    .fetch_one(pool)
+    .await
+    .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+    .unwrap();
+    RecoverySnapshot {
+        task_version,
+        events,
+        admission,
+        delivery,
+        disposition,
+        lease,
+        continuation,
     }
 }
 
