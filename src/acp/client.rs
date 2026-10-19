@@ -120,7 +120,7 @@ impl AcpClient {
         if let Some(ref mut reservation) = reservation {
             // The transport has spawned exactly one owned child. Registration is
             // mandatory for the runtime-owned path; an absent PID is fail-closed.
-            let pid = std::process::id();
+            let pid = transport.child_pid();
             if !AcpSpawnGate::register_child(reservation, pid) {
                 let _ = transport.shutdown().await;
                 return Err(AcpError::TransportClosed);

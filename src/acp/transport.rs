@@ -264,6 +264,7 @@ pub struct AcpTransport {
     /// Taken by [`AcpTransport::shutdown`] so the handle is awaited exactly once.
     /// The lock is held only to take it out, never across an await.
     loop_handle: Mutex<Option<JoinHandle<Option<i32>>>>,
+    child_pid: u32,
 }
 
 /// A message from a caller to the transport loop.
@@ -360,6 +361,7 @@ impl AcpTransport {
             source,
         })?;
 
+        let child_pid = child.id().ok_or_else(|| missing_pipe("pid"))?;
         let stdin = child.stdin.take().ok_or_else(|| missing_pipe("stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| missing_pipe("stdout"))?;
         let stderr = child.stderr.take().ok_or_else(|| missing_pipe("stderr"))?;
@@ -381,7 +383,12 @@ impl AcpTransport {
             next_id: AtomicI64::new(0),
             alive,
             loop_handle: Mutex::new(Some(loop_handle)),
+            child_pid,
         })
+    }
+
+    pub(crate) fn child_pid(&self) -> u32 {
+        self.child_pid
     }
 
     /// Whether the child and its loop are still running.
