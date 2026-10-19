@@ -210,6 +210,50 @@ impl AcpSpawnGate {
             })
             .unwrap_or_default()
     }
+    pub(crate) fn rescan_children(&self) -> Result<String, &'static str> {
+        let state = self.state.0.lock().map_err(|_| "malformed")?;
+        if state.children.len() > 64 {
+            return Err("overflow");
+        }
+        let mut out = Vec::with_capacity(state.children.len());
+        for identity in &state.children {
+            let pid = identity
+                .strip_prefix("pid=")
+                .and_then(|s| s.split(';').next())
+                .and_then(|s| s.parse::<u32>().ok())
+                .ok_or("malformed")?;
+            let stat =
+                std::fs::read_to_string(format!("/proc/{pid}/stat")).map_err(|_| "inaccessible")?;
+            let start = stat
+                .rsplit_once(") ")
+                .and_then(|(_, r)| r.split_whitespace().nth(19))
+                .ok_or("malformed")?;
+            let exe = std::fs::read_link(format!("/proc/{pid}/exe"))
+                .map_err(|_| "inaccessible")?
+                .to_string_lossy()
+                .into_owned();
+            let cgroup = std::fs::read_to_string(format!("/proc/{pid}/cgroup"))
+                .map_err(|_| "inaccessible")?;
+            let expected_start = identity
+                .split(';')
+                .find_map(|v| v.strip_prefix("starttime="))
+                .ok_or("malformed")?;
+            if start != expected_start
+                || !identity.contains(&format!("exe={exe}"))
+                || !identity.contains(&format!("cgroup={cgroup}"))
+            {
+                return Err("raced_changed");
+            }
+            out.push(identity.clone());
+        }
+        Ok(format!(
+            "{{\"outcome\":\"complete\",\"children\":[{}]}}",
+            out.iter()
+                .map(|v| format!("\"{}\"", v.replace('"', "\\\"")))
+                .collect::<Vec<_>>()
+                .join(",")
+        ))
+    }
 }
 
 impl Drop for SpawnReservation {
