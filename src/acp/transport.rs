@@ -194,22 +194,6 @@ impl AcpSpawnGate {
     pub(crate) fn epoch(&self) -> i64 {
         self.state.0.lock().map(|s| s.epoch as i64).unwrap_or(-1)
     }
-    pub(crate) fn child_snapshot(&self) -> String {
-        self.state
-            .0
-            .lock()
-            .map(|s| {
-                format!(
-                    "[{}]",
-                    s.children
-                        .iter()
-                        .map(|v| format!("\"{}\"", v.replace('\\', "\\\\").replace('"', "\\\"")))
-                        .collect::<Vec<_>>()
-                        .join(",")
-                )
-            })
-            .unwrap_or_default()
-    }
     pub(crate) fn rescan_children(&self) -> Result<String, &'static str> {
         let state = self.state.0.lock().map_err(|_| "malformed")?;
         if state.children.len() > 64 {
