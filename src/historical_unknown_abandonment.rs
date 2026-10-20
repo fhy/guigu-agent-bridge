@@ -55,9 +55,30 @@ pub(crate) fn parse_args(args: &[std::ffi::OsString]) -> Result<Request, Abandon
             .and_then(|x| x.to_str())
             .ok_or(AbandonmentError::InvalidArguments)?;
         match k {
-            "--mode" => mode = Some(v),
-            _ if k.starts_with("--") => {
-                vals.insert(k.trim_start_matches('-'), v.to_owned());
+            "--mode" => {
+                if mode.replace(v).is_some() {
+                    return Err(AbandonmentError::InvalidArguments);
+                }
+            }
+            "--database"
+            | "--config"
+            | "--decision-id"
+            | "--task-id"
+            | "--delivery-id"
+            | "--resource-key"
+            | "--owner-token"
+            | "--fence"
+            | "--revision"
+            | "--generation"
+            | "--reason"
+            | "--policy-ref"
+            | "--authorization-ref" => {
+                if vals
+                    .insert(k.trim_start_matches('-'), v.to_owned())
+                    .is_some()
+                {
+                    return Err(AbandonmentError::InvalidArguments);
+                }
             }
             _ => return Err(AbandonmentError::InvalidArguments),
         }
@@ -184,6 +205,112 @@ pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> 
                 return Err(AbandonmentError::CommittedVerification);
             }
             Ok("applied")
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::ffi::OsString;
+
+    fn valid_args() -> Vec<OsString> {
+        [
+            "historical-unknown-abandon",
+            "--mode",
+            "dry-run",
+            "--database",
+            "db.sqlite",
+            "--config",
+            "config.toml",
+            "--decision-id",
+            "decision",
+            "--task-id",
+            "task",
+            "--delivery-id",
+            "delivery",
+            "--resource-key",
+            "resource",
+            "--owner-token",
+            "owner",
+            "--fence",
+            "3",
+            "--revision",
+            "4",
+            "--generation",
+            "generation",
+            "--reason",
+            "reason",
+            "--policy-ref",
+            "policy",
+            "--authorization-ref",
+            "authorization",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect()
+    }
+
+    #[test]
+    fn parser_accepts_each_explicit_mode() {
+        for mode in ["dry-run", "apply", "verify"] {
+            let mut args = valid_args();
+            args[2] = OsString::from(mode);
+            assert_eq!(parse_args(&args).unwrap().mode, mode.parse_mode());
+        }
+    }
+
+    #[test]
+    fn parser_rejects_unknown_or_duplicate_options() {
+        let mut unknown = valid_args();
+        unknown.push(OsString::from("--unexpected"));
+        unknown.push(OsString::from("value"));
+        assert_eq!(
+            parse_args(&unknown),
+            Err(AbandonmentError::InvalidArguments)
+        );
+
+        let mut duplicate = valid_args();
+        duplicate.extend([OsString::from("--mode"), OsString::from("verify")]);
+        assert_eq!(
+            parse_args(&duplicate),
+            Err(AbandonmentError::InvalidArguments)
+        );
+    }
+
+    #[test]
+    fn parser_rejects_malformed_or_incomplete_selectors() {
+        let mut missing = valid_args();
+        missing.truncate(missing.len() - 2);
+        assert_eq!(
+            parse_args(&missing),
+            Err(AbandonmentError::InvalidArguments)
+        );
+
+        let mut invalid_number = valid_args();
+        let fence_value = invalid_number
+            .iter()
+            .position(|value| value == "3")
+            .unwrap();
+        invalid_number[fence_value] = OsString::from("not-a-fence");
+        assert_eq!(
+            parse_args(&invalid_number),
+            Err(AbandonmentError::InvalidArguments)
+        );
+    }
+
+    trait ParseMode {
+        fn parse_mode(self) -> Mode;
+    }
+
+    impl ParseMode for &str {
+        fn parse_mode(self) -> Mode {
+            match self {
+                "dry-run" => Mode::DryRun,
+                "apply" => Mode::Apply,
+                "verify" => Mode::Verify,
+                _ => unreachable!(),
+            }
         }
     }
 }
