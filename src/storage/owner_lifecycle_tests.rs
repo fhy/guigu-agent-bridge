@@ -4,6 +4,9 @@ use crate::storage::owner_observation::ScanOutcome;
 #[path = "owner_consumer_tests.rs"]
 mod consumer;
 
+#[path = "owner_clock_fixture_tests.rs"]
+mod clock_fixture;
+
 struct Fixture {
     _root: tempfile::TempDir,
     pool: sqlx::SqlitePool,
@@ -275,54 +278,7 @@ async fn owner_clock_identity_failures_are_unknown_and_never_qualify() {
 
 #[tokio::test]
 async fn owner_time_and_revision_gap_cases_fail_closed() {
-    let fixture = Fixture::new().await;
-    fixture.start().await;
-    fixture.stop().await;
-    for offset in [-40, -6, 40] {
-        let now = (Utc::now() + chrono::Duration::seconds(offset)).to_rfc3339();
-        assert!(
-            !fixture
-                .store
-                .finalize_owner(
-                    &fixture.token,
-                    &now,
-                    &fixture.evidence,
-                    &fixture.observation(ScanOutcome::Complete)
-                )
-                .await
-                .unwrap()
-        );
-    }
-    assert!(
-        !fixture
-            .store
-            .finalize_owner(
-                &fixture.token,
-                "malformed",
-                &fixture.evidence,
-                &fixture.observation(ScanOutcome::Complete)
-            )
-            .await
-            .unwrap()
-    );
-    sqlx::query("DELETE FROM runtime_owner_evidence WHERE evidence_revision=1")
-        .execute(&fixture.pool)
-        .await
-        .unwrap();
-    assert!(
-        !fixture
-            .store
-            .finalize_owner(
-                &fixture.token,
-                &Utc::now().to_rfc3339(),
-                &fixture.evidence,
-                &fixture.observation(ScanOutcome::Complete)
-            )
-            .await
-            .unwrap()
-    );
-    assert_eq!(fixture.qualified_count().await, 0);
-    fixture.pool.close().await;
+    clock_fixture::controlled_time_and_revision_cases().await;
 }
 
 #[tokio::test]
