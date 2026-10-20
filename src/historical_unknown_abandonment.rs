@@ -41,6 +41,12 @@ pub(crate) enum Mode {
     Verify,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailurePoint {
+    AfterAudit,
+    AfterContinuation,
+}
+
 pub(crate) fn parse_args(args: &[std::ffi::OsString]) -> Result<Request, AbandonmentError> {
     let mut it = args.iter();
     if it.next().and_then(|x| x.to_str()) != Some("historical-unknown-abandon") {
@@ -129,6 +135,13 @@ async fn connect(path: &Path) -> Result<SqliteConnection, AbandonmentError> {
 }
 
 pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> {
+    run_with_failure(req, None).await
+}
+
+async fn run_with_failure(
+    req: Request,
+    failure: Option<FailurePoint>,
+) -> Result<&'static str, AbandonmentError> {
     let guard = if matches!(req.mode, Mode::Apply) {
         Some(
             crate::runtime_admission::Guard::acquire(
@@ -244,8 +257,14 @@ pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> 
             if audit.rows_affected() != 1 {
                 return Err(AbandonmentError::Conflict);
             }
+            if failure == Some(FailurePoint::AfterAudit) {
+                return Err(AbandonmentError::Database);
+            }
             let l=sqlx::query("UPDATE execution_leases SET state='released',heartbeat_at=datetime('now') WHERE task_id=? AND resource_key=? AND owner_token=? AND fence=? AND state='recovery_needed'").bind(&req.task_id).bind(&req.resource_key).bind(&req.owner_token).bind(req.fence).execute(&mut *tx).await.map_err(|_|AbandonmentError::Database)?;
             let k=sqlx::query("UPDATE task_continuations SET state='terminal',revision=revision+1,heartbeat_at=datetime('now') WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='recovery_needed'").bind(&req.task_id).bind(&req.resource_key).bind(req.fence).bind(req.revision).bind(&req.generation).execute(&mut *tx).await.map_err(|_|AbandonmentError::Database)?;
+            if failure == Some(FailurePoint::AfterContinuation) {
+                return Err(AbandonmentError::Database);
+            }
             let d=sqlx::query("UPDATE delivery_dispositions SET state='terminal',reason_code='manual_abandonment' WHERE task_id=? AND delivery_id=? AND attempt=? AND state='outcome_unknown'").bind(&req.task_id).bind(&req.delivery_id).bind(row.get::<i64,_>(5)).execute(&mut *tx).await.map_err(|_|AbandonmentError::Database)?;
             if l.rows_affected() != 1 || k.rows_affected() != 1 || d.rows_affected() != 1 {
                 return Err(AbandonmentError::Conflict);
@@ -262,10 +281,8 @@ pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::ffi::OsString;
-    use std::path::PathBuf;
-
     use crate::storage::{connect as storage_connect, migrate};
+    use std::ffi::OsString;
 
     fn valid_args() -> Vec<OsString> {
         [
@@ -304,10 +321,10 @@ mod tests {
         .collect()
     }
 
-    async fn fixture() -> (PathBuf, PathBuf, Request) {
-        let stem = format!("t096-behavior-{}", uuid::Uuid::now_v7());
-        let database = std::env::temp_dir().join(format!("{stem}.db"));
-        let config = std::env::temp_dir().join(format!("{stem}.toml"));
+    async fn fixture() -> (tempfile::TempDir, Request) {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("bridge.db");
+        let config = root.path().join("bridge.toml");
         std::fs::write(&config, "").unwrap();
         let pool = storage_connect(&database).await.unwrap();
         migrate(&pool).await.unwrap();
@@ -339,8 +356,7 @@ mod tests {
         }
         pool.close().await;
         (
-            database.clone(),
-            config.clone(),
+            root,
             Request {
                 database,
                 config,
@@ -362,7 +378,8 @@ mod tests {
 
     #[tokio::test]
     async fn apply_reopen_verify_and_repeat_are_post_state_based() {
-        let (database, config, request) = fixture().await;
+        let (_root, request) = fixture().await;
+        let database = request.database.clone();
         assert_eq!(run(request.clone()).await.unwrap(), "applied");
 
         let mut verify = request.clone();
@@ -403,13 +420,12 @@ mod tests {
         let mut conflict = request;
         conflict.decision_id = "other-decision".into();
         assert_eq!(run(conflict).await, Err(AbandonmentError::Conflict));
-        let _ = std::fs::remove_file(database);
-        let _ = std::fs::remove_file(config);
     }
 
     #[tokio::test]
     async fn stale_target_refuses_without_audit_or_side_effects() {
-        let (database, config, mut request) = fixture().await;
+        let (_root, mut request) = fixture().await;
+        let database = request.database.clone();
         request.fence = 8;
         assert_eq!(run(request).await, Err(AbandonmentError::Conflict));
         let pool = storage_connect(&database).await.unwrap();
@@ -425,8 +441,45 @@ mod tests {
         assert_eq!(audit_count, 0);
         assert_eq!(lease_state, "recovery_needed");
         pool.close().await;
-        let _ = std::fs::remove_file(database);
-        let _ = std::fs::remove_file(config);
+    }
+
+    #[tokio::test]
+    async fn injected_failures_roll_back_audit_and_all_target_rows_after_reopen() {
+        for failure in [FailurePoint::AfterAudit, FailurePoint::AfterContinuation] {
+            let (_root, request) = fixture().await;
+            let database = request.database.clone();
+            let config = request.config.clone();
+            assert_eq!(
+                run_with_failure(request, Some(failure)).await,
+                Err(AbandonmentError::Database)
+            );
+            let pool = storage_connect(&database).await.unwrap();
+            let audit_count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM historical_unknown_abandonments")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            let lease_state: String = sqlx::query_scalar("SELECT state FROM execution_leases")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let continuation: (i64, String) =
+                sqlx::query_as("SELECT revision,state FROM task_continuations")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            let disposition: (String, String) =
+                sqlx::query_as("SELECT state,reason_code FROM delivery_dispositions")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(audit_count, 0);
+            assert_eq!(lease_state, "recovery_needed");
+            assert_eq!(continuation, (1, "recovery_needed".into()));
+            assert_eq!(disposition, ("outcome_unknown".into(), "unknown".into()));
+            pool.close().await;
+            let _ = std::fs::remove_file(config);
+        }
     }
 
     #[test]
