@@ -195,7 +195,20 @@ async fn committed_repeat(
     }))
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FailurePoint {
+    AfterAudit,
+    AfterCas,
+}
+
 pub(crate) async fn run(req: Request) -> Result<&'static str, CleanupError> {
+    run_with_failure(req, None).await
+}
+
+async fn run_with_failure(
+    req: Request,
+    failure: Option<FailurePoint>,
+) -> Result<&'static str, CleanupError> {
     let guard = if req.mode == Mode::Apply {
         Some(
             crate::runtime_admission::Guard::acquire(
@@ -253,10 +266,16 @@ pub(crate) async fn run(req: Request) -> Result<&'static str, CleanupError> {
             }
             sqlx::query("INSERT INTO historical_unknown_abandonments (decision_id,task_id,delivery_id,resource_key,owner_token,fence,before_task_version,before_admission_revision,before_continuation_revision,before_generation,post_continuation_revision,disposition,reason,policy_ref,authorization_ref,not_replayed,created_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,'manual_abandonment',?,?,?,1,datetime('now'))")
                 .bind(&req.decision_id).bind(&fresh.task_id).bind(&fresh.delivery_id).bind(&fresh.resource_key).bind(&fresh.owner_token).bind(fresh.fence).bind(fresh.task_version).bind(fresh.admission_revision).bind(fresh.continuation_revision).bind(&fresh.generation).bind(fresh.continuation_revision + 1).bind("R050 terminal acknowledged cleanup").bind(&req.policy_ref).bind(&req.authorization_ref).execute(&mut *tx).await.map_err(|_| CleanupError::Database)?;
+            if failure == Some(FailurePoint::AfterAudit) {
+                return Err(CleanupError::Database);
+            }
             let lease = sqlx::query("UPDATE execution_leases SET state='released' WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='recovery_needed'").bind(&fresh.resource_key).bind(&fresh.task_id).bind(&fresh.owner_token).bind(fresh.fence).execute(&mut *tx).await.map_err(|_| CleanupError::Database)?;
             let continuation = sqlx::query("UPDATE task_continuations SET state='terminal', revision=revision+1 WHERE task_id=? AND resource_key=? AND delivery_id=? AND lease_fence=? AND revision=? AND state='recovery_needed'").bind(&fresh.task_id).bind(&fresh.resource_key).bind(&fresh.delivery_id).bind(fresh.fence).bind(fresh.continuation_revision).execute(&mut *tx).await.map_err(|_| CleanupError::Database)?;
             if lease.rows_affected() != 1 || continuation.rows_affected() != 1 {
                 return Err(CleanupError::Conflict);
+            }
+            if failure == Some(FailurePoint::AfterCas) {
+                return Err(CleanupError::Database);
             }
             tx.commit().await.map_err(|_| CleanupError::Database)?;
             if guard.as_ref().and_then(|g| g.revalidate().ok()).is_none() {
@@ -362,5 +381,35 @@ mod tests {
         assert_eq!(event_count, 1);
         assert_eq!(receipt_count, 0);
         pool.close().await;
+    }
+
+    #[tokio::test]
+    async fn injected_failures_after_audit_and_cas_roll_back_after_reopen() {
+        for failure in [FailurePoint::AfterAudit, FailurePoint::AfterCas] {
+            let (_root, request) = fixture().await;
+            assert_eq!(
+                run_with_failure(request.clone(), Some(failure)).await,
+                Err(CleanupError::Database)
+            );
+            let pool = crate::storage::connect(&request.database).await.unwrap();
+            let audit_count: i64 =
+                sqlx::query_scalar("SELECT count(*) FROM historical_unknown_abandonments")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            let lease_state: String = sqlx::query_scalar("SELECT state FROM execution_leases")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+            let continuation: (i64, String) =
+                sqlx::query_as("SELECT revision,state FROM task_continuations")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(audit_count, 0);
+            assert_eq!(lease_state, "recovery_needed");
+            assert_eq!(continuation, (1, "recovery_needed".into()));
+            pool.close().await;
+        }
     }
 }
