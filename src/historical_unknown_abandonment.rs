@@ -227,7 +227,7 @@ pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> 
         .ok_or(AbandonmentError::Conflict)?;
     let before_task = row.get::<i64, _>(0);
     let before_adm = row.get::<i64, _>(1);
-    let before_cont = row.get::<i64, _>(8);
+    let before_cont = row.get::<i64, _>(9);
     match req.mode {
         Mode::DryRun => Ok("dry-run eligible"),
         Mode::Verify => Ok("verify eligible pre-state"),
@@ -263,6 +263,9 @@ pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> 
 mod tests {
     use super::*;
     use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use crate::storage::{connect as storage_connect, migrate};
 
     fn valid_args() -> Vec<OsString> {
         [
@@ -299,6 +302,131 @@ mod tests {
         .into_iter()
         .map(OsString::from)
         .collect()
+    }
+
+    async fn fixture() -> (PathBuf, PathBuf, Request) {
+        let stem = format!("t096-behavior-{}", uuid::Uuid::now_v7());
+        let database = std::env::temp_dir().join(format!("{stem}.db"));
+        let config = std::env::temp_dir().join(format!("{stem}.toml"));
+        std::fs::write(&config, "").unwrap();
+        let pool = storage_connect(&database).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let now = "2026-10-20T00:00:00Z";
+        for query in [
+            "INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES('endpoint','worker','acp',1,'[]')",
+            "INSERT INTO conversations(conversation_id,participants_json) VALUES('conversation','[]')",
+            "INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES('runtime',?,?, 'stopped','fixture')",
+            "INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES('task','task','endpoint','endpoint','conversation','fixture',1,0,0,1)",
+            "INSERT INTO task_admissions(task_id,state,revision,runtime_instance,created_at,updated_at) VALUES('task','terminal',1,'runtime',?,?)",
+            "INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES('delivery','task',1,'endpoint',?)",
+            "INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state,reason_code) VALUES('delivery','task',1,'outcome_unknown','unknown')",
+            "INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('resource','task','owner',7,'recovery_needed',?,?,?)",
+            "INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes) VALUES('task','resource','delivery',7,1,'recovery_needed',1,0,0,'prompt',?,?,?,0)",
+        ] {
+            let mut statement = sqlx::query(query);
+            if query.contains("runtime_instances") {
+                statement = statement.bind(now).bind(now);
+            } else if query.contains("task_admissions") {
+                statement = statement.bind(now).bind(now);
+            } else if query.contains("deliveries") {
+                statement = statement.bind(now);
+            } else if query.contains("execution_leases") {
+                statement = statement.bind(now).bind(now).bind("2099-01-01T00:00:00Z");
+            } else if query.contains("task_continuations") {
+                statement = statement.bind(now).bind(now).bind(now);
+            }
+            statement.execute(&pool).await.unwrap();
+        }
+        pool.close().await;
+        (
+            database.clone(),
+            config.clone(),
+            Request {
+                database,
+                config,
+                mode: Mode::Apply,
+                decision_id: "decision".into(),
+                task_id: "task".into(),
+                delivery_id: "delivery".into(),
+                resource_key: "resource".into(),
+                owner_token: "owner".into(),
+                fence: 7,
+                revision: 1,
+                generation: "generation.v1:strict".into(),
+                reason: "operator decision".into(),
+                policy_ref: "T096".into(),
+                authorization_ref: "fixture".into(),
+            },
+        )
+    }
+
+    #[tokio::test]
+    async fn apply_reopen_verify_and_repeat_are_post_state_based() {
+        let (database, config, request) = fixture().await;
+        assert_eq!(run(request.clone()).await.unwrap(), "applied");
+
+        let mut verify = request.clone();
+        verify.mode = Mode::Verify;
+        assert_eq!(run(verify).await.unwrap(), "verified post-state");
+        assert_eq!(run(request.clone()).await.unwrap(), "already applied");
+
+        let pool = storage_connect(&database).await.unwrap();
+        for (table, count) in [
+            (
+                "task_events",
+                sqlx::query_scalar("SELECT count(*) FROM task_events"),
+            ),
+            (
+                "transport_receipts",
+                sqlx::query_scalar("SELECT count(*) FROM transport_receipts"),
+            ),
+            (
+                "projection_outbox",
+                sqlx::query_scalar("SELECT count(*) FROM projection_outbox"),
+            ),
+            (
+                "agent_work_queue",
+                sqlx::query_scalar("SELECT count(*) FROM agent_work_queue"),
+            ),
+        ] {
+            let count: i64 = count.fetch_one(&pool).await.unwrap();
+            assert_eq!(count, 0, "repeat must not create {table} rows");
+        }
+        let audit_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM historical_unknown_abandonments")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(audit_count, 1);
+        pool.close().await;
+
+        let mut conflict = request;
+        conflict.decision_id = "other-decision".into();
+        assert_eq!(run(conflict).await, Err(AbandonmentError::Conflict));
+        let _ = std::fs::remove_file(database);
+        let _ = std::fs::remove_file(config);
+    }
+
+    #[tokio::test]
+    async fn stale_target_refuses_without_audit_or_side_effects() {
+        let (database, config, mut request) = fixture().await;
+        request.fence = 8;
+        assert_eq!(run(request).await, Err(AbandonmentError::Conflict));
+        let pool = storage_connect(&database).await.unwrap();
+        let audit_count: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM historical_unknown_abandonments")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let lease_state: String = sqlx::query_scalar("SELECT state FROM execution_leases")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        assert_eq!(audit_count, 0);
+        assert_eq!(lease_state, "recovery_needed");
+        pool.close().await;
+        let _ = std::fs::remove_file(database);
+        let _ = std::fs::remove_file(config);
     }
 
     #[test]
