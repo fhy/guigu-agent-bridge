@@ -196,6 +196,7 @@ impl AcpDispatcherBuilder {
                 durable_output,
                 session_gate: tokio::sync::Mutex::new(()),
                 client: Mutex::new(None),
+                connecting: tokio::sync::Mutex::new(()),
                 legacy_results,
                 allow_nonterminal_end_turn,
                 spawn_gate,
@@ -238,6 +239,7 @@ struct DispatcherInner {
     /// client is simply dropped when it is replaced, which closes its outgoing
     /// channel, tears its loop down and reaps the child.
     client: Mutex<Option<Arc<AcpClient>>>,
+    connecting: tokio::sync::Mutex<()>,
     legacy_results: bool,
     allow_nonterminal_end_turn: bool,
     spawn_gate: Option<AcpSpawnGate>,
@@ -744,6 +746,11 @@ impl AcpDispatcher {
 
     /// The running backend, spawning and negotiating one when needed.
     async fn ensure_client(&self, target: &RegisteredEndpoint) -> Result<Arc<AcpClient>, AcpError> {
+        let _connecting = self.inner.connecting.lock().await;
+        let _reservation = match &self.inner.spawn_gate {
+            Some(gate) => Some(gate.reserve().ok_or(AcpError::TransportClosed)?),
+            None => None,
+        };
         if let Some(client) = self.client_slot()
             && client.is_alive()
         {

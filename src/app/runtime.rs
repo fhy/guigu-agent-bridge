@@ -261,34 +261,19 @@ impl AppRuntime {
             pool.close().await;
             return Err(error.into());
         }
-        let reliability = crate::storage::ReliabilityStore::new(pool.clone());
+        let reliability = crate::storage::ReliabilityStore::with_owner_evidence_window(
+            pool.clone(),
+            config.bridge.owner_evidence_max_age_seconds as i64,
+        )
+        .map_err(|_| AppError::Runtime)?;
         let admission_guard =
             crate::runtime_admission::Guard::acquire(&config.bridge.database, &path, "startup")
                 .map_err(|_| AppError::Runtime)?;
         let runtime_instance = uuid::Uuid::now_v7().to_string();
-        let process_fingerprint = format!("pid:{}", std::process::id());
+        let process_fingerprint =
+            crate::storage::RuntimeOwnerEvidence::fingerprint().ok_or(AppError::Runtime)?;
         let startup_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-        let evidence = crate::storage::RuntimeOwnerEvidence {
-            pid: i64::from(std::process::id()),
-            proc_starttime: std::fs::read_to_string("/proc/self/stat")
-                .ok()
-                .and_then(|s| s.rsplit_once(") ").map(|(_, rest)| rest.to_owned()))
-                .and_then(|s| s.split_whitespace().nth(19).and_then(|v| v.parse().ok()))
-                .ok_or(AppError::Runtime)?,
-            boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-                .unwrap_or_else(|_| "unknown".to_owned())
-                .trim()
-                .to_owned(),
-            boottime_ns: std::fs::read_to_string("/proc/uptime")
-                .ok()
-                .and_then(|s| {
-                    s.split_whitespace()
-                        .next()
-                        .and_then(|v| v.parse::<f64>().ok())
-                })
-                .map(|v| (v * 1_000_000_000.0) as i64)
-                .ok_or(AppError::Runtime)?,
-        };
+        let evidence = crate::storage::RuntimeOwnerEvidence::capture().ok_or(AppError::Runtime)?;
         let mut owns_runtime = reliability
             .begin_runtime_with_evidence(
                 &runtime_instance,
@@ -353,7 +338,12 @@ impl AppRuntime {
             );
             if proven_stale && !blocked {
                 owns_runtime = reliability
-                    .begin_runtime(&runtime_instance, &process_fingerprint, &startup_at)
+                    .begin_runtime_with_evidence(
+                        &runtime_instance,
+                        &process_fingerprint,
+                        &startup_at,
+                        &evidence,
+                    )
                     .await
                     .map_err(|_| AppError::Runtime)?;
             }
@@ -564,36 +554,27 @@ impl AppRuntime {
         if owns_runtime {
             let heartbeat_store = reliability.clone();
             let heartbeat_token = runtime_instance.clone();
+            let heartbeat_interval =
+                Duration::from_millis(config.bridge.owner_evidence_max_age_seconds * 1_000 / 3);
             runtime.heartbeat = Some(tokio::spawn(async move {
-                let mut tick = tokio::time::interval(Duration::from_secs(10));
+                let mut tick = tokio::time::interval(heartbeat_interval);
                 loop {
                     tick.tick().await;
                     let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-                    let evidence = crate::storage::RuntimeOwnerEvidence {
-                        pid: i64::from(std::process::id()),
-                        proc_starttime: std::fs::read_to_string("/proc/self/stat")
-                            .ok()
-                            .and_then(|s| s.rsplit_once(") ").map(|(_, r)| r.to_owned()))
-                            .and_then(|s| s.split_whitespace().nth(19).and_then(|v| v.parse().ok()))
-                            .unwrap_or(0),
-                        boot_id: std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-                            .unwrap_or_default()
-                            .trim()
-                            .to_owned(),
-                        boottime_ns: std::fs::read_to_string("/proc/uptime")
-                            .ok()
-                            .and_then(|s| {
-                                s.split_whitespace()
-                                    .next()
-                                    .and_then(|v| v.parse::<f64>().ok())
-                            })
-                            .map(|v| (v * 1_000_000_000.0) as i64)
-                            .unwrap_or(0),
-                    };
+                    let evidence = crate::storage::RuntimeOwnerEvidence::capture().unwrap_or(
+                        crate::storage::RuntimeOwnerEvidence {
+                            pid: 0,
+                            proc_starttime: 0,
+                            boot_id: String::new(),
+                            boottime_ns: 0,
+                        },
+                    );
+                    let heartbeat_fingerprint =
+                        crate::storage::RuntimeOwnerEvidence::fingerprint().unwrap_or_default();
                     if !heartbeat_store
                         .publish_owner_heartbeat(
                             &heartbeat_token,
-                            &heartbeat_token,
+                            &heartbeat_fingerprint,
                             &now,
                             &evidence,
                         )
@@ -703,7 +684,7 @@ impl AppRuntime {
         };
 
         let mut endpoint_dispatchers = HashMap::new();
-        let spawn_gate = crate::acp::AcpSpawnGate::new();
+        let spawn_gate = crate::acp::AcpSpawnGate::for_generation(&runtime_instance);
         for (agent_id, declared) in &config.agents {
             if !declared.enabled || declared.transport != TransportType::Acp {
                 continue;
@@ -1160,7 +1141,7 @@ impl AppRuntime {
         }
         let mut acp_shutdown = None;
         if let Some(acp) = self.acp.take() {
-            acp_shutdown = Some(acp.shutdown_with_epoch().await);
+            acp_shutdown = Some(acp.shutdown_observation().await);
         }
         if let Some(cleanup) = self.gateway_cleanup.take()
             && cleanup.shutdown().await.is_err()
@@ -1186,10 +1167,24 @@ impl AppRuntime {
         self.health_state.set_owner(OwnerState::Stopped);
         if let Some(token) = self.runtime_instance.take() {
             let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-            let result = if let Some((epoch, snapshot)) = acp_shutdown {
-                self.reliability
-                    .publish_runtime_reaped(&token, &now, epoch, &snapshot)
-                    .await
+            let result = if let Some(observation) = acp_shutdown {
+                match crate::storage::RuntimeOwnerEvidence::capture() {
+                    Some(evidence) => {
+                        match self
+                            .reliability
+                            .finalize_owner(&token, &now, &evidence, &observation)
+                            .await
+                        {
+                            Ok(true) => {
+                                self.reliability
+                                    .verify_final_owner(&token, &now, &evidence, &observation)
+                                    .await
+                            }
+                            other => other,
+                        }
+                    }
+                    None => Ok(false),
+                }
             } else {
                 self.reliability.stop_runtime(&token, &now).await
             };

@@ -58,6 +58,7 @@ pub struct BridgeConfig {
     pub event_capacity: usize,
     /// Graceful shutdown deadline.
     pub shutdown_timeout_seconds: u64,
+    pub owner_evidence_max_age_seconds: u64,
     /// Optional loopback-only health listener.
     pub health_bind: Option<SocketAddr>,
 }
@@ -333,6 +334,8 @@ struct RawBridge {
     event_capacity: usize,
     #[serde(default = "default_shutdown_timeout")]
     shutdown_timeout_seconds: u64,
+    #[serde(default = "default_shutdown_timeout")]
+    owner_evidence_max_age_seconds: u64,
     #[serde(default)]
     health_bind: String,
 }
@@ -578,6 +581,7 @@ impl Default for RawBridge {
             queue_capacity: default_queue_capacity(),
             event_capacity: default_event_capacity(),
             shutdown_timeout_seconds: default_shutdown_timeout(),
+            owner_evidence_max_age_seconds: default_shutdown_timeout(),
             health_bind: String::new(),
         }
     }
@@ -961,6 +965,12 @@ fn build_config(raw: RawConfig, env: &BTreeMap<String, String>) -> Result<Config
     }
 
     validate_capacity("bridge.queue_capacity", raw.bridge.queue_capacity)?;
+    if !(1..=300).contains(&raw.bridge.owner_evidence_max_age_seconds) {
+        return Err(validation(
+            "bridge.owner_evidence_max_age_seconds",
+            "must be in range 1..=300",
+        ));
+    }
     validate_capacity("bridge.event_capacity", raw.bridge.event_capacity)?;
     if !(1..=300).contains(&raw.bridge.shutdown_timeout_seconds) {
         return Err(validation(
@@ -1012,6 +1022,7 @@ fn build_config(raw: RawConfig, env: &BTreeMap<String, String>) -> Result<Config
             queue_capacity: raw.bridge.queue_capacity,
             event_capacity: raw.bridge.event_capacity,
             shutdown_timeout_seconds: raw.bridge.shutdown_timeout_seconds,
+            owner_evidence_max_age_seconds: raw.bridge.owner_evidence_max_age_seconds,
             health_bind,
         },
         transports: TransportsConfig {

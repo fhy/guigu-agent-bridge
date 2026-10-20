@@ -90,6 +90,7 @@ mod tests {
                 queue_capacity: 1,
                 event_capacity: 4,
                 shutdown_timeout_seconds: 5,
+                owner_evidence_max_age_seconds: 30,
                 health_bind: None,
             },
             runtime: RuntimeConfig {

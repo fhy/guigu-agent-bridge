@@ -118,6 +118,10 @@ impl AcpClient {
         }
         let transport = Arc::new(AcpTransport::spawn(address, cwd, limits.transport)?);
         if let Some(ref mut reservation) = reservation {
+            if !AcpSpawnGate::retain_transport(reservation, Arc::clone(&transport)) {
+                let _ = transport.shutdown().await;
+                return Err(AcpError::TransportClosed);
+            }
             // The transport has spawned exactly one owned child. Registration is
             // mandatory for the runtime-owned path; an absent PID is fail-closed.
             let pid = transport.child_pid();
@@ -130,68 +134,75 @@ impl AcpClient {
                 return Err(AcpError::TransportClosed);
             }
         }
-        let params = encode(schema::METHOD_INITIALIZE, &InitializeParams::new())?;
-        let completed = transport
-            .request(
-                Phase::Initialize,
-                schema::METHOD_INITIALIZE,
-                params,
-                limits.initialize_deadline,
-            )
-            .await?;
-        let result: InitializeResult = decode(schema::METHOD_INITIALIZE, completed.result)?;
-
-        if result.protocol_version != schema::PROTOCOL_VERSION {
-            // The ACP schema tells a client that does not support the negotiated
-            // version to disconnect. We do exactly that: no heuristic fallback.
-            let _ = transport.shutdown().await;
-            return Err(AcpError::UnsupportedProtocol {
-                got: result.protocol_version,
-                supported: schema::PROTOCOL_VERSION,
-            });
-        }
-        let api_methods: Vec<_> = result
-            .auth_methods
-            .iter()
-            .filter(|method| method.is_supported_api_key())
-            .collect();
-        if api_methods.len() > 1 {
-            let _ = transport.shutdown().await;
-            return Err(AcpError::Authentication {
-                advertised: result.auth_methods.len(),
-            });
-        }
-        if !result.auth_methods.is_empty() {
-            let Some(method) = api_methods.first() else {
-                let _ = transport.shutdown().await;
-                return Err(AcpError::Authentication {
-                    advertised: result.auth_methods.len(),
-                });
-            };
-            let params = encode(
-                schema::METHOD_AUTHENTICATE,
-                &AuthenticateParams {
-                    method_id: method.id.clone(),
-                },
-            )?;
+        let connected = async {
+            let params = encode(schema::METHOD_INITIALIZE, &InitializeParams::new())?;
             let completed = transport
                 .request(
-                    Phase::Authenticate,
-                    schema::METHOD_AUTHENTICATE,
+                    Phase::Initialize,
+                    schema::METHOD_INITIALIZE,
                     params,
                     limits.initialize_deadline,
                 )
                 .await?;
-            let _: AuthenticateResult = decode(schema::METHOD_AUTHENTICATE, completed.result)?;
-        }
+            let result: InitializeResult = decode(schema::METHOD_INITIALIZE, completed.result)?;
 
-        let backend_id = backend_id(agent_id, result.agent_info.as_ref());
-        tracing::debug!(%backend_id, "acp backend negotiated");
-        Ok(Self {
-            transport,
-            limits,
-            backend_id,
-        })
+            if result.protocol_version != schema::PROTOCOL_VERSION {
+                // The ACP schema tells a client that does not support the negotiated
+                // version to disconnect. We do exactly that: no heuristic fallback.
+                let _ = transport.shutdown().await;
+                return Err(AcpError::UnsupportedProtocol {
+                    got: result.protocol_version,
+                    supported: schema::PROTOCOL_VERSION,
+                });
+            }
+            let api_methods: Vec<_> = result
+                .auth_methods
+                .iter()
+                .filter(|method| method.is_supported_api_key())
+                .collect();
+            if api_methods.len() > 1 {
+                let _ = transport.shutdown().await;
+                return Err(AcpError::Authentication {
+                    advertised: result.auth_methods.len(),
+                });
+            }
+            if !result.auth_methods.is_empty() {
+                let Some(method) = api_methods.first() else {
+                    let _ = transport.shutdown().await;
+                    return Err(AcpError::Authentication {
+                        advertised: result.auth_methods.len(),
+                    });
+                };
+                let params = encode(
+                    schema::METHOD_AUTHENTICATE,
+                    &AuthenticateParams {
+                        method_id: method.id.clone(),
+                    },
+                )?;
+                let completed = transport
+                    .request(
+                        Phase::Authenticate,
+                        schema::METHOD_AUTHENTICATE,
+                        params,
+                        limits.initialize_deadline,
+                    )
+                    .await?;
+                let _: AuthenticateResult = decode(schema::METHOD_AUTHENTICATE, completed.result)?;
+            }
+
+            let backend_id = backend_id(agent_id, result.agent_info.as_ref());
+            tracing::debug!(%backend_id, "acp backend negotiated");
+            Ok(Self {
+                transport: Arc::clone(&transport),
+                limits,
+                backend_id,
+            })
+        }
+        .await;
+        if connected.is_err() {
+            let _ = transport.shutdown().await;
+        }
+        connected
     }
 
     /// The negotiated backend identity, `agent/name@version` (ADR-001).

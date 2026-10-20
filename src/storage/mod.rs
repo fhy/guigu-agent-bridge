@@ -143,6 +143,7 @@ mod error;
 mod event_consumer;
 mod output_delivery;
 mod output_spool;
+pub(crate) mod owner_observation;
 mod pool;
 mod recovery;
 mod reliability;

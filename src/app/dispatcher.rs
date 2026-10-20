@@ -18,6 +18,10 @@ pub struct AcpDispatcherRouter {
 
 impl crate::matrix::sealed::ReapIssuer for AcpDispatcherRouter {}
 
+#[cfg(test)]
+#[path = "dispatcher_owner_tests.rs"]
+mod owner_tests;
+
 impl AcpDispatcherRouter {
     pub fn new(endpoints: HashMap<EndpointId, Arc<LeasedAcpDispatcher>>) -> Self {
         Self {
@@ -50,18 +54,17 @@ impl AcpDispatcherRouter {
     pub async fn shutdown(&self) {
         self.spawn_gate.close_and_join().await;
         debug_assert!(self.spawn_gate.is_closed_joined());
+        self.spawn_gate.reap_transports().await;
         for dispatcher in self.endpoints.values() {
             dispatcher.shutdown().await;
         }
     }
 
-    pub(crate) async fn shutdown_with_epoch(&self) -> (i64, String) {
+    pub(crate) async fn shutdown_observation(
+        &self,
+    ) -> crate::storage::owner_observation::FinalObservation {
         self.shutdown().await;
-        let snapshot = self
-            .spawn_gate
-            .rescan_children()
-            .unwrap_or_else(|outcome| format!("{{\"outcome\":\"{outcome}\"}}"));
-        (self.spawn_gate.epoch(), snapshot)
+        self.spawn_gate.final_observation()
     }
 }
 

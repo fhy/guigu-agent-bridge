@@ -71,6 +71,7 @@ mod output_tests;
 pub mod result;
 pub mod schema;
 pub mod session;
+mod spawn_gate;
 pub mod transport;
 
 mod dispatcher;

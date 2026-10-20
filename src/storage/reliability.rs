@@ -1,15 +1,16 @@
 //! T018 durable idempotency facts.  This store is intentionally additive: the
 //! event log remains the task-status authority while receipts are replay keys.
 
-use chrono::{DateTime, Utc};
+#[cfg(test)]
+use chrono::Utc;
 use sqlx::{Row, SqlitePool};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[path = "owner_lifecycle.rs"]
+mod owner_lifecycle;
+
 pub const OWNER_EVIDENCE_MAX_AGE_SECS: i64 = 30;
-const OWNER_EVIDENCE_MIN_AGE_SECS: i64 = 1;
-const OWNER_EVIDENCE_MAX_ALLOWED_SECS: i64 = 300;
-const OWNER_EVIDENCE_FUTURE_SKEW_SECS: i64 = 5;
 
 use crate::{
     bus::AdmissionContext,
@@ -49,19 +50,14 @@ pub struct RuntimeOwnerEvidence {
 }
 
 fn valid_owner_clock(evidence: &RuntimeOwnerEvidence, now: &str) -> bool {
-    if evidence.boot_id.trim().is_empty() || evidence.boottime_ns <= 0 {
+    if evidence.boot_id.trim().is_empty()
+        || evidence.boottime_ns <= 0
+        || evidence.pid <= 0
+        || evidence.proc_starttime <= 0
+    {
         return false;
     }
-    let Ok(now) = DateTime::parse_from_rfc3339(now) else {
-        return false;
-    };
-    let now = now.with_timezone(&Utc);
-    let _ = (
-        OWNER_EVIDENCE_MAX_AGE_SECS,
-        OWNER_EVIDENCE_MIN_AGE_SECS,
-        OWNER_EVIDENCE_MAX_ALLOWED_SECS,
-    );
-    now <= Utc::now() + chrono::Duration::seconds(OWNER_EVIDENCE_FUTURE_SKEW_SECS)
+    super::owner_observation::current_timestamp(now)
 }
 
 fn boot_identity_matches(expected: &str, observed: &str) -> bool {
@@ -162,11 +158,28 @@ pub struct AdmissionRecovery {
 #[derive(Clone)]
 pub struct ReliabilityStore {
     pool: SqlitePool,
+    owner_evidence_max_age: i64,
 }
 
 impl ReliabilityStore {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            owner_evidence_max_age: OWNER_EVIDENCE_MAX_AGE_SECS,
+        }
+    }
+
+    pub(crate) fn with_owner_evidence_window(
+        pool: SqlitePool,
+        seconds: i64,
+    ) -> Result<Self, ReliabilityError> {
+        if !(1..=300).contains(&seconds) {
+            return Err(ReliabilityError::Malformed);
+        }
+        Ok(Self {
+            pool,
+            owner_evidence_max_age: seconds,
+        })
     }
 
     /// Atomically reserves a bounded queue row after T025 admission has committed.
@@ -1093,115 +1106,23 @@ impl ReliabilityStore {
         Ok(result.rows_affected() == 1)
     }
 
-    /// Atomically publishes the runtime row and generation-one owner evidence.
-    pub async fn begin_runtime_with_evidence(
-        &self,
-        token: &str,
-        fingerprint: &str,
-        now: &str,
-        evidence: &RuntimeOwnerEvidence,
-    ) -> Result<bool, ReliabilityError> {
-        if !valid_owner_clock(evidence, now) {
-            return Ok(false);
-        }
-        let mut tx = self.pool.begin().await?;
-        let result = sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES (?,?,?,'active',?) ON CONFLICT DO NOTHING")
-            .bind(token).bind(now).bind(now).bind(fingerprint).execute(&mut *tx).await?;
-        if result.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Ok(false);
-        }
-        sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current) VALUES(?,1,1,'live',?,?,?,?,?,?,0,'open',0,'complete_zero_escaped','{}',1)")
-            .bind(token).bind(evidence.pid).bind(evidence.proc_starttime).bind(fingerprint)
-            .bind(&evidence.boot_id).bind(evidence.boottime_ns).bind(now).execute(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(true)
-    }
-
-    pub async fn stop_runtime(&self, token: &str, now: &str) -> Result<bool, ReliabilityError> {
-        let result=sqlx::query("UPDATE runtime_instances SET state='stopped',heartbeat_at=? WHERE instance_token=? AND state IN ('active','stopping')")
-            .bind(now).bind(token).execute(&self.pool).await?;
-        Ok(result.rows_affected() == 1)
-    }
-
-    pub async fn publish_owner_heartbeat(
-        &self,
-        token: &str,
-        fingerprint: &str,
-        now: &str,
-        evidence: &RuntimeOwnerEvidence,
-    ) -> Result<bool, ReliabilityError> {
-        if !valid_owner_clock(evidence, now) {
-            return Ok(false);
-        }
-        let mut tx = self.pool.begin().await?;
-        let current: Option<(i64, i64)> = sqlx::query_as("SELECT runtime_generation,evidence_revision FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1 AND state IN ('live','observing')")
-            .bind(token).fetch_optional(&mut *tx).await?;
-        let Some((generation, revision)) = current else {
-            tx.rollback().await?;
-            return Ok(false);
-        };
-        sqlx::query("UPDATE runtime_owner_evidence SET is_current=0 WHERE instance_token=? AND runtime_generation=? AND is_current=1")
-            .bind(token).bind(generation).execute(&mut *tx).await?;
-        sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current) VALUES(?,?,?,'live',?,?,?,?,?,?,0,'open',0,'complete_zero_escaped','{}',1)")
-            .bind(token).bind(generation).bind(revision + 1).bind(evidence.pid).bind(evidence.proc_starttime).bind(fingerprint)
-            .bind(&evidence.boot_id).bind(evidence.boottime_ns).bind(now).execute(&mut *tx).await?;
-        tx.commit().await?;
-        Ok(true)
-    }
-
-    pub async fn publish_runtime_reaped(
-        &self,
-        token: &str,
-        now: &str,
-        barrier_epoch: i64,
-        child_snapshot: &str,
-    ) -> Result<bool, ReliabilityError> {
-        if child_snapshot.trim().is_empty() || child_snapshot.trim() == "[]" {
-            return Ok(false);
-        }
-        let mut tx = self.pool.begin().await?;
-        let result = sqlx::query("UPDATE runtime_owner_evidence SET is_current=0 WHERE instance_token=? AND is_current=1 AND state IN ('live','scan_pending') AND barrier_state='closed_joined' AND in_flight_spawns=0 AND barrier_epoch=?")
-            .bind(token).bind(barrier_epoch).execute(&mut *tx).await?;
-        if result.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Ok(false);
-        }
-        let current: (i64, i64, String) = sqlx::query_as("SELECT runtime_generation,evidence_revision,captured_at FROM runtime_owner_evidence WHERE instance_token=? ORDER BY evidence_revision DESC LIMIT 1").bind(token).fetch_one(&mut *tx).await?;
-        let captured = DateTime::parse_from_rfc3339(&current.2)
-            .ok()
-            .map(|v| v.with_timezone(&Utc));
-        let observed = DateTime::parse_from_rfc3339(now)
-            .ok()
-            .map(|v| v.with_timezone(&Utc));
-        let Some((captured, observed)) = captured.zip(observed) else {
-            tx.rollback().await?;
-            return Ok(false);
-        };
-        let age = (observed - captured).num_seconds();
-        if !(0..=OWNER_EVIDENCE_MAX_AGE_SECS).contains(&age) {
-            tx.rollback().await?;
-            return Ok(false);
-        }
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM runtime_owner_evidence WHERE instance_token=? AND runtime_generation=?").bind(token).bind(current.0).fetch_one(&mut *tx).await?;
-        if count != current.1 {
-            tx.rollback().await?;
-            return Ok(false);
-        }
-        sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current) SELECT instance_token,runtime_generation,?,'reaped',pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,?, ?, 'closed_joined',0,'complete_zero_escaped',?,1 FROM runtime_owner_evidence WHERE instance_token=? AND evidence_revision=?")
-            .bind(current.1 + 1).bind(now).bind(barrier_epoch).bind(child_snapshot).bind(token).bind(current.1).execute(&mut *tx).await?;
-        let stopped = sqlx::query("UPDATE runtime_instances SET state='stopped',heartbeat_at=? WHERE instance_token=? AND state='stopping'").bind(now).bind(token).execute(&mut *tx).await?;
-        if stopped.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Ok(false);
-        }
-        tx.commit().await?;
-        Ok(true)
-    }
-
     pub async fn stopping_runtime(&self, token: &str, now: &str) -> Result<bool, ReliabilityError> {
+        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
         let result=sqlx::query("UPDATE runtime_instances SET state='stopping',heartbeat_at=? WHERE instance_token=? AND state='active'")
-            .bind(now).bind(token).execute(&self.pool).await?;
+            .bind(now).bind(token).execute(&mut *transaction).await?;
+        if result.rows_affected() != 1 {
+            return Ok(false);
+        }
+        let current: Option<i64> = sqlx::query_scalar("SELECT evidence_revision FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1 AND state='live'")
+            .bind(token).fetch_optional(&mut *transaction).await?;
+        if let Some(revision) = current {
+            let next = revision.checked_add(1).ok_or(ReliabilityError::Malformed)?;
+            sqlx::query("UPDATE runtime_owner_evidence SET is_current=0 WHERE instance_token=? AND is_current=1")
+                .bind(token).execute(&mut *transaction).await?;
+            sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current,max_age_seconds) SELECT instance_token,runtime_generation,?,'scan_pending',pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,1,max_age_seconds FROM runtime_owner_evidence WHERE instance_token=? AND evidence_revision=?")
+                .bind(next).bind(token).bind(revision).execute(&mut *transaction).await?;
+        }
+        transaction.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1356,7 +1277,7 @@ mod reap_pause_tests {
             .await
             .unwrap();
         assert!(
-            store
+            !store
                 .publish_runtime_reaped(
                     &token,
                     &later,
@@ -1372,7 +1293,7 @@ mod reap_pause_tests {
                 .fetch_one(&pool)
                 .await
                 .unwrap();
-        assert_eq!(state, "stopped");
+        assert_eq!(state, "stopping");
         pool.close().await;
         let _ = std::fs::remove_file(path);
     }
