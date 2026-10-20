@@ -139,6 +139,7 @@ fn read_record(path: &Path) -> std::io::Result<Record> {
             "startup"
                 | "reconcile"
                 | "manual-abandonment"
+                | "terminal-cleanup"
                 | "fixture-prepare"
                 | "fixture-migrate"
                 | "backup"

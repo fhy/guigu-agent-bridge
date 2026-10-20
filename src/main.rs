@@ -4,6 +4,7 @@ async fn main() -> std::process::ExitCode {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(guigu_agent_bridge::Error::Cli(failure)) => {
             if failure.command == "reconcile-lease-owner"
+                || failure.command == "historical-terminal-cleanup"
                 || failure.command == "reconcile-orphaned-preacceptance"
                 || failure.command == "reconcile-isolated-legacy-owner"
                 || failure.command == "prepare-isolated-legacy-owner-manifest"

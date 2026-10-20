@@ -341,9 +341,7 @@ mod tests {
             "INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes) VALUES('task','resource','delivery',7,1,'recovery_needed',1,0,0,'prompt',?,?,?,0)",
         ] {
             let mut statement = sqlx::query(query);
-            if query.contains("runtime_instances") {
-                statement = statement.bind(now).bind(now);
-            } else if query.contains("task_admissions") {
+            if query.contains("runtime_instances") || query.contains("task_admissions") {
                 statement = statement.bind(now).bind(now);
             } else if query.contains("deliveries") {
                 statement = statement.bind(now);

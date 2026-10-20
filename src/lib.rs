@@ -31,6 +31,7 @@ pub mod runtime;
 pub mod runtime_admission;
 pub mod selected_preacceptance;
 pub mod storage;
+pub(crate) mod terminal_acknowledged_cleanup;
 pub(crate) mod terminal_closure;
 
 use std::future::Future;
@@ -99,6 +100,37 @@ pub fn init_tracing() {
 /// termination signal.
 pub async fn run() -> Result<(), Error> {
     let all_args = std::env::args_os().collect::<Vec<_>>();
+    if all_args.get(1).and_then(|v| v.to_str()) == Some("historical-terminal-cleanup") {
+        let req = terminal_acknowledged_cleanup::parse_args(&all_args[1..]).map_err(|_| {
+            Error::Cli(error::CliFailure {
+                command: "historical-terminal-cleanup",
+                category: "invalid-arguments",
+                status: 2,
+            })
+        })?;
+        let result = terminal_acknowledged_cleanup::run(req)
+            .await
+            .map_err(|error| {
+                let (category, status) = match error {
+                    terminal_acknowledged_cleanup::CleanupError::InvalidArguments => {
+                        ("invalid-arguments", 2)
+                    }
+                    terminal_acknowledged_cleanup::CleanupError::Schema => ("schema", 5),
+                    terminal_acknowledged_cleanup::CleanupError::NoUniqueTarget => {
+                        ("no-unique-target", 3)
+                    }
+                    terminal_acknowledged_cleanup::CleanupError::Conflict => ("conflicting", 6),
+                    terminal_acknowledged_cleanup::CleanupError::Database => ("database", 9),
+                };
+                Error::Cli(error::CliFailure {
+                    command: "historical-terminal-cleanup",
+                    category,
+                    status,
+                })
+            })?;
+        println!("historical-terminal-cleanup result={result}");
+        return Ok(());
+    }
     if all_args.get(1).and_then(|v| v.to_str()) == Some("historical-unknown-abandon") {
         let req = historical_unknown_abandonment::parse_args(&all_args[1..]).map_err(|_| {
             Error::Cli(error::CliFailure {
