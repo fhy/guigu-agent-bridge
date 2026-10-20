@@ -253,6 +253,7 @@ async fn an_empty_database_initializes_and_migrating_twice_is_idempotent() {
         "a2a_artifacts",
         "a2a_artifact_parts",
         "historical_unknown_abandonments",
+        "runtime_owner_evidence",
         "isolated_owner_binding_remediation_witness",
         "isolated_owner_binding_remediation_receipts",
     ] {
@@ -263,7 +264,16 @@ async fn an_empty_database_initializes_and_migrating_twice_is_idempotent() {
     }
 
     let applied = applied_migration_count(&pool).await;
-    assert_eq!(applied, 16, "the sixteen migrations are recorded once each");
+    assert_eq!(
+        applied, 18,
+        "the eighteen migrations are recorded once each"
+    );
+    let max_age: Option<i64> =
+        sqlx::query_scalar("SELECT max_age_seconds FROM runtime_owner_evidence LIMIT 1")
+            .fetch_optional(&pool)
+            .await
+            .expect("owner-evidence window column exists");
+    assert_eq!(max_age, None);
 
     migrate(&pool).await.expect("second migrate is a no-op");
     assert_eq!(
