@@ -27,7 +27,7 @@ fn copy_legacy_migrations(target: &Path) {
     for entry in fs::read_dir(source).unwrap() {
         let entry = entry.unwrap();
         let name = entry.file_name();
-        if name.to_string_lossy().starts_with("0015_") {
+        if name.to_string_lossy()[..4].parse::<u32>().unwrap() >= 15 {
             continue;
         }
         fs::copy(entry.path(), target.join(name)).unwrap();
@@ -92,7 +92,7 @@ async fn v0211_upgrade_preserves_rows_and_reopens_once() {
             .fetch_one(&reopened)
             .await
             .unwrap(),
-        15
+        18
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tasks WHERE task_id=?")

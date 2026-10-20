@@ -1372,8 +1372,21 @@ async fn execute_business(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::storage::{connect, migrate};
+    use crate::storage::connect;
     use sqlx::Executor;
+
+    async fn migrate(pool: &sqlx::SqlitePool) -> Result<(), sqlx::migrate::MigrateError> {
+        let mut migrator = sqlx::migrate!("./migrations");
+        migrator.migrations = std::borrow::Cow::Owned(
+            migrator
+                .migrations
+                .into_owned()
+                .into_iter()
+                .filter(|migration| migration.version <= 14)
+                .collect(),
+        );
+        migrator.run(pool).await
+    }
 
     async fn open(path: &Path) -> SqliteConnection {
         SqliteConnection::connect_with(

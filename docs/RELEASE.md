@@ -1,9 +1,9 @@
 # Release Checklist
 
-## Current local candidate: v0.2.12
+## Current local candidate: v0.2.19
 
-Version `0.2.12` is prepared locally, not published or deployed. See
-[candidate notes](RELEASE-0.2.12.md) for package portability and accepted evidence
+Version `0.2.19` is prepared locally, not published or deployed. See
+[candidate notes](RELEASE-0.2.19.md) for package portability and accepted evidence
 limits. Registry publication, tag creation and production rollout require separate
 decisions. The historical v0.2.1 checklist below remains historical guidance, not
 proof of current deployment readiness.

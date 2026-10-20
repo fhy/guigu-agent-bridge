@@ -109,7 +109,7 @@ fn parse_args(args: &[OsString]) -> Result<Inputs, Failure> {
         return Err(Failure::new("invalid-arguments", 2));
     }
     let mut m = BTreeMap::new();
-    for p in args.chunks_exact(2) {
+    for p in args.as_chunks::<2>().0 {
         let k = p[0].to_str().unwrap();
         if !matches!(
             k,

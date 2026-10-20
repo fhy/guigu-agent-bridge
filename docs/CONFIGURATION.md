@@ -1,5 +1,12 @@
 # Configuration Reference
 
+## Owner-evidence freshness
+
+`bridge.owner_evidence_max_age_seconds` is optional (default 30) and must be
+between 1 and 300 seconds inclusive. Existing configurations remain valid.
+The window controls freshness, not containment: no configuration value enables
+modeled positive owner qualification or supplies a trusted execution domain.
+
 For a standard single-turn ACP agent without the bridge's structured `taskResult`
 extension, opt into `[runtime] legacy_acp_results = true`. This treats successful
 `end_turn` as terminal and returns streamed output; refusal and other stop reasons

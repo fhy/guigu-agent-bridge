@@ -1,12 +1,25 @@
 use std::{ffi::OsString, os::unix::ffi::OsStringExt, process::Command};
 
-use guigu_agent_bridge::storage::{connect, migrate};
+use guigu_agent_bridge::storage::connect;
 use sqlx::Executor;
 
 const COMMAND: &str = "remediate-isolated-owner-bindings";
 const OBSERVED: &str = "fdae494127ac9acf616ce16d0e0f5cb9a0ab3d3ac1cc8974e5525bddb45cb10f";
 const REJECTED: &str =
     "remediate-isolated-owner-bindings result=rejected status=3 cause=arguments substage=none\n";
+
+async fn migrate(pool: &sqlx::SqlitePool) -> Result<(), sqlx::migrate::MigrateError> {
+    let mut migrator = sqlx::migrate!("./migrations");
+    migrator.migrations = std::borrow::Cow::Owned(
+        migrator
+            .migrations
+            .into_owned()
+            .into_iter()
+            .filter(|migration| migration.version <= 14)
+            .collect(),
+    );
+    migrator.run(pool).await
+}
 
 fn run(args: Vec<OsString>) -> std::process::Output {
     Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))

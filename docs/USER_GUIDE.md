@@ -45,6 +45,24 @@ and a matching durable proof. Ambiguous work becomes `recovery_needed`.
 
 ## Operations
 
+### Explicit local historical disposition
+
+`historical-unknown-abandon` never runs during startup and never replays work.
+Only use it on an independently authorized offline database with exact retained
+selectors. Start with `--mode dry-run`; after separately authorizing the
+decision use `--mode apply`, then `--mode verify` with the same selector and
+decision fields. Repeat apply succeeds only when the retained audit and actual
+post-state still match. Drift or a conflicting decision refuses.
+
+Required flags are `--database`, `--config`, `--decision-id`, `--task-id`,
+`--delivery-id`, `--resource-key`, `--owner-token`, `--fence`, `--revision`,
+`--generation`, `--reason`, `--policy-ref` and `--authorization-ref`, in addition
+to `--mode`. Paths and identifiers must refer to the same offline target;
+do not use a live database or treat passing validation as operating authority.
+Existing unknown history is retained with a same-database audit, not converted
+into a fabricated execution outcome. Trusted owner containment is not supplied
+by this CLI. See [candidate limits](RELEASE-0.2.19.md).
+
 Use `GET /health` for diagnostics and `GET /ready` for traffic eligibility. The health
 listener must remain loopback-only. A 503 readiness response, recovery backlog, expired
 lease, repeated child exit, or queue-full response requires investigation before
