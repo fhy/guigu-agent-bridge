@@ -22,10 +22,36 @@ fn owner_liveness(pid: u32) -> OwnerLiveness {
 }
 
 fn owner_fingerprint_liveness(fingerprint: &str) -> OwnerLiveness {
-    fingerprint
-        .strip_prefix("pid:")
-        .and_then(|value| value.parse::<u32>().ok())
-        .map_or(OwnerLiveness::Unknown, owner_liveness)
+    owner_fingerprint_pid(fingerprint).map_or(OwnerLiveness::Unknown, owner_liveness)
+}
+
+fn owner_fingerprint_pid(fingerprint: &str) -> Option<u32> {
+    let value = fingerprint.strip_prefix("pid:")?;
+    let pid = if let Some((pid, fields)) = value.split_once(';') {
+        let (executable, cgroup) = fields.strip_prefix("exe:")?.split_once(";cgroup:")?;
+        let fields: Vec<_> = executable.split(':').collect();
+        if fields.len() != 5
+            || fields[..3]
+                .iter()
+                .any(|field| field.parse::<u64>().is_err())
+            || fields[3].parse::<i64>().is_err()
+            || !fields[4]
+                .parse::<u32>()
+                .ok()
+                .is_some_and(|value| value < 1_000_000_000)
+            || cgroup.trim().is_empty()
+            || cgroup.contains('\0')
+        {
+            return None;
+        }
+        pid
+    } else {
+        value
+    };
+    if pid.is_empty() || !pid.bytes().all(|byte| byte.is_ascii_digit()) {
+        return None;
+    }
+    pid.parse::<u32>().ok().filter(|pid| *pid > 0)
 }
 
 #[cfg(test)]
@@ -60,6 +86,42 @@ mod owner_liveness_tests {
             owner_fingerprint_liveness(&format!("pid:{}", std::process::id())),
             OwnerLiveness::Live
         );
+    }
+
+    #[test]
+    fn structured_fingerprint_retains_current_and_stale_pid_liveness() {
+        let fingerprint = crate::storage::RuntimeOwnerEvidence::fingerprint().unwrap();
+        assert_eq!(
+            owner_fingerprint_liveness(&fingerprint),
+            OwnerLiveness::Live
+        );
+        let (_, suffix) = fingerprint.split_once(';').unwrap();
+        assert_eq!(
+            owner_fingerprint_liveness(&format!("pid:{};{suffix}", u32::MAX)),
+            OwnerLiveness::Stale
+        );
+    }
+
+    #[test]
+    fn malformed_structured_and_numeric_fingerprints_remain_unknown() {
+        for fingerprint in [
+            "pid:0",
+            "pid:+1",
+            "pid:4294967296",
+            "pid:",
+            "pid:1;",
+            "pid:1;garbage",
+            "pid:1;exe:1:2:3:4:5",
+            "pid:1;exe:1:2:3:4:5;cgroup:",
+            "pid:1;exe:1:2:3:4:1000000000;cgroup:0::/",
+            "pid:x;exe:1:2:3:4:5;cgroup:0::/",
+        ] {
+            assert_eq!(
+                owner_fingerprint_liveness(fingerprint),
+                OwnerLiveness::Unknown,
+                "{fingerprint}"
+            );
+        }
     }
 }
 
@@ -1167,27 +1229,12 @@ impl AppRuntime {
         self.health_state.set_owner(OwnerState::Stopped);
         if let Some(token) = self.runtime_instance.take() {
             let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-            let result = if let Some(observation) = acp_shutdown {
-                match crate::storage::RuntimeOwnerEvidence::capture() {
-                    Some(evidence) => {
-                        match self
-                            .reliability
-                            .finalize_owner(&token, &now, &evidence, &observation)
-                            .await
-                        {
-                            Ok(true) => {
-                                self.reliability
-                                    .verify_final_owner(&token, &now, &evidence, &observation)
-                                    .await
-                            }
-                            other => other,
-                        }
-                    }
-                    None => Ok(false),
-                }
-            } else {
-                self.reliability.stop_runtime(&token, &now).await
-            };
+            let evidence = crate::storage::RuntimeOwnerEvidence::capture();
+            let final_owner = evidence.as_ref().zip(acp_shutdown.as_ref());
+            let result = self
+                .reliability
+                .finish_runtime_stop(&token, &now, final_owner)
+                .await;
             match result {
                 Ok(true) => {}
                 Ok(false) if shutdown_error.is_none() => shutdown_error = Some(AppError::Runtime),

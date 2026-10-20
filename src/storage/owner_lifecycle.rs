@@ -6,6 +6,24 @@ use crate::storage::owner_observation::{FinalObservation, fresh_timestamp};
 mod tests;
 
 impl ReliabilityStore {
+    pub(crate) async fn finish_runtime_stop(
+        &self,
+        token: &str,
+        now: &str,
+        final_owner: Option<(&RuntimeOwnerEvidence, &FinalObservation)>,
+    ) -> Result<bool, ReliabilityError> {
+        if let Some((evidence, observation)) = final_owner
+            && self
+                .finalize_owner(token, now, evidence, observation)
+                .await?
+        {
+            return self
+                .verify_final_owner(token, now, evidence, observation)
+                .await;
+        }
+        self.stop_runtime(token, now).await
+    }
+
     pub async fn begin_runtime_with_evidence(
         &self,
         token: &str,

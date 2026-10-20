@@ -7,6 +7,9 @@ mod consumer;
 #[path = "owner_clock_fixture_tests.rs"]
 mod clock_fixture;
 
+#[path = "owner_stop_tests.rs"]
+mod ordinary_stop;
+
 struct Fixture {
     _root: tempfile::TempDir,
     pool: sqlx::SqlitePool,

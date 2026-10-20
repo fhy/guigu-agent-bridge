@@ -967,7 +967,7 @@ async fn concurrent_second_start_rejects_live_owner_without_takeover() {
     .unwrap();
     assert_eq!(before.0, 1);
     assert_eq!(before.1, "active");
-    assert_eq!(before.2, format!("pid:{first_pid}"));
+    assert!(before.2.starts_with(&format!("pid:{first_pid};exe:")));
     let second_stderr = temp.0.join("second.stderr");
     let mut second = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
         .arg(&config_path)
@@ -1023,6 +1023,15 @@ async fn stale_owner_startup_recovers_then_acquires_durable_generation() {
         "t050-recovery status=0 blocking=none",
     )
     .await;
+    let pool = connect(&database).await.unwrap();
+    let fingerprint: String = sqlx::query_scalar(
+        "SELECT process_fingerprint FROM runtime_instances WHERE state='active'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(fingerprint.starts_with(&format!("pid:{first_pid};exe:")));
+    pool.close().await;
     Command::new("kill")
         .args(["-KILL", &first_pid.to_string()])
         .status()
@@ -1046,7 +1055,7 @@ async fn stale_owner_startup_recovers_then_acquires_durable_generation() {
     let stopped: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM runtime_instances WHERE state='stopped' AND process_fingerprint=?",
     )
-    .bind(format!("pid:{first_pid}"))
+    .bind(fingerprint)
     .fetch_one(&pool)
     .await
     .unwrap();
