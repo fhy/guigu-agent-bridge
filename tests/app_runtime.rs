@@ -856,7 +856,8 @@ async fn wait_for_child_diagnostic(child: &mut Child, path: &std::path::Path, ne
     loop {
         assert!(
             child.try_wait().unwrap().is_none(),
-            "runtime exited before diagnostic"
+            "runtime exited before diagnostic; expected={needle:?}; stderr={:?}",
+            std::fs::read_to_string(path).unwrap_or_default()
         );
         if std::fs::read_to_string(path)
             .unwrap_or_default()
@@ -976,12 +977,23 @@ async fn concurrent_second_start_rejects_live_owner_without_takeover() {
         .spawn()
         .unwrap();
     assert!(first_pid != second.id());
-    wait_for_child_diagnostic(
-        &mut second,
-        &second_stderr,
-        "t050-recovery status=3 blocking=owner",
-    )
-    .await;
+    let status = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            if let Some(status) = second.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("blocked second runtime did not exit");
+    assert_eq!(status.code(), Some(1));
+    let diagnostic = std::fs::read_to_string(second_stderr).unwrap();
+    assert!(
+        diagnostic.contains("t050-recovery status=3 blocking=owner"),
+        "{diagnostic}"
+    );
+    assert!(first.try_wait().unwrap().is_none());
     let after: (i64, String, String) = sqlx::query_as(
         "SELECT count(*),state,process_fingerprint FROM runtime_instances WHERE state='active'",
     )
@@ -990,7 +1002,6 @@ async fn concurrent_second_start_rejects_live_owner_without_takeover() {
     .unwrap();
     assert_eq!(after, before);
     pool.close().await;
-    stop_child(second);
     stop_child(first);
 }
 
