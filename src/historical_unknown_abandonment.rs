@@ -161,6 +161,56 @@ pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> 
     if active != 0 {
         return Err(AbandonmentError::Conflict);
     }
+    let retained = sqlx::query(
+        "SELECT decision_id,owner_token,fence,before_task_version,before_admission_revision,before_continuation_revision,before_generation,post_continuation_revision,reason,policy_ref,authorization_ref,not_replayed FROM historical_unknown_abandonments WHERE task_id=? AND delivery_id=? AND resource_key=?",
+    )
+    .bind(&req.task_id)
+    .bind(&req.delivery_id)
+    .bind(&req.resource_key)
+    .fetch_optional(&mut c)
+    .await
+    .map_err(|_| AbandonmentError::Database)?;
+    if let Some(retained) = retained {
+        let matches_input = retained.get::<String, _>(0) == req.decision_id
+            && retained.get::<String, _>(1) == req.owner_token
+            && retained.get::<i64, _>(2) == req.fence
+            && retained.get::<i64, _>(3) == req.revision
+            && retained.get::<String, _>(6) == req.generation
+            && retained.get::<String, _>(8) == req.reason
+            && retained.get::<String, _>(9) == req.policy_ref
+            && retained.get::<String, _>(10) == req.authorization_ref
+            && retained.get::<i64, _>(11) == 1;
+        if !matches_input {
+            return Err(AbandonmentError::Conflict);
+        }
+        let post_state = sqlx::query(
+            "SELECT t.version,a.revision,l.state,c.revision,c.state,d.state,d.reason_code FROM tasks t JOIN task_admissions a ON a.task_id=t.task_id JOIN execution_leases l ON l.task_id=t.task_id AND l.resource_key=? JOIN task_continuations c ON c.task_id=t.task_id AND c.resource_key=? JOIN deliveries v ON v.task_id=t.task_id AND v.delivery_id=? JOIN delivery_dispositions d ON d.delivery_id=v.delivery_id AND d.attempt=v.attempt WHERE t.task_id=?",
+        )
+        .bind(&req.resource_key)
+        .bind(&req.resource_key)
+        .bind(&req.delivery_id)
+        .bind(&req.task_id)
+        .fetch_optional(&mut c)
+        .await
+        .map_err(|_| AbandonmentError::Database)?;
+        let post_matches = post_state.is_some_and(|row| {
+            row.get::<i64, _>(0) == retained.get::<i64, _>(3)
+                && row.get::<i64, _>(1) == retained.get::<i64, _>(4)
+                && row.get::<String, _>(2) == "released"
+                && row.get::<i64, _>(3) == retained.get::<i64, _>(7)
+                && row.get::<String, _>(4) == "terminal"
+                && row.get::<String, _>(5) == "terminal"
+                && row.get::<String, _>(6) == "manual_abandonment"
+        });
+        if !post_matches {
+            return Err(AbandonmentError::Conflict);
+        }
+        return Ok(match req.mode {
+            Mode::DryRun => "dry-run already applied",
+            Mode::Apply => "already applied",
+            Mode::Verify => "verified post-state",
+        });
+    }
     let eligible = "SELECT t.version,a.revision,a.state,d.state,d.reason_code,v.attempt,l.state,l.owner_token,l.fence,c.revision,c.state,c.runtime_generation FROM tasks t JOIN task_admissions a ON a.task_id=t.task_id JOIN runtime_instances r ON r.instance_token=a.runtime_instance JOIN deliveries v ON v.task_id=t.task_id AND v.delivery_id=? JOIN delivery_dispositions d ON d.delivery_id=v.delivery_id JOIN execution_leases l ON l.task_id=t.task_id AND l.resource_key=? JOIN task_continuations c ON c.task_id=t.task_id WHERE t.task_id=? AND r.state='stopped' AND v.attempt=d.attempt AND t.version=? AND c.revision=? AND c.runtime_generation=? AND l.owner_token=? AND l.fence=? AND l.state='recovery_needed' AND c.state='recovery_needed' AND d.state='outcome_unknown'";
     let row = sqlx::query(eligible)
         .bind(&req.delivery_id)
@@ -180,7 +230,7 @@ pub(crate) async fn run(req: Request) -> Result<&'static str, AbandonmentError> 
     let before_cont = row.get::<i64, _>(8);
     match req.mode {
         Mode::DryRun => Ok("dry-run eligible"),
-        Mode::Verify => Ok("verify read-only"),
+        Mode::Verify => Ok("verify eligible pre-state"),
         Mode::Apply => {
             if guard.as_ref().and_then(|g| g.revalidate().ok()).is_none() {
                 return Err(AbandonmentError::Conflict);
