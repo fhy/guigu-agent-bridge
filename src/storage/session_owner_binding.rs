@@ -46,7 +46,7 @@ impl SessionOwnerBinding {
         format!("{:x}", Sha256::digest(value.as_bytes()))
     }
 
-    fn validate(&self) -> Result<(), BindingError> {
+    pub(crate) fn validate_for_transaction(&self) -> Result<(), BindingError> {
         if self.binding_id.is_empty()
             || self.task_id.is_empty()
             || self.delivery_id.is_empty()
@@ -85,7 +85,7 @@ impl SessionOwnerBindingStore {
     }
 
     pub(crate) async fn insert(&self, binding: &SessionOwnerBinding) -> Result<bool, BindingError> {
-        binding.validate()?;
+        binding.validate_for_transaction()?;
         let result = sqlx::query("INSERT INTO session_owner_bindings (binding_id,task_id,delivery_id,attempt,session_id_digest,endpoint_id,conversation_id,cwd_digest,backend_id,runtime_instance,runtime_generation,resource_key,owner_fence,child_pid,child_starttime,executable_fingerprint,boot_id,domain_device,domain_inode,binding_revision,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(&binding.binding_id).bind(&binding.task_id).bind(&binding.delivery_id).bind(binding.attempt)
             .bind(&binding.session_id_digest).bind(&binding.endpoint_id).bind(&binding.conversation_id).bind(&binding.cwd_digest)

@@ -12,6 +12,7 @@ mod owner_lifecycle;
 
 pub const OWNER_EVIDENCE_MAX_AGE_SECS: i64 = 30;
 
+use super::session_owner_binding::SessionOwnerBinding;
 use crate::{
     bus::AdmissionContext,
     models::{AgentTask, TaskEvent, WorkflowRole},
@@ -872,6 +873,46 @@ impl ReliabilityStore {
         Ok(true)
     }
 
+    #[allow(dead_code)]
+    pub(crate) async fn acknowledge_delivery_with_binding(
+        &self,
+        delivery_id: &str,
+        session_id: &str,
+        now: &str,
+        binding: &SessionOwnerBinding,
+    ) -> Result<bool, ReliabilityError> {
+        if binding.delivery_id != delivery_id
+            || binding.session_id_digest != SessionOwnerBinding::digest(session_id)
+        {
+            return Err(ReliabilityError::Malformed);
+        }
+        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let delivery = sqlx::query("UPDATE deliveries SET acknowledged_at=? WHERE delivery_id=? AND acknowledged_at IS NULL")
+            .bind(now).bind(delivery_id).execute(&mut *tx).await?;
+        let disposition = sqlx::query("UPDATE delivery_dispositions SET state='acknowledged',session_id=? WHERE delivery_id=? AND state='prepared'")
+            .bind(session_id).bind(delivery_id).execute(&mut *tx).await?;
+        if delivery.rows_affected() != disposition.rows_affected() {
+            return Err(ReliabilityError::Malformed);
+        }
+        if delivery.rows_affected() == 0 {
+            let acknowledged: Option<i64> = sqlx::query_scalar("SELECT 1 FROM delivery_dispositions WHERE delivery_id=? AND state='acknowledged' AND session_id=?")
+                .bind(delivery_id).bind(session_id).fetch_optional(&mut *tx).await?;
+            return Ok(acknowledged.is_some());
+        }
+        binding
+            .validate_for_transaction()
+            .map_err(|_| ReliabilityError::Malformed)?;
+        sqlx::query("INSERT INTO session_owner_bindings (binding_id,task_id,delivery_id,attempt,session_id_digest,endpoint_id,conversation_id,cwd_digest,backend_id,runtime_instance,runtime_generation,resource_key,owner_fence,child_pid,child_starttime,executable_fingerprint,boot_id,domain_device,domain_inode,binding_revision,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(&binding.binding_id).bind(&binding.task_id).bind(&binding.delivery_id).bind(binding.attempt)
+            .bind(&binding.session_id_digest).bind(&binding.endpoint_id).bind(&binding.conversation_id).bind(&binding.cwd_digest)
+            .bind(&binding.backend_id).bind(&binding.runtime_instance).bind(binding.runtime_generation).bind(&binding.resource_key)
+            .bind(binding.owner_fence).bind(binding.child_pid).bind(binding.child_starttime).bind(&binding.executable_fingerprint)
+            .bind(&binding.boot_id).bind(binding.domain_device).bind(binding.domain_inode).bind(binding.binding_revision)
+            .bind(binding.state).bind(&binding.created_at).bind(&binding.updated_at).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(true)
+    }
+
     /// Reserve an external event exactly once. A duplicate returns the
     /// immutable winner and never changes routing or admission facts.
     pub async fn reserve_receipt(
@@ -1158,9 +1199,16 @@ mod reap_pause_tests {
     use super::*;
     use crate::storage::{connect, migrate};
 
-    async fn fixture() -> (ReliabilityStore, SqlitePool, String, String, String) {
+    async fn fixture() -> (
+        ReliabilityStore,
+        SqlitePool,
+        String,
+        String,
+        String,
+        std::path::PathBuf,
+    ) {
         let path = std::env::temp_dir().join(format!("t022-reap-{}.db", Uuid::now_v7()));
-        let pool = connect(path).await.unwrap();
+        let pool = connect(path.clone()).await.unwrap();
         migrate(&pool).await.unwrap();
         let endpoint = Uuid::now_v7().to_string();
         let conversation = Uuid::now_v7().to_string();
@@ -1176,12 +1224,13 @@ mod reap_pause_tests {
             task,
             delivery,
             endpoint,
+            path,
         )
     }
 
     #[tokio::test]
     async fn forged_resource_binding_is_rejected() {
-        let (store, pool, task, delivery, endpoint) = fixture().await;
+        let (store, pool, task, delivery, endpoint, _) = fixture().await;
         let q = store
             .reserve_queue(
                 &task,
@@ -1208,7 +1257,7 @@ mod reap_pause_tests {
 
     #[tokio::test]
     async fn released_lease_allows_running_pause() {
-        let (store, pool, task, delivery, endpoint) = fixture().await;
+        let (store, pool, task, delivery, endpoint, _) = fixture().await;
         let q = store
             .reserve_queue(
                 &task,
@@ -1233,6 +1282,83 @@ mod reap_pause_tests {
                 .unwrap(),
             "paused"
         );
+    }
+
+    #[tokio::test]
+    async fn acknowledge_binding_rolls_back_on_insert_failure_after_reopen() {
+        let (store, pool, task, delivery, endpoint, path) = fixture().await;
+        let conversation: String =
+            sqlx::query_scalar("SELECT conversation_id FROM tasks WHERE task_id=?")
+                .bind(&task)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let runtime = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES(?,?,?,'stopped','fp')")
+            .bind(&runtime).bind("2026-09-20T00:00:00Z").bind("2026-09-20T00:00:01Z")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state) VALUES(?,?,1,'prepared')")
+            .bind(&delivery).bind(&task).execute(&pool).await.unwrap();
+        sqlx::query("CREATE TRIGGER fail_session_owner_binding BEFORE INSERT ON session_owner_bindings BEGIN SELECT RAISE(ABORT, 'injected binding failure'); END")
+            .execute(&pool).await.unwrap();
+
+        let binding = SessionOwnerBinding {
+            binding_id: Uuid::now_v7().to_string(),
+            task_id: task.clone(),
+            delivery_id: delivery.clone(),
+            attempt: 1,
+            session_id_digest: SessionOwnerBinding::digest("session"),
+            endpoint_id: endpoint.clone(),
+            conversation_id: conversation,
+            cwd_digest: "c".repeat(64),
+            backend_id: "backend".into(),
+            runtime_instance: runtime,
+            runtime_generation: 1,
+            resource_key: "resource".into(),
+            owner_fence: 1,
+            child_pid: 1,
+            child_starttime: 1,
+            executable_fingerprint: "exe".into(),
+            boot_id: "boot".into(),
+            domain_device: 1,
+            domain_inode: 1,
+            binding_revision: 1,
+            state: "bound",
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        };
+        assert!(
+            store
+                .acknowledge_delivery_with_binding(&delivery, "session", "now", &binding)
+                .await
+                .is_err()
+        );
+        pool.close().await;
+
+        let reopened = connect(path.clone()).await.unwrap();
+        let acknowledged: Option<String> =
+            sqlx::query_scalar("SELECT acknowledged_at FROM deliveries WHERE delivery_id=?")
+                .bind(&delivery)
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+        let disposition: String =
+            sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=?")
+                .bind(&delivery)
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+        let binding_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM session_owner_bindings WHERE delivery_id=?")
+                .bind(&delivery)
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+        assert!(acknowledged.is_none());
+        assert_eq!(disposition, "prepared");
+        assert_eq!(binding_count, 0);
+        reopened.close().await;
+        let _ = std::fs::remove_file(path);
     }
 
     #[tokio::test]
