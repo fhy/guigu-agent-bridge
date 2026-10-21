@@ -110,6 +110,10 @@ impl DomainBinding {
         };
         observation
     }
+
+    pub(crate) fn identity(&self) -> Option<(u64, u64)> {
+        self.identity
+    }
 }
 
 impl FinalObservation {

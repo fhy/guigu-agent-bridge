@@ -181,6 +181,32 @@ impl AcpSpawnGate {
         self.domain.scan(epoch)
     }
 
+    pub(crate) fn binding_identity(&self) -> Option<(i64, i64, String, i64, i64)> {
+        let state = self.state.0.lock().ok()?;
+        let identity = state.children.first()?;
+        let pid = identity
+            .strip_prefix("pid=")?
+            .split(';')
+            .next()?
+            .parse()
+            .ok()?;
+        let starttime = identity
+            .split(";starttime=")
+            .nth(1)?
+            .split(';')
+            .next()?
+            .parse()
+            .ok()?;
+        let executable = identity
+            .split(";exe=")
+            .nth(1)?
+            .split(';')
+            .next()?
+            .to_owned();
+        let (device, inode) = self.domain.identity()?;
+        Some((pid, starttime, executable, device as i64, inode as i64))
+    }
+
     #[cfg(test)]
     pub(crate) fn rescan_children(&self) -> Result<String, &'static str> {
         let observation = self.final_observation();

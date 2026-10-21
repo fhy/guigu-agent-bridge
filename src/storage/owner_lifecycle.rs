@@ -190,4 +190,31 @@ impl ReliabilityStore {
             && row.get::<String, _>("child_snapshot")
                 == serde_json::to_string(observation).map_err(|_| ReliabilityError::Malformed)?)
     }
+
+    #[allow(dead_code, clippy::too_many_arguments)]
+    pub(crate) async fn verify_final_owner_for_binding(
+        &self,
+        token: &str,
+        binding_id: &str,
+        owner_fence: i64,
+        binding_revision: i64,
+        now: &str,
+        evidence: &RuntimeOwnerEvidence,
+        observation: &FinalObservation,
+    ) -> Result<bool, ReliabilityError> {
+        let binding = sqlx::query("SELECT b.runtime_instance,b.runtime_generation,b.owner_fence,b.binding_revision,b.state FROM session_owner_bindings b JOIN runtime_owner_evidence e ON e.instance_token=b.runtime_instance AND e.runtime_generation=b.runtime_generation AND e.is_current=1 WHERE b.binding_id=?")
+            .bind(binding_id).fetch_optional(&self.pool).await?;
+        let Some(binding) = binding else {
+            return Ok(false);
+        };
+        if binding.get::<String, _>("runtime_instance") != token
+            || binding.get::<i64, _>("owner_fence") != owner_fence
+            || binding.get::<i64, _>("binding_revision") != binding_revision
+            || binding.get::<String, _>("state") != "bound"
+        {
+            return Ok(false);
+        }
+        self.verify_final_owner(token, now, evidence, observation)
+            .await
+    }
 }

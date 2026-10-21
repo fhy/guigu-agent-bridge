@@ -364,6 +364,7 @@ async fn authenticated_pause_uses_real_router_and_marks_running_queue_paused() {
             target: &target,
             delivery_id: delivery_for_run,
             attempt: 1,
+            queue_lease: None,
         };
         let _ = leased_for_run.deliver(request.clone()).await;
         let _ = leased_for_run.execute_prepared(request).await;
@@ -1524,6 +1525,7 @@ async fn lease_conflict_is_rejected_before_the_acp_process_starts() {
         target,
         delivery_id: DeliveryId::generate(),
         attempt: 1,
+        queue_lease: None,
     };
     assert!(matches!(
         leased.deliver(request).await,
@@ -1687,6 +1689,7 @@ async fn router_finalization_missing_endpoint_and_second_consumption_are_recover
         target,
         delivery_id: DeliveryId::generate(),
         attempt: 1,
+        queue_lease: None,
     };
     let empty = AcpDispatcherRouter::new(HashMap::new());
     assert!(matches!(
@@ -1774,6 +1777,7 @@ async fn router_finalization_missing_endpoint_and_second_consumption_are_recover
         target,
         delivery_id,
         attempt: 1,
+        queue_lease: None,
     };
     let delivery_error = leased2.deliver(request2.clone()).await;
     assert!(
@@ -1879,6 +1883,7 @@ async fn router_finalization_missing_endpoint_and_second_consumption_are_recover
         target,
         delivery_id: delivery3,
         attempt: 1,
+        queue_lease: None,
     };
     assert!(leased3.deliver(request3.clone()).await.is_err());
     sqlx::query("UPDATE execution_leases SET state='recovery_needed' WHERE task_id=?")

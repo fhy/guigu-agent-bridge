@@ -535,6 +535,7 @@ enabled = true
                     .expect("the target is declared, enabled and addressable"),
                 delivery_id: DeliveryId::generate(),
                 attempt,
+                queue_lease: None,
             }
         }
 

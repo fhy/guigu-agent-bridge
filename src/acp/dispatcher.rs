@@ -49,7 +49,8 @@ use crate::bus::RegisteredEndpoint;
 use crate::bus::{
     BusFuture, Clock, DispatchError, DispatchOutcome, DispatchRequest, TaskDispatcher,
 };
-use crate::storage::{Delivery, Repository};
+use crate::storage::session_owner_binding::SessionOwnerBinding;
+use crate::storage::{Delivery, Repository, RuntimeOwnerEvidence};
 
 /// Builds an [`AcpDispatcher`].
 ///
@@ -586,20 +587,92 @@ impl AcpDispatcher {
         // (T009's policy), while a conflicting attempt is reported.
         let now = self.inner.clock.now();
         if let Some(reliability) = &self.inner.reliability {
-            if !reliability
-                .acknowledge_delivery(
-                    &request.delivery_id.to_string(),
-                    &session_id,
-                    &now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-                )
-                .await
-                .map_err(|_| AcpError::Storage {
-                    source: crate::storage::StorageError::Malformed {
-                        field: "delivery_dispositions",
-                        detail: "delivery acknowledgement failed".into(),
-                    },
-                })?
-            {
+            let now = now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            let acknowledged = (if let Some(lease) = request.queue_lease {
+                let generation = reliability
+                    .runtime_generation(&lease.runtime_owner)
+                    .await
+                    .map_err(|_| AcpError::Storage {
+                        source: crate::storage::StorageError::Malformed {
+                            field: "runtime_owner_evidence",
+                            detail: "binding generation lookup failed".into(),
+                        },
+                    })?
+                    .ok_or_else(|| AcpError::Storage {
+                        source: crate::storage::StorageError::Malformed {
+                            field: "runtime_owner_evidence",
+                            detail: "binding generation unavailable".into(),
+                        },
+                    })?;
+                let (
+                    child_pid,
+                    child_starttime,
+                    executable_fingerprint,
+                    domain_device,
+                    domain_inode,
+                ) = self
+                    .inner
+                    .spawn_gate
+                    .as_ref()
+                    .and_then(AcpSpawnGate::binding_identity)
+                    .ok_or_else(|| AcpError::Storage {
+                        source: crate::storage::StorageError::Malformed {
+                            field: "owner_binding",
+                            detail: "child or containment identity unavailable".into(),
+                        },
+                    })?;
+                let binding = SessionOwnerBinding {
+                    binding_id: uuid::Uuid::now_v7().to_string(),
+                    task_id: request.task.task_id.to_string(),
+                    delivery_id: request.delivery_id.to_string(),
+                    attempt: i64::from(request.attempt),
+                    session_id_digest: SessionOwnerBinding::digest(&session_id),
+                    endpoint_id: endpoint.to_string(),
+                    conversation_id: conversation.to_string(),
+                    cwd_digest: SessionOwnerBinding::digest(&self.inner.cwd),
+                    backend_id: client.backend_id().to_owned(),
+                    runtime_instance: lease.runtime_owner.clone(),
+                    runtime_generation: generation,
+                    resource_key: lease.resource_key.clone(),
+                    owner_fence: lease.owner_fence,
+                    child_pid,
+                    child_starttime,
+                    executable_fingerprint,
+                    boot_id: RuntimeOwnerEvidence::capture()
+                        .ok_or_else(|| AcpError::Storage {
+                            source: crate::storage::StorageError::Malformed {
+                                field: "owner_binding",
+                                detail: "boot identity unavailable".into(),
+                            },
+                        })?
+                        .boot_id,
+                    domain_device,
+                    domain_inode,
+                    binding_revision: 1,
+                    state: "bound",
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                };
+                reliability
+                    .acknowledge_delivery_with_binding(
+                        &request.delivery_id.to_string(),
+                        &session_id,
+                        &now,
+                        &binding,
+                    )
+                    .await
+            } else {
+                reliability
+                    .acknowledge_delivery(&request.delivery_id.to_string(), &session_id, &now)
+                    .await
+            })
+            .map_err(|_| AcpError::Storage {
+                source: crate::storage::StorageError::Malformed {
+                    field: "delivery_dispositions",
+                    detail: "delivery acknowledgement failed".into(),
+                },
+            })?;
+            if !acknowledged {
                 return Err(AcpError::Storage {
                     source: crate::storage::StorageError::Malformed {
                         field: "delivery_dispositions",

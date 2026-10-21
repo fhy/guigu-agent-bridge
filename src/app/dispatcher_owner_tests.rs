@@ -194,6 +194,7 @@ async fn owner_real_router_reaps_but_cannot_publish_without_containment() {
         target: &fixture.target,
         delivery_id: DeliveryId::generate(),
         attempt: 1,
+        queue_lease: None,
     };
     fixture.router.deliver(request.clone()).await.unwrap();
     let outcome = fixture.router.execute(request.clone()).await.unwrap();

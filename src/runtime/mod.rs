@@ -2263,6 +2263,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                     target: &target,
                     delivery_id,
                     attempt,
+                    queue_lease: None,
                 };
                 let outcome = dispatcher
                     .execute_loop(&owned, pending_lease.clone(), true, &mut cancel_rx)

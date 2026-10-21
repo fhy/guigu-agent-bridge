@@ -336,6 +336,8 @@ pub struct DispatchRequest<'a> {
     pub delivery_id: DeliveryId,
     /// Attempt number. T005 always uses `1`; retries (`> 1`) belong to T006.
     pub attempt: u32,
+    /// Producer-owned lease facts captured before dispatch.
+    pub queue_lease: Option<&'a QueueLeaseContext>,
 }
 
 /// The terminal outcome produced by [`TaskDispatcher::execute`].
@@ -1278,6 +1280,7 @@ impl Worker {
                 target,
                 delivery_id,
                 attempt,
+                queue_lease: queue_lease.as_ref(),
             };
 
             // Paths B/C: the delivery attempt is recorded before it is made.
@@ -2368,6 +2371,7 @@ enabled = true
             target,
             delivery_id,
             attempt: 1,
+            queue_lease: None,
         };
         let clone = request.clone();
         assert_eq!(clone.delivery_id, delivery_id);
