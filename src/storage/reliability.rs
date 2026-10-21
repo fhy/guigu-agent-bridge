@@ -163,6 +163,13 @@ pub struct ReliabilityStore {
 }
 
 impl ReliabilityStore {
+    pub(crate) async fn runtime_generation(
+        &self,
+        instance_token: &str,
+    ) -> Result<Option<i64>, ReliabilityError> {
+        Ok(sqlx::query_scalar("SELECT runtime_generation FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1")
+            .bind(instance_token).fetch_optional(&self.pool).await?)
+    }
     pub fn new(pool: SqlitePool) -> Self {
         Self {
             pool,
