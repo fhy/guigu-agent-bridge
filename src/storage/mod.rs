@@ -148,6 +148,7 @@ mod pool;
 mod recovery;
 mod reliability;
 mod repository;
+pub(crate) mod session_owner_binding;
 
 pub use cycle::{CycleHit, CycleKind, CycleLimits, DEFAULT_MAX_SUBTASKS, detect};
 pub use error::StorageError;
