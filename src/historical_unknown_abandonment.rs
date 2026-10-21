@@ -1,3 +1,4 @@
+use sha2::{Digest, Sha256};
 use sqlx::{Connection, Row, SqliteConnection, sqlite::SqliteConnectOptions};
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -122,6 +123,10 @@ pub(crate) fn parse_args(args: &[std::ffi::OsString]) -> Result<Request, Abandon
     })
 }
 
+fn digest(value: &str) -> String {
+    format!("{:x}", Sha256::digest(value.as_bytes()))
+}
+
 async fn connect(path: &Path) -> Result<SqliteConnection, AbandonmentError> {
     SqliteConnection::connect_with(
         &SqliteConnectOptions::new()
@@ -213,7 +218,7 @@ async fn run_with_failure(
                 && row.get::<i64, _>(3) == retained.get::<i64, _>(7)
                 && row.get::<String, _>(4) == "terminal"
                 && row.get::<String, _>(5) == "terminal"
-                && row.get::<String, _>(6) == "manual_abandonment"
+                && row.get::<String, _>(6) == "historical_unknown_abandoned"
         });
         if !post_matches {
             return Err(AbandonmentError::Conflict);
@@ -224,7 +229,7 @@ async fn run_with_failure(
             Mode::Verify => "verified post-state",
         });
     }
-    let eligible = "SELECT t.version,a.revision,a.state,d.state,d.reason_code,v.attempt,l.state,l.owner_token,l.fence,c.revision,c.state,c.runtime_generation FROM tasks t JOIN task_admissions a ON a.task_id=t.task_id JOIN runtime_instances r ON r.instance_token=a.runtime_instance JOIN deliveries v ON v.task_id=t.task_id AND v.delivery_id=? JOIN delivery_dispositions d ON d.delivery_id=v.delivery_id JOIN execution_leases l ON l.task_id=t.task_id AND l.resource_key=? JOIN task_continuations c ON c.task_id=t.task_id WHERE t.task_id=? AND r.state='stopped' AND v.attempt=d.attempt AND t.version=? AND c.revision=? AND c.runtime_generation=? AND l.owner_token=? AND l.fence=? AND l.state='recovery_needed' AND c.state='recovery_needed' AND d.state='outcome_unknown'";
+    let eligible = "SELECT t.version,a.revision,a.state,d.state,d.reason_code,d.session_id,v.attempt,l.state,l.owner_token,l.fence,c.revision,c.state,c.runtime_generation FROM tasks t JOIN task_admissions a ON a.task_id=t.task_id JOIN runtime_instances r ON r.instance_token=a.runtime_instance JOIN deliveries v ON v.task_id=t.task_id AND v.delivery_id=? JOIN delivery_dispositions d ON d.delivery_id=v.delivery_id JOIN execution_leases l ON l.task_id=t.task_id AND l.resource_key=? JOIN task_continuations c ON c.task_id=t.task_id WHERE t.task_id=? AND r.state='stopped' AND v.attempt=d.attempt AND t.version=? AND c.revision=? AND c.runtime_generation=? AND l.owner_token=? AND l.fence=? AND l.state='recovery_needed' AND c.state='recovery_needed' AND d.state='outcome_unknown' AND d.session_id IS NOT NULL";
     let row = sqlx::query(eligible)
         .bind(&req.delivery_id)
         .bind(&req.resource_key)
@@ -240,7 +245,12 @@ async fn run_with_failure(
         .ok_or(AbandonmentError::Conflict)?;
     let before_task = row.get::<i64, _>(0);
     let before_adm = row.get::<i64, _>(1);
-    let before_cont = row.get::<i64, _>(9);
+    let before_cont = row.get::<i64, _>(10);
+    let session_digest = digest(&row.get::<String, _>(5));
+    let before_digest = digest(&format!(
+        "{}:{}:{}:{}",
+        before_task, before_adm, before_cont, req.generation
+    ));
     match req.mode {
         Mode::DryRun => Ok("dry-run eligible"),
         Mode::Verify => Ok("verify eligible pre-state"),
@@ -252,20 +262,20 @@ async fn run_with_failure(
                 .begin_with("BEGIN IMMEDIATE")
                 .await
                 .map_err(|_| AbandonmentError::Database)?;
-            let audit=sqlx::query("INSERT INTO historical_unknown_abandonments(decision_id,task_id,delivery_id,resource_key,owner_token,fence,before_task_version,before_admission_revision,before_continuation_revision,before_generation,post_continuation_revision,disposition,reason,policy_ref,authorization_ref,not_replayed,created_at) SELECT ?,?,?,?,?,?,?,?,?,?,?, 'manual_abandonment',?,?,?,1,datetime('now') WHERE NOT EXISTS (SELECT 1 FROM historical_unknown_abandonments WHERE task_id=? AND delivery_id=? AND resource_key=?)")
-   .bind(&req.decision_id).bind(&req.task_id).bind(&req.delivery_id).bind(&req.resource_key).bind(&req.owner_token).bind(req.fence).bind(before_task).bind(before_adm).bind(before_cont).bind(&req.generation).bind(before_cont+1).bind(&req.reason).bind(&req.policy_ref).bind(&req.authorization_ref).bind(&req.task_id).bind(&req.delivery_id).bind(&req.resource_key).execute(&mut *tx).await.map_err(|_|AbandonmentError::Database)?;
+            let audit=sqlx::query("INSERT INTO historical_unknown_abandonments(decision_id,task_id,delivery_id,resource_key,owner_token,fence,before_task_version,before_admission_revision,before_continuation_revision,before_generation,post_continuation_revision,disposition,reason,policy_ref,authorization_ref,not_replayed,created_at,session_id_digest,before_state_digest,abandonment_kind) VALUES (?,?,?,?,?,?,?,?,?,?,?,'manual_abandonment',?,?,?,1,datetime('now'),?,?,'historical_unknown_abandoned')")
+   .bind(&req.decision_id).bind(&req.task_id).bind(&req.delivery_id).bind(&req.resource_key).bind(&req.owner_token).bind(req.fence).bind(before_task).bind(before_adm).bind(before_cont).bind(&req.generation).bind(before_cont+1).bind(&req.reason).bind(&req.policy_ref).bind(&req.authorization_ref).bind(&session_digest).bind(&before_digest).execute(&mut *tx).await.map_err(|_| AbandonmentError::Database)?;
             if audit.rows_affected() != 1 {
                 return Err(AbandonmentError::Conflict);
             }
             if failure == Some(FailurePoint::AfterAudit) {
                 return Err(AbandonmentError::Database);
             }
-            let l=sqlx::query("UPDATE execution_leases SET state='released',heartbeat_at=datetime('now') WHERE task_id=? AND resource_key=? AND owner_token=? AND fence=? AND state='recovery_needed'").bind(&req.task_id).bind(&req.resource_key).bind(&req.owner_token).bind(req.fence).execute(&mut *tx).await.map_err(|_|AbandonmentError::Database)?;
-            let k=sqlx::query("UPDATE task_continuations SET state='terminal',revision=revision+1,heartbeat_at=datetime('now') WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='recovery_needed'").bind(&req.task_id).bind(&req.resource_key).bind(req.fence).bind(req.revision).bind(&req.generation).execute(&mut *tx).await.map_err(|_|AbandonmentError::Database)?;
+            let l=sqlx::query("UPDATE execution_leases SET state='released',heartbeat_at=datetime('now') WHERE task_id=? AND resource_key=? AND owner_token=? AND fence=? AND state='recovery_needed'").bind(&req.task_id).bind(&req.resource_key).bind(&req.owner_token).bind(req.fence).execute(&mut *tx).await.map_err(|_| AbandonmentError::Database)?;
+            let k=sqlx::query("UPDATE task_continuations SET state='terminal',revision=revision+1,heartbeat_at=datetime('now') WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='recovery_needed'").bind(&req.task_id).bind(&req.resource_key).bind(req.fence).bind(req.revision).bind(&req.generation).execute(&mut *tx).await.map_err(|_| AbandonmentError::Database)?;
             if failure == Some(FailurePoint::AfterContinuation) {
                 return Err(AbandonmentError::Database);
             }
-            let d=sqlx::query("UPDATE delivery_dispositions SET state='terminal',reason_code='manual_abandonment' WHERE task_id=? AND delivery_id=? AND attempt=? AND state='outcome_unknown'").bind(&req.task_id).bind(&req.delivery_id).bind(row.get::<i64,_>(5)).execute(&mut *tx).await.map_err(|_|AbandonmentError::Database)?;
+            let d=sqlx::query("UPDATE delivery_dispositions SET state='terminal',reason_code='historical_unknown_abandoned' WHERE task_id=? AND delivery_id=? AND attempt=? AND state='outcome_unknown'").bind(&req.task_id).bind(&req.delivery_id).bind(row.get::<i64,_>(6)).execute(&mut *tx).await.map_err(|_| AbandonmentError::Database)?;
             if l.rows_affected() != 1 || k.rows_affected() != 1 || d.rows_affected() != 1 {
                 return Err(AbandonmentError::Conflict);
             }
@@ -336,7 +346,7 @@ mod tests {
             "INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES('task','task','endpoint','endpoint','conversation','fixture',1,0,0,1)",
             "INSERT INTO task_admissions(task_id,state,revision,runtime_instance,created_at,updated_at) VALUES('task','terminal',1,'runtime',?,?)",
             "INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES('delivery','task',1,'endpoint',?)",
-            "INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state,reason_code) VALUES('delivery','task',1,'outcome_unknown','unknown')",
+            "INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state,session_id,reason_code) VALUES('delivery','task',1,'outcome_unknown','session-fixture','unknown')",
             "INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('resource','task','owner',7,'recovery_needed',?,?,?)",
             "INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes) VALUES('task','resource','delivery',7,1,'recovery_needed',1,0,0,'prompt',?,?,?,0)",
         ] {
