@@ -16,7 +16,7 @@ async fn seed_unknown(pool: &SqlitePool) {
          INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES('task','task','endpoint','endpoint','conversation','retained unknown',1,0,0,1);
          INSERT INTO task_admissions(task_id,state,revision,runtime_instance,created_at,updated_at) VALUES('task','terminal',1,'runtime','2026-10-20T00:00:00Z','2026-10-20T00:00:00Z');
          INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at) VALUES('delivery','task',1,'endpoint','2026-10-20T00:00:00Z');
-         INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state,reason_code) VALUES('delivery','task',1,'outcome_unknown','unknown');
+         INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state,session_id,reason_code) VALUES('delivery','task',1,'outcome_unknown','session-fixture','unknown');
          INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES('resource','task','owner',7,'recovery_needed','2026-10-20T00:00:00Z','2026-10-20T00:00:00Z','2099-01-01T00:00:00Z');
          INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes) VALUES('task','resource','delivery',7,1,'recovery_needed',1,0,0,'prompt','2026-10-20T00:00:00Z','2026-10-20T00:00:00Z','2026-10-20T00:00:00Z',0);",
     ).execute(pool).await.unwrap();
