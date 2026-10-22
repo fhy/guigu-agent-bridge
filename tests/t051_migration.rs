@@ -7,6 +7,8 @@ use guigu_agent_bridge::storage::{connect, migrate};
 use sqlx::Row;
 use uuid::Uuid;
 
+static FULL_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 struct Temp(PathBuf);
 impl Temp {
     fn new() -> Self {
@@ -92,7 +94,12 @@ async fn v0211_upgrade_preserves_rows_and_reopens_once() {
             .fetch_one(&reopened)
             .await
             .unwrap(),
-        18
+        FULL_MIGRATOR
+            .migrations
+            .iter()
+            .map(|migration| migration.version)
+            .max()
+            .unwrap()
     );
     assert_eq!(
         sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM tasks WHERE task_id=?")

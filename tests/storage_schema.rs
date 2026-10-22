@@ -15,6 +15,8 @@ use guigu_agent_bridge::models::{ConversationId, DeliveryId, EventId, MessageId,
 use guigu_agent_bridge::storage::{StorageError, connect, migrate};
 use sqlx::{Row, SqlitePool};
 
+static FULL_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 /// A canonical, fixed-width UTC nanosecond timestamp (analyse §4.5).
 const TIMESTAMP: &str = "2026-09-16T10:00:00.000000000Z";
 
@@ -265,8 +267,9 @@ async fn an_empty_database_initializes_and_migrating_twice_is_idempotent() {
 
     let applied = applied_migration_count(&pool).await;
     assert_eq!(
-        applied, 18,
-        "the eighteen migrations are recorded once each"
+        applied,
+        FULL_MIGRATOR.migrations.len() as i64,
+        "the current migrations are recorded once each"
     );
     let max_age: Option<i64> =
         sqlx::query_scalar("SELECT max_age_seconds FROM runtime_owner_evidence LIMIT 1")

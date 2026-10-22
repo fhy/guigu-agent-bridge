@@ -310,7 +310,10 @@ async fn sqlx_migrator_rolls_back_rebuild_and_ledger_then_clean_retry_succeeds()
         })
         .collect();
     assert_eq!(ledger, expected);
-    assert_eq!(ledger.last().map(|row| row.0), Some(15));
+    assert_eq!(
+        ledger.last().map(|row| row.0),
+        FULL_MIGRATOR.migrations.iter().map(|migration| migration.version).max()
+    );
     assert_integrity(&pool).await;
     pool.close().await;
 }

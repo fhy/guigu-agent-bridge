@@ -6,6 +6,8 @@ use guigu_agent_bridge::{
 };
 use sqlx::{Row, SqlitePool};
 
+static FULL_MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
+
 async fn seed_unknown(pool: &SqlitePool) {
     sqlx::raw_sql(
         "INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES('endpoint','worker','acp',1,'[]');
@@ -66,7 +68,7 @@ async fn v0218_upgrade_reopen_preserves_unknown_history_through_0018() {
             .fetch_one(&pool)
             .await
             .unwrap(),
-        18
+        FULL_MIGRATOR.migrations.len() as i64
     );
     let columns = sqlx::query("PRAGMA table_info(runtime_owner_evidence)")
         .fetch_all(&pool)
