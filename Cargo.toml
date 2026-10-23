@@ -45,6 +45,7 @@ include = [
     "/docs/RELEASE-0.2.20.md",
     "/docs/RELEASE-0.2.21.md",
     "/docs/USER_GUIDE.md",
+    "/docs/OFFLINE_PRODUCTION_MIGRATION.md",
     "/docs/decisions/**",
     "/docs/integrations/**",
     "/examples/**",

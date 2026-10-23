@@ -77,7 +77,20 @@ pub(crate) fn migration_contract() -> Vec<(i64, String, Vec<u8>)> {
 /// [`StorageError::Open`] when the database file cannot be opened or created,
 /// including when its parent directory does not exist.
 pub async fn connect(path: impl AsRef<Path>) -> Result<SqlitePool, StorageError> {
-    let path = path.as_ref();
+    connect_inner(path.as_ref(), None).await
+}
+
+pub(crate) async fn connect_for_runtime(
+    path: &Path,
+    guard: std::sync::Arc<crate::maintenance_lock::MaintenanceLock>,
+) -> Result<SqlitePool, StorageError> {
+    connect_inner(path, Some(guard)).await
+}
+
+async fn connect_inner(
+    path: &Path,
+    guard: Option<std::sync::Arc<crate::maintenance_lock::MaintenanceLock>>,
+) -> Result<SqlitePool, StorageError> {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
@@ -88,6 +101,13 @@ pub async fn connect(path: impl AsRef<Path>) -> Result<SqlitePool, StorageError>
 
     SqlitePoolOptions::new()
         .max_connections(MAX_CONNECTIONS)
+        .after_connect(move |_, _| {
+            let retained = guard.clone();
+            Box::pin(async move {
+                let _retained = retained;
+                Ok(())
+            })
+        })
         .connect_with(options)
         .await
         .map_err(|source| StorageError::Open {

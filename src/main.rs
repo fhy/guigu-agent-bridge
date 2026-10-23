@@ -14,6 +14,7 @@ async fn main() -> std::process::ExitCode {
                 || failure.command == "verify-isolated-t050-backup"
                 || failure.command == "restore-isolated-t050-state"
                 || failure.command == "cleanup-isolated-t050-backup"
+                || failure.command == "offline-migrate-production"
             {
                 if failure.command.ends_with("t050-state")
                     || failure.command == "verify-isolated-t050-backup"

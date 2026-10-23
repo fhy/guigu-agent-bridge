@@ -145,7 +145,7 @@ use crate::{
     },
     storage::{
         RecoveryDiagnostic, RecoveryFixture, Repository, RepositoryEventConsumer, SqliteRepository,
-        StorageError, connect, migrate, plan_recovery, sync_agents,
+        StorageError, migrate, plan_recovery, sync_agents,
     },
 };
 
@@ -202,6 +202,7 @@ pub struct AppRuntime {
     reliability: crate::storage::ReliabilityStore,
     runtime_instance: Option<String>,
     first_failure: Arc<Mutex<Option<RequiredOwnerFailure>>>,
+    _maintenance_lock: Option<Arc<crate::offline_production_migration::RuntimeLock>>,
 }
 
 #[derive(Clone, Copy)]
@@ -318,7 +319,13 @@ impl AppRuntime {
         a2a_faults: Arc<dyn crate::a2a::IngressFaultInjector>,
     ) -> Result<Self, AppError> {
         prepare_directories(&config).map_err(AppError::Health)?;
-        let pool = connect(&config.bridge.database).await?;
+        let maintenance_lock = Arc::new(
+            crate::offline_production_migration::acquire_runtime_lock(&config.bridge.database)
+                .map_err(|_| AppError::Runtime)?,
+        );
+        let pool =
+            crate::storage::connect_for_runtime(&config.bridge.database, maintenance_lock.clone())
+                .await?;
         if let Err(error) = migrate(&pool).await {
             pool.close().await;
             return Err(error.into());
@@ -421,6 +428,7 @@ impl AppRuntime {
             reliability.clone(),
             runtime_instance.clone(),
             owns_runtime,
+            maintenance_lock.clone(),
             a2a_faults,
         )
         .await
@@ -443,6 +451,7 @@ impl AppRuntime {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn build(
         path: PathBuf,
         config: Config,
@@ -450,6 +459,7 @@ impl AppRuntime {
         reliability: crate::storage::ReliabilityStore,
         runtime_instance: String,
         owns_runtime: bool,
+        maintenance_lock: Arc<crate::offline_production_migration::RuntimeLock>,
         a2a_faults: Arc<dyn crate::a2a::IngressFaultInjector>,
     ) -> Result<Self, AppError> {
         let repository = Arc::new(SqliteRepository::new(pool.clone()));
@@ -591,6 +601,7 @@ impl AppRuntime {
         health_state.set_recovery_diagnostic(recovery_diagnostic.line());
         let first_failure = Arc::new(Mutex::new(None));
         let mut runtime = Self {
+            _maintenance_lock: Some(maintenance_lock),
             pool: Some(pool.clone()),
             reload,
             health_state,
@@ -1245,6 +1256,7 @@ impl AppRuntime {
         if let Some(pool) = self.pool.take() {
             pool.close().await;
         }
+        self._maintenance_lock.take();
         self.health_state.matrix().stopped();
         if let Some(failure) = *self
             .first_failure
@@ -1571,6 +1583,7 @@ enabled = true
             reliability,
             instance,
             true,
+            Arc::new(crate::offline_production_migration::acquire_runtime_lock(&database).unwrap()),
             Arc::new(crate::a2a::NoFault),
         );
         tokio::pin!(build);
@@ -1865,6 +1878,7 @@ enabled = true
             reliability,
             runtime_instance,
             true,
+            Arc::new(crate::offline_production_migration::acquire_runtime_lock(&database).unwrap()),
             Arc::new(crate::a2a::NoFault),
         )
         .await;

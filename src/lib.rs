@@ -16,11 +16,13 @@ pub mod isolated_fixture_migration;
 pub mod isolated_state_backup;
 pub mod lease_owner_diagnostics;
 pub mod legacy_owner_reconciliation;
+pub(crate) mod maintenance_lock;
 pub mod matrix;
 pub mod models;
 pub mod observer;
 pub mod offline_delivery;
 pub mod offline_preacceptance;
+pub(crate) mod offline_production_migration;
 pub mod offline_recovery;
 pub mod orphaned_preacceptance;
 pub mod owner_binding_remediation;
@@ -100,6 +102,43 @@ pub fn init_tracing() {
 /// termination signal.
 pub async fn run() -> Result<(), Error> {
     let all_args = std::env::args_os().collect::<Vec<_>>();
+    if all_args.get(1).and_then(|v| v.to_str()) == Some("offline-migrate-production") {
+        let req = offline_production_migration::parse_args(&all_args[1..]).map_err(|_| {
+            Error::Cli(error::CliFailure {
+                command: "offline-migrate-production",
+                category: "invalid-arguments",
+                status: 2,
+            })
+        })?;
+        let result = offline_production_migration::run(req)
+            .await
+            .map_err(|error| {
+                let (category, status) = match error {
+                    offline_production_migration::Failure::InvalidArguments => {
+                        ("invalid-arguments", 2)
+                    }
+                    offline_production_migration::Failure::Busy => ("busy", 4),
+                    offline_production_migration::Failure::Preflight => ("preflight", 5),
+                    offline_production_migration::Failure::ManualRequired => ("manual-required", 6),
+                    offline_production_migration::Failure::Migration => ("migration", 7),
+                };
+                Error::Cli(error::CliFailure {
+                    command: "offline-migrate-production",
+                    category,
+                    status,
+                })
+            })?;
+        println!("{result}");
+        return Ok(());
+    }
+    let _maintenance_guard = offline_production_migration::cli_exclusion::acquire(&all_args)
+        .map_err(|_| {
+            Error::Cli(error::CliFailure {
+                command: "maintenance-exclusion",
+                category: "busy-or-unresolved",
+                status: 4,
+            })
+        })?;
     if all_args.get(1).and_then(|v| v.to_str()) == Some("historical-terminal-cleanup") {
         let req = terminal_acknowledged_cleanup::parse_args(&all_args[1..]).map_err(|_| {
             Error::Cli(error::CliFailure {

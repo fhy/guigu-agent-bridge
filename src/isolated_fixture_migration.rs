@@ -988,6 +988,9 @@ pub async fn migrate(path: impl AsRef<Path>) -> Result<Outcome, Error> {
         .canonicalize()
         .map_err(|_| Error::Rejected)?;
     authenticate(&m, path, &binary)?;
+    let _maintenance =
+        crate::offline_production_migration::acquire_runtime_lock(Path::new(&m.database))
+            .map_err(|_| Error::Rejected)?;
     let admission = crate::runtime_admission::Guard::acquire(
         Path::new(&m.database),
         Path::new(&m.config),

@@ -1348,6 +1348,9 @@ fn precommit_test_pause() -> Result<(), Error> {
 pub async fn reconcile(path: impl AsRef<Path>) -> Result<Outcome, Error> {
     let (m, manifest_bytes) = read_manifest(path.as_ref())?;
     authenticate_root(&m, path.as_ref())?;
+    let _maintenance =
+        crate::offline_production_migration::acquire_runtime_lock(Path::new(&m.database))
+            .map_err(|_| Error::Rejected)?;
     let binary = std::env::current_exe()
         .map_err(|_| Error::Rejected)?
         .canonicalize()

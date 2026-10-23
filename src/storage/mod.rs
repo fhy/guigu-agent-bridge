@@ -158,6 +158,7 @@ pub(crate) use output_spool::OutputSetInput;
 pub(crate) use output_spool::{
     DeliveryPart, OutputSegment, OutputSpoolStore, OutputStoreError, PendingDelivery,
 };
+pub(crate) use pool::connect_for_runtime;
 pub(crate) use pool::migration_contract;
 pub use pool::{DEFAULT_BUSY_TIMEOUT, MAX_CONNECTIONS, connect, migrate};
 pub use recovery::{
