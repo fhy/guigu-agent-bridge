@@ -153,7 +153,7 @@ impl Fixture {
     }
 
     async fn new_unprepared() -> Self {
-        use std::os::unix::fs::PermissionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let root =
             std::env::temp_dir().join(format!("t050-fixture-migration-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir(&root).unwrap();
@@ -182,6 +182,12 @@ impl Fixture {
         .to_string();
         sqlx::query("INSERT INTO continuation_response_receipts VALUES('receipt','task','delivery','resource',7,1,?,'structured',2,'generation.v1:strict','2026-10-01T00:00:03.000000000Z')").bind(response_hash).execute(&pool).await.unwrap();
         pool.close().await;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(root.join(".state.db.offline-migration.lock"))
+            .unwrap();
         let config = root.join("config.toml");
         std::fs::write(&config, b"fixture=true\n").unwrap();
         let systemctl = root.join("systemctl");
