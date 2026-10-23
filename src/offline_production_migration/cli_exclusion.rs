@@ -19,6 +19,7 @@ pub(crate) fn acquire(args: &[OsString]) -> Result<Option<RuntimeLock>, Failure>
             | "recover-runtime"
             | "reconcile-delivery"
             | "recover-preacceptance"
+            | "recover-selected-preacceptance"
             | "reconcile-orphaned-preacceptance"
             | "reconcile-lease-owner"
             | "prepare-isolated-legacy-fixture-migration-manifest"

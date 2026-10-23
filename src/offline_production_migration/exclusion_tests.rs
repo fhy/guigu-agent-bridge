@@ -108,6 +108,7 @@ async fn lock_aliases_and_cli_mutators_share_the_same_guard() {
         "recover-runtime",
         "reconcile-delivery",
         "recover-preacceptance",
+        "recover-selected-preacceptance",
         "reconcile-orphaned-preacceptance",
         "reconcile-lease-owner",
     ] {
