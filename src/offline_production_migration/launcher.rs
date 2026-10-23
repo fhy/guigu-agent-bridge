@@ -3,13 +3,17 @@ use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
 
 const UNIT: &str = "guigu-agent-bridge-observer.service";
 
-pub(super) async fn check(listeners: &[SocketAddr]) -> Result<(), Failure> {
+pub(super) async fn check(
+    listeners: &[SocketAddr],
+    live: bool,
+    phase: &str,
+) -> Result<(), Failure> {
+    if !live {
+        return fixture_check(phase);
+    }
     let show = query(&["show", UNIT, "--no-pager"]).await?;
     validate_show(&show)?;
     let jobs = query(&["list-jobs", "--no-legend", "--no-pager"]).await?;
-    if !jobs.trim().is_empty() {
-        return Err(Failure::Busy);
-    }
     let reverse = query(&[
         "list-dependencies",
         "--reverse",
@@ -18,18 +22,41 @@ pub(super) async fn check(listeners: &[SocketAddr]) -> Result<(), Failure> {
         UNIT,
     ])
     .await?;
-    if reverse
-        .lines()
-        .any(|line| !matches!(line.trim(), "" | UNIT))
-    {
-        return Err(Failure::Busy);
-    }
+    validate_launchers(&jobs, &reverse)?;
     for address in listeners {
         let listener = std::net::TcpListener::bind(address).map_err(|_| Failure::Busy)?;
         drop(listener);
     }
     no_other_bridge()?;
     Ok(())
+}
+
+fn validate_launchers(jobs: &str, reverse: &str) -> Result<(), Failure> {
+    if !jobs.trim().is_empty()
+        || reverse
+            .lines()
+            .any(|line| !matches!(line.trim(), "" | UNIT))
+    {
+        return Err(Failure::Busy);
+    }
+    Ok(())
+}
+
+fn fixture_check(_phase: &str) -> Result<(), Failure> {
+    #[cfg(not(test))]
+    {
+        Err(Failure::Busy)
+    }
+    #[cfg(test)]
+    {
+        if std::env::var("R071_TEST_LAUNCHER_FAIL").as_deref() == Ok(_phase) {
+            return Err(Failure::Busy);
+        }
+        validate_show(
+            "LoadState=masked\nUnitFileState=masked-runtime\nActiveState=inactive\nSubState=dead\nMainPID=0\nControlPID=0\nFragmentPath=/dev/null\nJob=\nTriggeredBy=\n",
+        )?;
+        validate_launchers("", UNIT)
+    }
 }
 
 fn no_other_bridge() -> Result<(), Failure> {

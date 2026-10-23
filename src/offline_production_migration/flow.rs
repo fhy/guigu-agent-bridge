@@ -14,13 +14,9 @@ pub async fn run(req: Request) -> Result<String, Failure> {
 
 pub(super) async fn execute(req: Request, live_launcher: bool) -> Result<String, Failure> {
     let mut evidence = Evidence::read(&req)?;
-    if live_launcher {
-        launcher::check(&evidence.listeners).await?;
-    }
+    launcher::check(&evidence.listeners, live_launcher, "pre-lock").await?;
     let _lock = RuntimeLock::acquire(&req.database).map_err(|_| Failure::Busy)?;
-    if live_launcher {
-        launcher::check(&evidence.listeners).await?;
-    }
+    launcher::check(&evidence.listeners, live_launcher, "post-lock").await?;
     evidence.recheck(&req)?;
     if req.mode == Mode::Preflight {
         let facts = snapshot::inspect(&req.database).await?;
@@ -35,9 +31,7 @@ pub(super) async fn execute(req: Request, live_launcher: bool) -> Result<String,
     let before = snapshot::inspect(&req.database).await?;
     let backup = prepare(&req, &expected, &before).await?;
     evidence.recheck(&req)?;
-    if live_launcher {
-        launcher::check(&evidence.listeners).await?;
-    }
+    launcher::check(&evidence.listeners, live_launcher, "pre-intent").await?;
     let current = validate_current(&req, &backup).await?;
     let intent = intent(&req, &expected, &backup, &current)?;
     fault("after-intent");
@@ -49,9 +43,7 @@ pub(super) async fn execute(req: Request, live_launcher: bool) -> Result<String,
             verify_complete(&req, &intent, &backup).await?;
         } else {
             evidence.recheck(&req)?;
-            if live_launcher {
-                launcher::check(&evidence.listeners).await?;
-            }
+            launcher::check(&evidence.listeners, live_launcher, "pre-migration").await?;
             migrate(&req, &backup).await?;
             evidence.recheck(&req)?;
             let after = validate_current(&req, &backup).await?;

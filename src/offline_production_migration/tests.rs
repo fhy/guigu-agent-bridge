@@ -135,7 +135,12 @@ async fn child_entry() {
         return;
     };
     let request = Fixture::request(std::path::Path::new(&root), Mode::Apply);
-    flow::execute(request, false).await.unwrap();
+    match flow::execute(request, false).await {
+        Err(Failure::Busy) => std::process::exit(4),
+        result => {
+            result.unwrap();
+        }
+    }
 }
 
 #[tokio::test]

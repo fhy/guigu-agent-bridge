@@ -1,4 +1,43 @@
 use super::{Failure, Mode, flow, records, snapshot, test_fixture::Fixture};
+
+#[tokio::test]
+async fn launcher_changes_after_lock_and_before_sql_are_refused() {
+    for phase in ["post-lock", "pre-intent", "pre-migration"] {
+        let fixture = Fixture::new().await;
+        let result = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "offline_production_migration::tests::child_entry",
+                "--nocapture",
+            ])
+            .env("R071_TEST_ROOT", fixture.root.path())
+            .env("R071_TEST_LAUNCHER_FAIL", phase)
+            .output()
+            .unwrap();
+        assert_eq!(
+            result.status.code(),
+            Some(4),
+            "{}",
+            String::from_utf8_lossy(&result.stderr)
+        );
+        assert_eq!(
+            snapshot::inspect(&fixture.request.database)
+                .await
+                .unwrap()
+                .version,
+            18
+        );
+        assert!(!fixture.request.manifest_dir.join("complete.json").exists());
+        if phase == "post-lock" {
+            assert!(!records::anchor(&fixture.request.database).exists());
+        } else {
+            assert!(super::acquire_runtime_lock(&fixture.request.database).is_err());
+            flow::execute(fixture.mode(Mode::Resume), false)
+                .await
+                .unwrap();
+        }
+    }
+}
 use std::{fs, process::Command};
 
 #[tokio::test]
