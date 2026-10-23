@@ -10,7 +10,7 @@ fn version_flag_prints_package_version_and_exits_successfully() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8_lossy(&output.stdout).trim(),
-        "guigu-agent-bridge 0.2.21"
+        "guigu-agent-bridge 0.2.22"
     );
     assert!(output.stderr.is_empty());
 }
