@@ -144,13 +144,17 @@ impl Evidence {
         if Identity::of(&req.executable)? != executable_identity {
             return Err(Failure::ManualRequired);
         }
+        let config_digest = hash_file(&req.config)?;
         let listeners = super::configuration::listeners(req)?;
+        if hash_file(&req.config)? != config_digest {
+            return Err(Failure::ManualRequired);
+        }
         Ok(Self {
             executable_stamp: stamp(&meta),
             executable,
             executable_identity,
             provenance_digest: digest(&bytes),
-            config_digest: hash_file(&req.config)?,
+            config_digest,
             database_identity: Identity::of(&req.database)?,
             listeners,
         })
