@@ -18,6 +18,7 @@ pub(super) async fn execute(req: Request, live_launcher: bool) -> Result<String,
     let _lock = RuntimeLock::acquire(&req.database).map_err(|_| Failure::Busy)?;
     launcher::check(&evidence.listeners, live_launcher, "post-lock").await?;
     evidence.recheck(&req)?;
+    records::no_pending(&req)?;
     if req.mode == Mode::Preflight {
         let facts = snapshot::inspect(&req.database).await?;
         preflight_operation(&req, &evidence, &facts).await?;
@@ -87,6 +88,10 @@ async fn preflight_operation(
         return Err(Failure::ManualRequired);
     }
     validate_current(req, &backup).await?;
+    if req.manifest_dir.join("complete.json").exists() {
+        let existing: Intent = records::load(&intent_path)?;
+        verify_complete(req, &existing, &backup).await?;
+    }
     Ok(())
 }
 
@@ -103,12 +108,6 @@ async fn prepare(req: &Request, expected: &Operation, before: &Facts) -> Result<
         let operation: Operation = records::load(&records::anchor(&req.database))?;
         if &operation != expected {
             return Err(Failure::ManualRequired);
-        }
-        for entry in std::fs::read_dir(&req.manifest_dir).map_err(|_| Failure::ManualRequired)? {
-            let entry = entry.map_err(|_| Failure::ManualRequired)?;
-            if entry.file_name().to_string_lossy().ends_with(".pending") {
-                return Err(Failure::ManualRequired);
-            }
         }
         snapshot::validate(req, expected).await
     }

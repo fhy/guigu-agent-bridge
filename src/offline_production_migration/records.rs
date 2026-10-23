@@ -114,6 +114,23 @@ pub(super) fn no_residue(req: &Request) -> Result<(), Failure> {
     Ok(())
 }
 
+pub(super) fn no_pending(req: &Request) -> Result<(), Failure> {
+    if present(&anchor(&req.database).with_extension("pending"))? {
+        return Err(Failure::ManualRequired);
+    }
+    for entry in fs::read_dir(&req.manifest_dir).map_err(|_| Failure::ManualRequired)? {
+        if entry
+            .map_err(|_| Failure::ManualRequired)?
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".pending")
+        {
+            return Err(Failure::ManualRequired);
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn startup_allowed(database: &Path) -> Result<(), Failure> {
     let path = anchor(database);
     if present(&path.with_extension("pending"))? {

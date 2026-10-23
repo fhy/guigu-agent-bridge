@@ -95,6 +95,28 @@ async fn immutable_publication_refuses_overwrite_and_retains_pending_crash_resid
 }
 
 #[tokio::test]
+async fn completed_operation_with_malformed_result_or_pending_anchor_is_refused() {
+    let fixture = Fixture::new().await;
+    flow::execute(fixture.request.clone(), false).await.unwrap();
+    let pending = records::anchor(&fixture.request.database).with_extension("pending");
+    fs::write(&pending, b"interrupted").unwrap();
+    assert!(matches!(
+        flow::execute(fixture.mode(Mode::Resume), false).await,
+        Err(Failure::ManualRequired)
+    ));
+    fs::remove_file(pending).unwrap();
+    fs::write(
+        fixture.request.manifest_dir.join("complete.json"),
+        b"malformed",
+    )
+    .unwrap();
+    assert!(matches!(
+        flow::execute(fixture.mode(Mode::Preflight), false).await,
+        Err(Failure::ManualRequired)
+    ));
+}
+
+#[tokio::test]
 async fn empty_and_absent_wal_are_valid_backup_inputs() {
     for keep_open in [false, true] {
         let fixture = Fixture::new().await;
