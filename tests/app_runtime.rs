@@ -969,6 +969,20 @@ async fn concurrent_second_start_rejects_live_owner_without_takeover() {
     assert_eq!(before.0, 1);
     assert_eq!(before.1, "active");
     assert!(before.2.starts_with(&format!("pid:{first_pid};exe:")));
+    let lock = std::fs::File::open(temp.0.join(".state.db.offline-migration.lock")).unwrap();
+    assert_eq!(
+        unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&lock),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EWOULDBLOCK)
+    );
     let second_stderr = temp.0.join("second.stderr");
     let mut second = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
         .arg(&config_path)
@@ -989,10 +1003,7 @@ async fn concurrent_second_start_rejects_live_owner_without_takeover() {
     .expect("blocked second runtime did not exit");
     assert_eq!(status.code(), Some(1));
     let diagnostic = std::fs::read_to_string(second_stderr).unwrap();
-    assert!(
-        diagnostic.contains("t050-recovery status=3 blocking=owner"),
-        "{diagnostic}"
-    );
+    assert_eq!(diagnostic.trim(), "Error: Application(Runtime)");
     assert!(first.try_wait().unwrap().is_none());
     let after: (i64, String, String) = sqlx::query_as(
         "SELECT count(*),state,process_fingerprint FROM runtime_instances WHERE state='active'",
