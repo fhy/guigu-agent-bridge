@@ -111,6 +111,10 @@ impl MatrixClient {
             device_id: self.device_id.clone(),
             cutover_baseline: Some(baseline.to_owned()),
         };
+        active
+            .inner
+            .enable_isolated_sync_replay()
+            .map_err(|_| MatrixError::CutoverRefused)?;
         if active.stored_sync_token().await?.as_deref() != Some(baseline)
             || active.inner.user_id() != self.inner.user_id()
             || active.inner.device_id() != self.inner.device_id()

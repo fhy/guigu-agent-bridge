@@ -1,14 +1,14 @@
 # R076 local hydration patch
 
-The two directories are extracted from exact crates.io 0.13.0 archives. Their
+The three directories are extracted from exact crates.io 0.13.0 archives. Their
 SHA-256 identities, upstream Git identity and license are in `PROVENANCE.toml`;
 original source license headers and Cargo manifests are retained. The standard
 Apache-2.0 license text is included alongside the sources. Registry cache sources
-are not modified. Root `[patch.crates-io]` and Cargo.lock select both local crates;
-`matrix-sdk` itself remains the unmodified registry 0.13.0 crate.
+are not modified. Root `[patch.crates-io]` and Cargo.lock select all three local
+crates. Direct SDK glue exposes the base client's isolated replay opt-in only.
 
 `hydration.patch` is the complete minimal diff against those exact archives.
-To reproduce it, verify both archive hashes, extract into an empty directory,
+To reproduce it, verify all three archive hashes, extract into an empty directory,
 then compare each extracted crate with the corresponding directory here using
 zero-context unified diffs (`diff -U0`, with `a/vendor/` and `b/vendor/` labels).
 No generated build files are needed.
@@ -27,6 +27,14 @@ BaseClient seeds a fresh MemoryStore and loads its room/cached-cursor state only
 after successful export. All future state writes remain in memory. Authenticated
 crypto store and Olm machine sharing are unchanged. Persistent outgoing queues,
 media and event-cache data are intentionally not exported or replayed.
+
+F1 adds a fallible opt-in available only on successfully hydrated memory clones.
+It bypasses duplicate-token suppression, not processing: repeated wire responses
+traverse the full SDK pipeline. Ordinary clients still return the SDK's default
+processed response on duplicate tokens, and cannot enable the opt-in. Each clone
+has its own opt-in flag, shared only by handles of that clone. No cursor reset or
+persistent-client behavior change is involved. Bridge enables it before publishing
+the active client, deduplicates durable dispositions and paces active batches.
 
 CL-R076-04 permits unchanged upstream baseline files to exceed Bridge structure
 limits when provenance and this minimal diff are supplied. New snapshot modules,

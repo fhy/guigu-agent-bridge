@@ -7,6 +7,13 @@ selection = "Root Cargo.toml [patch.crates-io]; locked exact 0.13.0 packages onl
 distribution = "Local source patch; not a registry publication or installation artifact"
 
 [[crate]]
+name = "matrix-sdk"
+version = "0.13.0"
+archive_sha256 = "1de309d33d0c5d77829f952110e8b9e3e6c730880152db6e1778bcaa2cbfaef9"
+path = "matrix-sdk-0.13.0"
+upstream_path = "crates/matrix-sdk"
+
+[[crate]]
 name = "matrix-sdk-base"
 version = "0.13.0"
 archive_sha256 = "ad7f18305090c059293ebafefbfd8cac494f43386c3f255861995ee7b48f9e89"

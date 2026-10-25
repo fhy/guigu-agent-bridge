@@ -14,6 +14,9 @@ use fixture::Fixture;
 #[path = "cutover_refusal_tests.rs"]
 mod refusal;
 
+#[path = "cutover_repeat_tests.rs"]
+mod repeated;
+
 async fn sync_owner(client: crate::matrix::MatrixClient, store: CutoverStore) -> MatrixSync {
     MatrixSync::new(client, Arc::new(MemorySyncTokenStore::default()), 8)
         .unwrap()
@@ -178,6 +181,7 @@ async fn b_is_application_only_all_subsequent_requests_still_use_a() {
 
 #[tokio::test]
 async fn sdk_default_and_limited_batches_refuse_without_advancing_b() {
+    assert!(super::validate_response(&matrix_sdk::sync::SyncResponse::default(), None).is_err());
     let fixture = Fixture::new().await;
     let active = fixture.baseline().await;
     let sync = sync_owner(active, fixture.store.clone()).await;
@@ -186,7 +190,7 @@ async fn sdk_default_and_limited_batches_refuse_without_advancing_b() {
         assert!(sync.request_response().await.is_err());
     }
     {
-        let _mock = fixture.sync_mock("B", &["$new"], false).await;
+        let _mock = fixture.sync_mock("", &["$new"], false).await;
         assert!(sync.request_response().await.is_err());
     }
     assert_eq!(

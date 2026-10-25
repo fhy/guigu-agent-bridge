@@ -1,18 +1,49 @@
+--- a/vendor/matrix-sdk-0.13.0/src/client/mod.rs
++++ b/vendor/matrix-sdk-0.13.0/src/client/mod.rs
+@@ -464,0 +465,5 @@
++    /// Enable full repeated-response processing on a hydrated isolated client.
++    pub fn enable_isolated_sync_replay(&self) -> matrix_sdk_base::Result<()> {
++        self.base_client().enable_isolated_sync_replay()
++    }
++
 --- a/vendor/matrix-sdk-base-0.13.0/src/client.rs
 +++ b/vendor/matrix-sdk-base-0.13.0/src/client.rs
-@@ -64 +64 @@
+@@ -16 +15,0 @@
+-#[cfg(feature = "e2e-encryption")]
+@@ -64 +63 @@
 -        ambiguity_map::AmbiguityCache, BaseStateStore, DynStateStore, MemoryStore,
 +        ambiguity_map::AmbiguityCache, BaseStateStore, DynStateStore,
-@@ -210,0 +211,3 @@
+@@ -128,0 +128 @@
++    isolated_sync_replay: Option<Arc<std::sync::atomic::AtomicBool>>,
+@@ -199,0 +200 @@
++            isolated_sync_replay: None,
+@@ -210,0 +212,3 @@
 +        self.session_meta().ok_or(Error::InsufficientData)?;
 +        let snapshot = self.state_store.snapshot().await?;
 +        let memory = snapshot.into_memory_store().await?;
-@@ -212 +215 @@
+@@ -212 +216 @@
 -            .state_store(MemoryStore::new());
 +            .state_store(memory);
-@@ -251 +254 @@
+@@ -231,0 +236 @@
++            isolated_sync_replay: Some(Default::default()),
+@@ -251 +256 @@
 -            .state_store(MemoryStore::new());
 +            .state_store(crate::store::MemoryStore::new());
+@@ -522,0 +528,9 @@
++    /// Enable full repeated-response processing on a hydrated isolated client.
++    pub fn enable_isolated_sync_replay(&self) -> Result<()> {
++        self.isolated_sync_replay
++            .as_ref()
++            .ok_or(Error::InsufficientData)?
++            .store(true, std::sync::atomic::Ordering::Release);
++        Ok(())
++    }
++
+@@ -555 +569,3 @@
+-        if self.state_store.sync_token.read().await.as_ref() == Some(&response.next_batch) {
++        if !self.isolated_sync_replay.as_ref().is_some_and(|enabled| {
++            enabled.load(std::sync::atomic::Ordering::Acquire)
++        }) && self.state_store.sync_token.read().await.as_ref() == Some(&response.next_batch) {
 --- a/vendor/matrix-sdk-base-0.13.0/src/store/mod.rs
 +++ b/vendor/matrix-sdk-base-0.13.0/src/store/mod.rs
 @@ -68,0 +69,2 @@

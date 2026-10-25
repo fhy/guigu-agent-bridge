@@ -1900,8 +1900,6 @@ dependencies = [
 [[package]]
 name = "matrix-sdk"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1de309d33d0c5d77829f952110e8b9e3e6c730880152db6e1778bcaa2cbfaef9"
 dependencies = [
  "anymap2",
  "aquamarine",

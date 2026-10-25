@@ -13,7 +13,6 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-#[cfg(feature = "e2e-encryption")]
 use std::sync::Arc;
 use std::{
     collections::{BTreeMap, BTreeSet, HashMap},
@@ -126,6 +125,7 @@ pub struct BaseClient {
 
     /// Whether the client supports threads or not.
     pub threading_support: ThreadingSupport,
+    isolated_sync_replay: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
 #[cfg(not(tarpaulin_include))]
@@ -197,6 +197,7 @@ impl BaseClient {
             #[cfg(feature = "e2e-encryption")]
             handle_verification_events: true,
             threading_support,
+            isolated_sync_replay: None,
         }
     }
 
@@ -232,6 +233,7 @@ impl BaseClient {
             decryption_settings: self.decryption_settings.clone(),
             handle_verification_events,
             threading_support: self.threading_support,
+            isolated_sync_replay: Some(Default::default()),
         };
 
         copy.state_store
@@ -523,6 +525,15 @@ impl BaseClient {
         self.state_store.sync_lock()
     }
 
+    /// Enable full repeated-response processing on a hydrated isolated client.
+    pub fn enable_isolated_sync_replay(&self) -> Result<()> {
+        self.isolated_sync_replay
+            .as_ref()
+            .ok_or(Error::InsufficientData)?
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(())
+    }
+
     /// Receive a response from a sync call.
     ///
     /// # Arguments
@@ -555,7 +566,9 @@ impl BaseClient {
         // The server might respond multiple times with the same sync token, in
         // that case we already received this response and there's nothing to
         // do.
-        if self.state_store.sync_token.read().await.as_ref() == Some(&response.next_batch) {
+        if !self.isolated_sync_replay.as_ref().is_some_and(|enabled| {
+            enabled.load(std::sync::atomic::Ordering::Acquire)
+        }) && self.state_store.sync_token.read().await.as_ref() == Some(&response.next_batch) {
             info!("Got the same sync response twice");
             return Ok(SyncResponse::default());
         }

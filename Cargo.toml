@@ -59,6 +59,7 @@ include = [
 test-support = []
 
 [patch.crates-io]
+matrix-sdk = { version = "=0.13.0", path = "vendor/matrix-sdk-0.13.0" }
 matrix-sdk-base = { version = "=0.13.0", path = "vendor/matrix-sdk-base-0.13.0" }
 matrix-sdk-sqlite = { version = "=0.13.0", path = "vendor/matrix-sdk-sqlite-0.13.0" }
 

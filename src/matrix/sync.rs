@@ -163,17 +163,14 @@ impl MatrixSync {
     }
 
     async fn request_response(&self) -> Result<SyncResponse, MatrixError> {
-        let (token, previous) = if let Some(cutover) = &self.cutover {
+        let token = if let Some(cutover) = &self.cutover {
             let state = cutover.store.state().await?;
             if state.baseline.as_deref() != Some(cutover.baseline.as_str()) {
                 return Err(MatrixError::CutoverRefused);
             }
-            (
-                Some(cutover.baseline.clone()),
-                self.client.stored_sync_token().await?,
-            )
+            Some(cutover.baseline.clone())
         } else {
-            (self.tokens.load().await?, None)
+            self.tokens.load().await?
         };
         let mut settings = SyncSettings::new().timeout(self.server_timeout);
         if let Some(token) = token {
@@ -186,7 +183,7 @@ impl MatrixSync {
             .await
             .map_err(classify_sdk_error)?;
         if self.cutover.is_some() {
-            validate_response(&response, previous.as_deref())?;
+            validate_response(&response, None)?;
         }
         Ok(response)
     }
@@ -311,6 +308,16 @@ impl MatrixSync {
             match response {
                 Ok(ProcessResult::Complete(_)) => {
                     failures = 0;
+                    if self.cutover.is_some() {
+                        tokio::select! {
+                            biased;
+                            changed = shutdown.changed() => {
+                                let _ = changed;
+                                return Ok(());
+                            }
+                            _ = tokio::time::sleep(Duration::from_millis(100)) => {}
+                        }
+                    }
                 }
                 Ok(ProcessResult::Cancelled) => return Ok(()),
                 Err(MatrixError::Transport) if failures < 2 => {
