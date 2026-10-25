@@ -21,7 +21,8 @@ use super::store_identity;
 pub struct MatrixClient {
     pub(crate) inner: Client,
     pub(crate) user_id: String,
-    device_id: String,
+    pub(crate) device_id: String,
+    pub(crate) cutover_baseline: Option<String>,
 }
 
 impl std::fmt::Debug for MatrixClient {
@@ -41,6 +42,7 @@ impl MatrixClient {
                 .expect("test Matrix client"),
             user_id: "@bridge:example.test".into(),
             device_id: "BRIDGE".into(),
+            cutover_baseline: None,
         }
     }
 
@@ -120,6 +122,7 @@ impl MatrixClient {
             inner,
             user_id: config.user_id.clone(),
             device_id: config.device_id.clone(),
+            cutover_baseline: None,
         })
     }
 

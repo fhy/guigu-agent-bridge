@@ -18,7 +18,16 @@ use tokio::{
     task::JoinHandle,
 };
 
-use super::{InboundMatrixEvent, MatrixClient, MatrixError, event::decode_event};
+use super::cutover::{ActiveCutover, validate_response};
+use super::{InboundMatrixEvent, MatrixClient, MatrixError};
+use crate::storage::CutoverStore;
+
+#[path = "sync_processing.rs"]
+mod processing;
+
+#[cfg(test)]
+#[path = "cutover_tests.rs"]
+mod cutover_tests;
 
 /// Boxed future returned by [`SyncTokenStore`].
 pub type SyncTokenFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -84,6 +93,8 @@ pub struct MatrixSync {
     missing_key_observer: Option<Arc<dyn MissingRoomKeyObserver>>,
     initial_response: Option<SyncResponse>,
     failure_observer: Option<FailureObserver>,
+    cutover: Option<ActiveCutover>,
+    batch_lock: tokio::sync::Mutex<()>,
     #[cfg(test)]
     test_failure: Option<MatrixError>,
 }
@@ -116,6 +127,8 @@ impl MatrixSync {
             missing_key_observer: None,
             initial_response: None,
             failure_observer: None,
+            cutover: None,
+            batch_lock: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             test_failure: None,
         })
@@ -134,6 +147,48 @@ impl MatrixSync {
     pub fn with_initial_response(mut self, response: SyncResponse) -> Self {
         self.initial_response = Some(response);
         self
+    }
+
+    pub async fn with_cutover(mut self, store: CutoverStore) -> Result<Self, MatrixError> {
+        let state = store.state().await?;
+        let baseline = state.baseline.ok_or(MatrixError::CutoverRefused)?;
+        if self.initial_response.is_some()
+            || self.client.cutover_baseline.as_deref() != Some(baseline.as_str())
+            || self.client.stored_sync_token().await?.as_deref() != Some(baseline.as_str())
+        {
+            return Err(MatrixError::CutoverRefused);
+        }
+        self.cutover = Some(ActiveCutover { store, baseline });
+        Ok(self)
+    }
+
+    async fn request_response(&self) -> Result<SyncResponse, MatrixError> {
+        let (token, previous) = if let Some(cutover) = &self.cutover {
+            let state = cutover.store.state().await?;
+            if state.baseline.as_deref() != Some(cutover.baseline.as_str()) {
+                return Err(MatrixError::CutoverRefused);
+            }
+            (
+                Some(cutover.baseline.clone()),
+                self.client.stored_sync_token().await?,
+            )
+        } else {
+            (self.tokens.load().await?, None)
+        };
+        let mut settings = SyncSettings::new().timeout(self.server_timeout);
+        if let Some(token) = token {
+            settings = settings.token(token);
+        }
+        let response = self
+            .client
+            .inner
+            .sync_once(settings)
+            .await
+            .map_err(classify_sdk_error)?;
+        if self.cutover.is_some() {
+            validate_response(&response, previous.as_deref())?;
+        }
+        Ok(response)
     }
 
     pub(crate) fn with_failure_observer(mut self, observer: FailureObserver) -> Self {
@@ -200,77 +255,6 @@ impl MatrixSync {
         )
     }
 
-    /// Run one initial or incremental sync and commit its checkpoint.
-    async fn process_response(
-        &self,
-        events: &mpsc::Sender<InboundMatrixEvent>,
-        dispositions: &mut Option<mpsc::Receiver<Disposition>>,
-        mut shutdown: Option<&mut watch::Receiver<bool>>,
-        response: SyncResponse,
-    ) -> Result<ProcessResult, MatrixError> {
-        let mut delivered = 0;
-        for (room_id, update) in response.rooms.joined {
-            for timeline in update.timeline.events {
-                let raw = timeline.kind.raw().json().get();
-                if let Some(consumer) = &self.raw_consumer
-                    && consumer.consume(raw, room_id.as_str()).await?
-                {
-                    delivered += 1;
-                    continue;
-                }
-                match decode_event(raw, room_id.as_str(), &self.client.user_id) {
-                    Ok(Some(event)) => {
-                        events.try_send(event).map_err(|error| match error {
-                            mpsc::error::TrySendError::Full(_) => MatrixError::Backpressure,
-                            mpsc::error::TrySendError::Closed(_) => MatrixError::ConsumerClosed,
-                        })?;
-                        if let Some(dispositions) = dispositions {
-                            let disposition = if let Some(shutdown) = shutdown.as_deref_mut() {
-                                tokio::select! {
-                                    biased;
-                                    changed = shutdown.changed() => {
-                                        let _ = changed;
-                                        return Ok(ProcessResult::Cancelled);
-                                    }
-                                    disposition = dispositions.recv() => disposition,
-                                }
-                            } else {
-                                dispositions.recv().await
-                            };
-                            disposition.ok_or(MatrixError::ConsumerClosed)??;
-                        }
-                        delivered += 1;
-                    }
-                    Ok(None) => {}
-                    Err(MatrixError::Protocol { .. }) => {
-                        // Malformed and unauthorized timeline items have a terminal
-                        // disposition. They are consumed from this batch without
-                        // advancing the bounded event channel.
-                    }
-                    Err(error) => return Err(error),
-                }
-                let missing_decryption = serde_json::from_str::<serde_json::Value>(raw)
-                    .ok()
-                    .and_then(|event| {
-                        event
-                            .get("type")
-                            .and_then(|value| value.as_str())
-                            .map(str::to_owned)
-                    })
-                    .as_deref()
-                    == Some("m.room.encrypted");
-                if missing_decryption {
-                    if let Some(observer) = &self.missing_key_observer {
-                        observer.record_missing_room_key();
-                    }
-                    return Err(MatrixError::CryptoInitialization);
-                }
-            }
-        }
-        self.tokens.save(&response.next_batch).await?;
-        Ok(ProcessResult::Complete(delivered))
-    }
-
     pub async fn sync_once(
         &self,
         events: &mpsc::Sender<InboundMatrixEvent>,
@@ -283,17 +267,11 @@ impl MatrixSync {
         events: &mpsc::Sender<InboundMatrixEvent>,
         dispositions: &mut Option<mpsc::Receiver<Disposition>>,
     ) -> Result<usize, MatrixError> {
-        let token = self.tokens.load().await?;
-        let mut settings = SyncSettings::new().timeout(self.server_timeout);
-        if let Some(token) = token {
-            settings = settings.token(token);
+        let _batch = self.batch_lock.lock().await;
+        if self.cutover.is_some() {
+            return Err(MatrixError::CutoverRefused);
         }
-        let response = self
-            .client
-            .inner
-            .sync_once(settings)
-            .await
-            .map_err(classify_sdk_error)?;
+        let response = self.request_response().await?;
         match self
             .process_response(events, dispositions, None, response)
             .await?
@@ -312,6 +290,9 @@ impl MatrixSync {
         #[cfg(test)]
         if let Some(error) = self.test_failure.take() {
             return Err(error);
+        }
+        if self.cutover.is_some() && (self.initial_response.is_some() || dispositions.is_none()) {
+            return Err(MatrixError::CutoverRefused);
         }
         if let Some(response) = self.initial_response.take()
             && matches!(
@@ -355,19 +336,15 @@ impl MatrixSync {
         dispositions: &mut Option<mpsc::Receiver<Disposition>>,
         shutdown: &mut watch::Receiver<bool>,
     ) -> Result<ProcessResult, MatrixError> {
-        let token = self.tokens.load().await?;
-        let mut settings = SyncSettings::new().timeout(self.server_timeout);
-        if let Some(token) = token {
-            settings = settings.token(token);
-        }
+        let _batch = self.batch_lock.lock().await;
         let response = tokio::select! {
             biased;
             changed = shutdown.changed() => {
                 let _ = changed;
                 return Ok(ProcessResult::Cancelled);
             }
-            response = self.client.inner.sync_once(settings) => {
-                response.map_err(classify_sdk_error)?
+            response = self.request_response() => {
+                response?
             }
         };
         self.process_response(events, dispositions, Some(shutdown), response)

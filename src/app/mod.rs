@@ -5,6 +5,7 @@ mod dispatcher;
 pub mod gateway_handoff;
 mod health;
 mod ingress;
+mod matrix_cutover;
 mod outbox;
 pub(crate) mod output_drain;
 pub(crate) mod output_projection;

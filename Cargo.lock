@@ -1955,8 +1955,6 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-base"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad7f18305090c059293ebafefbfd8cac494f43386c3f255861995ee7b48f9e89"
 dependencies = [
  "as_variant",
  "async-trait",
@@ -2077,8 +2075,6 @@ dependencies = [
 [[package]]
 name = "matrix-sdk-sqlite"
 version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa2ff57473e92bad1b7320b3d70d640661b95064e091b925c5ef88acfa281853"
 dependencies = [
  "as_variant",
  "async-trait",

@@ -7,6 +7,7 @@ mod admin;
 pub(crate) use admin::sealed;
 mod client;
 mod conversation;
+mod cutover;
 mod dedup;
 mod error;
 mod event;

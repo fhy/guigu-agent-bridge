@@ -141,6 +141,8 @@ pub(crate) mod codec;
 mod cycle;
 mod error;
 mod event_consumer;
+mod matrix_cutover;
+mod matrix_cutover_receipts;
 mod output_delivery;
 mod output_spool;
 pub(crate) mod owner_observation;
@@ -148,6 +150,8 @@ mod pool;
 mod recovery;
 mod reliability;
 mod repository;
+pub use matrix_cutover::{CutoverState, CutoverStore, cutover_digest};
+pub use matrix_cutover_receipts::cutover_event_identity;
 pub(crate) mod session_owner_binding;
 
 pub use cycle::{CycleHit, CycleKind, CycleLimits, DEFAULT_MAX_SUBTASKS, detect};

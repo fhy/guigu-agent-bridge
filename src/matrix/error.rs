@@ -6,6 +6,8 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 #[non_exhaustive]
 pub enum MatrixError {
+    #[error("Matrix inbound cutover requires operator review")]
+    CutoverRefused,
     /// Matrix configuration cannot construct a client or session.
     #[error("invalid Matrix configuration")]
     Configuration,

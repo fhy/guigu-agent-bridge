@@ -723,8 +723,11 @@ impl AppRuntime {
                 &[MatrixPhase::IdentityMatched],
                 MatrixPhase::StoreBound,
             );
-            let proof =
-                tokio::time::timeout(Duration::from_secs(30), client.initialize_and_prove()).await;
+            let proof = tokio::time::timeout(
+                Duration::from_secs(30),
+                super::matrix_cutover::initialize(client, &config, &pool),
+            )
+            .await;
             let (initial_response, proof_error) = match proof {
                 Ok(Ok(response)) => (Some(response), None),
                 Ok(Err(error)) => (None, Some(matrix_failure(&error))),
@@ -748,10 +751,7 @@ impl AppRuntime {
                 &[MatrixPhase::StoreBound],
                 MatrixPhase::KeyProved,
             );
-            Some((
-                client,
-                initial_response.expect("successful Matrix proof has initial response"),
-            ))
+            Some(initial_response.expect("successful Matrix proof has prepared client"))
         } else {
             None
         };
@@ -930,7 +930,7 @@ impl AppRuntime {
             ));
         }
 
-        let matrix = if let Some((client, initial_response)) = matrix_client {
+        let matrix = if let Some((client, initial_response, cutover)) = matrix_client {
             let sdk = Arc::new(SdkMatrixSender::new(client.clone()));
             let failure_slot = Arc::clone(&first_failure);
             let health_for_failure = Arc::clone(&runtime.health_state);
@@ -941,7 +941,6 @@ impl AppRuntime {
                 Arc::new(MemorySyncTokenStore::default()),
                 config.transports.matrix.sync_capacity,
             )
-            .map(|sync| sync.with_initial_response(initial_response))
             .map_err(|_| AppError::Matrix)?
             .with_failure_observer(matrix_failure_observer(
                 failure_slot,
@@ -949,6 +948,15 @@ impl AppRuntime {
                 matrix_failure_generation,
             ))
             .with_missing_key_observer(runtime.health_state.clone());
+            if let Some(response) = initial_response {
+                sync = sync.with_initial_response(response);
+            }
+            if let Some(store) = cutover {
+                sync = sync
+                    .with_cutover(store)
+                    .await
+                    .map_err(|_| AppError::Matrix)?;
+            }
             let gateway = if config.transports.gateway.enabled {
                 let gateway = Arc::new(MatrixGateway::new(
                     sdk.clone(),

@@ -57,7 +57,7 @@ async fn server() -> MockServer {
 }
 
 #[tokio::test]
-async fn pinned_notification_client_does_not_copy_anchor_cursor_or_room_state() {
+async fn pinned_notification_client_hydrates_anchor_and_isolates_writes() {
     let server = server().await;
     let temporary = tempfile::tempdir().unwrap();
     let anchor = Client::builder()
@@ -102,10 +102,18 @@ async fn pinned_notification_client_does_not_copy_anchor_cursor_or_room_state() 
         active.encryption().ed25519_key().await,
         anchor.encryption().ed25519_key().await
     );
-    assert_eq!(token(&active).await, None);
-    assert!(active.get_room(&room).is_none());
+    assert_eq!(token(&active).await.as_deref(), Some("A"));
+    assert!(active.get_room(&room).is_some());
+    active
+        .state_store()
+        .set_kv_data(
+            StateStoreDataKey::SyncToken,
+            matrix_sdk::store::StateStoreDataValue::SyncToken("B".into()),
+        )
+        .await
+        .unwrap();
     assert_eq!(token(&anchor).await.as_deref(), Some("A"));
     println!(
-        "anchor: token=A, room=present; notification clone: token=None, room=absent; authenticated device/crypto identity retained"
+        "anchor: token=A, room=present; notification clone: hydrated A, isolated write B; authenticated device/crypto identity retained"
     );
 }

@@ -58,6 +58,10 @@ include = [
 [features]
 test-support = []
 
+[patch.crates-io]
+matrix-sdk-base = { version = "=0.13.0", path = "vendor/matrix-sdk-base-0.13.0" }
+matrix-sdk-sqlite = { version = "=0.13.0", path = "vendor/matrix-sdk-sqlite-0.13.0" }
+
 [dependencies]
 # `time` backs the production `Timer` (`TokioTimer`, T006 D1/Q2 = T-B): the
 # worker's timeout/backoff race needs `tokio::time::sleep`. `process` backs the

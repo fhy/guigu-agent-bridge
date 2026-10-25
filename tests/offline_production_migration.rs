@@ -106,7 +106,12 @@ async fn selected_recovery_real_cli_refuses_held_lock_without_durable_mutation()
     pool.close().await;
     let _guard = hold_maintenance_lock(temporary.path());
     let before = durable_snapshot(&database).await;
-    assert_eq!(before.ledger.last().unwrap().0, 20);
+    let latest = sqlx::migrate!("./migrations")
+        .iter()
+        .map(|migration| migration.version)
+        .max()
+        .unwrap();
+    assert_eq!(before.ledger.last().unwrap().0, latest);
     let before_bytes = std::fs::read(&database).unwrap();
     assert_maintenance_refusal(invoke_selected_recovery(&database).await);
     assert_eq!(std::fs::read(&database).unwrap(), before_bytes);
