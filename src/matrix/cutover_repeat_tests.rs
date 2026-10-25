@@ -25,7 +25,7 @@ async fn wait_requests(fixture: &Fixture, minimum: usize, handle: &MatrixSyncHan
             let requests = fixture.server.received_requests().await.unwrap();
             if requests
                 .iter()
-                .filter(|r| r.url.path().ends_with("/sync"))
+                .filter(|request| request.url.path().ends_with("/sync"))
                 .count()
                 >= minimum
             {
@@ -104,7 +104,7 @@ async fn assert_reopen_no_effects(fixture: &Fixture) {
         .await
         .unwrap()
         .iter()
-        .filter(|r| r.url.path().ends_with("/sync"))
+        .filter(|request| request.url.path().ends_with("/sync"))
         .count();
     let _mock = fixture.sync_mock("C", &["$first", "$second"], false).await;
     let (handle, mut events, _ack) = sync_owner(active, store.clone())
@@ -124,9 +124,9 @@ async fn assert_a_only(fixture: &Fixture) {
     assert!(
         requests
             .iter()
-            .filter(|r| r.url.path().ends_with("/sync"))
+            .filter(|request| request.url.path().ends_with("/sync"))
             .skip(1)
-            .all(|r| r
+            .all(|request| request
                 .url
                 .query_pairs()
                 .any(|(key, value)| key == "since" && value == "A"))
