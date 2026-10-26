@@ -354,6 +354,8 @@ impl MatrixSync {
                                 event_id,
                                 &recovery.operation_id,
                                 &batch_id,
+                                &recovery.operation_id,
+                                recovery.owner_epoch,
                                 "missing_room_key",
                                 "sync",
                             )
@@ -366,7 +368,13 @@ impl MatrixSync {
         if let Some(recovery) = &recovery {
             recovery
                 .store
-                .complete_batch(&batch_id, &response.next_batch, "sync")
+                .complete_batch(
+                    &batch_id,
+                    &response.next_batch,
+                    &recovery.operation_id,
+                    recovery.owner_epoch,
+                    "sync",
+                )
                 .await
                 .map_err(|_| MatrixError::Storage)?;
         } else {

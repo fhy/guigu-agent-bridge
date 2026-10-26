@@ -48,7 +48,12 @@ async fn partial_batch_keeps_watermark_until_all_receipts_are_dispositioned() {
             .unwrap(),
         BatchAdmission::New
     );
-    assert!(store.complete_batch("batch-1", "C", "t4").await.is_err());
+    assert!(
+        store
+            .complete_batch("batch-1", "C", "op-1", 1, "t4")
+            .await
+            .is_err()
+    );
     let watermark: Option<String> =
         sqlx::query_scalar("SELECT watermark FROM matrix_recovery_control WHERE control_id=1")
             .fetch_one(&pool)
@@ -83,7 +88,10 @@ async fn partial_batch_keeps_watermark_until_all_receipts_are_dispositioned() {
         )
         .await
         .unwrap();
-    store.complete_batch("batch-1", "C", "t7").await.unwrap();
+    store
+        .complete_batch("batch-1", "C", "op-1", 1, "t7")
+        .await
+        .unwrap();
     let watermark: Option<String> =
         sqlx::query_scalar("SELECT watermark FROM matrix_recovery_control WHERE control_id=1")
             .fetch_one(&pool)
@@ -187,7 +195,12 @@ async fn pending_receipt_is_not_terminal_until_effect_disposition() {
             .await
             .unwrap();
     assert_eq!(state, "pending");
-    assert!(store.complete_batch("batch-3", "C", "t3").await.is_err());
+    assert!(
+        store
+            .complete_batch("batch-3", "C", "op-3", 1, "t3")
+            .await
+            .is_err()
+    );
     store
         .finish_event(
             "@a:test",
@@ -201,5 +214,8 @@ async fn pending_receipt_is_not_terminal_until_effect_disposition() {
         )
         .await
         .unwrap();
-    store.complete_batch("batch-3", "C", "t5").await.unwrap();
+    store
+        .complete_batch("batch-3", "C", "op-3", 1, "t5")
+        .await
+        .unwrap();
 }

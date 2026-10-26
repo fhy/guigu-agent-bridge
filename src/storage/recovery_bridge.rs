@@ -61,6 +61,11 @@ impl MatrixRecoveryStore {
         initial_watermark: &str,
         now: &str,
     ) -> Result<(), sqlx::Error> {
+        if initial_watermark.is_empty() {
+            return Err(sqlx::Error::Protocol(
+                "baseline watermark is not validated".into(),
+            ));
+        }
         self.initialize_cutover(operation_id, now).await?;
         let phase: String =
             sqlx::query_scalar("SELECT phase FROM matrix_recovery_control WHERE control_id=1")
@@ -271,11 +276,13 @@ impl MatrixRecoveryStore {
         event_id: &str,
         operation_id: &str,
         batch_id: &str,
+        owner_token: &str,
+        owner_epoch: i64,
         code: &str,
         now: &str,
     ) -> Result<(), sqlx::Error> {
-        let result = sqlx::query("UPDATE matrix_recovery_receipts SET state='refused',refusal_code=?,updated_at=? WHERE account_id=? AND room_id=? AND event_id=? AND cutover_operation_id=? AND batch_id=? AND state IN ('pending','processing')")
-            .bind(code).bind(now).bind(account_id).bind(room_id).bind(event_id).bind(operation_id).bind(batch_id).execute(&self.pool).await?;
+        let result = sqlx::query("UPDATE matrix_recovery_receipts SET state='refused',refusal_code=?,updated_at=? WHERE account_id=? AND room_id=? AND event_id=? AND cutover_operation_id=? AND batch_id=? AND state IN ('pending','processing') AND EXISTS (SELECT 1 FROM matrix_recovery_batches WHERE batch_id=? AND owner_token=? AND owner_epoch=? AND state='processing')")
+            .bind(code).bind(now).bind(account_id).bind(room_id).bind(event_id).bind(operation_id).bind(batch_id).bind(batch_id).bind(owner_token).bind(owner_epoch).execute(&self.pool).await?;
         if result.rows_affected() != 1 {
             return Err(sqlx::Error::Protocol(
                 "refusal disposition fence failed".into(),
@@ -288,11 +295,13 @@ impl MatrixRecoveryStore {
         &self,
         batch_id: &str,
         checkpoint: &str,
+        owner_token: &str,
+        owner_epoch: i64,
         now: &str,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT previous_watermark,response_token,expected_events_json,covered_events_json,state FROM matrix_recovery_batches WHERE batch_id=?")
-            .bind(batch_id).fetch_one(&mut *tx).await?;
+        let row = sqlx::query("SELECT previous_watermark,response_token,response_digest,expected_events_json,covered_events_json,state FROM matrix_recovery_batches WHERE batch_id=? AND component='MatrixSync' AND owner_token=? AND owner_epoch=?")
+            .bind(batch_id).bind(owner_token).bind(owner_epoch).fetch_one(&mut *tx).await?;
         let expected: Vec<String> =
             serde_json::from_str(row.try_get::<String, _>("expected_events_json")?.as_str())
                 .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
@@ -317,16 +326,20 @@ impl MatrixRecoveryStore {
         }
         let previous: String = row.try_get("previous_watermark")?;
         let token: String = row.try_get("response_token")?;
+        let response_digest: String = row.try_get("response_digest")?;
+        if response_digest.is_empty() {
+            return Err(sqlx::Error::Protocol("missing response digest".into()));
+        }
         if token != checkpoint {
             return Err(sqlx::Error::Protocol(
                 "checkpoint is not batch response token".into(),
             ));
         }
         let batch_update = sqlx::query(
-            "UPDATE matrix_recovery_batches SET state='terminal',updated_at=? WHERE batch_id=? AND previous_watermark=? AND state='processing'",
+            "UPDATE matrix_recovery_batches SET state='terminal',updated_at=? WHERE batch_id=? AND previous_watermark=? AND owner_token=? AND owner_epoch=? AND response_digest=? AND state='processing'",
         )
         .bind(now)
-        .bind(batch_id).bind(&previous).execute(&mut *tx).await?;
+        .bind(batch_id).bind(&previous).bind(owner_token).bind(owner_epoch).bind(&response_digest).execute(&mut *tx).await?;
         if batch_update.rows_affected() != 1 {
             return Err(sqlx::Error::Protocol(
                 "batch completion fence failed".into(),

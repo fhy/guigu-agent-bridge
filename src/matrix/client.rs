@@ -172,6 +172,14 @@ impl MatrixClient {
             .map(|_| ())
             .map_err(|_| MatrixError::CryptoInitialization)
     }
+
+    pub(crate) async fn baseline_sync_token(&self) -> Result<String, MatrixError> {
+        self.inner
+            .sync_once(SyncSettings::new().timeout(std::time::Duration::from_secs(10)))
+            .await
+            .map(|response| response.next_batch)
+            .map_err(|_| MatrixError::Transport)
+    }
 }
 
 fn session(

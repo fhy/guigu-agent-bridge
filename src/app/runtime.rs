@@ -607,10 +607,14 @@ impl AppRuntime {
         let matrix = if let Some(client) = matrix_client {
             let sdk = Arc::new(SdkMatrixSender::new(client.clone()));
             let recovery = crate::storage::MatrixRecoveryStore::new(pool.clone());
+            let baseline = client
+                .baseline_sync_token()
+                .await
+                .map_err(|_| AppError::Matrix)?;
             recovery
                 .ensure_active(
                     &runtime_instance,
-                    "",
+                    &baseline,
                     &Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
                 )
                 .await
