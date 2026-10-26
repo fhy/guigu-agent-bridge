@@ -35,10 +35,30 @@ def add_archive(registry, archive, record):
         if previous["vers"] == record["vers"]:
             if previous != record:
                 raise ValueError(f"immutable index conflict: {archive.name}")
+            if not destination.exists():
+                shutil.copyfile(archive, destination)
             return
     shutil.copyfile(archive, destination)
     records.append(record)
     entry.write_text("".join(json.dumps(row, separators=(",", ":")) + "\n" for row in records))
+
+
+def fetch_archive(registry, name, version):
+    if not re.fullmatch(r"[a-z0-9_-]+", name) or not re.fullmatch(r"[a-zA-Z0-9.+_-]+", version):
+        raise ValueError("invalid public archive identity")
+    entry = registry / "index" / index_path(name)
+    selected = [json.loads(row) for row in entry.read_text().splitlines() if json.loads(row)["vers"] == version]
+    if len(selected) != 1:
+        raise ValueError("expected one public index version")
+    destination = registry / f"{name}-{version}.crate"
+    if destination.exists():
+        raise ValueError("refusing to overwrite rehearsal archive")
+    with urllib.request.urlopen(f"https://static.crates.io/crates/{name}/{name}-{version}.crate", timeout=60) as response:
+        content = response.read()
+    if hashlib.sha256(content).hexdigest() != selected[0]["cksum"]:
+        raise ValueError("public archive checksum mismatch")
+    with destination.open("xb") as output:
+        output.write(content)
 
 
 def seed(registry, cache, index):
@@ -105,6 +125,7 @@ def main():
     parser.add_argument("--stage", type=Path)
     parser.add_argument("--cargo-home", type=Path)
     parser.add_argument("--fetch-index")
+    parser.add_argument("--fetch-archive", nargs=2, metavar=("NAME", "VERSION"))
     args = parser.parse_args()
     args.registry.mkdir(parents=True, exist_ok=True)
     if args.seed_cache:
@@ -113,6 +134,8 @@ def main():
         seed(args.registry, args.seed_cache, args.seed_index)
     if args.stage:
         stage(args.registry, args.stage)
+    if args.fetch_archive:
+        fetch_archive(args.registry, *args.fetch_archive)
     if args.fetch_index:
         name = args.fetch_index
         if not re.fullmatch(r"[a-z0-9_-]+", name):
