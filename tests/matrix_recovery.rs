@@ -16,12 +16,18 @@ async fn partial_batch_keeps_watermark_until_all_receipts_are_dispositioned() {
     store.initialize_cutover("op-1", "t0").await.unwrap();
     store.activate_cutover("B", "t1").await.unwrap();
     store
+        .acquire_component_lease("MatrixSync", "op-1", "t1", "t9")
+        .await
+        .unwrap();
+    store
         .begin_batch(
             "batch-1",
             Some("B"),
             "C",
             "digest",
             "B",
+            "op-1",
+            1,
             &["$one".into(), "$two".into()],
             "t2",
         )
@@ -93,12 +99,18 @@ async fn receipt_digest_mismatch_is_fail_closed() {
     store.initialize_cutover("op-2", "t0").await.unwrap();
     store.activate_cutover("B", "t1").await.unwrap();
     store
+        .acquire_component_lease("MatrixSync", "op-2", "t1", "t9")
+        .await
+        .unwrap();
+    store
         .begin_batch(
             "batch-2",
             Some("B"),
             "C",
             "digest",
             "B",
+            "op-2",
+            1,
             &["$one".into()],
             "t2",
         )
@@ -137,12 +149,18 @@ async fn pending_receipt_is_not_terminal_until_effect_disposition() {
     let store = MatrixRecoveryStore::new(pool.clone());
     store.ensure_active("op-3", "B", "t0").await.unwrap();
     store
+        .acquire_component_lease("MatrixSync", "op-3", "t0", "t9")
+        .await
+        .unwrap();
+    store
         .begin_batch(
             "batch-3",
             Some("B"),
             "C",
             "digest",
             "B",
+            "op-3",
+            1,
             &["$one".into()],
             "t1",
         )
@@ -171,7 +189,16 @@ async fn pending_receipt_is_not_terminal_until_effect_disposition() {
     assert_eq!(state, "pending");
     assert!(store.complete_batch("batch-3", "C", "t3").await.is_err());
     store
-        .finish_event("@a:test", "!room:test", "$one", "op-3", "batch-3", "t4")
+        .finish_event(
+            "@a:test",
+            "!room:test",
+            "$one",
+            "op-3",
+            "batch-3",
+            "op-3",
+            1,
+            "t4",
+        )
         .await
         .unwrap();
     store.complete_batch("batch-3", "C", "t5").await.unwrap();

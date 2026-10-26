@@ -31,6 +31,7 @@ CREATE TABLE matrix_recovery_receipts (
     cutover_operation_id TEXT NOT NULL,
     payload_digest TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('pending', 'processing', 'dispositioned', 'unknown', 'refused')),
+    refusal_code TEXT,
     batch_id TEXT NOT NULL REFERENCES matrix_recovery_batches(batch_id),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL,

@@ -122,6 +122,7 @@ struct RecoveryBinding {
     store: MatrixRecoveryStore,
     account_id: String,
     operation_id: String,
+    owner_epoch: i64,
 }
 
 impl std::fmt::Debug for MatrixSync {
@@ -169,11 +170,13 @@ impl MatrixSync {
         store: MatrixRecoveryStore,
         account_id: impl Into<String>,
         operation_id: impl Into<String>,
+        owner_epoch: i64,
     ) -> Self {
         self.recovery = Some(RecoveryBinding {
             store,
             account_id: account_id.into(),
             operation_id: operation_id.into(),
+            owner_epoch,
         });
         self
     }
@@ -236,6 +239,7 @@ impl MatrixSync {
                 .collect::<Vec<_>>();
             let mut digest = Sha256::new();
             digest.update(response.next_batch.as_str());
+            digest.update(serde_json::to_vec(&expected_events).map_err(|_| MatrixError::Storage)?);
             recovery
                 .store
                 .begin_batch(
@@ -244,6 +248,8 @@ impl MatrixSync {
                     &response.next_batch,
                     &format!("{:x}", digest.finalize()),
                     token.as_deref().unwrap_or_default(),
+                    &recovery.operation_id,
+                    recovery.owner_epoch,
                     &expected_events,
                     "sync",
                 )
@@ -294,6 +300,8 @@ impl MatrixSync {
                                 event_id,
                                 &recovery.operation_id,
                                 &batch_id,
+                                &recovery.operation_id,
+                                recovery.owner_epoch,
                                 "sync",
                             )
                             .await
@@ -317,6 +325,8 @@ impl MatrixSync {
                                 event_id,
                                 &recovery.operation_id,
                                 &batch_id,
+                                &recovery.operation_id,
+                                recovery.owner_epoch,
                                 "sync",
                             )
                             .await
@@ -335,6 +345,21 @@ impl MatrixSync {
                     && let Some(observer) = &self.missing_key_observer
                 {
                     observer.record_missing_room_key();
+                    if let (Some(recovery), Some(event_id)) = (&recovery, &receipt_event) {
+                        recovery
+                            .store
+                            .refuse_event(
+                                &recovery.account_id,
+                                room_id.as_str(),
+                                event_id,
+                                &recovery.operation_id,
+                                &batch_id,
+                                "missing_room_key",
+                                "sync",
+                            )
+                            .await
+                            .map_err(|_| MatrixError::Storage)?;
+                    }
                 }
             }
         }

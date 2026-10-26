@@ -616,7 +616,7 @@ impl AppRuntime {
                 .await
                 .map_err(|_| AppError::Runtime)?;
             let lease_now = Utc::now();
-            recovery
+            let matrix_epoch = recovery
                 .acquire_component_lease(
                     "MatrixSync",
                     &runtime_instance,
@@ -636,6 +636,7 @@ impl AppRuntime {
                 recovery,
                 config.transports.matrix.user_id.clone(),
                 runtime_instance.clone(),
+                matrix_epoch,
             )
             .with_missing_key_observer(runtime.health_state.clone());
             let gateway = if config.transports.gateway.enabled {

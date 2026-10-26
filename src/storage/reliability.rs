@@ -990,6 +990,17 @@ impl ReliabilityStore {
         Ok(result.rows_affected() == 1)
     }
 
+    pub async fn mark_projection_abandoned(
+        &self,
+        row: &PendingProjection,
+    ) -> Result<bool, ReliabilityError> {
+        let result = sqlx::query("UPDATE projection_outbox SET state='abandoned',attempt_count=attempt_count+1,updated_at=? WHERE source_kind=? AND source_id=? AND projection=? AND state='sending' AND claim_owner=? AND claim_revision=?")
+            .bind(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+            .bind(&row.source_kind).bind(&row.source_id).bind(&row.projection)
+            .bind(&row.claim_owner).bind(row.claim_revision).execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
     pub async fn claim_admission(
         &self,
         task_id: &str,
