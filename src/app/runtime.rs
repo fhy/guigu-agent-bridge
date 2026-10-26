@@ -18,7 +18,7 @@ use crate::{
     },
     config::{Config, ConfigError},
     gateway::{GatewayRawConsumer, GatewayStore, MatrixGateway, MatrixRoute},
-    matrix::{MatrixClient, MatrixSync, MatrixSyncHandle, MemorySyncTokenStore, SdkMatrixSender},
+    matrix::{MatrixClient, MatrixSync, MatrixSyncHandle, SdkMatrixSender, SqliteSyncTokenStore},
     models::TransportType,
     runtime::{
         ContinuationPolicy, LeasedAcpDispatcher, RuntimeMetrics, SqliteRuntimeStore,
@@ -606,12 +606,37 @@ impl AppRuntime {
 
         let matrix = if let Some(client) = matrix_client {
             let sdk = Arc::new(SdkMatrixSender::new(client.clone()));
+            let recovery = crate::storage::MatrixRecoveryStore::new(pool.clone());
+            recovery
+                .ensure_active(
+                    &runtime_instance,
+                    "",
+                    &Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                )
+                .await
+                .map_err(|_| AppError::Runtime)?;
+            let lease_now = Utc::now();
+            recovery
+                .acquire_component_lease(
+                    "MatrixSync",
+                    &runtime_instance,
+                    &lease_now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                    &(lease_now + chrono::Duration::seconds(60))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                )
+                .await
+                .map_err(|_| AppError::Runtime)?;
             let mut sync = MatrixSync::new(
                 client,
-                Arc::new(MemorySyncTokenStore::default()),
+                Arc::new(SqliteSyncTokenStore::new(pool.clone())),
                 config.transports.matrix.sync_capacity,
             )
             .map_err(|_| AppError::Matrix)?
+            .with_recovery(
+                recovery,
+                config.transports.matrix.user_id.clone(),
+                runtime_instance.clone(),
+            )
             .with_missing_key_observer(runtime.health_state.clone());
             let gateway = if config.transports.gateway.enabled {
                 let gateway = Arc::new(MatrixGateway::new(

@@ -21,6 +21,7 @@ async fn partial_batch_keeps_watermark_until_all_receipts_are_dispositioned() {
             Some("B"),
             "C",
             "digest",
+            "B",
             &["$one".into(), "$two".into()],
             "t2",
         )
@@ -92,7 +93,15 @@ async fn receipt_digest_mismatch_is_fail_closed() {
     store.initialize_cutover("op-2", "t0").await.unwrap();
     store.activate_cutover("B", "t1").await.unwrap();
     store
-        .begin_batch("batch-2", Some("B"), "C", "digest", &["$one".into()], "t2")
+        .begin_batch(
+            "batch-2",
+            Some("B"),
+            "C",
+            "digest",
+            "B",
+            &["$one".into()],
+            "t2",
+        )
         .await
         .unwrap();
     store
@@ -120,4 +129,50 @@ async fn receipt_digest_mismatch_is_fail_closed() {
         .await
         .unwrap_err();
     assert!(error.to_string().contains("digest mismatch"));
+}
+
+#[tokio::test]
+async fn pending_receipt_is_not_terminal_until_effect_disposition() {
+    let pool = database().await;
+    let store = MatrixRecoveryStore::new(pool.clone());
+    store.ensure_active("op-3", "B", "t0").await.unwrap();
+    store
+        .begin_batch(
+            "batch-3",
+            Some("B"),
+            "C",
+            "digest",
+            "B",
+            &["$one".into()],
+            "t1",
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        store
+            .reserve_event(
+                "@a:test",
+                "!room:test",
+                "$one",
+                "op-3",
+                "p1",
+                "batch-3",
+                "t2"
+            )
+            .await
+            .unwrap(),
+        BatchAdmission::New
+    );
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM matrix_recovery_receipts WHERE event_id='$one'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "pending");
+    assert!(store.complete_batch("batch-3", "C", "t3").await.is_err());
+    store
+        .finish_event("@a:test", "!room:test", "$one", "op-3", "batch-3", "t4")
+        .await
+        .unwrap();
+    store.complete_batch("batch-3", "C", "t5").await.unwrap();
 }

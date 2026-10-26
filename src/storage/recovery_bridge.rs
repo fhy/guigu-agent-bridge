@@ -32,9 +32,17 @@ impl MatrixRecoveryStore {
         now: &str,
     ) -> Result<(), sqlx::Error> {
         sqlx::query(
-            "INSERT INTO matrix_recovery_control(control_id,cutover_operation_id,phase,watermark,updated_at) VALUES(1,?,'baseline',NULL,?) ON CONFLICT(control_id) DO UPDATE SET cutover_operation_id=excluded.cutover_operation_id,phase='baseline',watermark=NULL,updated_at=excluded.updated_at",
+            "INSERT INTO matrix_recovery_control(control_id,cutover_operation_id,phase,watermark,updated_at) VALUES(1,?,'baseline',NULL,?) ON CONFLICT(control_id) DO NOTHING",
         )
         .bind(operation_id).bind(now).execute(&self.pool).await?;
+        let stored: String = sqlx::query_scalar(
+            "SELECT cutover_operation_id FROM matrix_recovery_control WHERE control_id=1",
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        if stored != operation_id {
+            return Err(sqlx::Error::Protocol("cutover provenance mismatch".into()));
+        }
         Ok(())
     }
 
@@ -47,17 +55,80 @@ impl MatrixRecoveryStore {
         Ok(())
     }
 
+    pub async fn ensure_active(
+        &self,
+        operation_id: &str,
+        initial_watermark: &str,
+        now: &str,
+    ) -> Result<(), sqlx::Error> {
+        self.initialize_cutover(operation_id, now).await?;
+        let phase: String =
+            sqlx::query_scalar("SELECT phase FROM matrix_recovery_control WHERE control_id=1")
+                .fetch_one(&self.pool)
+                .await?;
+        if phase == "baseline" {
+            self.activate_cutover(initial_watermark, now).await?;
+        }
+        Ok(())
+    }
+
+    pub async fn acquire_component_lease(
+        &self,
+        component: &str,
+        owner_token: &str,
+        now: &str,
+        expires_at: &str,
+    ) -> Result<i64, sqlx::Error> {
+        let mut tx = self.pool.begin().await?;
+        let existing = sqlx::query(
+            "SELECT owner_token,epoch,state,expires_at FROM matrix_component_leases WHERE component=?",
+        )
+        .bind(component)
+        .fetch_optional(&mut *tx)
+        .await?;
+        let epoch = match existing {
+            None => 1,
+            Some(row) => {
+                let state: String = row.try_get("state")?;
+                let current: String = row.try_get("owner_token")?;
+                let expires: String = row.try_get("expires_at")?;
+                if state == "active" && current != owner_token && expires.as_str() > now {
+                    return Err(sqlx::Error::Protocol("component lease is owned".into()));
+                }
+                row.try_get::<i64, _>("epoch")? + 1
+            }
+        };
+        sqlx::query("INSERT INTO matrix_component_leases(component,owner_token,epoch,state,expires_at,updated_at) VALUES(?,?,?,'active',?,?) ON CONFLICT(component) DO UPDATE SET owner_token=excluded.owner_token,epoch=excluded.epoch,state='active',expires_at=excluded.expires_at,updated_at=excluded.updated_at")
+            .bind(component).bind(owner_token).bind(epoch).bind(expires_at).bind(now).execute(&mut *tx).await?;
+        tx.commit().await?;
+        Ok(epoch)
+    }
+
     pub async fn begin_batch(
         &self,
         batch_id: &str,
         request_token: Option<&str>,
         response_token: &str,
         response_digest: &str,
+        previous_watermark: &str,
         expected_events: &[String],
         now: &str,
     ) -> Result<(), sqlx::Error> {
-        sqlx::query("INSERT INTO matrix_recovery_batches(batch_id,request_token,response_token,response_digest,expected_events_json,covered_events_json,state,created_at,updated_at) VALUES(?,?,?,?,?,'[]','pending',?,?)")
-            .bind(batch_id).bind(request_token).bind(response_token).bind(response_digest)
+        let active: Option<String> = sqlx::query_scalar(
+            "SELECT watermark FROM matrix_recovery_control WHERE control_id=1 AND phase='active'",
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        if active.as_deref() != Some(previous_watermark)
+            || (request_token != Some(previous_watermark)
+                && !(previous_watermark.is_empty() && request_token.is_none()))
+        {
+            return Err(sqlx::Error::Protocol(
+                "batch previous watermark mismatch".into(),
+            ));
+        }
+        sqlx::query("INSERT INTO matrix_recovery_batches(batch_id,request_token,previous_watermark,response_token,response_digest,component,owner_token,owner_epoch,expected_events_json,covered_events_json,state,created_at,updated_at) VALUES(?,?,?,?,?,'MatrixSync','legacy',1,?,'[]','pending',?,?)")
+            .bind(batch_id).bind(request_token).bind(previous_watermark).bind(response_token).bind(response_digest)
             .bind(serde_json::to_string(expected_events).map_err(|error| sqlx::Error::Protocol(error.to_string()))?)
             .bind(now).bind(now).execute(&self.pool).await?;
         Ok(())
@@ -65,6 +136,35 @@ impl MatrixRecoveryStore {
 
     #[allow(clippy::too_many_arguments)]
     pub async fn admit_event(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        event_id: &str,
+        operation_id: &str,
+        payload_digest: &str,
+        batch_id: &str,
+        now: &str,
+    ) -> Result<BatchAdmission, sqlx::Error> {
+        let admission = self
+            .reserve_event(
+                account_id,
+                room_id,
+                event_id,
+                operation_id,
+                payload_digest,
+                batch_id,
+                now,
+            )
+            .await?;
+        if admission == BatchAdmission::New {
+            self.finish_event(account_id, room_id, event_id, operation_id, batch_id, now)
+                .await?;
+        }
+        Ok(admission)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub async fn reserve_event(
         &self,
         account_id: &str,
         room_id: &str,
@@ -85,7 +185,14 @@ impl MatrixRecoveryStore {
             tx.commit().await?;
             return Ok(BatchAdmission::Duplicate);
         }
-        sqlx::query("INSERT INTO matrix_recovery_receipts(account_id,room_id,event_id,cutover_operation_id,payload_digest,state,batch_id,created_at,updated_at) VALUES(?,?,?,?,?,'dispositioned',?,?,?)")
+        let expected: String = sqlx::query_scalar("SELECT expected_events_json FROM matrix_recovery_batches WHERE batch_id=? AND state IN ('pending','processing')")
+            .bind(batch_id).fetch_one(&mut *tx).await?;
+        let expected: Vec<String> = serde_json::from_str(&expected)
+            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
+        if !expected.iter().any(|value| value == event_id) {
+            return Err(sqlx::Error::Protocol("event outside batch coverage".into()));
+        }
+        sqlx::query("INSERT INTO matrix_recovery_receipts(account_id,room_id,event_id,cutover_operation_id,payload_digest,state,batch_id,created_at,updated_at) VALUES(?,?,?,?,?,'pending',?,?,?)")
             .bind(account_id).bind(room_id).bind(event_id).bind(operation_id).bind(payload_digest).bind(batch_id).bind(now).bind(now).execute(&mut *tx).await?;
         let row = sqlx::query("SELECT covered_events_json FROM matrix_recovery_batches WHERE batch_id=? AND state IN ('pending','processing')")
             .bind(batch_id).fetch_one(&mut *tx).await?;
@@ -102,6 +209,25 @@ impl MatrixRecoveryStore {
         Ok(BatchAdmission::New)
     }
 
+    pub async fn finish_event(
+        &self,
+        account_id: &str,
+        room_id: &str,
+        event_id: &str,
+        operation_id: &str,
+        batch_id: &str,
+        now: &str,
+    ) -> Result<(), sqlx::Error> {
+        let result = sqlx::query("UPDATE matrix_recovery_receipts SET state='dispositioned',updated_at=? WHERE account_id=? AND room_id=? AND event_id=? AND cutover_operation_id=? AND batch_id=? AND state IN ('pending','processing')")
+            .bind(now).bind(account_id).bind(room_id).bind(event_id).bind(operation_id).bind(batch_id).execute(&self.pool).await?;
+        if result.rows_affected() != 1 {
+            return Err(sqlx::Error::Protocol(
+                "receipt disposition fence failed".into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub async fn complete_batch(
         &self,
         batch_id: &str,
@@ -109,7 +235,7 @@ impl MatrixRecoveryStore {
         now: &str,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT response_token,expected_events_json,covered_events_json,state FROM matrix_recovery_batches WHERE batch_id=?")
+        let row = sqlx::query("SELECT previous_watermark,response_token,expected_events_json,covered_events_json,state FROM matrix_recovery_batches WHERE batch_id=?")
             .bind(batch_id).fetch_one(&mut *tx).await?;
         let expected: Vec<String> =
             serde_json::from_str(row.try_get::<String, _>("expected_events_json")?.as_str())
@@ -122,20 +248,38 @@ impl MatrixRecoveryStore {
         {
             return Err(sqlx::Error::Protocol("batch coverage incomplete".into()));
         }
-        let token: String = row.try_get("response_token")?;
-        sqlx::query(
-            "UPDATE matrix_recovery_batches SET state='terminal',updated_at=? WHERE batch_id=?",
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM matrix_recovery_receipts WHERE batch_id=? AND state NOT IN ('dispositioned','refused')",
         )
-        .bind(now)
         .bind(batch_id)
-        .execute(&mut *tx)
+        .fetch_one(&mut *tx)
         .await?;
-        sqlx::query("UPDATE matrix_recovery_control SET watermark=?,updated_at=? WHERE control_id=1 AND phase='active'")
-            .bind(checkpoint).bind(now).execute(&mut *tx).await?;
+        if pending != 0 {
+            return Err(sqlx::Error::Protocol(
+                "batch effects are not terminal".into(),
+            ));
+        }
+        let previous: String = row.try_get("previous_watermark")?;
+        let token: String = row.try_get("response_token")?;
         if token != checkpoint {
             return Err(sqlx::Error::Protocol(
                 "checkpoint is not batch response token".into(),
             ));
+        }
+        let batch_update = sqlx::query(
+            "UPDATE matrix_recovery_batches SET state='terminal',updated_at=? WHERE batch_id=? AND previous_watermark=? AND state='processing'",
+        )
+        .bind(now)
+        .bind(batch_id).bind(&previous).execute(&mut *tx).await?;
+        if batch_update.rows_affected() != 1 {
+            return Err(sqlx::Error::Protocol(
+                "batch completion fence failed".into(),
+            ));
+        }
+        let watermark_update = sqlx::query("UPDATE matrix_recovery_control SET watermark=?,updated_at=? WHERE control_id=1 AND phase='active' AND watermark=?")
+            .bind(checkpoint).bind(now).bind(&previous).execute(&mut *tx).await?;
+        if watermark_update.rows_affected() != 1 {
+            return Err(sqlx::Error::Protocol("watermark CAS failed".into()));
         }
         tx.commit().await?;
         Ok(())

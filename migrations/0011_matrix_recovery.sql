@@ -10,8 +10,12 @@ CREATE TABLE matrix_recovery_control (
 CREATE TABLE matrix_recovery_batches (
     batch_id TEXT PRIMARY KEY,
     request_token TEXT,
+    previous_watermark TEXT,
     response_token TEXT NOT NULL,
     response_digest TEXT NOT NULL,
+    component TEXT NOT NULL,
+    owner_token TEXT NOT NULL,
+    owner_epoch INTEGER NOT NULL CHECK (owner_epoch >= 1),
     expected_events_json TEXT NOT NULL,
     covered_events_json TEXT NOT NULL,
     state TEXT NOT NULL CHECK (state IN ('pending', 'processing', 'terminal', 'unknown', 'refused')),

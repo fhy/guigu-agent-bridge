@@ -12,13 +12,16 @@ use std::{
 
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::ruma::api::client::error::ErrorKind;
+use sha2::{Digest, Sha256};
 use sqlx::SqlitePool;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
 };
+use uuid::Uuid;
 
 use super::{InboundMatrixEvent, MatrixClient, MatrixError, event::decode_event};
+use crate::storage::{BatchAdmission, MatrixRecoveryStore};
 
 /// Boxed future returned by [`SyncTokenStore`].
 pub type SyncTokenFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
@@ -111,6 +114,14 @@ pub struct MatrixSync {
     server_timeout: Duration,
     raw_consumer: Option<Arc<dyn RawMatrixEventConsumer>>,
     missing_key_observer: Option<Arc<dyn MissingRoomKeyObserver>>,
+    recovery: Option<RecoveryBinding>,
+}
+
+#[derive(Clone)]
+struct RecoveryBinding {
+    store: MatrixRecoveryStore,
+    account_id: String,
+    operation_id: String,
 }
 
 impl std::fmt::Debug for MatrixSync {
@@ -139,6 +150,7 @@ impl MatrixSync {
             server_timeout: Duration::from_secs(30),
             raw_consumer: None,
             missing_key_observer: None,
+            recovery: None,
         })
     }
 
@@ -149,6 +161,20 @@ impl MatrixSync {
 
     pub fn with_missing_key_observer(mut self, observer: Arc<dyn MissingRoomKeyObserver>) -> Self {
         self.missing_key_observer = Some(observer);
+        self
+    }
+
+    pub fn with_recovery(
+        mut self,
+        store: MatrixRecoveryStore,
+        account_id: impl Into<String>,
+        operation_id: impl Into<String>,
+    ) -> Self {
+        self.recovery = Some(RecoveryBinding {
+            store,
+            account_id: account_id.into(),
+            operation_id: operation_id.into(),
+        });
         self
     }
 
@@ -180,7 +206,7 @@ impl MatrixSync {
     ) -> Result<usize, MatrixError> {
         let token = self.tokens.load().await?;
         let mut settings = SyncSettings::new().timeout(self.server_timeout);
-        if let Some(token) = token {
+        if let Some(ref token) = token {
             settings = settings.token(token);
         }
         let response = self
@@ -189,13 +215,90 @@ impl MatrixSync {
             .sync_once(settings)
             .await
             .map_err(classify_sdk_error)?;
+        let recovery = self.recovery.clone();
+        let batch_id = Uuid::now_v7().to_string();
+        if let Some(recovery) = &recovery {
+            let expected_events = response
+                .rooms
+                .joined
+                .values()
+                .flat_map(|update| update.timeline.events.iter())
+                .filter_map(|event| {
+                    serde_json::from_str::<serde_json::Value>(event.kind.raw().json().get())
+                        .ok()
+                        .and_then(|value| {
+                            value
+                                .get("event_id")
+                                .and_then(|id| id.as_str())
+                                .map(str::to_owned)
+                        })
+                })
+                .collect::<Vec<_>>();
+            let mut digest = Sha256::new();
+            digest.update(response.next_batch.as_str());
+            recovery
+                .store
+                .begin_batch(
+                    &batch_id,
+                    token.as_deref(),
+                    &response.next_batch,
+                    &format!("{:x}", digest.finalize()),
+                    token.as_deref().unwrap_or_default(),
+                    &expected_events,
+                    "sync",
+                )
+                .await
+                .map_err(|_| MatrixError::Storage)?;
+        }
         let mut delivered = 0;
         for (room_id, update) in response.rooms.joined {
             for timeline in update.timeline.events {
                 let raw = timeline.kind.raw().json().get();
+                let receipt_event = serde_json::from_str::<serde_json::Value>(raw)
+                    .ok()
+                    .and_then(|value| {
+                        value
+                            .get("event_id")
+                            .and_then(|id| id.as_str())
+                            .map(str::to_owned)
+                    });
+                if let (Some(recovery), Some(event_id)) = (&recovery, &receipt_event) {
+                    let mut digest = Sha256::new();
+                    digest.update(raw.as_bytes());
+                    let admission = recovery
+                        .store
+                        .reserve_event(
+                            &recovery.account_id,
+                            room_id.as_str(),
+                            event_id,
+                            &recovery.operation_id,
+                            &format!("{:x}", digest.finalize()),
+                            &batch_id,
+                            "sync",
+                        )
+                        .await
+                        .map_err(|_| MatrixError::Storage)?;
+                    if admission == BatchAdmission::Duplicate {
+                        continue;
+                    }
+                }
                 if let Some(consumer) = &self.raw_consumer
                     && consumer.consume(raw, room_id.as_str()).await?
                 {
+                    if let (Some(recovery), Some(event_id)) = (&recovery, &receipt_event) {
+                        recovery
+                            .store
+                            .finish_event(
+                                &recovery.account_id,
+                                room_id.as_str(),
+                                event_id,
+                                &recovery.operation_id,
+                                &batch_id,
+                                "sync",
+                            )
+                            .await
+                            .map_err(|_| MatrixError::Storage)?;
+                    }
                     delivered += 1;
                     continue;
                 }
@@ -205,6 +308,20 @@ impl MatrixSync {
                         mpsc::error::TrySendError::Closed(_) => MatrixError::ConsumerClosed,
                     })?;
                     delivered += 1;
+                    if let (Some(recovery), Some(event_id)) = (&recovery, &receipt_event) {
+                        recovery
+                            .store
+                            .finish_event(
+                                &recovery.account_id,
+                                room_id.as_str(),
+                                event_id,
+                                &recovery.operation_id,
+                                &batch_id,
+                                "sync",
+                            )
+                            .await
+                            .map_err(|_| MatrixError::Storage)?;
+                    }
                 } else if serde_json::from_str::<serde_json::Value>(raw)
                     .ok()
                     .and_then(|event| {
@@ -221,7 +338,15 @@ impl MatrixSync {
                 }
             }
         }
-        self.tokens.save(&response.next_batch).await?;
+        if let Some(recovery) = &recovery {
+            recovery
+                .store
+                .complete_batch(&batch_id, &response.next_batch, "sync")
+                .await
+                .map_err(|_| MatrixError::Storage)?;
+        } else {
+            self.tokens.save(&response.next_batch).await?;
+        }
         Ok(delivered)
     }
 
