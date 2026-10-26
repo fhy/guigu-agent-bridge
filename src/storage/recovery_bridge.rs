@@ -16,6 +16,12 @@ pub struct BatchState {
     pub state: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryControl {
+    pub phase: String,
+    pub watermark: Option<String>,
+}
+
 #[derive(Clone)]
 pub struct MatrixRecoveryStore {
     pool: SqlitePool,
@@ -44,6 +50,25 @@ impl MatrixRecoveryStore {
             return Err(sqlx::Error::Protocol("cutover provenance mismatch".into()));
         }
         Ok(())
+    }
+
+    pub async fn control(&self) -> Result<Option<RecoveryControl>, sqlx::Error> {
+        sqlx::query("SELECT phase,watermark FROM matrix_recovery_control WHERE control_id=1")
+            .fetch_optional(&self.pool)
+            .await?
+            .map(|row| {
+                Ok(RecoveryControl {
+                    phase: row.try_get("phase")?,
+                    watermark: row.try_get("watermark")?,
+                })
+            })
+            .transpose()
+    }
+
+    pub async fn unresolved_receipts(&self) -> Result<Vec<(String, String)>, sqlx::Error> {
+        sqlx::query_as("SELECT event_id,state FROM matrix_recovery_receipts WHERE state <> 'dispositioned' ORDER BY created_at,event_id")
+            .fetch_all(&self.pool)
+            .await
     }
 
     pub async fn activate_cutover(&self, watermark: &str, now: &str) -> Result<(), sqlx::Error> {
@@ -281,8 +306,8 @@ impl MatrixRecoveryStore {
         code: &str,
         now: &str,
     ) -> Result<(), sqlx::Error> {
-        let result = sqlx::query("UPDATE matrix_recovery_receipts SET state='refused',refusal_code=?,updated_at=? WHERE account_id=? AND room_id=? AND event_id=? AND cutover_operation_id=? AND batch_id=? AND state IN ('pending','processing') AND EXISTS (SELECT 1 FROM matrix_recovery_batches WHERE batch_id=? AND owner_token=? AND owner_epoch=? AND state='processing')")
-            .bind(code).bind(now).bind(account_id).bind(room_id).bind(event_id).bind(operation_id).bind(batch_id).bind(batch_id).bind(owner_token).bind(owner_epoch).execute(&self.pool).await?;
+        let result = sqlx::query("UPDATE matrix_recovery_receipts SET state='refused',refusal_code=?,updated_at=? WHERE account_id=? AND room_id=? AND event_id=? AND cutover_operation_id=? AND batch_id=? AND state IN ('pending','processing') AND EXISTS (SELECT 1 FROM matrix_recovery_batches b JOIN matrix_component_leases l ON l.component=b.component AND l.owner_token=b.owner_token AND l.epoch=b.owner_epoch WHERE b.batch_id=? AND b.owner_token=? AND b.owner_epoch=? AND b.state='processing' AND l.state='active' AND l.expires_at>=?)")
+            .bind(code).bind(now).bind(account_id).bind(room_id).bind(event_id).bind(operation_id).bind(batch_id).bind(batch_id).bind(owner_token).bind(owner_epoch).bind(now).execute(&self.pool).await?;
         if result.rows_affected() != 1 {
             return Err(sqlx::Error::Protocol(
                 "refusal disposition fence failed".into(),
@@ -300,15 +325,15 @@ impl MatrixRecoveryStore {
         now: &str,
     ) -> Result<(), sqlx::Error> {
         let mut tx = self.pool.begin().await?;
-        let row = sqlx::query("SELECT previous_watermark,response_token,response_digest,expected_events_json,covered_events_json,state FROM matrix_recovery_batches WHERE batch_id=? AND component='MatrixSync' AND owner_token=? AND owner_epoch=?")
-            .bind(batch_id).bind(owner_token).bind(owner_epoch).fetch_one(&mut *tx).await?;
+        let row = sqlx::query("SELECT b.previous_watermark,b.response_token,b.response_digest,b.expected_events_json,b.covered_events_json,b.state AS batch_state FROM matrix_recovery_batches b JOIN matrix_component_leases l ON l.component=b.component AND l.owner_token=b.owner_token AND l.epoch=b.owner_epoch WHERE b.batch_id=? AND b.component='MatrixSync' AND b.owner_token=? AND b.owner_epoch=? AND l.state='active' AND l.expires_at>=?")
+            .bind(batch_id).bind(owner_token).bind(owner_epoch).bind(now).fetch_one(&mut *tx).await?;
         let expected: Vec<String> =
             serde_json::from_str(row.try_get::<String, _>("expected_events_json")?.as_str())
                 .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
         let covered: Vec<String> =
             serde_json::from_str(row.try_get::<String, _>("covered_events_json")?.as_str())
                 .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-        if row.try_get::<String, _>("state")? == "refused"
+        if row.try_get::<String, _>("batch_state")? == "refused"
             || expected.iter().any(|event| !covered.contains(event))
         {
             return Err(sqlx::Error::Protocol("batch coverage incomplete".into()));

@@ -44,15 +44,18 @@ impl OutboxDrain {
                     &row.stable_txn_id,
                 )
                 .await;
-            if send_result.is_ok()
-                && self
+            if send_result.is_ok() {
+                if self
                     .store
                     .mark_projection_sent(&row)
                     .await
                     .map_err(|_| ())?
-            {
-                sent += 1;
-            } else if send_result.is_err() {
+                {
+                    sent += 1;
+                } else {
+                    let _ = self.store.mark_projection_abandoned(&row).await;
+                }
+            } else {
                 let _ = self.store.mark_projection_abandoned(&row).await;
             }
         }

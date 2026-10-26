@@ -152,7 +152,9 @@ pub use error::StorageError;
 pub use event_consumer::RepositoryEventConsumer;
 pub use pool::{DEFAULT_BUSY_TIMEOUT, MAX_CONNECTIONS, connect, migrate};
 pub use recovery::{RecoveryPlan, plan_recovery, sync_agents};
-pub use recovery_bridge::{BatchAdmission, BatchState, MatrixRecoveryStore, event_set};
+pub use recovery_bridge::{
+    BatchAdmission, BatchState, MatrixRecoveryStore, RecoveryControl, event_set,
+};
 pub use reliability::{
     AdmissionRecovery, PendingProjection, QueueReservation, ReceiptOutcome, ReliabilityError,
     ReliabilityStore, RetryTaskInput, WorkflowAdmission, WorkflowAuthorization,

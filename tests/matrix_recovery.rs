@@ -16,7 +16,7 @@ async fn partial_batch_keeps_watermark_until_all_receipts_are_dispositioned() {
     store.initialize_cutover("op-1", "t0").await.unwrap();
     store.activate_cutover("B", "t1").await.unwrap();
     store
-        .acquire_component_lease("MatrixSync", "op-1", "t1", "t9")
+        .acquire_component_lease("MatrixSync", "op-1", "a", "z")
         .await
         .unwrap();
     store
@@ -29,7 +29,7 @@ async fn partial_batch_keeps_watermark_until_all_receipts_are_dispositioned() {
             "op-1",
             1,
             &["$one".into(), "$two".into()],
-            "t2",
+            "2026-01-01T00:00:02Z",
         )
         .await
         .unwrap();
@@ -50,7 +50,7 @@ async fn partial_batch_keeps_watermark_until_all_receipts_are_dispositioned() {
     );
     assert!(
         store
-            .complete_batch("batch-1", "C", "op-1", 1, "t4")
+            .complete_batch("batch-1", "C", "op-1", 1, "b")
             .await
             .is_err()
     );
@@ -89,7 +89,7 @@ async fn partial_batch_keeps_watermark_until_all_receipts_are_dispositioned() {
         .await
         .unwrap();
     store
-        .complete_batch("batch-1", "C", "op-1", 1, "t7")
+        .complete_batch("batch-1", "C", "op-1", 1, "b")
         .await
         .unwrap();
     let watermark: Option<String> =
@@ -107,7 +107,7 @@ async fn receipt_digest_mismatch_is_fail_closed() {
     store.initialize_cutover("op-2", "t0").await.unwrap();
     store.activate_cutover("B", "t1").await.unwrap();
     store
-        .acquire_component_lease("MatrixSync", "op-2", "t1", "t9")
+        .acquire_component_lease("MatrixSync", "op-2", "a", "z")
         .await
         .unwrap();
     store
@@ -132,7 +132,7 @@ async fn receipt_digest_mismatch_is_fail_closed() {
             "op-2",
             "p1",
             "batch-2",
-            "t3",
+            "2026-01-01T00:00:03Z",
         )
         .await
         .unwrap();
@@ -157,7 +157,7 @@ async fn pending_receipt_is_not_terminal_until_effect_disposition() {
     let store = MatrixRecoveryStore::new(pool.clone());
     store.ensure_active("op-3", "B", "t0").await.unwrap();
     store
-        .acquire_component_lease("MatrixSync", "op-3", "t0", "t9")
+        .acquire_component_lease("MatrixSync", "op-3", "a", "z")
         .await
         .unwrap();
     store
@@ -197,7 +197,7 @@ async fn pending_receipt_is_not_terminal_until_effect_disposition() {
     assert_eq!(state, "pending");
     assert!(
         store
-            .complete_batch("batch-3", "C", "op-3", 1, "t3")
+            .complete_batch("batch-3", "C", "op-3", 1, "b")
             .await
             .is_err()
     );
@@ -215,7 +215,66 @@ async fn pending_receipt_is_not_terminal_until_effect_disposition() {
         .await
         .unwrap();
     store
-        .complete_batch("batch-3", "C", "op-3", 1, "t5")
+        .complete_batch("batch-3", "C", "op-3", 1, "b")
         .await
         .unwrap();
+}
+
+#[tokio::test]
+async fn stale_owner_and_restart_selector_fail_closed() {
+    let pool = database().await;
+    let store = MatrixRecoveryStore::new(pool.clone());
+    store.ensure_active("op-4", "B", "t0").await.unwrap();
+    store
+        .acquire_component_lease(
+            "MatrixSync",
+            "owner-a",
+            "2026-01-01T00:00:00Z",
+            "2026-01-02T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    store
+        .begin_batch(
+            "batch-4",
+            Some("B"),
+            "C",
+            "digest",
+            "B",
+            "owner-a",
+            1,
+            &["$one".into()],
+            "2026-01-01T01:00:00Z",
+        )
+        .await
+        .unwrap();
+    store
+        .reserve_event(
+            "@a:test",
+            "!room:test",
+            "$one",
+            "op-4",
+            "p1",
+            "batch-4",
+            "2026-01-01T02:00:00Z",
+        )
+        .await
+        .unwrap();
+    let unresolved = store.unresolved_receipts().await.unwrap();
+    assert_eq!(unresolved, vec![("$one".to_owned(), "pending".to_owned())]);
+    store
+        .acquire_component_lease(
+            "MatrixSync",
+            "owner-b",
+            "2026-01-03T00:00:00Z",
+            "2026-01-04T00:00:00Z",
+        )
+        .await
+        .unwrap();
+    assert!(
+        store
+            .complete_batch("batch-4", "C", "owner-a", 1, "2026-01-03T01:00:00Z")
+            .await
+            .is_err()
+    );
 }
