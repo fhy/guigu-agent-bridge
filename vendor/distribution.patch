@@ -1,0 +1,849 @@
+diff --git a/Cargo.lock b/Cargo.lock
+index dab99d3..8d21b54 100644
+--- a/Cargo.lock
++++ b/Cargo.lock
+@@ -1163 +1163 @@ name = "guigu-agent-bridge"
+-version = "0.2.22"
++version = "0.2.23"
+@@ -1166,0 +1167 @@ dependencies = [
++ "guigu-matrix-sdk",
+@@ -1169 +1169,0 @@ dependencies = [
+- "matrix-sdk",
+@@ -1185,0 +1186,103 @@ dependencies = [
++[[package]]
++name = "guigu-matrix-sdk"
++version = "0.13.0-guigu.1"
++dependencies = [
++ "anymap2",
++ "aquamarine",
++ "as_variant",
++ "async-channel",
++ "async-stream",
++ "async-trait",
++ "backon",
++ "bytes",
++ "bytesize",
++ "cfg-if",
++ "event-listener",
++ "eyeball",
++ "eyeball-im",
++ "futures-core",
++ "futures-util",
++ "gloo-timers",
++ "guigu-matrix-sdk-base",
++ "guigu-matrix-sdk-sqlite",
++ "http",
++ "imbl",
++ "indexmap",
++ "js_int",
++ "language-tags",
++ "matrix-sdk-common",
++ "matrix-sdk-indexeddb",
++ "mime",
++ "mime2ext",
++ "oauth2",
++ "once_cell",
++ "percent-encoding",
++ "pin-project-lite",
++ "reqwest",
++ "ruma",
++ "serde",
++ "serde_html_form",
++ "serde_json",
++ "sha2 0.10.9",
++ "tempfile",
++ "thiserror 2.0.20",
++ "tokio",
++ "tokio-stream",
++ "tokio-util",
++ "tracing",
++ "url",
++ "urlencoding",
++ "vodozemac",
++ "zeroize",
++]
++
++[[package]]
++name = "guigu-matrix-sdk-base"
++version = "0.13.0-guigu.1"
++dependencies = [
++ "as_variant",
++ "async-trait",
++ "bitflags",
++ "decancer",
++ "eyeball",
++ "eyeball-im",
++ "futures-util",
++ "growable-bloom-filter",
++ "matrix-sdk-common",
++ "matrix-sdk-crypto",
++ "matrix-sdk-store-encryption",
++ "once_cell",
++ "regex",
++ "ruma",
++ "serde",
++ "serde_json",
++ "thiserror 2.0.20",
++ "tokio",
++ "tracing",
++ "unicode-normalization",
++]
++
++[[package]]
++name = "guigu-matrix-sdk-sqlite"
++version = "0.13.0-guigu.1"
++dependencies = [
++ "as_variant",
++ "async-trait",
++ "deadpool-sqlite",
++ "guigu-matrix-sdk-base",
++ "itertools 0.14.0",
++ "matrix-sdk-crypto",
++ "matrix-sdk-store-encryption",
++ "num_cpus",
++ "rmp-serde",
++ "ruma",
++ "rusqlite",
++ "serde",
++ "serde_json",
++ "serde_path_to_error",
++ "thiserror 2.0.20",
++ "tokio",
++ "tracing",
++ "vodozemac",
++]
++
+@@ -1900,79 +2002,0 @@ dependencies = [
+-[[package]]
+-name = "matrix-sdk"
+-version = "0.13.0"
+-dependencies = [
+- "anymap2",
+- "aquamarine",
+- "as_variant",
+- "async-channel",
+- "async-stream",
+- "async-trait",
+- "backon",
+- "bytes",
+- "bytesize",
+- "cfg-if",
+- "event-listener",
+- "eyeball",
+- "eyeball-im",
+- "futures-core",
+- "futures-util",
+- "gloo-timers",
+- "http",
+- "imbl",
+- "indexmap",
+- "js_int",
+- "language-tags",
+- "matrix-sdk-base",
+- "matrix-sdk-common",
+- "matrix-sdk-indexeddb",
+- "matrix-sdk-sqlite",
+- "mime",
+- "mime2ext",
+- "oauth2",
+- "once_cell",
+- "percent-encoding",
+- "pin-project-lite",
+- "reqwest",
+- "ruma",
+- "serde",
+- "serde_html_form",
+- "serde_json",
+- "sha2 0.10.9",
+- "tempfile",
+- "thiserror 2.0.20",
+- "tokio",
+- "tokio-stream",
+- "tokio-util",
+- "tracing",
+- "url",
+- "urlencoding",
+- "vodozemac",
+- "zeroize",
+-]
+-
+-[[package]]
+-name = "matrix-sdk-base"
+-version = "0.13.0"
+-dependencies = [
+- "as_variant",
+- "async-trait",
+- "bitflags",
+- "decancer",
+- "eyeball",
+- "eyeball-im",
+- "futures-util",
+- "growable-bloom-filter",
+- "matrix-sdk-common",
+- "matrix-sdk-crypto",
+- "matrix-sdk-store-encryption",
+- "once_cell",
+- "regex",
+- "ruma",
+- "serde",
+- "serde_json",
+- "thiserror 2.0.20",
+- "tokio",
+- "tracing",
+- "unicode-normalization",
+-]
+-
+@@ -2073,24 +2096,0 @@ dependencies = [
+-[[package]]
+-name = "matrix-sdk-sqlite"
+-version = "0.13.0"
+-dependencies = [
+- "as_variant",
+- "async-trait",
+- "deadpool-sqlite",
+- "itertools 0.14.0",
+- "matrix-sdk-base",
+- "matrix-sdk-crypto",
+- "matrix-sdk-store-encryption",
+- "num_cpus",
+- "rmp-serde",
+- "ruma",
+- "rusqlite",
+- "serde",
+- "serde_json",
+- "serde_path_to_error",
+- "thiserror 2.0.20",
+- "tokio",
+- "tracing",
+- "vodozemac",
+-]
+-
+diff --git a/Cargo.toml b/Cargo.toml
+index 30ecac3..1bdfc64 100644
+--- a/Cargo.toml
++++ b/Cargo.toml
+@@ -3 +3 @@ name = "guigu-agent-bridge"
+-version = "0.2.22"
++version = "0.2.23"
+@@ -18 +17,0 @@ include = [
+-    "!/tests/**",
+@@ -55,0 +55,5 @@ include = [
++    "/vendor/**",
++    "/tests/matrix_sdk_clone_capability.rs",
++    "/tests/matrix_sdk_hydration.rs",
++    "/tests/support/matrix_hydration.rs",
++    "/docs/RELEASE-0.2.23.md",
+@@ -61,5 +64,0 @@ test-support = []
+-[patch.crates-io]
+-matrix-sdk = { version = "=0.13.0", path = "vendor/matrix-sdk-0.13.0" }
+-matrix-sdk-base = { version = "=0.13.0", path = "vendor/matrix-sdk-base-0.13.0" }
+-matrix-sdk-sqlite = { version = "=0.13.0", path = "vendor/matrix-sdk-sqlite-0.13.0" }
+-
+@@ -94 +93 @@ url = "2.5.8"
+-matrix-sdk = { version = "=0.13.0", default-features = false, features = ["rustls-tls", "e2e-encryption", "sqlite", "bundled-sqlite"] }
++matrix-sdk = { package = "guigu-matrix-sdk", version = "=0.13.0-guigu.1", path = "vendor/matrix-sdk-0.13.0", default-features = false, features = ["rustls-tls", "e2e-encryption", "sqlite", "bundled-sqlite"] }
+diff --git a/vendor/PROVENANCE.toml b/vendor/PROVENANCE.toml
+index 1f9b7ac..7a323b7 100644
+--- a/vendor/PROVENANCE.toml
++++ b/vendor/PROVENANCE.toml
+@@ -6,2 +6,2 @@ license_text = "LICENSE-APACHE-2.0"
+-selection = "Root Cargo.toml [patch.crates-io]; locked exact 0.13.0 packages only"
+-distribution = "Local source patch; not a registry publication or installation artifact"
++selection = "Renamed guigu-matrix-sdk/base/sqlite exact 0.13.0-guigu.1; Rust aliases unchanged"
++distribution = "R077 registry-compatible metadata; rehearsal does not establish publication"
+diff --git a/vendor/README.md b/vendor/README.md
+index 8f90aa7..e7d5890 100644
+--- a/vendor/README.md
++++ b/vendor/README.md
+@@ -43,4 +43,18 @@ Bridge code and tests remain subject to normal file/function/test limits.
+-This patch is local-only. Cargo registry packaging does not propagate a root
+-`[patch]` section to downstream consumers; it is not evidence of a publishable
+-patched SDK release. Any later release task must resolve that distribution
+-boundary explicitly, without silently installing an unpatched registry build.
++R077 distributes these reviewed sources under `guigu-matrix-sdk`,
++`guigu-matrix-sdk-base` and `guigu-matrix-sdk-sqlite`, all exact
++`0.13.0-guigu.1`. Dependency aliases and library names remain unchanged; relative
++path-plus-version inputs are for development only, and normalized registry
++manifests retain the renamed exact versions without a root patch. Normal/dev
++base edges and the SDK SQLite edge select the same fork base. Crypto/common and
++store-encryption remain upstream. Only Bridge's native SQLite graph is certified;
++browser/indexeddb, all-features and arbitrary providers are not certified.
++
++`hydration.patch` remains the original R076 source diff with its original SHA;
++`distribution.patch` separately records metadata/documentation changes against
++the reviewed R076 tree. Each fork archive carries license, upstream provenance,
++the reviewed patch and a distribution identity section. Historical upstream
++Cargo.toml.orig files are archive evidence, not effective fork manifests.
++
++Local registry rehearsal is not publication or a live-name ownership claim.
++The later authorized publisher must verify names/permissions and publish/verify
++downloads in base → SQLite → SDK → Bridge order before public cargo installation.
+diff --git a/vendor/matrix-sdk-0.13.0/Cargo.lock b/vendor/matrix-sdk-0.13.0/Cargo.lock
+index 9904e3b..631f5ba 100644
+--- a/vendor/matrix-sdk-0.13.0/Cargo.lock
++++ b/vendor/matrix-sdk-0.13.0/Cargo.lock
+@@ -1156,0 +1157,131 @@ dependencies = [
++[[package]]
++name = "guigu-matrix-sdk"
++version = "0.13.0-guigu.1"
++dependencies = [
++ "anyhow",
++ "anymap2",
++ "aquamarine",
++ "as_variant",
++ "assert-json-diff",
++ "assert_matches",
++ "assert_matches2",
++ "async-channel",
++ "async-stream",
++ "async-trait",
++ "axum",
++ "backon",
++ "bytes",
++ "bytesize",
++ "cfg-if",
++ "dirs",
++ "event-listener",
++ "eyeball",
++ "eyeball-im",
++ "eyre",
++ "futures-core",
++ "futures-executor",
++ "futures-util",
++ "gloo-timers",
++ "guigu-matrix-sdk-base",
++ "guigu-matrix-sdk-sqlite",
++ "http",
++ "imbl",
++ "indexmap",
++ "insta",
++ "js_int",
++ "language-tags",
++ "matrix-sdk-common",
++ "matrix-sdk-ffi-macros",
++ "matrix-sdk-indexeddb",
++ "matrix-sdk-test",
++ "mime",
++ "mime2ext",
++ "oauth2",
++ "once_cell",
++ "percent-encoding",
++ "pin-project-lite",
++ "proptest",
++ "rand",
++ "reqwest",
++ "ruma",
++ "serde",
++ "serde_html_form",
++ "serde_json",
++ "serde_urlencoded",
++ "sha2",
++ "similar-asserts",
++ "stream_assert",
++ "tempfile",
++ "thiserror 2.0.11",
++ "tokio",
++ "tokio-stream",
++ "tokio-test",
++ "tokio-util",
++ "tower",
++ "tracing",
++ "tracing-subscriber",
++ "uniffi",
++ "url",
++ "urlencoding",
++ "uuid",
++ "vodozemac",
++ "wasm-bindgen-test",
++ "wiremock",
++ "zeroize",
++]
++
++[[package]]
++name = "guigu-matrix-sdk-base"
++version = "0.13.0-guigu.1"
++dependencies = [
++ "as_variant",
++ "assert_matches",
++ "assert_matches2",
++ "async-trait",
++ "bitflags",
++ "decancer",
++ "eyeball",
++ "eyeball-im",
++ "futures-util",
++ "growable-bloom-filter",
++ "http",
++ "matrix-sdk-common",
++ "matrix-sdk-crypto",
++ "matrix-sdk-store-encryption",
++ "matrix-sdk-test",
++ "once_cell",
++ "regex",
++ "ruma",
++ "serde",
++ "serde_json",
++ "thiserror 2.0.11",
++ "tokio",
++ "tracing",
++ "unicode-normalization",
++ "uniffi",
++]
++
++[[package]]
++name = "guigu-matrix-sdk-sqlite"
++version = "0.13.0-guigu.1"
++dependencies = [
++ "as_variant",
++ "async-trait",
++ "deadpool-sqlite",
++ "guigu-matrix-sdk-base",
++ "itertools 0.14.0",
++ "matrix-sdk-crypto",
++ "matrix-sdk-store-encryption",
++ "num_cpus",
++ "rmp-serde",
++ "ruma",
++ "rusqlite",
++ "serde",
++ "serde_json",
++ "serde_path_to_error",
++ "thiserror 2.0.11",
++ "tokio",
++ "tracing",
++ "vodozemac",
++]
++
+@@ -1888,76 +2018,0 @@ dependencies = [
+-[[package]]
+-name = "matrix-sdk"
+-version = "0.13.0"
+-dependencies = [
+- "anyhow",
+- "anymap2",
+- "aquamarine",
+- "as_variant",
+- "assert-json-diff",
+- "assert_matches",
+- "assert_matches2",
+- "async-channel",
+- "async-stream",
+- "async-trait",
+- "axum",
+- "backon",
+- "bytes",
+- "bytesize",
+- "cfg-if",
+- "dirs",
+- "event-listener",
+- "eyeball",
+- "eyeball-im",
+- "eyre",
+- "futures-core",
+- "futures-executor",
+- "futures-util",
+- "gloo-timers",
+- "http",
+- "imbl",
+- "indexmap",
+- "insta",
+- "js_int",
+- "language-tags",
+- "matrix-sdk-base",
+- "matrix-sdk-common",
+- "matrix-sdk-ffi-macros",
+- "matrix-sdk-indexeddb",
+- "matrix-sdk-sqlite",
+- "matrix-sdk-test",
+- "mime",
+- "mime2ext",
+- "oauth2",
+- "once_cell",
+- "percent-encoding",
+- "pin-project-lite",
+- "proptest",
+- "rand",
+- "reqwest",
+- "ruma",
+- "serde",
+- "serde_html_form",
+- "serde_json",
+- "serde_urlencoded",
+- "sha2",
+- "similar-asserts",
+- "stream_assert",
+- "tempfile",
+- "thiserror 2.0.11",
+- "tokio",
+- "tokio-stream",
+- "tokio-test",
+- "tokio-util",
+- "tower",
+- "tracing",
+- "tracing-subscriber",
+- "uniffi",
+- "url",
+- "urlencoding",
+- "uuid",
+- "vodozemac",
+- "wasm-bindgen-test",
+- "wiremock",
+- "zeroize",
+-]
+-
+@@ -1971,2 +2025,0 @@ dependencies = [
+- "assert_matches",
+- "assert_matches2",
+@@ -1980 +2032,0 @@ dependencies = [
+- "http",
+@@ -1984 +2035,0 @@ dependencies = [
+- "matrix-sdk-test",
+@@ -1994 +2044,0 @@ dependencies = [
+- "uniffi",
+@@ -2121,26 +2170,0 @@ dependencies = [
+-[[package]]
+-name = "matrix-sdk-sqlite"
+-version = "0.13.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "aa2ff57473e92bad1b7320b3d70d640661b95064e091b925c5ef88acfa281853"
+-dependencies = [
+- "as_variant",
+- "async-trait",
+- "deadpool-sqlite",
+- "itertools 0.14.0",
+- "matrix-sdk-base",
+- "matrix-sdk-crypto",
+- "matrix-sdk-store-encryption",
+- "num_cpus",
+- "rmp-serde",
+- "ruma",
+- "rusqlite",
+- "serde",
+- "serde_json",
+- "serde_path_to_error",
+- "thiserror 2.0.11",
+- "tokio",
+- "tracing",
+- "vodozemac",
+-]
+-
+diff --git a/vendor/matrix-sdk-0.13.0/Cargo.toml b/vendor/matrix-sdk-0.13.0/Cargo.toml
+index f70e129..3d3ce1f 100644
+--- a/vendor/matrix-sdk-0.13.0/Cargo.toml
++++ b/vendor/matrix-sdk-0.13.0/Cargo.toml
+@@ -15,2 +15,3 @@ rust-version = "1.85"
+-name = "matrix-sdk"
+-version = "0.13.0"
++name = "guigu-matrix-sdk"
++version = "0.13.0-guigu.1"
++exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json", "Cargo.lock"]
+@@ -208 +209,3 @@ version = "0.3.2"
+-version = "0.13.0"
++package = "guigu-matrix-sdk-base"
++version = "=0.13.0-guigu.1"
++path = "../matrix-sdk-base-0.13.0"
+@@ -223 +226,3 @@ default-features = false
+-version = "0.13.0"
++package = "guigu-matrix-sdk-sqlite"
++version = "=0.13.0-guigu.1"
++path = "../matrix-sdk-sqlite-0.13.0"
+@@ -380 +385,3 @@ features = [
+-version = "0.13.0"
++package = "guigu-matrix-sdk-base"
++version = "=0.13.0-guigu.1"
++path = "../matrix-sdk-base-0.13.0"
+diff --git a/vendor/matrix-sdk-0.13.0/README.md b/vendor/matrix-sdk-0.13.0/README.md
+index 5d1802a..f0de792 100644
+--- a/vendor/matrix-sdk-0.13.0/README.md
++++ b/vendor/matrix-sdk-0.13.0/README.md
+@@ -1,0 +2,11 @@ A high-level, batteries-included [Matrix](https://matrix.org/) client library
++
++## Guigu distribution boundary
++
++This package is `guigu-matrix-sdk = 0.13.0-guigu.1`, a renamed fork of
++upstream `matrix-sdk 0.13.0` with the reviewed R076 patch. Only the native
++SQLite feature graph used by guigu-agent-bridge is certified. Browser/indexeddb,
++all-features and arbitrary providers are not certified as drop-in compatible.
++Rust library names are unchanged. See `R076-PROVENANCE.toml` and `hydration.patch`.
++`Cargo.toml` is the effective standalone fork manifest. The checkout retains the
++historical upstream `Cargo.toml.orig` but excludes it from package inputs; Cargo
++generates the packaged `.orig` from the current fork manifest.
+@@ -95 +106 @@ more information on this, check out the [tracing_subscriber documentation].
+-[`matrix_sdk_base`]: https://docs.rs/matrix-sdk-base/
+\ No newline at end of file
++[`matrix_sdk_base`]: https://docs.rs/matrix-sdk-base/
+diff --git a/vendor/matrix-sdk-base-0.13.0/Cargo.lock b/vendor/matrix-sdk-base-0.13.0/Cargo.lock
+index fc8ae86..a6d947a 100644
+--- a/vendor/matrix-sdk-base-0.13.0/Cargo.lock
++++ b/vendor/matrix-sdk-base-0.13.0/Cargo.lock
+@@ -756,0 +757,37 @@ dependencies = [
++[[package]]
++name = "guigu-matrix-sdk-base"
++version = "0.13.0-guigu.1"
++dependencies = [
++ "anyhow",
++ "as_variant",
++ "assert_matches",
++ "assert_matches2",
++ "assign",
++ "async-trait",
++ "bitflags",
++ "decancer",
++ "eyeball",
++ "eyeball-im",
++ "futures-executor",
++ "futures-util",
++ "growable-bloom-filter",
++ "http",
++ "matrix-sdk-common",
++ "matrix-sdk-crypto",
++ "matrix-sdk-store-encryption",
++ "matrix-sdk-test",
++ "once_cell",
++ "regex",
++ "ruma",
++ "serde",
++ "serde_json",
++ "similar-asserts",
++ "stream_assert",
++ "thiserror 2.0.11",
++ "tokio",
++ "tracing",
++ "unicode-normalization",
++ "uniffi",
++ "wasm-bindgen-test",
++]
++
+@@ -1299,37 +1335,0 @@ dependencies = [
+-[[package]]
+-name = "matrix-sdk-base"
+-version = "0.13.0"
+-dependencies = [
+- "anyhow",
+- "as_variant",
+- "assert_matches",
+- "assert_matches2",
+- "assign",
+- "async-trait",
+- "bitflags",
+- "decancer",
+- "eyeball",
+- "eyeball-im",
+- "futures-executor",
+- "futures-util",
+- "growable-bloom-filter",
+- "http",
+- "matrix-sdk-common",
+- "matrix-sdk-crypto",
+- "matrix-sdk-store-encryption",
+- "matrix-sdk-test",
+- "once_cell",
+- "regex",
+- "ruma",
+- "serde",
+- "serde_json",
+- "similar-asserts",
+- "stream_assert",
+- "thiserror 2.0.11",
+- "tokio",
+- "tracing",
+- "unicode-normalization",
+- "uniffi",
+- "wasm-bindgen-test",
+-]
+-
+diff --git a/vendor/matrix-sdk-base-0.13.0/Cargo.toml b/vendor/matrix-sdk-base-0.13.0/Cargo.toml
+index 6cb67ed..6a1f96e 100644
+--- a/vendor/matrix-sdk-base-0.13.0/Cargo.toml
++++ b/vendor/matrix-sdk-base-0.13.0/Cargo.toml
+@@ -15,2 +15,3 @@ rust-version = "1.85"
+-name = "matrix-sdk-base"
+-version = "0.13.0"
++name = "guigu-matrix-sdk-base"
++version = "0.13.0-guigu.1"
++exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json", "Cargo.lock"]
+diff --git a/vendor/matrix-sdk-base-0.13.0/README.md b/vendor/matrix-sdk-base-0.13.0/README.md
+index 54065a6..4e96319 100644
+--- a/vendor/matrix-sdk-base-0.13.0/README.md
++++ b/vendor/matrix-sdk-base-0.13.0/README.md
+@@ -1,2 +1,12 @@
+-This crate implements the base to build a [Matrix](https://matrix.org/) client
+-library.
++This crate implements the base to build a [Matrix](https://matrix.org/) client library.
++
++## Guigu distribution boundary
++
++This package is `guigu-matrix-sdk-base = 0.13.0-guigu.1`, a renamed fork of
++upstream `matrix-sdk-base 0.13.0` with the reviewed R076 patch. Only the native
++SQLite feature graph used by guigu-agent-bridge is certified. Browser/indexeddb,
++all-features and arbitrary providers are not certified as drop-in compatible.
++Rust library names are unchanged. See `R076-PROVENANCE.toml` and `hydration.patch`.
++`Cargo.toml` is the effective standalone fork manifest. The checkout retains the
++historical upstream `Cargo.toml.orig` but excludes it from package inputs; Cargo
++generates the packaged `.orig` from the current fork manifest.
+diff --git a/vendor/matrix-sdk-sqlite-0.13.0/Cargo.lock b/vendor/matrix-sdk-sqlite-0.13.0/Cargo.lock
+index 1d4a1ac..7a198f4 100644
+--- a/vendor/matrix-sdk-sqlite-0.13.0/Cargo.lock
++++ b/vendor/matrix-sdk-sqlite-0.13.0/Cargo.lock
+@@ -818,0 +819,61 @@ dependencies = [
++[[package]]
++name = "guigu-matrix-sdk-base"
++version = "0.13.0-guigu.1"
++dependencies = [
++ "as_variant",
++ "assert_matches",
++ "assert_matches2",
++ "async-trait",
++ "bitflags",
++ "decancer",
++ "eyeball",
++ "eyeball-im",
++ "futures-util",
++ "growable-bloom-filter",
++ "http",
++ "matrix-sdk-common",
++ "matrix-sdk-crypto",
++ "matrix-sdk-store-encryption",
++ "matrix-sdk-test",
++ "once_cell",
++ "regex",
++ "ruma",
++ "serde",
++ "serde_json",
++ "thiserror 2.0.11",
++ "tokio",
++ "tracing",
++ "unicode-normalization",
++]
++
++[[package]]
++name = "guigu-matrix-sdk-sqlite"
++version = "0.13.0-guigu.1"
++dependencies = [
++ "as_variant",
++ "assert_matches",
++ "async-trait",
++ "deadpool-sqlite",
++ "glob",
++ "guigu-matrix-sdk-base",
++ "itertools 0.14.0",
++ "matrix-sdk-common",
++ "matrix-sdk-crypto",
++ "matrix-sdk-store-encryption",
++ "matrix-sdk-test",
++ "num_cpus",
++ "once_cell",
++ "rmp-serde",
++ "ruma",
++ "rusqlite",
++ "serde",
++ "serde_json",
++ "serde_path_to_error",
++ "similar-asserts",
++ "tempfile",
++ "thiserror 2.0.11",
++ "tokio",
++ "tracing",
++ "vodozemac",
++]
++
+@@ -1390,32 +1450,0 @@ dependencies = [
+-[[package]]
+-name = "matrix-sdk-base"
+-version = "0.13.0"
+-source = "registry+https://github.com/rust-lang/crates.io-index"
+-checksum = "ad7f18305090c059293ebafefbfd8cac494f43386c3f255861995ee7b48f9e89"
+-dependencies = [
+- "as_variant",
+- "assert_matches",
+- "assert_matches2",
+- "async-trait",
+- "bitflags",
+- "decancer",
+- "eyeball",
+- "eyeball-im",
+- "futures-util",
+- "growable-bloom-filter",
+- "http",
+- "matrix-sdk-common",
+- "matrix-sdk-crypto",
+- "matrix-sdk-store-encryption",
+- "matrix-sdk-test",
+- "once_cell",
+- "regex",
+- "ruma",
+- "serde",
+- "serde_json",
+- "thiserror 2.0.11",
+- "tokio",
+- "tracing",
+- "unicode-normalization",
+-]
+-
+@@ -1487,31 +1515,0 @@ dependencies = [
+-[[package]]
+-name = "matrix-sdk-sqlite"
+-version = "0.13.0"
+-dependencies = [
+- "as_variant",
+- "assert_matches",
+- "async-trait",
+- "deadpool-sqlite",
+- "glob",
+- "itertools 0.14.0",
+- "matrix-sdk-base",
+- "matrix-sdk-common",
+- "matrix-sdk-crypto",
+- "matrix-sdk-store-encryption",
+- "matrix-sdk-test",
+- "num_cpus",
+- "once_cell",
+- "rmp-serde",
+- "ruma",
+- "rusqlite",
+- "serde",
+- "serde_json",
+- "serde_path_to_error",
+- "similar-asserts",
+- "tempfile",
+- "thiserror 2.0.11",
+- "tokio",
+- "tracing",
+- "vodozemac",
+-]
+-
+diff --git a/vendor/matrix-sdk-sqlite-0.13.0/Cargo.toml b/vendor/matrix-sdk-sqlite-0.13.0/Cargo.toml
+index e3954a6..66a21fe 100644
+--- a/vendor/matrix-sdk-sqlite-0.13.0/Cargo.toml
++++ b/vendor/matrix-sdk-sqlite-0.13.0/Cargo.toml
+@@ -15,2 +15,3 @@ rust-version = "1.85"
+-name = "matrix-sdk-sqlite"
+-version = "0.13.0"
++name = "guigu-matrix-sdk-sqlite"
++version = "0.13.0-guigu.1"
++exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json", "Cargo.lock"]
+@@ -59 +60,3 @@ version = "0.14.0"
+-version = "0.13.0"
++package = "guigu-matrix-sdk-base"
++version = "=0.13.0-guigu.1"
++path = "../matrix-sdk-base-0.13.0"
+@@ -138 +141,3 @@ version = "0.3.2"
+-version = "0.13.0"
++package = "guigu-matrix-sdk-base"
++version = "=0.13.0-guigu.1"
++path = "../matrix-sdk-base-0.13.0"
+diff --git a/vendor/matrix-sdk-sqlite-0.13.0/README.md b/vendor/matrix-sdk-sqlite-0.13.0/README.md
+index e69de29..d6ffceb 100644
+--- a/vendor/matrix-sdk-sqlite-0.13.0/README.md
++++ b/vendor/matrix-sdk-sqlite-0.13.0/README.md
+@@ -0,0 +1,10 @@
++## Guigu distribution boundary
++
++This package is `guigu-matrix-sdk-sqlite = 0.13.0-guigu.1`, a renamed fork of
++upstream `matrix-sdk-sqlite 0.13.0` with the reviewed R076 patch. Only the native
++SQLite feature graph used by guigu-agent-bridge is certified. Browser/indexeddb,
++all-features and arbitrary providers are not certified as drop-in compatible.
++Rust library names are unchanged. See `R076-PROVENANCE.toml` and `hydration.patch`.
++`Cargo.toml` is the effective standalone fork manifest. The checkout retains the
++historical upstream `Cargo.toml.orig` but excludes it from package inputs; Cargo
++generates the packaged `.orig` from the current fork manifest.

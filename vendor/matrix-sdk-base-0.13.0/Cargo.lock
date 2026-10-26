@@ -755,6 +755,43 @@ dependencies = [
 ]
 
 [[package]]
+name = "guigu-matrix-sdk-base"
+version = "0.13.0-guigu.1"
+dependencies = [
+ "anyhow",
+ "as_variant",
+ "assert_matches",
+ "assert_matches2",
+ "assign",
+ "async-trait",
+ "bitflags",
+ "decancer",
+ "eyeball",
+ "eyeball-im",
+ "futures-executor",
+ "futures-util",
+ "growable-bloom-filter",
+ "http",
+ "matrix-sdk-common",
+ "matrix-sdk-crypto",
+ "matrix-sdk-store-encryption",
+ "matrix-sdk-test",
+ "once_cell",
+ "regex",
+ "ruma",
+ "serde",
+ "serde_json",
+ "similar-asserts",
+ "stream_assert",
+ "thiserror 2.0.11",
+ "tokio",
+ "tracing",
+ "unicode-normalization",
+ "uniffi",
+ "wasm-bindgen-test",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1294,43 +1331,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "matrix-sdk-base"
-version = "0.13.0"
-dependencies = [
- "anyhow",
- "as_variant",
- "assert_matches",
- "assert_matches2",
- "assign",
- "async-trait",
- "bitflags",
- "decancer",
- "eyeball",
- "eyeball-im",
- "futures-executor",
- "futures-util",
- "growable-bloom-filter",
- "http",
- "matrix-sdk-common",
- "matrix-sdk-crypto",
- "matrix-sdk-store-encryption",
- "matrix-sdk-test",
- "once_cell",
- "regex",
- "ruma",
- "serde",
- "serde_json",
- "similar-asserts",
- "stream_assert",
- "thiserror 2.0.11",
- "tokio",
- "tracing",
- "unicode-normalization",
- "uniffi",
- "wasm-bindgen-test",
 ]
 
 [[package]]

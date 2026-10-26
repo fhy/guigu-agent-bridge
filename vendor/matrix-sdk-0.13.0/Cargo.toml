@@ -12,8 +12,9 @@
 [package]
 edition = "2021"
 rust-version = "1.85"
-name = "matrix-sdk"
-version = "0.13.0"
+name = "guigu-matrix-sdk"
+version = "0.13.0-guigu.1"
+exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json", "Cargo.lock"]
 authors = ["Damir Jelić <poljar@termina.org.uk>"]
 build = "build.rs"
 autolib = false
@@ -205,7 +206,9 @@ version = "0.2.2"
 version = "0.3.2"
 
 [dependencies.matrix-sdk-base]
-version = "0.13.0"
+package = "guigu-matrix-sdk-base"
+version = "=0.13.0-guigu.1"
+path = "../matrix-sdk-base-0.13.0"
 
 [dependencies.matrix-sdk-common]
 version = "0.13.0"
@@ -220,7 +223,9 @@ optional = true
 default-features = false
 
 [dependencies.matrix-sdk-sqlite]
-version = "0.13.0"
+package = "guigu-matrix-sdk-sqlite"
+version = "=0.13.0-guigu.1"
+path = "../matrix-sdk-sqlite-0.13.0"
 optional = true
 default-features = false
 
@@ -377,7 +382,9 @@ features = [
 ]
 
 [dev-dependencies.matrix-sdk-base]
-version = "0.13.0"
+package = "guigu-matrix-sdk-base"
+version = "=0.13.0-guigu.1"
+path = "../matrix-sdk-base-0.13.0"
 features = ["testing"]
 
 [dev-dependencies.matrix-sdk-test]

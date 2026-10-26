@@ -12,8 +12,9 @@
 [package]
 edition = "2021"
 rust-version = "1.85"
-name = "matrix-sdk-base"
-version = "0.13.0"
+name = "guigu-matrix-sdk-base"
+version = "0.13.0-guigu.1"
+exclude = ["Cargo.toml.orig", ".cargo_vcs_info.json", "Cargo.lock"]
 authors = ["Damir Jelić <poljar@termina.org.uk>"]
 build = false
 autolib = false

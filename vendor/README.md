@@ -40,7 +40,21 @@ CL-R076-04 permits unchanged upstream baseline files to exceed Bridge structure
 limits when provenance and this minimal diff are supplied. New snapshot modules,
 Bridge code and tests remain subject to normal file/function/test limits.
 
-This patch is local-only. Cargo registry packaging does not propagate a root
-`[patch]` section to downstream consumers; it is not evidence of a publishable
-patched SDK release. Any later release task must resolve that distribution
-boundary explicitly, without silently installing an unpatched registry build.
+R077 distributes these reviewed sources under `guigu-matrix-sdk`,
+`guigu-matrix-sdk-base` and `guigu-matrix-sdk-sqlite`, all exact
+`0.13.0-guigu.1`. Dependency aliases and library names remain unchanged; relative
+path-plus-version inputs are for development only, and normalized registry
+manifests retain the renamed exact versions without a root patch. Normal/dev
+base edges and the SDK SQLite edge select the same fork base. Crypto/common and
+store-encryption remain upstream. Only Bridge's native SQLite graph is certified;
+browser/indexeddb, all-features and arbitrary providers are not certified.
+
+`hydration.patch` remains the original R076 source diff with its original SHA;
+`distribution.patch` separately records metadata/documentation changes against
+the reviewed R076 tree. Each fork archive carries license, upstream provenance,
+the reviewed patch and a distribution identity section. Historical upstream
+Cargo.toml.orig files are archive evidence, not effective fork manifests.
+
+Local registry rehearsal is not publication or a live-name ownership claim.
+The later authorized publisher must verify names/permissions and publish/verify
+downloads in base → SQLite → SDK → Bridge order before public cargo installation.

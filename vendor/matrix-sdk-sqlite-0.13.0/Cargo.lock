@@ -817,6 +817,67 @@ dependencies = [
 ]
 
 [[package]]
+name = "guigu-matrix-sdk-base"
+version = "0.13.0-guigu.1"
+dependencies = [
+ "as_variant",
+ "assert_matches",
+ "assert_matches2",
+ "async-trait",
+ "bitflags",
+ "decancer",
+ "eyeball",
+ "eyeball-im",
+ "futures-util",
+ "growable-bloom-filter",
+ "http",
+ "matrix-sdk-common",
+ "matrix-sdk-crypto",
+ "matrix-sdk-store-encryption",
+ "matrix-sdk-test",
+ "once_cell",
+ "regex",
+ "ruma",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.11",
+ "tokio",
+ "tracing",
+ "unicode-normalization",
+]
+
+[[package]]
+name = "guigu-matrix-sdk-sqlite"
+version = "0.13.0-guigu.1"
+dependencies = [
+ "as_variant",
+ "assert_matches",
+ "async-trait",
+ "deadpool-sqlite",
+ "glob",
+ "guigu-matrix-sdk-base",
+ "itertools 0.14.0",
+ "matrix-sdk-common",
+ "matrix-sdk-crypto",
+ "matrix-sdk-store-encryption",
+ "matrix-sdk-test",
+ "num_cpus",
+ "once_cell",
+ "rmp-serde",
+ "ruma",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "similar-asserts",
+ "tempfile",
+ "thiserror 2.0.11",
+ "tokio",
+ "tracing",
+ "vodozemac",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1388,38 +1449,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "matrix-sdk-base"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "ad7f18305090c059293ebafefbfd8cac494f43386c3f255861995ee7b48f9e89"
-dependencies = [
- "as_variant",
- "assert_matches",
- "assert_matches2",
- "async-trait",
- "bitflags",
- "decancer",
- "eyeball",
- "eyeball-im",
- "futures-util",
- "growable-bloom-filter",
- "http",
- "matrix-sdk-common",
- "matrix-sdk-crypto",
- "matrix-sdk-store-encryption",
- "matrix-sdk-test",
- "once_cell",
- "regex",
- "ruma",
- "serde",
- "serde_json",
- "thiserror 2.0.11",
- "tokio",
- "tracing",
- "unicode-normalization",
-]
-
-[[package]]
 name = "matrix-sdk-common"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1482,37 +1511,6 @@ dependencies = [
  "url",
  "vodozemac",
  "zeroize",
-]
-
-[[package]]
-name = "matrix-sdk-sqlite"
-version = "0.13.0"
-dependencies = [
- "as_variant",
- "assert_matches",
- "async-trait",
- "deadpool-sqlite",
- "glob",
- "itertools 0.14.0",
- "matrix-sdk-base",
- "matrix-sdk-common",
- "matrix-sdk-crypto",
- "matrix-sdk-store-encryption",
- "matrix-sdk-test",
- "num_cpus",
- "once_cell",
- "rmp-serde",
- "ruma",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "similar-asserts",
- "tempfile",
- "thiserror 2.0.11",
- "tokio",
- "tracing",
- "vodozemac",
 ]
 
 [[package]]

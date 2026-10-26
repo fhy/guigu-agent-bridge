@@ -1155,6 +1155,137 @@ dependencies = [
 ]
 
 [[package]]
+name = "guigu-matrix-sdk"
+version = "0.13.0-guigu.1"
+dependencies = [
+ "anyhow",
+ "anymap2",
+ "aquamarine",
+ "as_variant",
+ "assert-json-diff",
+ "assert_matches",
+ "assert_matches2",
+ "async-channel",
+ "async-stream",
+ "async-trait",
+ "axum",
+ "backon",
+ "bytes",
+ "bytesize",
+ "cfg-if",
+ "dirs",
+ "event-listener",
+ "eyeball",
+ "eyeball-im",
+ "eyre",
+ "futures-core",
+ "futures-executor",
+ "futures-util",
+ "gloo-timers",
+ "guigu-matrix-sdk-base",
+ "guigu-matrix-sdk-sqlite",
+ "http",
+ "imbl",
+ "indexmap",
+ "insta",
+ "js_int",
+ "language-tags",
+ "matrix-sdk-common",
+ "matrix-sdk-ffi-macros",
+ "matrix-sdk-indexeddb",
+ "matrix-sdk-test",
+ "mime",
+ "mime2ext",
+ "oauth2",
+ "once_cell",
+ "percent-encoding",
+ "pin-project-lite",
+ "proptest",
+ "rand",
+ "reqwest",
+ "ruma",
+ "serde",
+ "serde_html_form",
+ "serde_json",
+ "serde_urlencoded",
+ "sha2",
+ "similar-asserts",
+ "stream_assert",
+ "tempfile",
+ "thiserror 2.0.11",
+ "tokio",
+ "tokio-stream",
+ "tokio-test",
+ "tokio-util",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "uniffi",
+ "url",
+ "urlencoding",
+ "uuid",
+ "vodozemac",
+ "wasm-bindgen-test",
+ "wiremock",
+ "zeroize",
+]
+
+[[package]]
+name = "guigu-matrix-sdk-base"
+version = "0.13.0-guigu.1"
+dependencies = [
+ "as_variant",
+ "assert_matches",
+ "assert_matches2",
+ "async-trait",
+ "bitflags",
+ "decancer",
+ "eyeball",
+ "eyeball-im",
+ "futures-util",
+ "growable-bloom-filter",
+ "http",
+ "matrix-sdk-common",
+ "matrix-sdk-crypto",
+ "matrix-sdk-store-encryption",
+ "matrix-sdk-test",
+ "once_cell",
+ "regex",
+ "ruma",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.11",
+ "tokio",
+ "tracing",
+ "unicode-normalization",
+ "uniffi",
+]
+
+[[package]]
+name = "guigu-matrix-sdk-sqlite"
+version = "0.13.0-guigu.1"
+dependencies = [
+ "as_variant",
+ "async-trait",
+ "deadpool-sqlite",
+ "guigu-matrix-sdk-base",
+ "itertools 0.14.0",
+ "matrix-sdk-crypto",
+ "matrix-sdk-store-encryption",
+ "num_cpus",
+ "rmp-serde",
+ "ruma",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "thiserror 2.0.11",
+ "tokio",
+ "tracing",
+ "vodozemac",
+]
+
+[[package]]
 name = "h2"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1886,90 +2017,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "matrix-sdk"
-version = "0.13.0"
-dependencies = [
- "anyhow",
- "anymap2",
- "aquamarine",
- "as_variant",
- "assert-json-diff",
- "assert_matches",
- "assert_matches2",
- "async-channel",
- "async-stream",
- "async-trait",
- "axum",
- "backon",
- "bytes",
- "bytesize",
- "cfg-if",
- "dirs",
- "event-listener",
- "eyeball",
- "eyeball-im",
- "eyre",
- "futures-core",
- "futures-executor",
- "futures-util",
- "gloo-timers",
- "http",
- "imbl",
- "indexmap",
- "insta",
- "js_int",
- "language-tags",
- "matrix-sdk-base",
- "matrix-sdk-common",
- "matrix-sdk-ffi-macros",
- "matrix-sdk-indexeddb",
- "matrix-sdk-sqlite",
- "matrix-sdk-test",
- "mime",
- "mime2ext",
- "oauth2",
- "once_cell",
- "percent-encoding",
- "pin-project-lite",
- "proptest",
- "rand",
- "reqwest",
- "ruma",
- "serde",
- "serde_html_form",
- "serde_json",
- "serde_urlencoded",
- "sha2",
- "similar-asserts",
- "stream_assert",
- "tempfile",
- "thiserror 2.0.11",
- "tokio",
- "tokio-stream",
- "tokio-test",
- "tokio-util",
- "tower",
- "tracing",
- "tracing-subscriber",
- "uniffi",
- "url",
- "urlencoding",
- "uuid",
- "vodozemac",
- "wasm-bindgen-test",
- "wiremock",
- "zeroize",
-]
-
-[[package]]
 name = "matrix-sdk-base"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ad7f18305090c059293ebafefbfd8cac494f43386c3f255861995ee7b48f9e89"
 dependencies = [
  "as_variant",
- "assert_matches",
- "assert_matches2",
  "async-trait",
  "bitflags",
  "decancer",
@@ -1977,11 +2030,9 @@ dependencies = [
  "eyeball-im",
  "futures-util",
  "growable-bloom-filter",
- "http",
  "matrix-sdk-common",
  "matrix-sdk-crypto",
  "matrix-sdk-store-encryption",
- "matrix-sdk-test",
  "once_cell",
  "regex",
  "ruma",
@@ -1991,7 +2042,6 @@ dependencies = [
  "tokio",
  "tracing",
  "unicode-normalization",
- "uniffi",
 ]
 
 [[package]]
@@ -2115,32 +2165,6 @@ dependencies = [
  "qrcode",
  "ruma-common",
  "thiserror 2.0.11",
- "vodozemac",
-]
-
-[[package]]
-name = "matrix-sdk-sqlite"
-version = "0.13.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aa2ff57473e92bad1b7320b3d70d640661b95064e091b925c5ef88acfa281853"
-dependencies = [
- "as_variant",
- "async-trait",
- "deadpool-sqlite",
- "itertools 0.14.0",
- "matrix-sdk-base",
- "matrix-sdk-crypto",
- "matrix-sdk-store-encryption",
- "num_cpus",
- "rmp-serde",
- "ruma",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "thiserror 2.0.11",
- "tokio",
- "tracing",
  "vodozemac",
 ]
 

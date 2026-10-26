@@ -15,7 +15,6 @@ categories = ["asynchronous", "command-line-utilities"]
 include = [
     "!/.agent-governance/**",
     "!/AGENTS.md",
-    "!/tests/**",
     "!/target/**",
     "/Cargo.toml",
     "/Cargo.lock",
@@ -54,15 +53,14 @@ include = [
     "/src/**",
     "/release/**",
     "/vendor/**",
+    "/tests/matrix_sdk_clone_capability.rs",
+    "/tests/matrix_sdk_hydration.rs",
+    "/tests/support/matrix_hydration.rs",
+    "/docs/RELEASE-0.2.23.md",
 ]
 
 [features]
 test-support = []
-
-[patch.crates-io]
-matrix-sdk = { version = "=0.13.0", path = "vendor/matrix-sdk-0.13.0" }
-matrix-sdk-base = { version = "=0.13.0", path = "vendor/matrix-sdk-base-0.13.0" }
-matrix-sdk-sqlite = { version = "=0.13.0", path = "vendor/matrix-sdk-sqlite-0.13.0" }
 
 [dependencies]
 # `time` backs the production `Timer` (`TokioTimer`, T006 D1/Q2 = T-B): the
@@ -92,7 +90,7 @@ uuid = { version = "1", features = ["v7", "serde", "v5"] }
 chrono = { version = "0.4", features = ["serde"] }
 toml = "1.1.6"
 url = "2.5.8"
-matrix-sdk = { version = "=0.13.0", default-features = false, features = ["rustls-tls", "e2e-encryption", "sqlite", "bundled-sqlite"] }
+matrix-sdk = { package = "guigu-matrix-sdk", version = "=0.13.0-guigu.1", path = "vendor/matrix-sdk-0.13.0", default-features = false, features = ["rustls-tls", "e2e-encryption", "sqlite", "bundled-sqlite"] }
 axum = { version = "=0.8.6", default-features = false, features = ["http1", "json", "tokio"] }
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "json"] }
 # SQLite driver for the durable event store (ADR-002). `default-features = false`
