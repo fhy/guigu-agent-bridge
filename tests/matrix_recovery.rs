@@ -14,7 +14,7 @@ async fn partial_batch_keeps_watermark_until_all_receipts_are_dispositioned() {
     let pool = database().await;
     let store = MatrixRecoveryStore::new(pool.clone());
     store.initialize_cutover("op-1", "t0").await.unwrap();
-    store.activate_cutover("B", "t1").await.unwrap();
+    store.activate_cutover("op-1", "B", "t1").await.unwrap();
     store
         .acquire_component_lease("MatrixSync", "op-1", "a", "z")
         .await
@@ -105,7 +105,7 @@ async fn receipt_digest_mismatch_is_fail_closed() {
     let pool = database().await;
     let store = MatrixRecoveryStore::new(pool);
     store.initialize_cutover("op-2", "t0").await.unwrap();
-    store.activate_cutover("B", "t1").await.unwrap();
+    store.activate_cutover("op-2", "B", "t1").await.unwrap();
     store
         .acquire_component_lease("MatrixSync", "op-2", "a", "z")
         .await
@@ -277,4 +277,20 @@ async fn stale_owner_and_restart_selector_fail_closed() {
             .await
             .is_err()
     );
+}
+
+#[tokio::test]
+async fn activation_requires_operation_provenance_and_reads_back_marker() {
+    let pool = database().await;
+    let store = MatrixRecoveryStore::new(pool.clone());
+    store.initialize_cutover("op-5", "t0").await.unwrap();
+    assert!(store.activate_cutover("wrong-op", "B", "t1").await.is_err());
+    assert!(store.activate_cutover("op-5", "B", "t1").await.is_ok());
+    let marker: (String, String, String) = sqlx::query_as(
+        "SELECT phase,cutover_operation_id,watermark FROM matrix_recovery_control WHERE control_id=1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(marker, ("active".into(), "op-5".into(), "B".into()));
 }

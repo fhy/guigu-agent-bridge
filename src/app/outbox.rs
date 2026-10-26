@@ -45,15 +45,14 @@ impl OutboxDrain {
                 )
                 .await;
             if send_result.is_ok() {
-                if self
-                    .store
-                    .mark_projection_sent(&row)
-                    .await
-                    .map_err(|_| ())?
-                {
-                    sent += 1;
-                } else {
-                    let _ = self.store.mark_projection_abandoned(&row).await;
+                match self.store.mark_projection_sent(&row).await {
+                    Ok(true) => sent += 1,
+                    Ok(false) | Err(_) => {
+                        self.store
+                            .mark_projection_abandoned(&row)
+                            .await
+                            .map_err(|_| ())?;
+                    }
                 }
             } else {
                 let _ = self.store.mark_projection_abandoned(&row).await;

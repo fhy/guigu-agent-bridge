@@ -388,6 +388,17 @@ impl MatrixSync {
         events: mpsc::Sender<InboundMatrixEvent>,
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), MatrixError> {
+        if let Some(recovery) = &self.recovery {
+            if !recovery
+                .store
+                .unresolved_receipts()
+                .await
+                .map_err(|_| MatrixError::Storage)?
+                .is_empty()
+            {
+                return Err(MatrixError::Storage);
+            }
+        }
         let mut failures = 0_u8;
         loop {
             let response = tokio::select! {

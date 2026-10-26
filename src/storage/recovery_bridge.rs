@@ -71,11 +71,25 @@ impl MatrixRecoveryStore {
             .await
     }
 
-    pub async fn activate_cutover(&self, watermark: &str, now: &str) -> Result<(), sqlx::Error> {
-        let result = sqlx::query("UPDATE matrix_recovery_control SET phase='active',watermark=?,updated_at=? WHERE control_id=1 AND phase='baseline'")
-            .bind(watermark).bind(now).execute(&self.pool).await?;
+    pub async fn activate_cutover(
+        &self,
+        operation_id: &str,
+        watermark: &str,
+        now: &str,
+    ) -> Result<(), sqlx::Error> {
+        let result = sqlx::query("UPDATE matrix_recovery_control SET phase='active',watermark=?,updated_at=? WHERE control_id=1 AND cutover_operation_id=? AND phase='baseline'")
+            .bind(watermark).bind(now).bind(operation_id).execute(&self.pool).await?;
         if result.rows_affected() != 1 {
             return Err(sqlx::Error::RowNotFound);
+        }
+        let (phase, stored_operation, stored_watermark): (String, String, String) =
+            sqlx::query_as("SELECT phase,cutover_operation_id,watermark FROM matrix_recovery_control WHERE control_id=1")
+                .fetch_one(&self.pool)
+                .await?;
+        if phase != "active" || stored_operation != operation_id || stored_watermark != watermark {
+            return Err(sqlx::Error::Protocol(
+                "cutover activation read-back mismatch".into(),
+            ));
         }
         Ok(())
     }
@@ -97,7 +111,8 @@ impl MatrixRecoveryStore {
                 .fetch_one(&self.pool)
                 .await?;
         if phase == "baseline" {
-            self.activate_cutover(initial_watermark, now).await?;
+            self.activate_cutover(operation_id, initial_watermark, now)
+                .await?;
         }
         Ok(())
     }
@@ -284,8 +299,8 @@ impl MatrixRecoveryStore {
         owner_epoch: i64,
         now: &str,
     ) -> Result<(), sqlx::Error> {
-        let result = sqlx::query("UPDATE matrix_recovery_receipts SET state='dispositioned',updated_at=? WHERE account_id=? AND room_id=? AND event_id=? AND cutover_operation_id=? AND batch_id=? AND state IN ('pending','processing') AND EXISTS (SELECT 1 FROM matrix_recovery_batches WHERE batch_id=? AND owner_token=? AND owner_epoch=? AND state='processing')")
-            .bind(now).bind(account_id).bind(room_id).bind(event_id).bind(operation_id).bind(batch_id).bind(batch_id).bind(owner_token).bind(owner_epoch).execute(&self.pool).await?;
+        let result = sqlx::query("UPDATE matrix_recovery_receipts SET state='dispositioned',updated_at=? WHERE account_id=? AND room_id=? AND event_id=? AND cutover_operation_id=? AND batch_id=? AND state IN ('pending','processing') AND EXISTS (SELECT 1 FROM matrix_recovery_batches b JOIN matrix_component_leases l ON l.component=b.component AND l.owner_token=b.owner_token AND l.epoch=b.owner_epoch WHERE b.batch_id=? AND b.owner_token=? AND b.owner_epoch=? AND b.state='processing' AND l.state='active' AND l.expires_at>=?)")
+            .bind(now).bind(account_id).bind(room_id).bind(event_id).bind(operation_id).bind(batch_id).bind(batch_id).bind(owner_token).bind(owner_epoch).bind(now).execute(&self.pool).await?;
         if result.rows_affected() != 1 {
             return Err(sqlx::Error::Protocol(
                 "receipt disposition fence failed".into(),

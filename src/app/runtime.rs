@@ -619,7 +619,7 @@ impl AppRuntime {
                         .await
                         .map_err(|_| AppError::Matrix)?;
                     recovery
-                        .activate_cutover(&token, &now)
+                        .activate_cutover(&runtime_instance, &token, &now)
                         .await
                         .map_err(|_| AppError::Runtime)?;
                     token
