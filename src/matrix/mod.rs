@@ -40,5 +40,5 @@ pub use router::{
 };
 pub use sync::{
     MatrixSync, MatrixSyncHandle, MemorySyncTokenStore, MissingRoomKeyObserver,
-    RawMatrixEventConsumer, SyncTokenFuture, SyncTokenStore,
+    RawMatrixEventConsumer, SqliteSyncTokenStore, SyncTokenFuture, SyncTokenStore,
 };

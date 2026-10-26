@@ -12,6 +12,7 @@ use std::{
 
 use matrix_sdk::config::SyncSettings;
 use matrix_sdk::ruma::api::client::error::ErrorKind;
+use sqlx::SqlitePool;
 use tokio::{
     sync::{mpsc, watch},
     task::JoinHandle,
@@ -46,6 +47,42 @@ pub trait SyncTokenStore: Send + Sync {
 #[derive(Debug, Default)]
 pub struct MemorySyncTokenStore {
     token: Mutex<Option<String>>,
+}
+
+#[derive(Clone)]
+pub struct SqliteSyncTokenStore {
+    pool: SqlitePool,
+}
+
+impl SqliteSyncTokenStore {
+    pub fn new(pool: SqlitePool) -> Self {
+        Self { pool }
+    }
+}
+
+impl SyncTokenStore for SqliteSyncTokenStore {
+    fn load<'a>(&'a self) -> SyncTokenFuture<'a, Result<Option<String>, MatrixError>> {
+        Box::pin(async move {
+            sqlx::query_scalar("SELECT watermark FROM matrix_recovery_control WHERE control_id=1 AND phase='active'")
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(|_| MatrixError::Storage)
+        })
+    }
+
+    fn save<'a>(&'a self, token: &'a str) -> SyncTokenFuture<'a, Result<(), MatrixError>> {
+        Box::pin(async move {
+            let result = sqlx::query("UPDATE matrix_recovery_control SET watermark=?,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE control_id=1 AND phase='active'")
+                .bind(token)
+                .execute(&self.pool)
+                .await
+                .map_err(|_| MatrixError::Storage)?;
+            if result.rows_affected() != 1 {
+                return Err(MatrixError::Storage);
+            }
+            Ok(())
+        })
+    }
 }
 
 impl SyncTokenStore for MemorySyncTokenStore {
