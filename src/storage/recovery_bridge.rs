@@ -18,6 +18,7 @@ pub struct BatchState {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryControl {
+    pub operation_id: String,
     pub phase: String,
     pub watermark: Option<String>,
 }
@@ -53,11 +54,12 @@ impl MatrixRecoveryStore {
     }
 
     pub async fn control(&self) -> Result<Option<RecoveryControl>, sqlx::Error> {
-        sqlx::query("SELECT phase,watermark FROM matrix_recovery_control WHERE control_id=1")
+        sqlx::query("SELECT cutover_operation_id,phase,watermark FROM matrix_recovery_control WHERE control_id=1")
             .fetch_optional(&self.pool)
             .await?
             .map(|row| {
                 Ok(RecoveryControl {
+                    operation_id: row.try_get("cutover_operation_id")?,
                     phase: row.try_get("phase")?,
                     watermark: row.try_get("watermark")?,
                 })
@@ -69,6 +71,23 @@ impl MatrixRecoveryStore {
         sqlx::query_as("SELECT event_id,state FROM matrix_recovery_receipts WHERE state <> 'dispositioned' ORDER BY created_at,event_id")
             .fetch_all(&self.pool)
             .await
+    }
+
+    pub async fn reconcile_restart(&self) -> Result<(), sqlx::Error> {
+        let unresolved = self.unresolved_receipts().await?;
+        if let Some((event_id, state)) = unresolved.first() {
+            let reason = match state.as_str() {
+                "pending" => "pending admission requires replay decision",
+                "processing" => "processing admission requires effect reconciliation",
+                "unknown" => "unknown admission requires explicit disposition",
+                "refused" => "refused admission requires explicit recovery disposition",
+                _ => "invalid recovery receipt state",
+            };
+            return Err(sqlx::Error::Protocol(
+                format!("restart hold for {event_id}: {reason}").into(),
+            ));
+        }
+        Ok(())
     }
 
     pub async fn activate_cutover(

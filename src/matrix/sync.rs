@@ -389,15 +389,11 @@ impl MatrixSync {
         mut shutdown: watch::Receiver<bool>,
     ) -> Result<(), MatrixError> {
         if let Some(recovery) = &self.recovery {
-            if !recovery
+            recovery
                 .store
-                .unresolved_receipts()
+                .reconcile_restart()
                 .await
-                .map_err(|_| MatrixError::Storage)?
-                .is_empty()
-            {
-                return Err(MatrixError::Storage);
-            }
+                .map_err(|_| MatrixError::Storage)?;
         }
         let mut failures = 0_u8;
         loop {

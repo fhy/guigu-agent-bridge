@@ -262,6 +262,38 @@ async fn stale_owner_and_restart_selector_fail_closed() {
         .unwrap();
     let unresolved = store.unresolved_receipts().await.unwrap();
     assert_eq!(unresolved, vec![("$one".to_owned(), "pending".to_owned())]);
+    assert!(
+        store
+            .finish_event(
+                "@a:test",
+                "!room:test",
+                "$one",
+                "op-4",
+                "batch-4",
+                "owner-a",
+                1,
+                "2026-01-03T00:00:00Z",
+            )
+            .await
+            .is_err()
+    );
+    assert!(
+        store
+            .refuse_event(
+                "@a:test",
+                "!room:test",
+                "$one",
+                "op-4",
+                "batch-4",
+                "owner-a",
+                1,
+                "expired",
+                "2026-01-03T00:00:00Z",
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(store.unresolved_receipts().await.unwrap(), unresolved);
     store
         .acquire_component_lease(
             "MatrixSync",

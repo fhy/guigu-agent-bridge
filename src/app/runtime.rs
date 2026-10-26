@@ -608,21 +608,30 @@ impl AppRuntime {
             let sdk = Arc::new(SdkMatrixSender::new(client.clone()));
             let recovery = crate::storage::MatrixRecoveryStore::new(pool.clone());
             let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-            match recovery.control().await.map_err(|_| AppError::Runtime)? {
-                Some(control) if control.phase == "active" => control
-                    .watermark
-                    .filter(|token| !token.is_empty())
-                    .ok_or(AppError::Runtime)?,
+            let operation_id = match recovery.control().await.map_err(|_| AppError::Runtime)? {
+                Some(control) if control.phase == "active" => {
+                    if control
+                        .watermark
+                        .filter(|token| !token.is_empty())
+                        .is_none()
+                    {
+                        return Err(AppError::Runtime);
+                    }
+                    if control.operation_id.is_empty() {
+                        return Err(AppError::Runtime);
+                    }
+                    control.operation_id
+                }
                 Some(control) if control.phase == "baseline" => {
                     let token = client
                         .baseline_sync_token()
                         .await
                         .map_err(|_| AppError::Matrix)?;
                     recovery
-                        .activate_cutover(&runtime_instance, &token, &now)
+                        .activate_cutover(&control.operation_id, &token, &now)
                         .await
                         .map_err(|_| AppError::Runtime)?;
-                    token
+                    control.operation_id
                 }
                 None => {
                     let token = client
@@ -633,7 +642,7 @@ impl AppRuntime {
                         .ensure_active(&runtime_instance, &token, &now)
                         .await
                         .map_err(|_| AppError::Runtime)?;
-                    token
+                    runtime_instance.clone()
                 }
                 _ => return Err(AppError::Runtime),
             };
@@ -657,7 +666,7 @@ impl AppRuntime {
             .with_recovery(
                 recovery,
                 config.transports.matrix.user_id.clone(),
-                runtime_instance.clone(),
+                operation_id,
                 matrix_epoch,
             )
             .with_missing_key_observer(runtime.health_state.clone());
