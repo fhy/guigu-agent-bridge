@@ -48,14 +48,25 @@ impl OutboxDrain {
                 match self.store.mark_projection_sent(&row).await {
                     Ok(true) => sent += 1,
                     Ok(false) | Err(_) => {
-                        self.store
+                        if !self
+                            .store
                             .mark_projection_abandoned(&row)
                             .await
-                            .map_err(|_| ())?;
+                            .map_err(|_| ())?
+                        {
+                            return Err(());
+                        }
                     }
                 }
             } else {
-                let _ = self.store.mark_projection_abandoned(&row).await;
+                if !self
+                    .store
+                    .mark_projection_abandoned(&row)
+                    .await
+                    .map_err(|_| ())?
+                {
+                    return Err(());
+                }
             }
         }
         Ok(sent)

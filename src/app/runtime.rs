@@ -608,6 +608,15 @@ impl AppRuntime {
             let sdk = Arc::new(SdkMatrixSender::new(client.clone()));
             let recovery = crate::storage::MatrixRecoveryStore::new(pool.clone());
             let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            if recovery
+                .control()
+                .await
+                .map_err(|_| AppError::Runtime)?
+                .and_then(|control| control.restart_hold_state)
+                .is_some()
+            {
+                return Err(AppError::Runtime);
+            }
             let operation_id = match recovery.control().await.map_err(|_| AppError::Runtime)? {
                 Some(control) if control.phase == "active" => {
                     if control.restart_hold_state.is_some() {

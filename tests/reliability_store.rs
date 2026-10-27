@@ -549,6 +549,88 @@ impl MatrixOutboxSender for OutboxProbe {
     }
 }
 
+struct CasFailureProbe {
+    pool: SqlitePool,
+    calls: Mutex<usize>,
+    close_pool: bool,
+}
+
+impl MatrixOutboxSender for CasFailureProbe {
+    fn send_stable<'a>(
+        &'a self,
+        _room: &'a str,
+        _thread: Option<&'a str>,
+        _reply: Option<&'a str>,
+        _body: &'a str,
+        txn: &'a str,
+    ) -> ReplyFuture<'a> {
+        Box::pin(async move {
+            *self.calls.lock().unwrap() += 1;
+            if self.close_pool {
+                self.pool.close().await;
+            } else {
+                sqlx::query(
+                    "UPDATE projection_outbox SET claim_revision=claim_revision+1 WHERE stable_txn_id=?",
+                )
+                .bind(txn)
+                .execute(&self.pool)
+                .await
+                .unwrap();
+            }
+            Ok::<_, ReplyError>(())
+        })
+    }
+}
+
+async fn seed_outbox(pool: &SqlitePool) -> ReliabilityStore {
+    let (endpoint, conversation, source, _) = seed(pool, "completed").await;
+    let task = Uuid::now_v7().to_string();
+    let event = Uuid::now_v7().to_string();
+    let store = ReliabilityStore::new(pool.clone());
+    store
+        .admit_retry(retry(
+            &endpoint,
+            &conversation,
+            &source,
+            &task,
+            "$outbox-failure",
+            &event,
+        ))
+        .await
+        .unwrap();
+    store
+}
+
+#[tokio::test]
+async fn outbox_sent_cas_false_is_not_replayed() {
+    let pool = database().await;
+    let store = seed_outbox(&pool).await;
+    let probe = std::sync::Arc::new(CasFailureProbe {
+        pool: pool.clone(),
+        calls: Mutex::new(0),
+        close_pool: false,
+    });
+    let drain = OutboxDrain::new(store, probe.clone(), 8);
+    assert!(drain.drain_once().await.is_err());
+    assert_eq!(drain.drain_once().await.unwrap(), 0);
+    assert_eq!(*probe.calls.lock().unwrap(), 1);
+}
+
+#[tokio::test]
+async fn outbox_sent_cas_error_is_not_replayed() {
+    let pool = database().await;
+    let store = seed_outbox(&pool).await;
+    let probe = std::sync::Arc::new(CasFailureProbe {
+        pool: pool.clone(),
+        calls: Mutex::new(0),
+        close_pool: true,
+    });
+    let drain = OutboxDrain::new(store, probe.clone(), 8);
+    assert!(drain.drain_once().await.is_err());
+    assert!(drain.drain_once().await.is_err());
+    assert_eq!(*probe.calls.lock().unwrap(), 1);
+}
+
 #[tokio::test]
 async fn outbox_is_the_single_stable_transaction_send_owner() {
     let pool = database().await;
