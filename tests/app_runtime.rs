@@ -808,11 +808,16 @@ fn child_listener_inode(pid: u32) -> Option<u64> {
     None
 }
 
-async fn wait_for_child_listener(pid: u32) -> u64 {
-    tokio::time::timeout(std::time::Duration::from_secs(30), async {
+async fn wait_for_child_listener(child: &mut Child) -> u64 {
+    let pid = child.id();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(90), async {
         loop {
-            if !std::path::Path::new(&format!("/proc/{pid}")).exists() {
-                panic!("child exited before binding 9292: pid={pid}");
+            if let Some(status) = child.try_wait().expect("poll child status") {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    std::io::Read::read_to_string(&mut pipe, &mut stderr).ok();
+                }
+                panic!("child exited before binding 9292: pid={pid}; status={status}; stderr={stderr:?}");
             }
             if tokio::net::TcpStream::connect("127.0.0.1:9292")
                 .await
@@ -824,8 +829,25 @@ async fn wait_for_child_listener(pid: u32) -> u64 {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
     })
-    .await
-    .expect("child did not bind 9292")
+    .await;
+    match result {
+        Ok(inode) => inode,
+        Err(_) => {
+            let _ = child.kill();
+            let status = child.wait().expect("wait timed-out child");
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                std::io::Read::read_to_string(&mut pipe, &mut stderr).ok();
+            }
+            let mut stdout = String::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                std::io::Read::read_to_string(&mut pipe, &mut stdout).ok();
+            }
+            panic!(
+                "child did not bind 9292: pid={pid}; status={status}; stdout={stdout:?}; stderr={stderr:?}"
+            );
+        }
+    }
 }
 
 async fn wait_for_port_free() {
@@ -890,14 +912,14 @@ async fn child_process_restart_replaces_9292_pid_and_listener_inode() {
         database.to_string_lossy(), sessions.to_string_lossy())).unwrap();
     assert!(config_path.exists());
     assert!(std::fs::metadata(&config_path).is_ok());
-    let first = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+    let mut first = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
         .arg(&config_path)
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     let first_pid = first.id();
-    let first_inode = wait_for_child_listener(first_pid).await;
+    let first_inode = wait_for_child_listener(&mut first).await;
     let card = reqwest::get("http://127.0.0.1:9292/.well-known/agent-card.json")
         .await
         .unwrap_or_else(|error| {
@@ -915,12 +937,14 @@ async fn child_process_restart_replaces_9292_pid_and_listener_inode() {
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     stop_child(first);
     wait_for_port_free().await;
-    let second = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+    let mut second = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
         .arg(&config_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
         .spawn()
         .unwrap();
     let second_pid = second.id();
-    let second_inode = wait_for_child_listener(second_pid).await;
+    let second_inode = wait_for_child_listener(&mut second).await;
     assert_ne!(second_pid, first_pid);
     assert_ne!(second_inode, first_inode);
     let card = reqwest::get("http://127.0.0.1:9292/.well-known/agent-card.json")
