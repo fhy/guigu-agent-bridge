@@ -99,7 +99,7 @@ pub async fn run() -> Result<(), Error> {
     {
         if version_args.next().is_some() {
             return Err(Error::Cli(error::CliFailure {
-                command: "version",
+                command: "--version",
                 category: "invalid-arguments",
                 status: 2,
             }));

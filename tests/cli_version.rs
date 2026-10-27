@@ -25,7 +25,22 @@ fn version_rejects_extra_arguments() {
     assert_eq!(output.status.code(), Some(2));
     assert_eq!(
         String::from_utf8(output.stdout).expect("error output is utf8"),
-        "version result=invalid-arguments\n"
+        "--version result=invalid-arguments\n"
+    );
+    assert!(output.stderr.is_empty());
+}
+
+#[test]
+fn version_rejects_flag_like_extra_arguments() {
+    let output = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        .args(["--version", "--bad"])
+        .output()
+        .expect("version command should start");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert_eq!(
+        String::from_utf8(output.stdout).expect("error output is utf8"),
+        "--version result=invalid-arguments\n"
     );
     assert!(output.stderr.is_empty());
 }
