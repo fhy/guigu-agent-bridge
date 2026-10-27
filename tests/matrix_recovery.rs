@@ -262,6 +262,16 @@ async fn stale_owner_and_restart_selector_fail_closed() {
         .unwrap();
     let unresolved = store.unresolved_receipts().await.unwrap();
     assert_eq!(unresolved, vec![("$one".to_owned(), "pending".to_owned())]);
+    assert!(store.reconcile_restart().await.is_err());
+    let hold: (String, String, String) = sqlx::query_as(
+        "SELECT restart_hold_state,restart_hold_event_id,restart_hold_reason FROM matrix_recovery_control WHERE control_id=1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(hold.0, "pending");
+    assert_eq!(hold.1, "$one");
+    assert!(hold.2.contains("pending admission"));
     assert!(
         store
             .finish_event(

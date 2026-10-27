@@ -962,7 +962,7 @@ impl ReliabilityStore {
     ) -> Result<Vec<PendingProjection>, ReliabilityError> {
         let mut claimed = Vec::new();
         for _ in 0..limit {
-            let row=sqlx::query("UPDATE projection_outbox SET state='sending',claim_owner=?,claim_revision=COALESCE(claim_revision,0)+1,updated_at=? WHERE rowid=(SELECT rowid FROM projection_outbox WHERE state='pending' OR (state='sending' AND updated_at<=?) ORDER BY created_at,source_kind,source_id,projection LIMIT 1) RETURNING source_kind,source_id,projection,stable_txn_id,room_id,thread_root,reply_event_id,body,claim_revision")
+            let row=sqlx::query("UPDATE projection_outbox SET state='sending',claim_owner=?,claim_revision=COALESCE(claim_revision,0)+1,updated_at=? WHERE rowid=(SELECT rowid FROM projection_outbox WHERE state='pending' ORDER BY created_at,source_kind,source_id,projection LIMIT 1) RETURNING source_kind,source_id,projection,stable_txn_id,room_id,thread_root,reply_event_id,body,claim_revision")
                 .bind(owner).bind(now).bind(stale_before).fetch_optional(&self.pool).await?;
             let Some(row) = row else { break };
             claimed.push(PendingProjection {

@@ -580,7 +580,7 @@ async fn outbox_is_the_single_stable_transaction_send_owner() {
 }
 
 #[tokio::test]
-async fn concurrent_drains_claim_once_and_stale_sending_is_recoverable() {
+async fn concurrent_drains_do_not_replay_stale_sending_claims() {
     let pool = database().await;
     let (endpoint, conversation, source, _) = seed(&pool, "completed").await;
     let task = Uuid::now_v7().to_string();
@@ -611,8 +611,8 @@ async fn concurrent_drains_claim_once_and_stale_sending_is_recoverable() {
     let a = OutboxDrain::new(store.clone(), probe.clone(), 8);
     let b = OutboxDrain::new(store.clone(), probe.clone(), 8);
     let (left, right) = tokio::join!(a.drain_once(), b.drain_once());
-    assert_eq!(left.unwrap() + right.unwrap(), 1);
-    assert_eq!(probe.0.lock().unwrap().len(), 1);
+    assert_eq!(left.unwrap() + right.unwrap(), 0);
+    assert_eq!(probe.0.lock().unwrap().len(), 0);
 }
 
 #[tokio::test]

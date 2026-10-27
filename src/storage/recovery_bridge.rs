@@ -21,6 +21,9 @@ pub struct RecoveryControl {
     pub operation_id: String,
     pub phase: String,
     pub watermark: Option<String>,
+    pub restart_hold_state: Option<String>,
+    pub restart_hold_event_id: Option<String>,
+    pub restart_hold_reason: Option<String>,
 }
 
 #[derive(Clone)]
@@ -54,7 +57,7 @@ impl MatrixRecoveryStore {
     }
 
     pub async fn control(&self) -> Result<Option<RecoveryControl>, sqlx::Error> {
-        sqlx::query("SELECT cutover_operation_id,phase,watermark FROM matrix_recovery_control WHERE control_id=1")
+        sqlx::query("SELECT cutover_operation_id,phase,watermark,restart_hold_state,restart_hold_event_id,restart_hold_reason FROM matrix_recovery_control WHERE control_id=1")
             .fetch_optional(&self.pool)
             .await?
             .map(|row| {
@@ -62,6 +65,9 @@ impl MatrixRecoveryStore {
                     operation_id: row.try_get("cutover_operation_id")?,
                     phase: row.try_get("phase")?,
                     watermark: row.try_get("watermark")?,
+                    restart_hold_state: row.try_get("restart_hold_state")?,
+                    restart_hold_event_id: row.try_get("restart_hold_event_id")?,
+                    restart_hold_reason: row.try_get("restart_hold_reason")?,
                 })
             })
             .transpose()
@@ -74,7 +80,28 @@ impl MatrixRecoveryStore {
     }
 
     pub async fn reconcile_restart(&self) -> Result<(), sqlx::Error> {
-        let unresolved = self.unresolved_receipts().await?;
+        let mut tx = self.pool.begin().await?;
+        let existing: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT restart_hold_state,restart_hold_event_id,restart_hold_reason FROM matrix_recovery_control WHERE control_id=1",
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if let Some((state, event_id, reason)) = existing.filter(|(state, _, _)| !state.is_empty())
+        {
+            return Err(sqlx::Error::Protocol(
+                format!(
+                    "durable restart hold {state} {} {}",
+                    event_id.unwrap_or_default(),
+                    reason.unwrap_or_default()
+                )
+                .into(),
+            ));
+        }
+        let unresolved: Vec<(String, String)> = sqlx::query_as(
+            "SELECT event_id,state FROM matrix_recovery_receipts WHERE state <> 'dispositioned' ORDER BY created_at,event_id",
+        )
+        .fetch_all(&mut *tx)
+        .await?;
         if let Some((event_id, state)) = unresolved.first() {
             let reason = match state.as_str() {
                 "pending" => "pending admission requires replay decision",
@@ -83,10 +110,18 @@ impl MatrixRecoveryStore {
                 "refused" => "refused admission requires explicit recovery disposition",
                 _ => "invalid recovery receipt state",
             };
+            sqlx::query("UPDATE matrix_recovery_control SET restart_hold_state=?,restart_hold_event_id=?,restart_hold_reason=?,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE control_id=1 AND restart_hold_state IS NULL")
+                .bind(state)
+                .bind(event_id)
+                .bind(reason)
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
             return Err(sqlx::Error::Protocol(
                 format!("restart hold for {event_id}: {reason}").into(),
             ));
         }
+        tx.commit().await?;
         Ok(())
     }
 
