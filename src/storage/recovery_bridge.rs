@@ -88,14 +88,11 @@ impl MatrixRecoveryStore {
         .await?;
         if let Some((state, event_id, reason)) = existing.filter(|(state, _, _)| !state.is_empty())
         {
-            return Err(sqlx::Error::Protocol(
-                format!(
-                    "durable restart hold {state} {} {}",
-                    event_id.unwrap_or_default(),
-                    reason.unwrap_or_default()
-                )
-                .into(),
-            ));
+            return Err(sqlx::Error::Protocol(format!(
+                "durable restart hold {state} {} {}",
+                event_id.unwrap_or_default(),
+                reason.unwrap_or_default()
+            )));
         }
         let unresolved: Vec<(String, String)> = sqlx::query_as(
             "SELECT event_id,state FROM matrix_recovery_receipts WHERE state <> 'dispositioned' ORDER BY created_at,event_id",
@@ -117,9 +114,9 @@ impl MatrixRecoveryStore {
                 .execute(&mut *tx)
                 .await?;
             tx.commit().await?;
-            return Err(sqlx::Error::Protocol(
-                format!("restart hold for {event_id}: {reason}").into(),
-            ));
+            return Err(sqlx::Error::Protocol(format!(
+                "restart hold for {event_id}: {reason}"
+            )));
         }
         tx.commit().await?;
         Ok(())
@@ -203,6 +200,7 @@ impl MatrixRecoveryStore {
         Ok(epoch)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn begin_batch(
         &self,
         batch_id: &str,
@@ -233,17 +231,14 @@ impl MatrixRecoveryStore {
         if lease.as_ref() != Some(&(owner_token.to_owned(), owner_epoch)) {
             return Err(sqlx::Error::Protocol("stale component lease".into()));
         }
-        if let Some(existing_digest) = sqlx::query_scalar::<_, String>(
+        if let Some(existing_digest) = (sqlx::query_scalar::<_, String>(
             "SELECT response_digest FROM matrix_recovery_batches WHERE response_token=? AND previous_watermark=? ORDER BY created_at DESC LIMIT 1",
         )
         .bind(response_token)
         .bind(previous_watermark)
         .fetch_optional(&self.pool)
-        .await?
-        {
-            if existing_digest != response_digest {
-                return Err(sqlx::Error::Protocol("response digest mismatch".into()));
-            }
+        .await?) && existing_digest != response_digest {
+            return Err(sqlx::Error::Protocol("response digest mismatch".into()));
         }
         sqlx::query("INSERT INTO matrix_recovery_batches(batch_id,request_token,previous_watermark,response_token,response_digest,component,owner_token,owner_epoch,expected_events_json,covered_events_json,state,created_at,updated_at) VALUES(?,?,?,?,?,'MatrixSync',?,?,?,'[]','pending',?,?)")
             .bind(batch_id).bind(request_token).bind(previous_watermark).bind(response_token).bind(response_digest).bind(owner_token).bind(owner_epoch)
@@ -342,6 +337,7 @@ impl MatrixRecoveryStore {
         Ok(BatchAdmission::New)
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn finish_event(
         &self,
         account_id: &str,
@@ -363,6 +359,7 @@ impl MatrixRecoveryStore {
         Ok(())
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn refuse_event(
         &self,
         account_id: &str,
