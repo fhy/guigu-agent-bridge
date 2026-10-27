@@ -143,11 +143,15 @@ mod error;
 mod event_consumer;
 mod matrix_cutover;
 mod matrix_cutover_receipts;
+mod matrix_recovery_compatibility;
+mod matrix_recovery_snapshot;
+mod matrix_store_evidence;
 mod output_delivery;
 mod output_spool;
 pub(crate) mod owner_observation;
 mod pool;
 mod recovery;
+mod recovery_bridge;
 mod reliability;
 mod repository;
 pub use matrix_cutover::{CutoverState, CutoverStore, cutover_digest};
@@ -175,3 +179,8 @@ pub use reliability::{
     WorkflowAuthorization,
 };
 pub use repository::{AckOutcome, Delivery, Repository, SqliteRepository, StorageFuture};
+
+pub use matrix_recovery_compatibility::{CompatibilityGate, MatrixCompatibilityStore};
+pub use recovery_bridge::{
+    BatchAdmission, BatchState, MatrixRecoveryStore, RecoveryControl, event_set,
+};

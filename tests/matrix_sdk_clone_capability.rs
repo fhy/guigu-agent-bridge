@@ -57,7 +57,7 @@ async fn server() -> MockServer {
 }
 
 #[tokio::test]
-async fn pinned_notification_client_hydrates_anchor_and_isolates_writes() {
+async fn original_notification_client_isolates_state_and_rebuilds_from_application_b() {
     let server = server().await;
     let temporary = tempfile::tempdir().unwrap();
     let anchor = Client::builder()
@@ -102,8 +102,14 @@ async fn pinned_notification_client_hydrates_anchor_and_isolates_writes() {
         active.encryption().ed25519_key().await,
         anchor.encryption().ed25519_key().await
     );
-    assert_eq!(token(&active).await.as_deref(), Some("A"));
+    assert_eq!(token(&active).await, None);
+    assert!(active.get_room(&room).is_none());
+    active
+        .sync_once(SyncSettings::new().token("B").full_state(true))
+        .await
+        .unwrap();
     assert!(active.get_room(&room).is_some());
+    assert_eq!(token(&anchor).await.as_deref(), Some("A"));
     active
         .state_store()
         .set_kv_data(
@@ -114,6 +120,6 @@ async fn pinned_notification_client_hydrates_anchor_and_isolates_writes() {
         .unwrap();
     assert_eq!(token(&anchor).await.as_deref(), Some("A"));
     println!(
-        "anchor: token=A, room=present; notification clone: hydrated A, isolated write B; authenticated device/crypto identity retained"
+        "anchor: token=A; original notification client: explicit B/full_state rebuild, isolated write; shared identity"
     );
 }

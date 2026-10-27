@@ -1,3 +1,6 @@
+#[path = "recovery_startup.rs"]
+mod recovery_startup;
+
 use std::{
     collections::HashMap,
     future::Future,
@@ -137,7 +140,7 @@ use crate::{
     },
     config::{Config, ConfigError},
     gateway::{GatewayRawConsumer, GatewayStore, MatrixGateway, MatrixRoute},
-    matrix::{MatrixClient, MatrixSync, MatrixSyncHandle, MemorySyncTokenStore, SdkMatrixSender},
+    matrix::{MatrixClient, MatrixSyncHandle, SdkMatrixSender},
     models::TransportType,
     runtime::{
         ContinuationPolicy, LeasedAcpDispatcher, RuntimeMetrics, SqliteRuntimeStore,
@@ -154,6 +157,30 @@ use super::{
     MatrixIngressHandle, MatrixPhase, OwnerState, PersistenceFirstProjection, PersistingBus,
     ProjectionMetrics, ReloadController, ReloadError, ReplyRegistry,
 };
+
+const MATRIX_INITIALIZATION_BUDGET: Duration = Duration::from_secs(30);
+
+#[derive(Debug, PartialEq, Eq)]
+enum DeadlineOutcome<T> {
+    NotAttempted,
+    TimedOut,
+    Completed(T),
+}
+
+/// Both Matrix startup phases consume this deadline; a later phase never
+/// receives a fresh budget, and an exhausted budget never polls its operation.
+async fn within_matrix_deadline<T>(
+    deadline: tokio::time::Instant,
+    operation: impl Future<Output = T>,
+) -> DeadlineOutcome<T> {
+    if tokio::time::Instant::now() >= deadline {
+        return DeadlineOutcome::NotAttempted;
+    }
+    match tokio::time::timeout_at(deadline, operation).await {
+        Ok(value) => DeadlineOutcome::Completed(value),
+        Err(_) => DeadlineOutcome::TimedOut,
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum AppError {
@@ -338,6 +365,25 @@ impl AppRuntime {
         let admission_guard =
             crate::runtime_admission::Guard::acquire(&config.bridge.database, &path, "startup")
                 .map_err(|_| AppError::Runtime)?;
+        let gate = crate::storage::MatrixCompatibilityStore::new(pool.clone())
+            .gate(
+                config.transports.matrix.enabled,
+                config.transports.matrix.crypto_store_path.as_deref(),
+            )
+            .await
+            .map_err(|_| AppError::Runtime)?;
+        if let crate::storage::CompatibilityGate::Held(reason) = gate {
+            drop(admission_guard);
+            return Self::compatibility_held(
+                path,
+                config,
+                pool,
+                reliability,
+                maintenance_lock,
+                reason,
+            )
+            .await;
+        }
         let runtime_instance = uuid::Uuid::now_v7().to_string();
         let process_fingerprint =
             crate::storage::RuntimeOwnerEvidence::fingerprint().ok_or(AppError::Runtime)?;
@@ -665,6 +711,7 @@ impl AppRuntime {
         // prerequisites.
         if !recovery_allows_service_assembly(recovery_blocked) {
             if let Some(generation) = matrix_generation {
+                runtime.health_state.matrix().mark_recovery_blocked();
                 runtime.health_state.matrix().transition(
                     generation,
                     &[MatrixPhase::Preflight],
@@ -693,65 +740,161 @@ impl AppRuntime {
         // assembly gate. No ACP, bus, gateway, outbox or task owner exists before it.
         let matrix_client = if let Some(generation) = matrix_generation {
             let identity_health = Arc::clone(&runtime.health_state);
-            let client =
-                match MatrixClient::restore_with_identity(&config.transports.matrix, || {
+            let mut identity_matched = false;
+            let mut store_bound = false;
+            let client = match MatrixClient::restore_with_identity(
+                &config.transports.matrix,
+                || {
+                    identity_matched = true;
+                    identity_health.matrix().mark_authentication_succeeded();
                     identity_health.matrix().transition(
                         generation,
                         &[MatrixPhase::Preflight],
                         MatrixPhase::IdentityMatched,
                     );
-                })
-                .await
-                {
-                    Ok(client) => client,
-                    Err(error) => {
-                        runtime.health_state.matrix().transition(
-                            generation,
-                            &[MatrixPhase::Preflight, MatrixPhase::IdentityMatched],
-                            MatrixPhase::Failed(matrix_failure(&error)),
-                        );
-                        tracing::warn!(
-                            category = matrix_failure(&error).as_log_str(),
-                            "Matrix startup is health-only"
-                        );
-                        runtime.health_state.set_owner(OwnerState::Running);
-                        return Ok(runtime);
-                    }
-                };
+                },
+                || {
+                    store_bound = true;
+                    identity_health.matrix().mark_store_binding_succeeded();
+                },
+                || {
+                    identity_health.matrix().mark_session_restore_succeeded();
+                },
+            )
+            .await
+            {
+                Ok(client) => client,
+                Err(error) => {
+                    identity_health.matrix().mark_restore_failure(
+                        identity_matched,
+                        store_bound,
+                        matrix_failure(&error),
+                    );
+                    runtime.health_state.matrix().transition(
+                        generation,
+                        &[MatrixPhase::Preflight, MatrixPhase::IdentityMatched],
+                        MatrixPhase::Failed(matrix_failure(&error)),
+                    );
+                    tracing::warn!(
+                        category = matrix_failure(&error).as_log_str(),
+                        "Matrix startup is health-only"
+                    );
+                    runtime.health_state.set_owner(OwnerState::Running);
+                    return Ok(runtime);
+                }
+            };
             runtime.health_state.matrix().transition(
                 generation,
                 &[MatrixPhase::IdentityMatched],
                 MatrixPhase::StoreBound,
             );
-            let proof = tokio::time::timeout(
-                Duration::from_secs(30),
-                super::matrix_cutover::initialize(client, &config, &pool),
-            )
-            .await;
-            let (initial_response, proof_error) = match proof {
-                Ok(Ok(response)) => (Some(response), None),
-                Ok(Err(error)) => (None, Some(matrix_failure(&error))),
-                Err(_) => (None, Some(MatrixFailure::Timeout)),
-            };
-            if let Some(reason) = proof_error {
-                runtime.health_state.matrix().transition(
-                    generation,
-                    &[MatrixPhase::StoreBound],
-                    MatrixPhase::Failed(reason),
-                );
-                tracing::warn!(
-                    category = reason.as_log_str(),
-                    "Matrix startup is health-only"
-                );
-                runtime.health_state.set_owner(OwnerState::Running);
-                return Ok(runtime);
+            let deadline = tokio::time::Instant::now() + MATRIX_INITIALIZATION_BUDGET;
+            let e2ee = within_matrix_deadline(deadline, client.initialize_e2ee()).await;
+            match e2ee {
+                DeadlineOutcome::Completed(Ok(())) => {
+                    runtime.health_state.matrix().mark_e2ee_succeeded();
+                }
+                DeadlineOutcome::Completed(Err(error)) => {
+                    let reason = matrix_failure(&error);
+                    runtime.health_state.matrix().mark_e2ee_failure(reason);
+                    runtime.health_state.matrix().transition(
+                        generation,
+                        &[MatrixPhase::StoreBound],
+                        MatrixPhase::Failed(reason),
+                    );
+                    tracing::warn!(
+                        category = reason.as_log_str(),
+                        "Matrix startup is health-only"
+                    );
+                    runtime.health_state.set_owner(OwnerState::Running);
+                    return Ok(runtime);
+                }
+                DeadlineOutcome::TimedOut => {
+                    let reason = MatrixFailure::Timeout;
+                    runtime.health_state.matrix().mark_e2ee_timeout();
+                    runtime.health_state.matrix().transition(
+                        generation,
+                        &[MatrixPhase::StoreBound],
+                        MatrixPhase::Failed(reason),
+                    );
+                    tracing::warn!(
+                        category = reason.as_log_str(),
+                        "Matrix startup is health-only"
+                    );
+                    runtime.health_state.set_owner(OwnerState::Running);
+                    return Ok(runtime);
+                }
+                DeadlineOutcome::NotAttempted => {
+                    let reason = MatrixFailure::Timeout;
+                    runtime.health_state.matrix().transition(
+                        generation,
+                        &[MatrixPhase::StoreBound],
+                        MatrixPhase::Failed(reason),
+                    );
+                    tracing::warn!(
+                        category = reason.as_log_str(),
+                        "Matrix startup is health-only"
+                    );
+                    runtime.health_state.set_owner(OwnerState::Running);
+                    return Ok(runtime);
+                }
+            }
+            let proof = within_matrix_deadline(deadline, client.prove_server_device_key()).await;
+            match proof {
+                DeadlineOutcome::Completed(Ok(())) => {
+                    runtime.health_state.matrix().mark_key_proof_succeeded()
+                }
+                DeadlineOutcome::Completed(Err(error)) => {
+                    let reason = matrix_failure(&error);
+                    runtime.health_state.matrix().mark_key_proof_failure(reason);
+                    runtime.health_state.matrix().transition(
+                        generation,
+                        &[MatrixPhase::StoreBound],
+                        MatrixPhase::Failed(reason),
+                    );
+                    tracing::warn!(
+                        category = reason.as_log_str(),
+                        "Matrix startup is health-only"
+                    );
+                    runtime.health_state.set_owner(OwnerState::Running);
+                    return Ok(runtime);
+                }
+                DeadlineOutcome::TimedOut => {
+                    let reason = MatrixFailure::Timeout;
+                    runtime.health_state.matrix().mark_key_proof_timeout();
+                    runtime.health_state.matrix().transition(
+                        generation,
+                        &[MatrixPhase::StoreBound],
+                        MatrixPhase::Failed(reason),
+                    );
+                    tracing::warn!(
+                        category = reason.as_log_str(),
+                        "Matrix startup is health-only"
+                    );
+                    runtime.health_state.set_owner(OwnerState::Running);
+                    return Ok(runtime);
+                }
+                DeadlineOutcome::NotAttempted => {
+                    let reason = MatrixFailure::Timeout;
+                    runtime.health_state.matrix().transition(
+                        generation,
+                        &[MatrixPhase::StoreBound],
+                        MatrixPhase::Failed(reason),
+                    );
+                    tracing::warn!(
+                        category = reason.as_log_str(),
+                        "Matrix startup is health-only"
+                    );
+                    runtime.health_state.set_owner(OwnerState::Running);
+                    return Ok(runtime);
+                }
             }
             runtime.health_state.matrix().transition(
                 generation,
                 &[MatrixPhase::StoreBound],
                 MatrixPhase::KeyProved,
             );
-            Some(initial_response.expect("successful Matrix proof has prepared client"))
+            Some(client)
         } else {
             None
         };
@@ -930,33 +1073,18 @@ impl AppRuntime {
             ));
         }
 
-        let matrix = if let Some((client, initial_response, cutover)) = matrix_client {
-            let sdk = Arc::new(SdkMatrixSender::new(client.clone()));
-            let failure_slot = Arc::clone(&first_failure);
-            let health_for_failure = Arc::clone(&runtime.health_state);
-            let matrix_failure_generation =
-                matrix_generation.expect("enabled Matrix has a generation");
-            let mut sync = MatrixSync::new(
-                client,
-                Arc::new(MemorySyncTokenStore::default()),
-                config.transports.matrix.sync_capacity,
-            )
-            .map_err(|_| AppError::Matrix)?
-            .with_failure_observer(matrix_failure_observer(
-                failure_slot,
-                health_for_failure,
-                matrix_failure_generation,
-            ))
-            .with_missing_key_observer(runtime.health_state.clone());
-            if let Some(response) = initial_response {
-                sync = sync.with_initial_response(response);
-            }
-            if let Some(store) = cutover {
-                sync = sync
-                    .with_cutover(store)
-                    .await
-                    .map_err(|_| AppError::Matrix)?;
-            }
+        let matrix = if let Some(client) = matrix_client {
+            let (active, sync) =
+                super::matrix_recovery::prepare_sync(client, &config, &pool, &runtime_instance)
+                    .await?;
+            let sdk = Arc::new(SdkMatrixSender::new(active));
+            let mut sync = sync
+                .with_failure_observer(matrix_failure_observer(
+                    Arc::clone(&first_failure),
+                    Arc::clone(&runtime.health_state),
+                    matrix_generation.expect("Matrix generation"),
+                ))
+                .with_missing_key_observer(runtime.health_state.clone());
             let gateway = if config.transports.gateway.enabled {
                 let gateway = Arc::new(MatrixGateway::new(
                     sdk.clone(),
@@ -1438,6 +1566,41 @@ mod assembly_tests {
         models::TaskId,
         storage::{ReliabilityStore, connect, migrate},
     };
+
+    #[tokio::test]
+    async fn matrix_initialization_and_proof_share_one_total_budget() {
+        use std::time::Duration;
+        use tokio::time::{Instant, sleep};
+
+        assert_eq!(MATRIX_INITIALIZATION_BUDGET, Duration::from_secs(30));
+        // Scale only the duration, not the production deadline wrapper.
+        let budget = Duration::from_millis(200);
+        let start = Instant::now();
+        let deadline = start + budget;
+        assert_eq!(
+            within_matrix_deadline(deadline, sleep(Duration::from_millis(120))).await,
+            DeadlineOutcome::Completed(())
+        );
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        assert!(
+            remaining < budget / 2,
+            "initialization must consume proof budget"
+        );
+
+        assert_eq!(
+            // Each phase fits a fresh 200ms timer, but together they do not.
+            within_matrix_deadline(deadline, sleep(Duration::from_millis(120))).await,
+            DeadlineOutcome::TimedOut
+        );
+        assert!(Instant::now() >= deadline);
+        // Once consumed, the same budget cannot start any subsequent operation.
+        let mut polled = false;
+        assert_eq!(
+            within_matrix_deadline(deadline, async { polled = true }).await,
+            DeadlineOutcome::NotAttempted
+        );
+        assert!(!polled);
+    }
 
     #[derive(Clone, Copy)]
     enum FailureCase {

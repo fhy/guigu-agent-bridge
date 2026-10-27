@@ -1160,13 +1160,14 @@ dependencies = [
 
 [[package]]
 name = "guigu-agent-bridge"
-version = "0.2.23"
+version = "0.2.24"
 dependencies = [
  "axum",
  "chrono",
- "guigu-matrix-sdk",
  "libc",
  "libsqlite3-sys",
+ "matrix-sdk",
+ "matrix-sdk-crypto",
  "reqwest",
  "serde",
  "serde_json",
@@ -1181,109 +1182,6 @@ dependencies = [
  "url",
  "uuid",
  "wiremock",
-]
-
-[[package]]
-name = "guigu-matrix-sdk"
-version = "0.13.0-guigu.1"
-dependencies = [
- "anymap2",
- "aquamarine",
- "as_variant",
- "async-channel",
- "async-stream",
- "async-trait",
- "backon",
- "bytes",
- "bytesize",
- "cfg-if",
- "event-listener",
- "eyeball",
- "eyeball-im",
- "futures-core",
- "futures-util",
- "gloo-timers",
- "guigu-matrix-sdk-base",
- "guigu-matrix-sdk-sqlite",
- "http",
- "imbl",
- "indexmap",
- "js_int",
- "language-tags",
- "matrix-sdk-common",
- "matrix-sdk-indexeddb",
- "mime",
- "mime2ext",
- "oauth2",
- "once_cell",
- "percent-encoding",
- "pin-project-lite",
- "reqwest",
- "ruma",
- "serde",
- "serde_html_form",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tokio-stream",
- "tokio-util",
- "tracing",
- "url",
- "urlencoding",
- "vodozemac",
- "zeroize",
-]
-
-[[package]]
-name = "guigu-matrix-sdk-base"
-version = "0.13.0-guigu.1"
-dependencies = [
- "as_variant",
- "async-trait",
- "bitflags",
- "decancer",
- "eyeball",
- "eyeball-im",
- "futures-util",
- "growable-bloom-filter",
- "matrix-sdk-common",
- "matrix-sdk-crypto",
- "matrix-sdk-store-encryption",
- "once_cell",
- "regex",
- "ruma",
- "serde",
- "serde_json",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "unicode-normalization",
-]
-
-[[package]]
-name = "guigu-matrix-sdk-sqlite"
-version = "0.13.0-guigu.1"
-dependencies = [
- "as_variant",
- "async-trait",
- "deadpool-sqlite",
- "guigu-matrix-sdk-base",
- "itertools 0.14.0",
- "matrix-sdk-crypto",
- "matrix-sdk-store-encryption",
- "num_cpus",
- "rmp-serde",
- "ruma",
- "rusqlite",
- "serde",
- "serde_json",
- "serde_path_to_error",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "vodozemac",
 ]
 
 [[package]]
@@ -2001,6 +1899,89 @@ dependencies = [
 ]
 
 [[package]]
+name = "matrix-sdk"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "1de309d33d0c5d77829f952110e8b9e3e6c730880152db6e1778bcaa2cbfaef9"
+dependencies = [
+ "anymap2",
+ "aquamarine",
+ "as_variant",
+ "async-channel",
+ "async-stream",
+ "async-trait",
+ "backon",
+ "bytes",
+ "bytesize",
+ "cfg-if",
+ "event-listener",
+ "eyeball",
+ "eyeball-im",
+ "futures-core",
+ "futures-util",
+ "gloo-timers",
+ "http",
+ "imbl",
+ "indexmap",
+ "js_int",
+ "language-tags",
+ "matrix-sdk-base",
+ "matrix-sdk-common",
+ "matrix-sdk-indexeddb",
+ "matrix-sdk-sqlite",
+ "mime",
+ "mime2ext",
+ "oauth2",
+ "once_cell",
+ "percent-encoding",
+ "pin-project-lite",
+ "reqwest",
+ "ruma",
+ "serde",
+ "serde_html_form",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tokio-stream",
+ "tokio-util",
+ "tracing",
+ "url",
+ "urlencoding",
+ "vodozemac",
+ "zeroize",
+]
+
+[[package]]
+name = "matrix-sdk-base"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ad7f18305090c059293ebafefbfd8cac494f43386c3f255861995ee7b48f9e89"
+dependencies = [
+ "as_variant",
+ "async-trait",
+ "bitflags",
+ "decancer",
+ "eyeball",
+ "eyeball-im",
+ "futures-util",
+ "growable-bloom-filter",
+ "matrix-sdk-common",
+ "matrix-sdk-crypto",
+ "matrix-sdk-store-encryption",
+ "once_cell",
+ "regex",
+ "ruma",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "unicode-normalization",
+]
+
+[[package]]
 name = "matrix-sdk-common"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2092,6 +2073,32 @@ dependencies = [
  "wasm-bindgen",
  "web-sys",
  "zeroize",
+]
+
+[[package]]
+name = "matrix-sdk-sqlite"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa2ff57473e92bad1b7320b3d70d640661b95064e091b925c5ef88acfa281853"
+dependencies = [
+ "as_variant",
+ "async-trait",
+ "deadpool-sqlite",
+ "itertools 0.14.0",
+ "matrix-sdk-base",
+ "matrix-sdk-crypto",
+ "matrix-sdk-store-encryption",
+ "num_cpus",
+ "rmp-serde",
+ "ruma",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "serde_path_to_error",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "vodozemac",
 ]
 
 [[package]]

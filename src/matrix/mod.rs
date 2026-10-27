@@ -7,7 +7,6 @@ mod admin;
 pub(crate) use admin::sealed;
 mod client;
 mod conversation;
-mod cutover;
 mod dedup;
 mod error;
 mod event;
@@ -43,5 +42,5 @@ pub use router::{
 pub(crate) use sync::FailureObserver;
 pub use sync::{
     MatrixSync, MatrixSyncHandle, MemorySyncTokenStore, MissingRoomKeyObserver,
-    RawMatrixEventConsumer, SyncTokenFuture, SyncTokenStore,
+    RawMatrixEventConsumer, SqliteSyncTokenStore, SyncTokenFuture, SyncTokenStore,
 };

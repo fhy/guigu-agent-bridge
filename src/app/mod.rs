@@ -5,7 +5,7 @@ mod dispatcher;
 pub mod gateway_handoff;
 mod health;
 mod ingress;
-mod matrix_cutover;
+mod matrix_recovery;
 mod outbox;
 pub(crate) mod output_drain;
 pub(crate) mod output_projection;
@@ -17,7 +17,8 @@ mod runtime;
 pub use admission::PersistingBus;
 pub use dispatcher::AcpDispatcherRouter;
 pub use health::{
-    HealthServer, HealthState, MatrixFailure, MatrixPhase, MatrixReadinessOwner, OwnerState,
+    HealthServer, HealthState, MatrixFailure, MatrixPhase, MatrixReadinessOwner,
+    MatrixStartupAttempt, MatrixStartupDiagnostics, OwnerState,
 };
 pub use ingress::{
     MatrixIngress, MatrixIngressHandle, ReloadingMonitorSender, ReplyRegistry,

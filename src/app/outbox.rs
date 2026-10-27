@@ -34,7 +34,7 @@ impl OutboxDrain {
             .map_err(|_| ())?;
         let mut sent = 0;
         for row in rows {
-            if self
+            let send_result = self
                 .sender
                 .send_stable(
                     &row.room_id,
@@ -43,15 +43,30 @@ impl OutboxDrain {
                     &row.body,
                     &row.stable_txn_id,
                 )
-                .await
-                .is_ok()
-                && self
+                .await;
+            if send_result.is_ok() {
+                match self.store.mark_projection_sent(&row).await {
+                    Ok(true) => sent += 1,
+                    Ok(false) | Err(_) => {
+                        if !self
+                            .store
+                            .mark_projection_abandoned(&row)
+                            .await
+                            .map_err(|_| ())?
+                        {
+                            return Err(());
+                        }
+                    }
+                }
+            } else {
+                if !self
                     .store
-                    .mark_projection_sent(&row)
+                    .mark_projection_abandoned(&row)
                     .await
                     .map_err(|_| ())?
-            {
-                sent += 1;
+                {
+                    return Err(());
+                }
             }
         }
         Ok(sent)

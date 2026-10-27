@@ -48,6 +48,8 @@ pub async fn fixture(encrypted: bool) -> (tempfile::TempDir, MockServer, Client)
                     state("m.room.create", "", json!({"creator":"@bridge:example.test","room_version":"10"})),
                     state("m.room.member", "@bridge:example.test", json!({"membership":"join","displayname":"Bridge"})),
                     state("m.room.member", "@alice:example.test", json!({"membership":"join","displayname":"Alice"})),
+                    state("m.room.name", "", json!({"name":"Recovery room"})),
+                    state("m.room.encryption", "", json!({"algorithm":"m.megolm.v1.aes-sha2"})),
                     state("org.example.custom.state", "arbitrary", json!({"value":"anchor"}))
                 ]},
                 "account_data":{"events":[{"type":"org.example.room","content":{"value":"anchor"}}]},

@@ -1,6 +1,6 @@
 [package]
 name = "guigu-agent-bridge"
-version = "0.2.23"
+version = "0.2.24"
 edition = "2024"
 rust-version = "1.94"
 description = "Durable Matrix, ACP, and A2A task routing bridge for external agents"
@@ -52,11 +52,11 @@ include = [
     "/migrations/**",
     "/src/**",
     "/release/**",
-    "/vendor/**",
     "/tests/matrix_sdk_clone_capability.rs",
     "/tests/matrix_sdk_hydration.rs",
     "/tests/support/matrix_hydration.rs",
     "/docs/RELEASE-0.2.23.md",
+    "/docs/RELEASE-0.2.24.md",
 ]
 
 [features]
@@ -90,7 +90,7 @@ uuid = { version = "1", features = ["v7", "serde", "v5"] }
 chrono = { version = "0.4", features = ["serde"] }
 toml = "1.1.6"
 url = "2.5.8"
-matrix-sdk = { package = "guigu-matrix-sdk", version = "=0.13.0-guigu.1", path = "vendor/matrix-sdk-0.13.0", default-features = false, features = ["rustls-tls", "e2e-encryption", "sqlite", "bundled-sqlite"] }
+matrix-sdk = { version = "=0.13.0", default-features = false, features = ["rustls-tls", "e2e-encryption", "sqlite", "bundled-sqlite"] }
 axum = { version = "=0.8.6", default-features = false, features = ["http1", "json", "tokio"] }
 reqwest = { version = "=0.12.28", default-features = false, features = ["rustls-tls", "json"] }
 # SQLite driver for the durable event store (ADR-002). `default-features = false`
@@ -105,6 +105,7 @@ sqlx = { version = "0.9.0", default-features = false, features = [
 libsqlite3-sys = "=0.33.0"
 
 [dev-dependencies]
+matrix-sdk-crypto = { version = "=0.13.0", default-features = false }
 wiremock = "0.6.5"
 tempfile = "3"
 

@@ -636,8 +636,25 @@ impl crate::matrix::RawMatrixEventConsumer for GatewayRawConsumer {
     fn consume<'a>(
         &'a self,
         raw: &'a str,
-        room_id: &'a str,
+        _room: &'a str,
     ) -> crate::matrix::SyncTokenFuture<'a, Result<bool, crate::matrix::MatrixError>> {
+        Box::pin(async move {
+            let value: serde_json::Value =
+                serde_json::from_str(raw).map_err(|_| crate::matrix::MatrixError::Protocol {
+                    detail: "malformed gateway event",
+                })?;
+            Ok(value
+                .pointer("/content/msgtype")
+                .and_then(serde_json::Value::as_str)
+                == Some("com.guigu.bridge.a2a.v1"))
+        })
+    }
+
+    fn admit<'a>(
+        &'a self,
+        raw: &'a str,
+        room_id: &'a str,
+    ) -> crate::matrix::SyncTokenFuture<'a, Result<(), crate::matrix::MatrixError>> {
         Box::pin(async move {
             let value: serde_json::Value =
                 serde_json::from_str(raw).map_err(|_| crate::matrix::MatrixError::Protocol {
@@ -649,7 +666,7 @@ impl crate::matrix::RawMatrixEventConsumer for GatewayRawConsumer {
                 .and_then(|v| v.as_str())
                 != Some("com.guigu.bridge.a2a.v1")
             {
-                return Ok(false);
+                return Ok(());
             }
             let sender = value.get("sender").and_then(|v| v.as_str()).ok_or(
                 crate::matrix::MatrixError::Protocol {
@@ -657,7 +674,7 @@ impl crate::matrix::RawMatrixEventConsumer for GatewayRawConsumer {
                 },
             )?;
             if sender == self.gateway.route.own_user || room_id != self.gateway.route.room_id {
-                return Ok(true);
+                return Ok(());
             }
             let event_id = value.get("event_id").and_then(|v| v.as_str()).ok_or(
                 crate::matrix::MatrixError::Protocol {
@@ -674,7 +691,7 @@ impl crate::matrix::RawMatrixEventConsumer for GatewayRawConsumer {
                 .await
                 .map_err(|_| crate::matrix::MatrixError::Storage)?;
             let Some((winner, envelope)) = winner else {
-                return Ok(false);
+                return Ok(());
             };
             let task_id = match winner {
                 TaskWinner::Inserted(task_id) | TaskWinner::Replay(task_id) => task_id,
@@ -708,7 +725,7 @@ impl crate::matrix::RawMatrixEventConsumer for GatewayRawConsumer {
                     .await
                     .map_err(|_| crate::matrix::MatrixError::Storage)?;
             }
-            Ok(true)
+            Ok(())
         })
     }
 }

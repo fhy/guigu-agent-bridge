@@ -1060,13 +1060,13 @@ impl ReliabilityStore {
         &self,
         owner: &str,
         now: &str,
-        stale_before: &str,
+        _stale_before: &str,
         limit: u32,
     ) -> Result<Vec<PendingProjection>, ReliabilityError> {
         let mut claimed = Vec::new();
         for _ in 0..limit {
-            let row=sqlx::query("UPDATE projection_outbox SET state='sending',claim_owner=?,claim_revision=COALESCE(claim_revision,0)+1,updated_at=? WHERE rowid=(SELECT rowid FROM projection_outbox WHERE state='pending' OR (state='sending' AND updated_at<=?) ORDER BY created_at,source_kind,source_id,projection LIMIT 1) RETURNING source_kind,source_id,projection,stable_txn_id,room_id,thread_root,reply_event_id,body,claim_revision")
-                .bind(owner).bind(now).bind(stale_before).fetch_optional(&self.pool).await?;
+            let row=sqlx::query("UPDATE projection_outbox SET state='sending',claim_owner=?,claim_revision=COALESCE(claim_revision,0)+1,updated_at=? WHERE rowid=(SELECT rowid FROM projection_outbox WHERE state='pending' ORDER BY created_at,source_kind,source_id,projection LIMIT 1) RETURNING source_kind,source_id,projection,stable_txn_id,room_id,thread_root,reply_event_id,body,claim_revision")
+                .bind(owner).bind(now).fetch_optional(&self.pool).await?;
             let Some(row) = row else { break };
             claimed.push(PendingProjection {
                 source_kind: row.try_get("source_kind")?,
@@ -1090,6 +1090,17 @@ impl ReliabilityStore {
     ) -> Result<bool, ReliabilityError> {
         let result=sqlx::query("UPDATE projection_outbox SET state='sent',attempt_count=attempt_count+1 WHERE source_kind=? AND source_id=? AND projection=? AND state='sending' AND claim_owner=? AND claim_revision=?")
             .bind(&row.source_kind).bind(&row.source_id).bind(&row.projection).bind(&row.claim_owner).bind(row.claim_revision).execute(&self.pool).await?;
+        Ok(result.rows_affected() == 1)
+    }
+
+    pub async fn mark_projection_abandoned(
+        &self,
+        row: &PendingProjection,
+    ) -> Result<bool, ReliabilityError> {
+        let result = sqlx::query("UPDATE projection_outbox SET state='abandoned',attempt_count=attempt_count+1,updated_at=? WHERE source_kind=? AND source_id=? AND projection=? AND state='sending' AND claim_owner=? AND claim_revision=?")
+            .bind(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+            .bind(&row.source_kind).bind(&row.source_id).bind(&row.projection)
+            .bind(&row.claim_owner).bind(row.claim_revision).execute(&self.pool).await?;
         Ok(result.rows_affected() == 1)
     }
 
