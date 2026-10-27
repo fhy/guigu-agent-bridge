@@ -6,7 +6,12 @@ use sqlx::{Row, SqlitePool};
 static MIGRATOR: sqlx::migrate::Migrator = sqlx::migrate!("./migrations");
 
 async fn database() -> (tempfile::TempDir, SqlitePool) {
-    let root = tempfile::tempdir().unwrap();
+    let root = tempfile::tempdir_in(std::env::var_os("HOME").expect("HOME")).unwrap();
+    std::fs::set_permissions(
+        root.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
     let pool = connect(root.path().join("bridge.db")).await.unwrap();
     migrate(&pool).await.unwrap();
     (root, pool)
