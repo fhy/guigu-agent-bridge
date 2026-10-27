@@ -90,6 +90,15 @@ pub fn init_tracing() {
 /// Production entry point: initialize tracing, then run until an interrupt or
 /// termination signal.
 pub async fn run() -> Result<(), Error> {
+    if std::env::args_os()
+        .nth(1)
+        .as_deref()
+        .and_then(|value| value.to_str())
+        == Some("--version")
+    {
+        println!("guigu-agent-bridge {}", env!("CARGO_PKG_VERSION"));
+        return Ok(());
+    }
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref().and_then(|v| v.to_str()) == Some("recover-runtime") {
         let mut cli = vec![std::ffi::OsString::from("recover-runtime")];
