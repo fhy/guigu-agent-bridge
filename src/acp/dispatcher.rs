@@ -261,7 +261,13 @@ impl AcpStructuredTurn {
     }
 
     pub async fn finish(self) -> Result<crate::acp::TurnResult, AcpError> {
-        let completed = self.handle.finish().await;
+        let completed = self.handle.finish().await.and_then(|completed| {
+            classify_stream_completion(
+                completed,
+                self.dispatcher.inner.legacy_results,
+                self.dispatcher.inner.allow_nonterminal_end_turn,
+            )
+        });
         let output_result = match (completed.is_ok(), self.output) {
             (true, Some(output)) => output.finish().await.map_err(|_| AcpError::Schema {
                 method: crate::acp::schema::METHOD_SESSION_PROMPT.into(),
@@ -289,30 +295,7 @@ impl AcpStructuredTurn {
             tracing::warn!(%error,"could not mark the acp session ready after a streamed turn");
         }
         match completed {
-            Ok(completed) => {
-                let response = AcpClient::decode_prompt_completion(completed)?;
-                if self.dispatcher.inner.legacy_results
-                    && response.stop_reason.is_end_turn()
-                    && response.task_result.is_none()
-                {
-                    return Ok(crate::acp::TurnResult::Completed {
-                        output: response.text,
-                    });
-                }
-                if self.dispatcher.inner.allow_nonterminal_end_turn
-                    && response.stop_reason.is_end_turn()
-                    && response.task_result.is_none()
-                {
-                    return Ok(crate::acp::TurnResult::Continue {
-                        reason: "compatibility end_turn".into(),
-                        next_prompt: Some("bridge.continue.v1\nContinue the current task from durable progress. Emit taskResult or bounded progress.".into()),
-                    });
-                }
-                response.task_result.ok_or_else(|| AcpError::Schema {
-                    method: crate::acp::schema::METHOD_SESSION_PROMPT.to_owned(),
-                    detail: "missing taskResult in strict mode".to_owned(),
-                })
-            }
+            Ok(result) => Ok(result),
             Err(AcpError::Exited { .. } | AcpError::TransportClosed) => {
                 let recovered = self.dispatcher.ensure_client(&self.target).await?;
                 recovered
@@ -911,6 +894,31 @@ impl TaskDispatcher for AcpDispatcher {
 }
 
 /// Map a finished turn onto the frozen outcome.
+fn classify_stream_completion(
+    completed: crate::acp::CompletedRequest,
+    legacy_results: bool,
+    allow_nonterminal_end_turn: bool,
+) -> Result<crate::acp::TurnResult, AcpError> {
+    let response = AcpClient::decode_prompt_completion(completed)?;
+    if let Some(result) = response.task_result {
+        return Ok(result);
+    }
+    if response.stop_reason.is_end_turn() {
+        if legacy_results {
+            return Ok(crate::acp::TurnResult::Completed {
+                output: response.text,
+            });
+        }
+        if allow_nonterminal_end_turn {
+            return Ok(crate::acp::TurnResult::Continue {
+                reason: "compatibility end_turn".into(),
+                next_prompt: Some("bridge.continue.v1\nContinue the current task from durable progress. Emit taskResult or bounded progress.".into()),
+            });
+        }
+    }
+    Err(AcpError::MissingTaskResult)
+}
+
 fn map_turn(turn: client::PromptTurn, legacy_results: bool) -> DispatchOutcome {
     match turn.task_result {
         Some(crate::acp::TurnResult::Completed { output }) => DispatchOutcome::Completed { output },
@@ -936,6 +944,10 @@ fn map_turn(turn: client::PromptTurn, legacy_results: bool) -> DispatchOutcome {
 fn reason_of(error: &AcpError) -> String {
     bounded(&error.to_string())
 }
+
+#[cfg(test)]
+#[path = "stream_completion_tests.rs"]
+mod stream_completion_tests;
 
 #[cfg(test)]
 mod tests {

@@ -1722,10 +1722,14 @@ impl LeasedAcpDispatcher {
                 }
             }
         }
-        turn.finish()
-            .await
-            .map(TurnRun::Result)
-            .map_err(Self::execution_error)
+        match turn.finish().await {
+            Err(error @ crate::acp::AcpError::MissingTaskResult) => {
+                Ok(TurnRun::Result(TurnResult::Failed {
+                    reason: Self::execution_error(error).to_string(),
+                }))
+            }
+            result => result.map(TurnRun::Result).map_err(Self::execution_error),
+        }
     }
 
     async fn execute_loop(

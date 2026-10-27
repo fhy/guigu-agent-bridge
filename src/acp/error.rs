@@ -138,6 +138,8 @@ pub enum AcpError {
         /// Bounded description of the problem.
         detail: String,
     },
+    #[error("session/prompt returned a malformed payload: missing taskResult in strict mode")]
+    MissingTaskResult,
     /// The agent answered with a JSON-RPC error object.
     #[error("the agent rejected the request: {source}")]
     Agent {
@@ -182,6 +184,7 @@ mod tests {
             }
             .to_string(),
             AcpError::TransportClosed.to_string(),
+            AcpError::MissingTaskResult.to_string(),
             AcpError::UnsupportedProtocol {
                 got: 9,
                 supported: 1,

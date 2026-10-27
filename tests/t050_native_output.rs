@@ -168,7 +168,51 @@ async fn default_strict_stream_does_not_infer_task_completion() {
     let failed = terminal(&runtime, &accepted).await;
     assert_eq!(failed["status"], "failed");
     assert!(failed.get("artifacts").is_none());
+    assert_eq!(rpc(&runtime, "message/send", send()).await, failed);
+    let pool = connect(fixture.root.path().join("state.db")).await.unwrap();
+    assert_strict_terminal(&pool).await;
+    let children: Vec<i64> = sqlx::query_scalar("SELECT child_pid FROM session_owner_bindings")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(children.len(), 1);
     runtime.shutdown().await.unwrap();
+    for child in children {
+        assert!(!std::path::Path::new(&format!("/proc/{child}")).exists());
+    }
+    let runtime = fixture.start().await;
+    assert_eq!(rpc(&runtime, "message/send", send()).await, failed);
+    assert_strict_terminal(&pool).await;
+    runtime.shutdown().await.unwrap();
+    pool.close().await;
+}
+
+async fn assert_strict_terminal(pool: &sqlx::SqlitePool) {
+    let events: Vec<String> = sqlx::query_scalar("SELECT status FROM task_events ORDER BY seq")
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert_eq!(events, ["queued", "dispatched", "running", "failed"]);
+    let reason: String =
+        sqlx::query_scalar("SELECT payload FROM task_events WHERE status='failed'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert!(reason.contains("missing taskResult in strict mode"));
+    for (query, expected) in [
+        ("SELECT state FROM task_continuations", "terminal"),
+        ("SELECT state FROM execution_leases", "released"),
+        ("SELECT state FROM delivery_dispositions", "terminal"),
+        ("SELECT state FROM task_admissions", "terminal"),
+    ] {
+        let state: String = sqlx::query_scalar(query).fetch_one(pool).await.unwrap();
+        assert_eq!(state, expected);
+    }
+    let artifacts: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM a2a_artifacts")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(artifacts, 0);
 }
 
 #[test]

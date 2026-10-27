@@ -1985,6 +1985,45 @@ async fn end_turn_without_a_structured_result_is_not_completed() {
 }
 
 #[tokio::test]
+async fn leased_strict_completed_response_commits_failure_and_releases_ownership() {
+    let harness =
+        Harness::new_reliable("leased-strict", "legacy-end-turn", default_limits(), true).await;
+    let task = harness.task("strict terminal failure");
+    let (outcome, continuations, _) = harness
+        .run_leased(vec![task.clone()], default_policy(), Cp2Action::None)
+        .await;
+    let events = outcome.task_events(task.task_id);
+    assert_eq!(
+        statuses(&events),
+        [
+            TaskStatus::Queued,
+            TaskStatus::Dispatched,
+            TaskStatus::Running,
+            TaskStatus::Failed
+        ]
+    );
+    assert!(failed_payload(events.last().unwrap()).contains("missing taskResult"));
+    assert_eq!(
+        continuations[0].state,
+        guigu_agent_bridge::runtime::ContinuationState::Terminal
+    );
+    let lease: String = sqlx::query_scalar("SELECT state FROM execution_leases WHERE task_id=?")
+        .bind(task.task_id.to_string())
+        .fetch_one(&outcome.pool)
+        .await
+        .unwrap();
+    assert_eq!(lease, "released");
+    let disposition: String =
+        sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE task_id=?")
+            .bind(task.task_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .unwrap();
+    assert_eq!(disposition, "terminal");
+    outcome.cleanup().await;
+}
+
+#[tokio::test]
 async fn explicit_legacy_opt_in_preserves_end_turn_completion() {
     let harness = Harness::new(
         "legacy-optin",
