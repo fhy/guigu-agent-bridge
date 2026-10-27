@@ -148,7 +148,7 @@ impl MatrixCompatibilityStore {
         sqlx::query("INSERT INTO matrix_recovery_compatibility(singleton,decision,source_schema_version,source_state_digest,legacy_operation_id,legacy_phase,legacy_baseline,legacy_baseline_digest,legacy_watermark,legacy_revision,legacy_binding,legacy_archive_digest,native_operation_id,reason_code,created_at) VALUES(1,?,24,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(if reason.is_some() { "held" } else { "native" }).bind(&legacy.digest)
             .bind(legacy_operation).bind(phase).bind(baseline).bind(baseline_digest).bind(watermark)
-            .bind(revision).bind(binding).bind(archive).bind(operation).bind(reason.unwrap_or("pristine-native")).bind(&now)
+            .bind(revision).bind(binding).bind(archive).bind(operation).bind(reason.unwrap_or("pristine-native")).bind(now)
             .execute(&mut *connection).await?;
         Ok(())
     }

@@ -24,12 +24,17 @@ async fn prove_rebuild(encrypted_store: bool) {
     let restored = active.get_room(&room).unwrap();
     assert_eq!(restored.name().as_deref(), Some("Recovery room"));
     assert_eq!(restored.state(), matrix_sdk::RoomState::Joined);
-    assert!(restored.encryption_settings().await.unwrap().is_some());
+    assert!(restored.encryption_settings().is_some());
     assert_eq!(active.user_id(), anchor.user_id());
     assert_eq!(active.device_id(), anchor.device_id());
+    let agreement_key = anchor
+        .encryption()
+        .curve25519_key()
+        .await
+        .expect("device agreement key");
     assert_eq!(
         active.encryption().curve25519_key().await,
-        anchor.encryption().curve25519_key().await
+        Some(agreement_key)
     );
     let event = active
         .state_store()
@@ -75,10 +80,12 @@ async fn prove_rebuild(encrypted_store: bool) {
             .unwrap()
             .is_some()
     );
-    assert_eq!(
-        active.encryption().ed25519_key().await,
-        anchor.encryption().ed25519_key().await
-    );
+    let signing_key = anchor
+        .encryption()
+        .ed25519_key()
+        .await
+        .expect("device signing key");
+    assert_eq!(active.encryption().ed25519_key().await, Some(signing_key));
     active.state_store().remove_room(&room).await.unwrap();
     assert!(anchor.get_room(&room).is_some());
     assert_eq!(

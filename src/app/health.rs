@@ -1,3 +1,14 @@
+#[path = "health_diagnostics.rs"]
+mod diagnostics;
+pub use diagnostics::{MatrixStartupAttempt, MatrixStartupDiagnostics};
+
+#[path = "health_metrics.rs"]
+mod metrics;
+
+#[cfg(test)]
+#[path = "health_metrics_tests.rs"]
+mod metrics_tests;
+
 use std::{
     net::SocketAddr,
     sync::{
@@ -108,40 +119,6 @@ pub(crate) struct RedactedReadinessSnapshot {
     pub live: bool,
 }
 
-/// Redacted status for each independent Matrix startup prerequisite.
-///
-/// `NotAttemptedRecoveryBlocked` is intentionally distinct from an attempted
-/// failure: the recovery gate returns before any Matrix client or network work.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum MatrixStartupAttempt {
-    NotAttempted,
-    NotAttemptedRecoveryBlocked,
-    Succeeded,
-    Failed(MatrixFailure),
-    Unknown(MatrixFailure),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct MatrixStartupDiagnostics {
-    pub authentication: MatrixStartupAttempt,
-    pub store_binding: MatrixStartupAttempt,
-    pub session_restore: MatrixStartupAttempt,
-    pub e2ee_initialization: MatrixStartupAttempt,
-    pub server_device_key_proof: MatrixStartupAttempt,
-}
-
-impl Default for MatrixStartupDiagnostics {
-    fn default() -> Self {
-        Self {
-            authentication: MatrixStartupAttempt::NotAttempted,
-            store_binding: MatrixStartupAttempt::NotAttempted,
-            session_restore: MatrixStartupAttempt::NotAttempted,
-            e2ee_initialization: MatrixStartupAttempt::NotAttempted,
-            server_device_key_proof: MatrixStartupAttempt::NotAttempted,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Copy)]
 struct MatrixReadiness {
     generation: u64,
@@ -195,97 +172,6 @@ impl MatrixReadinessOwner {
         self.state.lock().unwrap_or_else(|p| p.into_inner()).phase
     }
 
-    pub fn startup_diagnostics(&self) -> MatrixStartupDiagnostics {
-        *self.diagnostics.lock().unwrap_or_else(|p| p.into_inner())
-    }
-
-    pub fn mark_recovery_blocked(&self) {
-        *self.diagnostics.lock().unwrap_or_else(|p| p.into_inner()) = MatrixStartupDiagnostics {
-            authentication: MatrixStartupAttempt::NotAttemptedRecoveryBlocked,
-            store_binding: MatrixStartupAttempt::NotAttemptedRecoveryBlocked,
-            session_restore: MatrixStartupAttempt::NotAttemptedRecoveryBlocked,
-            e2ee_initialization: MatrixStartupAttempt::NotAttemptedRecoveryBlocked,
-            server_device_key_proof: MatrixStartupAttempt::NotAttemptedRecoveryBlocked,
-        };
-    }
-
-    pub fn mark_authentication_succeeded(&self) {
-        self.diagnostics
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .authentication = MatrixStartupAttempt::Succeeded;
-    }
-
-    pub fn mark_store_binding_succeeded(&self) {
-        self.diagnostics
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .store_binding = MatrixStartupAttempt::Succeeded;
-    }
-
-    pub fn mark_session_restore_succeeded(&self) {
-        self.diagnostics
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .session_restore = MatrixStartupAttempt::Succeeded;
-    }
-
-    pub fn mark_key_proof_succeeded(&self) {
-        let mut diagnostics = self.diagnostics.lock().unwrap_or_else(|p| p.into_inner());
-        diagnostics.server_device_key_proof = MatrixStartupAttempt::Succeeded;
-    }
-
-    pub fn mark_e2ee_succeeded(&self) {
-        self.diagnostics
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .e2ee_initialization = MatrixStartupAttempt::Succeeded;
-    }
-
-    pub fn mark_restore_failure(
-        &self,
-        identity_matched: bool,
-        store_bound: bool,
-        reason: MatrixFailure,
-    ) {
-        let mut diagnostics = self.diagnostics.lock().unwrap_or_else(|p| p.into_inner());
-        if store_bound {
-            diagnostics.session_restore = MatrixStartupAttempt::Failed(reason);
-        } else if identity_matched {
-            diagnostics.store_binding = MatrixStartupAttempt::Failed(reason);
-        } else {
-            diagnostics.authentication = MatrixStartupAttempt::Failed(reason);
-        }
-    }
-
-    pub fn mark_e2ee_failure(&self, reason: MatrixFailure) {
-        self.diagnostics
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .e2ee_initialization = MatrixStartupAttempt::Failed(reason);
-    }
-
-    pub fn mark_e2ee_timeout(&self) {
-        self.diagnostics
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .e2ee_initialization = MatrixStartupAttempt::Unknown(MatrixFailure::Timeout);
-    }
-
-    pub fn mark_key_proof_failure(&self, reason: MatrixFailure) {
-        self.diagnostics
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .server_device_key_proof = MatrixStartupAttempt::Failed(reason);
-    }
-
-    pub fn mark_key_proof_timeout(&self) {
-        self.diagnostics
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .server_device_key_proof = MatrixStartupAttempt::Unknown(MatrixFailure::Timeout);
-    }
-
     pub fn fail_required_task(&self) {
         let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
         if matches!(state.phase, MatrixPhase::Registering | MatrixPhase::Ready) {
@@ -317,7 +203,7 @@ impl MatrixReadinessOwner {
         self.missing_room_keys.load(Ordering::Relaxed)
     }
 
-    fn diagnostics(&self) -> MatrixStartupDiagnostics {
+    pub(super) fn diagnostics(&self) -> MatrixStartupDiagnostics {
         self.startup_diagnostics()
     }
 }
@@ -552,139 +438,6 @@ impl HealthState {
             emission = "redacted-readiness-predicate-snapshot"
         );
         snapshot
-    }
-
-    async fn metrics_body(&self) -> String {
-        let readiness = self.snapshot().await;
-        let current_counts = self.runtime.counts().await;
-        let snapshot = self.metrics.snapshot();
-        let mut body = String::new();
-        for (metric, value) in snapshot.values {
-            body.push_str(&format!(
-                "guigu_runtime_total{{kind=\"{}\"}} {}\n",
-                metric_name(metric),
-                value
-            ));
-        }
-        let gauges = snapshot.gauges;
-        for (name, value) in [
-            ("active_leases", gauges.active_leases),
-            ("expired_leases", gauges.expired_leases),
-            ("recovery_needed_leases", gauges.recovery_needed_leases),
-            ("ready_turns", gauges.ready_turns),
-            ("in_flight_turns", gauges.in_flight_turns),
-            ("recovery_backlog", gauges.recovery_backlog),
-            ("projection_failures", self.projections.failures()),
-            ("a2a_insecure_peers", self.insecure_a2a_peers()),
-            ("matrix_missing_room_keys", self.matrix.missing_room_keys()),
-        ] {
-            body.push_str(&format!("guigu_runtime_{name} {value}\n"));
-        }
-        let (required_total, required_alive) = self.liveness_counts(&self.required);
-        let (matrix_required_total, matrix_required_alive) =
-            self.liveness_counts(&self.matrix_required);
-        body.push_str(&format!(
-            "guigu_readiness_evaluation{{readiness=\"{}\"}} 1\n",
-            readiness_name(readiness.readiness)
-        ));
-        let (storage_available, current_recovery) = match &current_counts {
-            Ok(counts) => {
-                body.push_str(&format!(
-                    "guigu_readiness_current_recovery_leases {}\n",
-                    counts.recovery_needed_leases
-                ));
-                body.push_str(&format!(
-                    "guigu_readiness_current_recovery_backlog {}\n",
-                    counts.recovery_backlog
-                ));
-                (
-                    true,
-                    counts.recovery_needed_leases > 0 || counts.recovery_backlog > 0,
-                )
-            }
-            Err(_) => {
-                body.push_str("guigu_readiness_storage_available 0\n");
-                (false, false)
-            }
-        };
-        if storage_available {
-            body.push_str("guigu_readiness_storage_available 1\n");
-        }
-        body.push_str(&format!(
-            "guigu_readiness_owner_state{{state=\"{}\"}} 1\n",
-            owner_state_name(self.owner())
-        ));
-        body.push_str(&format!(
-            "guigu_readiness_matrix_phase{{phase=\"{}\"}} 1\n",
-            matrix_phase_name(self.matrix.phase())
-        ));
-        if let Some(reason) = matrix_phase_reason(self.matrix.phase()) {
-            body.push_str(&format!(
-                "guigu_readiness_matrix_phase_failure{{reason=\"{reason}\"}} 1\n"
-            ));
-        }
-        body.push_str(&format!(
-            "guigu_readiness_adapter_ready {}\n",
-            u8::from(self.adapter_ready.load(Ordering::Acquire))
-        ));
-        body.push_str(&format!(
-            "guigu_readiness_recovery_blocked {}\n",
-            u8::from(self.recovery_blocked.load(Ordering::Acquire))
-        ));
-        body.push_str(&format!(
-            "guigu_readiness_required_total {required_total}\n"
-        ));
-        body.push_str(&format!(
-            "guigu_readiness_required_alive {required_alive}\n"
-        ));
-        body.push_str(&format!(
-            "guigu_readiness_matrix_required_total {matrix_required_total}\n"
-        ));
-        body.push_str(&format!(
-            "guigu_readiness_matrix_required_alive {matrix_required_alive}\n"
-        ));
-        let diagnostics = self.matrix.diagnostics();
-        body.push_str(&format!(
-            "guigu_readiness_matrix_startup{{phase=\"{}\",authentication=\"{}\",store_binding=\"{}\",session_restore=\"{}\",e2ee_initialization=\"{}\",server_device_key_proof=\"{}\"}} 1\n",
-            matrix_phase_name(self.matrix.phase()),
-            startup_attempt_name(diagnostics.authentication),
-            startup_attempt_name(diagnostics.store_binding),
-            startup_attempt_name(diagnostics.session_restore),
-            startup_attempt_name(diagnostics.e2ee_initialization),
-            startup_attempt_name(diagnostics.server_device_key_proof),
-        ));
-        for (stage, attempt) in [
-            ("authentication", diagnostics.authentication),
-            ("store-binding", diagnostics.store_binding),
-            ("session-restore", diagnostics.session_restore),
-            ("e2ee-initialization", diagnostics.e2ee_initialization),
-            (
-                "server-device-key-proof",
-                diagnostics.server_device_key_proof,
-            ),
-        ] {
-            if let Some(reason) = startup_attempt_reason(attempt) {
-                body.push_str(&format!(
-                    "guigu_readiness_matrix_failure{{stage=\"{stage}\",reason=\"{reason}\"}} 1\n"
-                ));
-            }
-        }
-        let blockers = readiness_blockers(ReadinessInputs {
-            owner: self.owner(),
-            adapter_ready: self.adapter_ready.load(Ordering::Acquire),
-            recovery_blocked: self.recovery_blocked.load(Ordering::Acquire),
-            required_total,
-            required_alive,
-            matrix_phase: self.matrix.phase(),
-            storage_available,
-            current_recovery,
-        });
-        for blocker in blockers {
-            body.push_str(&format!(
-                "guigu_readiness_blocker{{predicate=\"{blocker}\"}} 1\n"
-            ));
-        }
-        body
     }
 }
 
@@ -945,18 +698,7 @@ async fn write_response(stream: &mut TcpStream, status: u16, body: &str) -> std:
 
 #[cfg(test)]
 mod matrix_readiness_tests {
-    use std::sync::Arc;
-
-    use crate::{
-        app::ProjectionMetrics,
-        runtime::{RuntimeMetrics, SqliteRuntimeStore},
-        storage::{connect, migrate},
-    };
-
-    use super::{
-        MatrixFailure, MatrixPhase, MatrixReadinessOwner, MatrixStartupAttempt, OwnerState,
-        ReadinessInputs,
-    };
+    use super::*;
 
     fn readiness_blockers(
         owner: OwnerState,
@@ -976,174 +718,6 @@ mod matrix_readiness_tests {
             storage_available: true,
             current_recovery: false,
         })
-    }
-
-    async fn fixture() -> (super::HealthState, sqlx::SqlitePool, std::path::PathBuf) {
-        let root = std::env::temp_dir().join(format!("guigu-health-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&root).unwrap();
-        let pool = connect(root.join("state.db")).await.unwrap();
-        migrate(&pool).await.unwrap();
-        let state = super::HealthState::new(
-            SqliteRuntimeStore::new(pool.clone()),
-            Arc::new(RuntimeMetrics::default()),
-            Arc::new(ProjectionMetrics::default()),
-        );
-        (state, pool, root)
-    }
-
-    async fn assert_ready_metrics(state: &super::HealthState) {
-        assert_eq!(
-            state.snapshot().await.readiness,
-            crate::runtime::Readiness::Ready
-        );
-        let metrics = state.metrics_body().await;
-        assert!(metrics.contains("guigu_readiness_evaluation{readiness=\"ready\"} 1"));
-        assert!(metrics.contains("predicate=\"none\""));
-    }
-
-    #[tokio::test]
-    async fn metrics_matrix_matches_readiness_matrix() {
-        let (state, _pool, root) = fixture().await;
-        state.set_owner(OwnerState::Running);
-        state.set_adapter_ready(true);
-        assert_ready_metrics(&state).await;
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn metrics_matrix_failed_exposes_matrix_blocker() {
-        let (state, _pool, root) = fixture().await;
-        state.set_owner(OwnerState::Running);
-        state.set_adapter_ready(true);
-        let generation = state.matrix().begin();
-        assert!(state.matrix().transition(
-            generation,
-            &[MatrixPhase::Preflight],
-            MatrixPhase::Failed(MatrixFailure::Authentication)
-        ));
-        assert_eq!(
-            state.snapshot().await.readiness,
-            crate::runtime::Readiness::AdapterUnavailable
-        );
-        let metrics = state.metrics_body().await;
-        assert!(metrics.contains("predicate=\"matrix-phase-not-ready\""));
-        assert!(!metrics.contains("predicate=\"none\""));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn metrics_matrix_generic_child_dead_exposes_child_blocker() {
-        let (state, _pool, root) = fixture().await;
-        state.set_owner(OwnerState::Running);
-        state.set_adapter_ready(true);
-        state.register_required(Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        assert_eq!(
-            state.snapshot().await.readiness,
-            crate::runtime::Readiness::OwnerStopped
-        );
-        let metrics = state.metrics_body().await;
-        assert!(metrics.contains("predicate=\"required-child-not-alive\""));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn metrics_first_matrix_child_dead_updates_phase_before_classifying() {
-        let (state, _pool, root) = fixture().await;
-        state.set_owner(OwnerState::Running);
-        state.set_adapter_ready(true);
-        let generation = state.matrix().begin();
-        for (from, to) in [
-            (MatrixPhase::Preflight, MatrixPhase::IdentityMatched),
-            (MatrixPhase::IdentityMatched, MatrixPhase::StoreBound),
-            (MatrixPhase::StoreBound, MatrixPhase::KeyProved),
-            (MatrixPhase::KeyProved, MatrixPhase::Registering),
-            (MatrixPhase::Registering, MatrixPhase::Ready),
-        ] {
-            assert!(state.matrix().transition(generation, &[from], to));
-        }
-        state.register_matrix_required(Arc::new(std::sync::atomic::AtomicBool::new(false)));
-        let metrics = state.metrics_body().await;
-        assert!(metrics.contains("predicate=\"matrix-phase-not-ready\""));
-        assert!(!metrics.contains("predicate=\"none\""));
-        assert_eq!(
-            state.snapshot().await.readiness,
-            crate::runtime::Readiness::AdapterUnavailable
-        );
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn metrics_startup_recovery_block_matches_readiness() {
-        let (state, _pool, root) = fixture().await;
-        state.set_owner(OwnerState::Running);
-        state.set_adapter_ready(true);
-        state.set_recovery_blocked(true);
-        assert_eq!(
-            state.snapshot().await.readiness,
-            crate::runtime::Readiness::RecoveryBlocked
-        );
-        let metrics = state.metrics_body().await;
-        assert!(metrics.contains("predicate=\"recovery-blocked\""));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn metrics_current_recovery_lease_blocks_without_startup_flag() {
-        let (state, pool, root) = fixture().await;
-        let mut connection = pool.acquire().await.unwrap();
-        sqlx::query("PRAGMA foreign_keys=OFF")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES ('health-resource','health-task','health-owner',1,'recovery_needed','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z','2026-01-01T00:00:00Z')")
-            .execute(&mut *connection)
-            .await
-            .unwrap();
-        drop(connection);
-        state.set_owner(OwnerState::Running);
-        state.set_adapter_ready(true);
-        assert_eq!(
-            state.snapshot().await.readiness,
-            crate::runtime::Readiness::RecoveryBlocked
-        );
-        let metrics = state.metrics_body().await;
-        assert!(metrics.contains("current_recovery_leases 1"));
-        assert!(metrics.contains("predicate=\"recovery-backlog\""));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn metrics_storage_failure_is_not_reported_as_none() {
-        let (state, pool, root) = fixture().await;
-        pool.close().await;
-        let metrics = state.metrics_body().await;
-        assert!(metrics.contains("readiness_storage_available 0"));
-        assert!(metrics.contains("predicate=\"storage-unavailable\""));
-        assert!(!metrics.contains("predicate=\"none\""));
-        std::fs::remove_dir_all(root).unwrap();
-    }
-
-    #[tokio::test]
-    async fn metrics_missing_room_key_counter_is_not_causal() {
-        let (state, _pool, root) = fixture().await;
-        state.set_owner(OwnerState::Running);
-        state.set_adapter_ready(true);
-        let generation = state.matrix().begin();
-        for (from, to) in [
-            (MatrixPhase::Preflight, MatrixPhase::IdentityMatched),
-            (MatrixPhase::IdentityMatched, MatrixPhase::StoreBound),
-            (MatrixPhase::StoreBound, MatrixPhase::KeyProved),
-            (MatrixPhase::KeyProved, MatrixPhase::Registering),
-            (MatrixPhase::Registering, MatrixPhase::Ready),
-        ] {
-            assert!(state.matrix().transition(generation, &[from], to));
-        }
-        state.matrix().record_missing_room_key();
-        assert_ready_metrics(&state).await;
-        let metrics = state.metrics_body().await;
-        assert!(metrics.contains("matrix_missing_room_keys 1"));
-        assert!(!metrics.contains("predicate=\"matrix-phase-not-ready\""));
-        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
