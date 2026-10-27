@@ -14,7 +14,7 @@ use guigu_agent_bridge::{
         resolve_conversation,
     },
     observer::{MessageCategory, MonitorSender, ObserverMessage, Severity},
-    storage::{SqliteRepository, connect, migrate},
+    storage::{MatrixRecoveryStore, SqliteRepository, connect, migrate},
 };
 
 #[derive(Default)]
@@ -417,6 +417,88 @@ fn remove_db_files(path: &Path) {
         let mut candidate = path.as_os_str().to_owned();
         candidate.push(suffix);
         let _ = std::fs::remove_file(PathBuf::from(candidate));
+    }
+}
+
+#[tokio::test]
+async fn recovery_hold_states_stop_matrix_sync_before_sdk_sync() {
+    for state in ["pending", "processing", "unknown", "refused"] {
+        let server = MockServer::start().await;
+        mount_versions(&server).await;
+        let path = std::env::temp_dir().join(format!("guigu-hold-{}.db", uuid::Uuid::now_v7()));
+        let pool = connect(&path).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let recovery = MatrixRecoveryStore::new(pool.clone());
+        recovery
+            .initialize_cutover("op-hold", "2026-01-01T00:00:00Z")
+            .await
+            .unwrap();
+        recovery
+            .activate_cutover("op-hold", "B", "2026-01-01T00:00:01Z")
+            .await
+            .unwrap();
+        recovery
+            .acquire_component_lease(
+                "MatrixSync",
+                "op-hold",
+                "2026-01-01T00:00:00Z",
+                "2026-01-02T00:00:00Z",
+            )
+            .await
+            .unwrap();
+        recovery
+            .begin_batch(
+                "batch-hold",
+                Some("B"),
+                "C",
+                "digest",
+                "B",
+                "op-hold",
+                1,
+                &["$hold".to_owned()],
+                "2026-01-01T00:00:02Z",
+            )
+            .await
+            .unwrap();
+        recovery
+            .reserve_event(
+                "@bridge:example.test",
+                "!room:example.test",
+                "$hold",
+                "op-hold",
+                "payload",
+                "batch-hold",
+                "2026-01-01T00:00:03Z",
+            )
+            .await
+            .unwrap();
+        sqlx::query("UPDATE matrix_recovery_receipts SET state=? WHERE event_id='$hold'")
+            .bind(state)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(recovery.reconcile_restart().await.is_err());
+
+        let client = MatrixClient::restore(&config(&server.uri())).await.unwrap();
+        let owner = MatrixSync::new(client, Arc::new(MemorySyncTokenStore::default()), 1)
+            .unwrap()
+            .with_recovery(recovery, "@bridge:example.test", "op-hold", 1);
+        let (handle, receiver) = owner.start();
+        assert!(handle.wait().await.is_err());
+        drop(receiver);
+        let requests = server.received_requests().await.unwrap();
+        assert!(
+            requests
+                .iter()
+                .all(|request| !request.url.path().ends_with("/sync")),
+            "hold state {state} reached SDK sync"
+        );
+        let watermark: Option<String> =
+            sqlx::query_scalar("SELECT watermark FROM matrix_recovery_control WHERE control_id=1")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(watermark.as_deref(), Some("B"));
     }
 }
 
