@@ -4,7 +4,11 @@ use guigu_agent_bridge::{
     a2a::NoFault, app::AppRuntime, config::load_from_str_with_env, storage::connect,
 };
 use serde_json::{Value, json};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 
 struct Fixture {
     root: tempfile::TempDir,
@@ -171,10 +175,7 @@ async fn default_strict_stream_does_not_infer_task_completion() {
     assert_eq!(rpc(&runtime, "message/send", send()).await, failed);
     let pool = connect(fixture.root.path().join("state.db")).await.unwrap();
     assert_strict_terminal(&pool).await;
-    let children: Vec<i64> = sqlx::query_scalar("SELECT child_pid FROM session_owner_bindings")
-        .fetch_all(&pool)
-        .await
-        .unwrap();
+    let children = fixture_children(fixture.root.path());
     assert_eq!(children.len(), 1);
     runtime.shutdown().await.unwrap();
     for child in children {
@@ -213,6 +214,23 @@ async fn assert_strict_terminal(pool: &sqlx::SqlitePool) {
         .await
         .unwrap();
     assert_eq!(artifacts, 0);
+}
+
+fn fixture_children(root: &std::path::Path) -> BTreeSet<u32> {
+    let mut children = BTreeSet::new();
+    for thread in std::fs::read_dir("/proc/self/task").unwrap() {
+        let thread = thread.unwrap();
+        let listed = std::fs::read_to_string(thread.path().join("children")).unwrap_or_default();
+        for child in listed.split_whitespace() {
+            let path = std::path::PathBuf::from(format!("/proc/{child}"));
+            if std::fs::read_link(path.join("cwd")).ok().as_deref() == Some(root) {
+                let executable = std::fs::read_link(path.join("exe")).unwrap();
+                assert_eq!(executable.file_name().unwrap(), "acp-mock-backend");
+                children.insert(child.parse().unwrap());
+            }
+        }
+    }
+    children
 }
 
 #[test]
