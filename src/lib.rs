@@ -90,12 +90,20 @@ pub fn init_tracing() {
 /// Production entry point: initialize tracing, then run until an interrupt or
 /// termination signal.
 pub async fn run() -> Result<(), Error> {
-    if std::env::args_os()
-        .nth(1)
+    let mut version_args = std::env::args_os().skip(1);
+    if version_args
+        .next()
         .as_deref()
         .and_then(|value| value.to_str())
         == Some("--version")
     {
+        if version_args.next().is_some() {
+            return Err(Error::Cli(error::CliFailure {
+                command: "version",
+                category: "invalid-arguments",
+                status: 2,
+            }));
+        }
         println!("guigu-agent-bridge {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
