@@ -37,30 +37,7 @@ async fn admin_terminal_conversation_has_no_fresh_identity_or_eligible_parent_es
         .await
         .unwrap();
     crate::storage::migrate(&pool).await.unwrap();
-    let repository = SqliteRepository::new(pool.clone());
-    let conversation = Conversation {
-        id: ConversationId::generate(),
-        participants: Vec::new(),
-        external_ref: Some(ExternalRef {
-            transport: TransportType::Matrix,
-            external_id: "!synthetic:example.test".into(),
-            thread_ref: None,
-        }),
-    };
-    repository.insert_conversation(&conversation).await.unwrap();
-    let resolved =
-        crate::matrix::resolve_conversation(&repository, "!synthetic:example.test", None)
-            .await
-            .unwrap();
-    assert_eq!(resolved.id, conversation.id);
-    let replacement = Conversation {
-        id: ConversationId::generate(),
-        ..conversation.clone()
-    };
-    assert!(matches!(
-        repository.insert_conversation(&replacement).await,
-        Err(crate::storage::StorageError::Duplicate { .. })
-    ));
+    let conversation = verify_canonical_identity(&pool).await;
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
     seed_admin(&mut tx).await;
     let parent = RowIdentity {
@@ -112,6 +89,34 @@ async fn admin_terminal_conversation_has_no_fresh_identity_or_eligible_parent_es
         .is_err()
     );
     tx.rollback().await.unwrap();
+}
+
+async fn verify_canonical_identity(pool: &sqlx::SqlitePool) -> Conversation {
+    let repository = SqliteRepository::new(pool.clone());
+    let conversation = Conversation {
+        id: ConversationId::generate(),
+        participants: Vec::new(),
+        external_ref: Some(ExternalRef {
+            transport: TransportType::Matrix,
+            external_id: "!synthetic:example.test".into(),
+            thread_ref: None,
+        }),
+    };
+    repository.insert_conversation(&conversation).await.unwrap();
+    let resolved =
+        crate::matrix::resolve_conversation(&repository, "!synthetic:example.test", None)
+            .await
+            .unwrap();
+    assert_eq!(resolved.id, conversation.id);
+    let replacement = Conversation {
+        id: ConversationId::generate(),
+        ..conversation.clone()
+    };
+    assert!(matches!(
+        repository.insert_conversation(&replacement).await,
+        Err(crate::storage::StorageError::Duplicate { .. })
+    ));
+    conversation
 }
 
 async fn seed_admin(connection: &mut sqlx::SqliteConnection) {
