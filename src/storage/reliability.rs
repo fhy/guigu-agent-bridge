@@ -1033,6 +1033,16 @@ impl ReliabilityStore {
     ) -> Result<bool, ReliabilityError> {
         let mut tx =
             super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
+        let mutation = if let Some(scope) = self.recovery.as_ref() {
+            let identity = super::recovery_eligibility::writer::composite_text_identity(
+                "transport_receipts",
+                &[transport, external_event_id],
+            )?;
+            super::recovery_eligibility::writer::prepare_mutation(&mut tx, Some(scope), &identity)
+                .await?
+        } else {
+            None
+        };
         let result = sqlx::query(
             "UPDATE transport_receipts SET state=?,result_code=?,task_id=?,updated_at=?
              WHERE transport=? AND external_event_id=? AND state='reserved'",
@@ -1045,6 +1055,14 @@ impl ReliabilityStore {
         .bind(external_event_id)
         .execute(&mut *tx)
         .await?;
+        if result.rows_affected() == 1 {
+            super::recovery_eligibility::writer::complete_mutation(
+                &mut tx,
+                self.recovery.as_ref(),
+                mutation,
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
