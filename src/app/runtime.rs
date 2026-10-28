@@ -552,7 +552,7 @@ impl AppRuntime {
     ) -> Result<Self, AppError> {
         let repository = Arc::new(SqliteRepository::new(pool.clone()));
         let repository_trait: Arc<dyn Repository> = repository.clone();
-        let sessions = SqliteSessionStore::new(pool.clone());
+        let sessions = SqliteSessionStore::new_scoped(pool.clone(), recovery_scope.clone());
         let runtime_store = SqliteRuntimeStore::new(pool.clone());
         let metrics = Arc::new(RuntimeMetrics::default());
         let projection_metrics = Arc::new(ProjectionMetrics::default());

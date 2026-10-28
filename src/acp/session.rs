@@ -235,12 +235,23 @@ impl StoredSession {
 #[derive(Debug, Clone)]
 pub struct SqliteSessionStore {
     pool: SqlitePool,
+    recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
 }
 
 impl SqliteSessionStore {
     /// Wrap a pool that has been connected and migrated.
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            recovery: None,
+        }
+    }
+
+    pub fn new_scoped(
+        pool: SqlitePool,
+        recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
+    ) -> Self {
+        Self { pool, recovery }
     }
 
     /// The live session for this endpoint, conversation and working directory.
@@ -307,6 +318,10 @@ impl SqliteSessionStore {
     /// to a different conversation or working directory, or when the referenced
     /// endpoint/conversation does not exist (the migration's foreign keys).
     pub async fn upsert_session(&self, session: &StoredSession) -> Result<(), StorageError> {
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await
+                .map_err(StorageError::from)?;
         let result = sqlx::query(UPSERT_SESSION)
             .bind(&session.session_id)
             .bind(encode_id(session.endpoint_id))
@@ -320,12 +335,27 @@ impl SqliteSessionStore {
             .bind(session.state.as_str())
             .bind(encode_timestamp(&session.created_at))
             .bind(encode_timestamp(&session.updated_at))
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(StorageError::from)?;
         if result.rows_affected() == 1 {
+            if let Some(scope) = self.recovery.as_ref() {
+                crate::storage::recovery_eligibility::writer::inserted(
+                    &mut tx,
+                    Some(scope),
+                    &crate::storage::recovery_eligibility::writer::text_identity(
+                        "sessions",
+                        &session.session_id,
+                    )
+                    .map_err(StorageError::from)?,
+                )
+                .await
+                .map_err(StorageError::from)?;
+            }
+            tx.commit().await.map_err(StorageError::from)?;
             return Ok(());
         }
+        tx.rollback().await.map_err(StorageError::from)?;
         Err(StorageError::IntegrityViolation {
             detail: "sessions.session_id is bound to another conversation or cwd".to_owned(),
         })
