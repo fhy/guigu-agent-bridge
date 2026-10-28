@@ -515,7 +515,7 @@ impl AppRuntime {
             runtime_instance.clone(),
             owns_runtime,
             maintenance_lock.clone(),
-            recovery_scope,
+            recovery_scope.clone(),
             a2a_faults,
         )
         .await
@@ -574,7 +574,7 @@ impl AppRuntime {
         let output_store = crate::storage::OutputSpoolStore::new_scoped(
             pool.clone(),
             output_policy.process_quota_bytes,
-            recovery_scope,
+            recovery_scope.clone(),
         )
         .map_err(|_| AppError::Assembly("durable output store failed"))?;
         let output_spool =
@@ -874,12 +874,12 @@ impl AppRuntime {
             .with_reliability(reliability.clone(), runtime_instance.clone());
         let durable_bus = Arc::new(bus);
         let gateway_handoff = crate::app::gateway_handoff::GatewayHandoff::new(
-            crate::gateway::GatewayStore::new(pool.clone()),
+            crate::gateway::GatewayStore::new_scoped(pool.clone(), recovery_scope.clone()),
             Arc::clone(&durable_bus),
             runtime_instance.clone(),
         );
         if config.transports.gateway.enabled
-            && !crate::gateway::GatewayStore::new(pool.clone())
+            && !crate::gateway::GatewayStore::new_scoped(pool.clone(), recovery_scope.clone())
                 .validate_retained_bytes()
                 .await
                 .map_err(|_| AppError::Assembly("gateway retained-byte validation failed"))?
@@ -999,7 +999,7 @@ impl AppRuntime {
                 ));
                 sync = sync.with_raw_consumer(Arc::new(GatewayRawConsumer::new(
                     Arc::clone(&gateway),
-                    GatewayStore::new(pool.clone()),
+                    GatewayStore::new_scoped(pool.clone(), recovery_scope.clone()),
                     repository.as_ref().clone(),
                     gateway_handoff.clone(),
                 )));
@@ -1018,7 +1018,7 @@ impl AppRuntime {
             runtime.gateway = gateway;
             if runtime.gateway.is_some() {
                 runtime.gateway_cleanup = Some(crate::gateway::GatewayCleanupHandle::start(
-                    GatewayStore::new(pool.clone()),
+                    GatewayStore::new_scoped(pool.clone(), recovery_scope.clone()),
                     runtime_instance.clone(),
                 ));
             }

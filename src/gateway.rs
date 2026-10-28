@@ -208,6 +208,7 @@ pub trait GatewayMatrixSender: Send + Sync {
 #[derive(Clone)]
 pub struct GatewayStore {
     pool: SqlitePool,
+    recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,7 +225,17 @@ pub enum TaskWinner {
 
 impl GatewayStore {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            recovery: None,
+        }
+    }
+
+    pub fn new_scoped(
+        pool: SqlitePool,
+        recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
+    ) -> Self {
+        Self { pool, recovery }
     }
 
     pub async fn insert_envelope(
@@ -233,6 +244,9 @@ impl GatewayStore {
         canonical_json: &[u8],
         retained_bytes: i64,
     ) -> Result<(), sqlx::Error> {
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         sqlx::query("INSERT INTO gateway_envelopes (envelope_id,version,direction,peer_id,sender_user_id,idempotency_key,sender_endpoint,recipient_endpoint,conversation_id,correlation_id,kind,canonical_json,payload_sha256,created_at,route_generation,state,retained_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(envelope.envelope_id.to_string()).bind(&envelope.version).bind(match envelope.direction { Direction::Inbound => "inbound", Direction::Outbound => "outbound" })
             .bind(&envelope.peer_id).bind(&envelope.sender.peer_id).bind(&envelope.idempotency_key)
@@ -240,7 +254,19 @@ impl GatewayStore {
             .bind(envelope.conversation_id.to_string()).bind(envelope.correlation_id.to_string())
             .bind(format!("{:?}", envelope.kind).to_lowercase()).bind(canonical_json).bind(&envelope.payload_sha256)
             .bind(&envelope.created_at).bind(0_i64).bind("received").bind(retained_bytes)
-            .execute(&self.pool).await.map(|_| ())
+            .execute(&mut *tx).await?;
+        if let Some(scope) = self.recovery.as_ref() {
+            crate::storage::recovery_eligibility::writer::inserted(
+                &mut tx,
+                Some(scope),
+                &crate::storage::recovery_eligibility::writer::text_identity(
+                    "gateway_envelopes",
+                    &envelope.envelope_id.to_string(),
+                )?,
+            )
+            .await?;
+        }
+        tx.commit().await.map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
