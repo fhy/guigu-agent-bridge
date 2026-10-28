@@ -102,6 +102,17 @@ pub fn init_tracing() {
 /// termination signal.
 pub async fn run() -> Result<(), Error> {
     let all_args = std::env::args_os().collect::<Vec<_>>();
+    if all_args.get(1).and_then(|value| value.to_str()) == Some("--version") {
+        if all_args.len() == 2 {
+            println!("guigu-agent-bridge 0.2.24");
+            return Ok(());
+        }
+        return Err(Error::Cli(error::CliFailure {
+            command: "--version",
+            category: "invalid-arguments",
+            status: 2,
+        }));
+    }
     if all_args.get(1).and_then(|v| v.to_str()) == Some("offline-migrate-production") {
         let req = offline_production_migration::parse_args(&all_args[1..]).map_err(|_| {
             Error::Cli(error::CliFailure {
