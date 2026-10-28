@@ -114,6 +114,8 @@ async fn new_work_uses_exact_terminal_route_anchor_but_terminal_root_remains_den
     let fixture = Fixture::create().await;
     let mut tx = fixture.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
     let message = fixture.message(&mut tx, "fresh-idempotency-key").await;
+    sqlx::query("UPDATE offline_recovery_rows SET parent_relations=parent_relations WHERE table_name='messages'")
+        .execute(&mut *tx).await.unwrap();
     fixture.check(&mut tx, &message).await.unwrap();
     assert!(
         fixture

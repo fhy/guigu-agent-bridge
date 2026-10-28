@@ -374,9 +374,9 @@ END;
 
 CREATE TRIGGER offline_recovery_parent_roles_immutable
 BEFORE UPDATE OF parent_relations ON offline_recovery_rows
-WHEN EXISTS (SELECT 1 FROM json_each(NEW.parent_relations)
-    WHERE json_extract(value, '$.role') = 'metadata_anchor')
-    OR EXISTS (SELECT 1 FROM json_each(OLD.parent_relations)
+WHEN (SELECT json_group_array(json(value)) FROM json_each(NEW.parent_relations)
+    WHERE json_extract(value, '$.role') = 'metadata_anchor') IS NOT
+    (SELECT json_group_array(json(value)) FROM json_each(OLD.parent_relations)
     WHERE json_extract(value, '$.role') = 'metadata_anchor')
 BEGIN
     SELECT RAISE(ABORT, 'offline-recovery-parent-role-immutable');
