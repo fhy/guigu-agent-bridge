@@ -1,12 +1,18 @@
 mod authority;
+mod bootstrap;
+#[cfg(test)]
+mod bootstrap_tests;
 #[cfg(test)]
 mod contract_tests;
 mod inventory;
 mod metadata;
 #[cfg(test)]
 mod metadata_tests;
+mod native_context;
+mod semantic;
 #[cfg(test)]
 mod tests;
+pub(crate) mod writer;
 
 use std::collections::BTreeMap;
 
@@ -14,7 +20,9 @@ use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqliteConnection};
 
 pub use authority::{EffectDomain, EligibilityContext, LiveFence};
+pub use bootstrap::bootstrap_nonadmin;
 pub use inventory::RowIdentity;
+pub use writer::RecoveryScope;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -128,6 +136,13 @@ async fn validate_node(
         serde_json::from_str(row.try_get::<&str, _>(2)?).map_err(|_| refused())?;
     for required in snapshot.parents {
         if !parents.iter().any(|parent| parent.identity == required) {
+            return Err(refused());
+        }
+    }
+    for parent in &parents {
+        let inherited: i64 = sqlx::query_scalar("SELECT count(*) FROM offline_recovery_rows WHERE table_name=? AND canonical_pk=? AND matrix_operation_id IS NOT NULL")
+            .bind(&parent.identity.table).bind(&parent.identity.key).fetch_one(&mut *connection).await?;
+        if inherited != 0 && matrix_operation.is_none() {
             return Err(refused());
         }
     }

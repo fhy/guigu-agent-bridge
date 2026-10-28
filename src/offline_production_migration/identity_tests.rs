@@ -1,5 +1,8 @@
 use chrono::{Duration, Utc};
 
+#[path = "identity_failure_tests.rs"]
+mod failures;
+
 use crate::offline_identity::{
     CollectorResult, IsolationEvidence, ServerObservation, StoreGeneration,
 };

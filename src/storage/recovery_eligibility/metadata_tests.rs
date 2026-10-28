@@ -1,5 +1,8 @@
 use sqlx::{SqliteConnection, SqlitePool};
 
+#[path = "metadata_writer_tests.rs"]
+mod writer_tests;
+
 use super::{
     EffectDomain, EligibilityContext, LiveFence, ParentIdentity, ParentRole, RowIdentity,
     contract_tests::{classify, key, seed_admin, verify_canonical_identity},

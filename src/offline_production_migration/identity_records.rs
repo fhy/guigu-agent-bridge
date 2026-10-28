@@ -33,6 +33,48 @@ pub(super) struct IdentityEvidence {
     pub expires_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct IdentityFailure {
+    pub protocol: u8,
+    pub intent_digest: String,
+    pub root_digest: String,
+    pub operation_id: String,
+    pub stage: String,
+    pub category: String,
+    pub failed_at: DateTime<Utc>,
+}
+
+impl IdentityFailure {
+    pub fn publish(
+        request: &super::Request,
+        intent: &IdentityIntent,
+        stage: &str,
+        failure: &super::Failure,
+    ) -> Result<(), super::Failure> {
+        let category = match failure {
+            super::Failure::InvalidArguments => "invalid-arguments",
+            super::Failure::Busy => "busy",
+            super::Failure::Preflight => "identity-preflight",
+            super::Failure::ManualRequired => "manual-required",
+            super::Failure::Migration => "verification",
+        };
+        let failed = Self {
+            protocol: 1,
+            intent_digest: records::encoded_digest(intent)?,
+            root_digest: intent.root_digest.clone(),
+            operation_id: intent.operation_id.clone(),
+            stage: stage.into(),
+            category: category.into(),
+            failed_at: Utc::now(),
+        };
+        records::publish(
+            &request.manifest_dir.join("identity-failure-v1.json"),
+            &failed,
+        )
+    }
+}
+
 impl IdentityIntent {
     pub fn validate(&self, root: &Root, schema: &str) -> Result<(), Failure> {
         if self.protocol != 1

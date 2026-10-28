@@ -4,7 +4,7 @@ use sqlx::{AssertSqlSafe, Row, SqliteConnection};
 
 use super::refused;
 
-const TABLES: &[&str] = &[
+pub(super) const TABLES: &[&str] = &[
     "agents",
     "conversations",
     "messages",
@@ -57,11 +57,11 @@ pub(super) struct Snapshot {
     pub parents: Vec<RowIdentity>,
 }
 
-fn quoted(name: &str) -> String {
+pub(super) fn quoted(name: &str) -> String {
     format!("\"{}\"", name.replace('"', "\"\""))
 }
 
-fn encoded(name: &str) -> String {
+pub(super) fn encoded(name: &str) -> String {
     let column = quoted(name);
     format!("typeof({column})||':'||hex(CAST({column} AS BLOB))")
 }
@@ -83,7 +83,12 @@ pub(super) async fn snapshot(
             matches!(name.as_str(), "transport" | "source_transport")
                 && value == "text:6D6174726978"
         });
-    let parents = parents(connection, identity, &names, &values).await?;
+    let mut parents = parents(connection, identity, &names, &values).await?;
+    for parent in super::semantic::parents(connection, identity, &names, &values).await? {
+        if !parents.contains(&parent) {
+            parents.push(parent);
+        }
+    }
     Ok(Snapshot {
         revision,
         digest,
@@ -92,7 +97,7 @@ pub(super) async fn snapshot(
     })
 }
 
-async fn values(
+pub(super) async fn values(
     connection: &mut SqliteConnection,
     identity: &RowIdentity,
 ) -> Result<(Vec<String>, Vec<String>), sqlx::Error> {
@@ -150,6 +155,52 @@ async fn values(
         .map(|column| column.get::<String, _>("name"))
         .collect::<Vec<_>>();
     Ok((names, values))
+}
+
+pub(super) async fn identities(
+    connection: &mut SqliteConnection,
+) -> Result<Vec<RowIdentity>, sqlx::Error> {
+    let mut identities = Vec::new();
+    for table in TABLES {
+        let columns = sqlx::query(AssertSqlSafe(format!(
+            "PRAGMA table_info({})",
+            quoted(table)
+        )))
+        .fetch_all(&mut *connection)
+        .await?;
+        let mut primary = columns
+            .iter()
+            .filter_map(|column| {
+                let ordinal: i64 = column.get("pk");
+                (ordinal > 0).then(|| (ordinal, column.get::<String, _>("name")))
+            })
+            .collect::<Vec<_>>();
+        primary.sort();
+        if primary.is_empty() {
+            return Err(refused());
+        }
+        let selection = primary
+            .iter()
+            .map(|(_, name)| encoded(name))
+            .collect::<Vec<_>>()
+            .join(",");
+        let rows = sqlx::query(AssertSqlSafe(format!(
+            "SELECT {selection} FROM {} ORDER BY {selection}",
+            quoted(table)
+        )))
+        .fetch_all(&mut *connection)
+        .await?;
+        for row in rows {
+            let keys = (0..primary.len())
+                .map(|index| row.get::<String, _>(index))
+                .collect::<Vec<_>>();
+            identities.push(RowIdentity {
+                table: (*table).into(),
+                key: serde_json::to_string(&keys).map_err(|_| refused())?,
+            });
+        }
+    }
+    Ok(identities)
 }
 
 async fn parents(

@@ -10,7 +10,7 @@ use crate::offline_identity::{self, CollectorRequest};
 use super::{
     Failure, Mode, Request, RuntimeLock,
     evidence::{self, Evidence, Provenance},
-    identity_records::{IdentityEvidence, IdentityIntent},
+    identity_records::{IdentityEvidence, IdentityFailure, IdentityIntent},
     launcher, records, verification,
     version2_records::{self as graph, Root},
 };
@@ -33,6 +33,10 @@ pub(super) async fn execute(req: Request, live_launcher: bool) -> Result<String,
     let backup = super::version2_archive::validate(&req, &root).await?;
     let migration = graph::load(&req.manifest_dir.join("migration-intent-v2.json"))?;
     super::version2::verify_complete(&req, &root, &backup, &migration).await?;
+    match std::fs::symlink_metadata(req.manifest_dir.join("identity-failure-v1.json")) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        _ => return Err(Failure::ManualRequired),
+    }
     let config = crate::config::load(&req.config).map_err(|_| Failure::Preflight)?;
     let matrix = config.transports.matrix;
     if !matrix.device_trusted || matrix.access_token.expose().is_empty() {
@@ -55,22 +59,49 @@ pub(super) async fn execute(req: Request, live_launcher: bool) -> Result<String,
     } else {
         capture_identity(&req, &root, &schema, capture, &mut connection).await?
     };
-    provenance.recheck(&req)?;
+    if let Err(failure) = finalize_capture(
+        &req,
+        &mut provenance,
+        &store,
+        live_launcher,
+        &mut connection,
+        &intent,
+        &captured,
+    )
+    .await
+    {
+        if req.mode == Mode::Apply {
+            IdentityFailure::publish(&req, &intent, "final-validation-and-binding", &failure)?;
+        }
+        return Err(failure);
+    }
+    connection.close().await.map_err(|_| Failure::Migration)?;
+    Ok("offline-capture-matrix-identity result=identity-ready".into())
+}
+
+async fn finalize_capture(
+    req: &Request,
+    provenance: &mut Evidence,
+    store: &std::path::Path,
+    live_launcher: bool,
+    connection: &mut sqlx::SqliteConnection,
+    intent: &IdentityIntent,
+    captured: &IdentityEvidence,
+) -> Result<(), Failure> {
+    provenance.recheck(req)?;
     launcher::check(
         &provenance.listeners,
         live_launcher,
         "identity-post-capture",
     )
     .await?;
-    if offline_identity::store_generation(&store).map_err(|_| Failure::Preflight)?
+    if offline_identity::store_generation(store).map_err(|_| Failure::Preflight)?
         != captured.store_after
     {
         return Err(Failure::ManualRequired);
     }
-    captured.validate(&intent, Utc::now())?;
-    commit(&mut connection, &intent, &captured).await?;
-    connection.close().await.map_err(|_| Failure::Migration)?;
-    Ok("offline-capture-matrix-identity result=identity-ready".into())
+    captured.validate(intent, Utc::now())?;
+    commit(connection, intent, captured).await
 }
 
 async fn schema_binding(
@@ -119,9 +150,27 @@ async fn capture_identity(
     if changed.rows_affected() != 1 {
         return Err(Failure::ManualRequired);
     }
+    let mut stage = "before-observation";
+    let outcome = perform_capture(req, &intent, capture, &mut stage).await;
+    match outcome {
+        Ok(evidence) => Ok((intent, evidence)),
+        Err(failure) => {
+            IdentityFailure::publish(req, &intent, stage, &failure)?;
+            Err(failure)
+        }
+    }
+}
+
+async fn perform_capture(
+    req: &Request,
+    intent: &IdentityIntent,
+    capture: CollectorRequest,
+    stage: &mut &'static str,
+) -> Result<IdentityEvidence, Failure> {
     let before = offline_identity::observe_server(&capture)
         .await
         .map_err(|_| Failure::Preflight)?;
+    *stage = "before-store-recheck";
     if offline_identity::store_generation(&capture.store).map_err(|_| Failure::Preflight)?
         != intent.store_before
     {
@@ -136,12 +185,15 @@ async fn capture_identity(
         store: store.clone(),
         passphrase: None,
     };
+    *stage = "isolated-collector";
     let local = offline_identity::collect(capture)
         .await
         .map_err(|_| Failure::Preflight)?;
+    *stage = "after-observation";
     let after = offline_identity::observe_server(&after_request)
         .await
         .map_err(|_| Failure::Preflight)?;
+    *stage = "evidence-validation";
     let captured_at = Utc::now();
     let evidence = IdentityEvidence {
         protocol: 1,
@@ -153,12 +205,13 @@ async fn capture_identity(
         captured_at,
         expires_at: captured_at + Duration::minutes(15),
     };
-    evidence.validate(&intent, Utc::now())?;
+    evidence.validate(intent, Utc::now())?;
+    *stage = "evidence-publication";
     records::publish(
         &req.manifest_dir.join("identity-evidence-v1.json"),
         &evidence,
     )?;
-    Ok((intent, evidence))
+    Ok(evidence)
 }
 
 async fn verify(

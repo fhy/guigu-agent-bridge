@@ -114,6 +114,7 @@ pub(super) async fn validate(
     if !valid {
         return Err(refused());
     }
+    super::native_context::validate(connection, context).await?;
     let held: i64 = sqlx::query_scalar("SELECT count(*) FROM offline_recovery_rows WHERE disposition IN ('uncertain_hold','refused_hold')")
         .fetch_one(&mut *connection).await?;
     if held != 0 {
@@ -129,15 +130,6 @@ pub(super) async fn validate(
             .bind(operation).bind(&fence.component).bind(&fence.owner).bind(fence.epoch).fetch_one(&mut *connection).await?;
         if count != 1 {
             return Err(refused());
-        }
-        if matches!(context, EligibilityContext::NonAdmin { .. }) {
-            let (expected, actual): (Option<String>, Option<String>) = sqlx::query_as("SELECT context.expected_b_digest,control.watermark FROM runtime_eligibility_context AS context JOIN matrix_recovery_control AS control ON control.cutover_operation_id=context.compatibility_operation_id WHERE context.matrix_phase='active' AND context.provenance_kind='validated_native'")
-                .fetch_optional(&mut *connection).await?.ok_or_else(refused)?;
-            use sha2::{Digest, Sha256};
-            let actual = actual.map(|token| format!("{:x}", Sha256::digest(token.as_bytes())));
-            if expected.is_none() || expected != actual {
-                return Err(refused());
-            }
         }
     }
     if let Some(fence) = fence {
