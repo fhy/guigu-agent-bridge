@@ -372,7 +372,8 @@ impl ReliabilityStore {
         fence: i64,
         now: &str,
     ) -> Result<(), ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let changed = sqlx::query("UPDATE agent_work_queue SET state='paused',revision=revision+1,updated_at=? WHERE queue_id=? AND revision=? AND state IN ('queued','claimed','running') AND send_started=0 AND runtime_owner=? AND owner_fence=?")
             .bind(now).bind(queue_id).bind(revision).bind(owner).bind(fence).execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {
@@ -404,7 +405,8 @@ impl ReliabilityStore {
         owner_fence: i64,
         now: &str,
     ) -> Result<&'static str, ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let row = sqlx::query("SELECT queue_id,revision,state,runtime_owner,owner_fence,send_started FROM agent_work_queue WHERE task_id=? AND state IN ('queued','claimed','running') ORDER BY sequence LIMIT 1")
             .bind(task_id).fetch_optional(&mut *tx).await?;
         let Some(row) = row else {
@@ -464,7 +466,8 @@ impl ReliabilityStore {
     }
 
     pub async fn resume_task(&self, task_id: &str, now: &str) -> Result<u64, ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let rows = sqlx::query("SELECT queue_id,revision,target_endpoint_id,runtime_owner,owner_fence FROM agent_work_queue WHERE task_id=? AND state='paused' ORDER BY sequence")
             .bind(task_id).fetch_all(&mut *tx).await?;
         let mut count = 0;
@@ -501,7 +504,8 @@ impl ReliabilityStore {
         fence: i64,
         now: &str,
     ) -> Result<(), ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let target: String = sqlx::query_scalar("SELECT target_endpoint_id FROM agent_work_queue WHERE queue_id=? AND revision=? AND state='paused' AND ((runtime_owner=? AND owner_fence=?) OR (runtime_owner IS NULL AND owner_fence IS NULL))")
             .bind(queue_id).bind(revision).bind(owner).bind(fence).fetch_one(&mut *tx).await?;
         let sequence: i64 = sqlx::query_scalar(
@@ -527,7 +531,8 @@ impl ReliabilityStore {
         revision: i64,
         now: &str,
     ) -> Result<(), ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let changed = sqlx::query("UPDATE agent_work_queue SET state=CASE WHEN send_started=0 THEN 'queued' ELSE 'recovery_needed' END,revision=revision+1,claimed_at=CASE WHEN send_started=0 THEN NULL ELSE claimed_at END,runtime_owner=CASE WHEN send_started=0 THEN NULL ELSE runtime_owner END,owner_fence=CASE WHEN send_started=0 THEN NULL ELSE owner_fence END,updated_at=? WHERE queue_id=? AND revision=? AND state IN ('claimed','running') AND NOT EXISTS (SELECT 1 FROM execution_leases l WHERE l.task_id=agent_work_queue.task_id AND l.owner_token=agent_work_queue.runtime_owner AND l.fence=agent_work_queue.owner_fence AND l.state='active' AND l.expires_at>?)")
             .bind(now).bind(queue_id).bind(revision).bind(now).execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {
@@ -725,7 +730,8 @@ impl ReliabilityStore {
         thread_root: Option<&str>,
         capacity: i64,
     ) -> Result<QueueReservation, ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let admission = self.admit_workflow_tx(&mut tx, input).await;
         let result = match admission {
             Ok(ReceiptOutcome::Replay { .. }) => {
@@ -773,7 +779,8 @@ impl ReliabilityStore {
         runtime_instance: &str,
         context: Option<&AdmissionContext>,
     ) -> Result<ReceiptOutcome, ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         if let Some(context) = context {
             let inserted = sqlx::query("INSERT INTO transport_receipts(transport,external_event_id,room_id,thread_ref,reply_event_id,conversation_id,selected_endpoint_id,task_id,receipt_kind,route_kind,state,result_code,created_at,updated_at) VALUES(?,?,?,?,?,?,?,NULL,'ordinary','message','reserved','reserved',?,?) ON CONFLICT(transport,external_event_id) DO NOTHING")
                 .bind(&context.transport).bind(&context.external_event_id).bind(&context.room_id)
@@ -865,7 +872,8 @@ impl ReliabilityStore {
         target_endpoint: &str,
         now: &str,
     ) -> Result<(), ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at) VALUES(?,?,?,?,?,NULL)")
             .bind(delivery_id).bind(task_id).bind(i64::from(attempt)).bind(target_endpoint).bind(now)
             .execute(&mut *tx).await?;
@@ -881,7 +889,8 @@ impl ReliabilityStore {
         session_id: &str,
         now: &str,
     ) -> Result<bool, ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let delivery = sqlx::query("UPDATE deliveries SET acknowledged_at=? WHERE delivery_id=? AND acknowledged_at IS NULL")
             .bind(now).bind(delivery_id).execute(&mut *tx).await?;
         let disposition = sqlx::query("UPDATE delivery_dispositions SET state='acknowledged',session_id=? WHERE delivery_id=? AND state='prepared'")
@@ -911,7 +920,8 @@ impl ReliabilityStore {
         {
             return Err(ReliabilityError::Malformed);
         }
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let delivery = sqlx::query("UPDATE deliveries SET acknowledged_at=? WHERE delivery_id=? AND acknowledged_at IS NULL")
             .bind(now).bind(delivery_id).execute(&mut *tx).await?;
         let disposition = sqlx::query("UPDATE delivery_dispositions SET state='acknowledged',session_id=? WHERE delivery_id=? AND state='prepared'")
@@ -1015,7 +1025,8 @@ impl ReliabilityStore {
         &self,
         input: RetryTaskInput<'_>,
     ) -> Result<ReceiptOutcome, ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let existing = sqlx::query("SELECT task_id,result_code FROM transport_receipts WHERE transport=? AND external_event_id=?")
             .bind(input.transport).bind(input.external_event_id).fetch_optional(&mut *tx).await?;
         if let Some(row) = existing {
@@ -1139,7 +1150,8 @@ impl ReliabilityStore {
     }
 
     pub async fn stopping_runtime(&self, token: &str, now: &str) -> Result<bool, ReliabilityError> {
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut transaction =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let result=sqlx::query("UPDATE runtime_instances SET state='stopping',heartbeat_at=? WHERE instance_token=? AND state='active'")
             .bind(now).bind(token).execute(&mut *transaction).await?;
         if result.rows_affected() != 1 {
