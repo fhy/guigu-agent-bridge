@@ -6,7 +6,7 @@ use super::{
 };
 
 mod mutation;
-pub(crate) use mutation::{complete_mutation, prepare_mutation};
+pub(crate) use mutation::{Mutation, complete_mutation, prepare_mutation};
 
 #[derive(Debug, Clone)]
 pub struct RecoveryScope {

@@ -1,8 +1,8 @@
 use sqlx::Row;
 
 use super::output_spool::{
-    ClaimedOutputSet, DeliveryPart, OutputSegment, OutputSpoolStore, OutputStoreError,
-    PendingDelivery, decode_segment,
+    ClaimedOutputSet, DeliveryPart, OutputSpoolStore, OutputStoreError, PendingDelivery,
+    decode_segment,
 };
 
 pub(crate) struct PreparedOutput {
@@ -16,11 +16,19 @@ impl OutputSpoolStore {
         index: i64,
         owner: &str,
     ) -> Result<(), OutputStoreError> {
+        let mut tx = self.transaction().await?;
+        self.prepare_row(&mut tx, "acp_output_sets", set_id, None)
+            .await?;
+        let segment_change = self
+            .prepare_row(&mut tx, "acp_output_segments", set_id, Some(index))
+            .await?;
         let changed=sqlx::query("UPDATE acp_output_segments SET reservation_owner=?,revision=revision+1 WHERE set_id=? AND segment_index=? AND state='reserved' AND EXISTS(SELECT 1 FROM acp_output_sets WHERE set_id=? AND state='assembling')")
-            .bind(owner).bind(set_id).bind(index).bind(set_id).execute(&self.pool).await?;
+            .bind(owner).bind(set_id).bind(index).bind(set_id).execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {
             return Err(OutputStoreError::Conflict);
         }
+        self.finish_row(&mut tx, segment_change).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -40,11 +48,6 @@ impl OutputSpoolStore {
         Ok(())
     }
 
-    pub(crate) async fn cleanup_sets(&self) -> Result<Vec<String>, OutputStoreError> {
-        Ok(sqlx::query_scalar("SELECT set_id FROM acp_output_sets WHERE state IN ('delivered','cleaning') ORDER BY created_at")
-            .fetch_all(&self.pool).await?)
-    }
-
     pub(crate) async fn activate_prepared(
         &self,
         set_id: &str,
@@ -61,8 +64,23 @@ impl OutputSpoolStore {
         now: &str,
         stale_before: &str,
     ) -> Result<Option<ClaimedOutputSet>, OutputStoreError> {
-        let row = sqlx::query("UPDATE acp_output_sets SET state='delivering',claim_owner=?,claim_revision=claim_revision+1,updated_at=? WHERE rowid=(SELECT rowid FROM acp_output_sets WHERE state='sealed' OR (state='delivering' AND updated_at<=?) ORDER BY created_at LIMIT 1) RETURNING set_id,room_id,thread_root,reply_event_id,acknowledged_cursor,segment_count,claim_revision,attempt_count")
-            .bind(owner).bind(now).bind(stale_before).fetch_optional(&self.pool).await?;
+        let mut tx = self.transaction().await?;
+        let query = if self.recovery.is_some() {
+            sqlx::query("UPDATE acp_output_sets SET state='delivering',claim_owner=?,claim_revision=claim_revision+1,updated_at=? WHERE rowid=(SELECT rowid FROM acp_output_sets WHERE state='sealed' ORDER BY created_at LIMIT 1) RETURNING set_id,room_id,thread_root,reply_event_id,acknowledged_cursor,segment_count,claim_revision,attempt_count").bind(owner).bind(now)
+        } else {
+            sqlx::query("UPDATE acp_output_sets SET state='delivering',claim_owner=?,claim_revision=claim_revision+1,updated_at=? WHERE rowid=(SELECT rowid FROM acp_output_sets WHERE state='sealed' OR (state='delivering' AND updated_at<=?) ORDER BY created_at LIMIT 1) RETURNING set_id,room_id,thread_root,reply_event_id,acknowledged_cursor,segment_count,claim_revision,attempt_count").bind(owner).bind(now).bind(stale_before)
+        };
+        let row = query.fetch_optional(&mut *tx).await?;
+        if let Some(row) = &row {
+            self.prepare_row(
+                &mut tx,
+                "acp_output_sets",
+                &row.try_get::<String, _>("set_id")?,
+                None,
+            )
+            .await?;
+        }
+        tx.commit().await?;
         row.map(|row| {
             Ok(ClaimedOutputSet {
                 set_id: row.try_get("set_id")?,
@@ -140,49 +158,27 @@ impl OutputSpoolStore {
         } else {
             None
         };
+        let state = if self.recovery.is_some() {
+            "partial"
+        } else {
+            state
+        };
+        let failure = if self.recovery.is_some() && failure.is_none() {
+            Some("unknown")
+        } else {
+            failure
+        };
+        let mut tx = self.transaction().await?;
+        let mutation = self
+            .prepare_row(&mut tx, "acp_output_sets", &set.set_id, None)
+            .await?;
         let result = sqlx::query("UPDATE acp_output_sets SET state=?,attempt_count=?,failure_class=?,claim_owner=NULL,updated_at=? WHERE set_id=? AND state='delivering' AND claim_owner=? AND claim_revision=?")
             .bind(state).bind(next).bind(failure).bind(now).bind(&set.set_id)
-            .bind(&set.claim_owner).bind(set.claim_revision).execute(&self.pool).await?;
+            .bind(&set.claim_owner).bind(set.claim_revision).execute(&mut *tx).await?;
+        if result.rows_affected() == 1 {
+            self.finish_row(&mut tx, mutation).await?;
+        }
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
-    }
-
-    pub(crate) async fn begin_cleanup(
-        &self,
-        set_id: &str,
-        now: &str,
-    ) -> Result<Vec<OutputSegment>, OutputStoreError> {
-        let mut tx = self.pool.begin().await?;
-        let changed=sqlx::query("UPDATE acp_output_sets SET state='cleaning',claim_revision=claim_revision+1,updated_at=? WHERE set_id=? AND state IN ('delivered','cleaning')")
-            .bind(now).bind(set_id).execute(&mut *tx).await?;
-        if changed.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Err(OutputStoreError::Conflict);
-        }
-        let rows=sqlx::query("SELECT set_id,segment_index,byte_start,byte_end,content_hash,relative_name,stable_txn_id,reservation_owner,state,revision FROM acp_output_segments WHERE set_id=? AND state='landed' ORDER BY segment_index")
-            .bind(set_id).fetch_all(&mut *tx).await?;
-        let result = rows
-            .into_iter()
-            .map(decode_segment)
-            .collect::<Result<Vec<_>, _>>()?;
-        tx.commit().await?;
-        Ok(result)
-    }
-
-    pub(crate) async fn finish_cleanup(
-        &self,
-        set_id: &str,
-        now: &str,
-    ) -> Result<(), OutputStoreError> {
-        let mut tx = self.pool.begin().await?;
-        let bytes: i64=sqlx::query_scalar("SELECT COALESCE(SUM(byte_length),0) FROM acp_output_segments WHERE set_id=? AND state='landed'").bind(set_id).fetch_one(&mut *tx).await?;
-        sqlx::query("UPDATE acp_output_segments SET state='cleaned',revision=revision+1,updated_at=? WHERE set_id=? AND state='landed'").bind(now).bind(set_id).execute(&mut *tx).await?;
-        let quota=sqlx::query("UPDATE acp_output_quota SET landed_bytes=landed_bytes-?,revision=revision+1 WHERE singleton=1 AND landed_bytes>=?").bind(bytes).bind(bytes).execute(&mut *tx).await?;
-        let set=sqlx::query("UPDATE acp_output_sets SET state='cleaned',claim_owner=NULL,updated_at=? WHERE set_id=? AND state='cleaning'").bind(now).bind(set_id).execute(&mut *tx).await?;
-        if quota.rows_affected() != 1 || set.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Err(OutputStoreError::Conflict);
-        }
-        tx.commit().await?;
-        Ok(())
     }
 }

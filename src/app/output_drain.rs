@@ -51,6 +51,10 @@ impl OutputSetDrain {
             };
             let bytes = self.spool.read_delivery(&segment).map_err(|_| ())?;
             let body = std::str::from_utf8(&bytes).map_err(|_| ())?;
+            self.store
+                .authorize_delivery(&set.set_id, segment.part.index)
+                .await
+                .map_err(|_| ())?;
             let txn = segment.part.stable_txn_id.as_str();
             let send = self.sender.send_durable(
                 &set.room_id,
