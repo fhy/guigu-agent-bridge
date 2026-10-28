@@ -348,7 +348,8 @@ impl ReliabilityStore {
         runtime_owner: &str,
         now: &str,
     ) -> Result<(), ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let lease: i64 = sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
             .bind(resource_key).bind(&claim.task_id).bind(runtime_owner).bind(claim.owner_fence).bind(now).fetch_one(&mut *tx).await?;
         if lease != 1 {
@@ -568,7 +569,8 @@ impl ReliabilityStore {
         &self,
         input: WorkflowAdmission<'_>,
     ) -> Result<ReceiptOutcome, ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let result = self.admit_workflow_tx(&mut tx, input).await;
         match result {
             Ok(value) => {
@@ -947,6 +949,8 @@ impl ReliabilityStore {
         route_kind: &str,
         now: &str,
     ) -> Result<ReceiptOutcome, ReliabilityError> {
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let result = sqlx::query(
             "INSERT INTO transport_receipts
              (transport,external_event_id,room_id,receipt_kind,route_kind,state,result_code,created_at,updated_at)
@@ -960,7 +964,7 @@ impl ReliabilityStore {
         .bind(route_kind)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 1 {
             return Ok(ReceiptOutcome::Inserted);
@@ -971,8 +975,9 @@ impl ReliabilityStore {
         )
         .bind(transport)
         .bind(external_event_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(ReceiptOutcome::Replay {
             task_id: row.try_get("task_id")?,
             result_code: row.try_get("result_code")?,
