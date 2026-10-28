@@ -336,7 +336,9 @@ impl GatewayStore {
         thread_root: Option<&str>,
         route_generation: u64,
     ) -> Result<TaskWinner, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         let fenced = sqlx::query("UPDATE runtime_instances SET heartbeat_at=heartbeat_at WHERE instance_token=? AND state='active'")
             .bind(runtime_instance).execute(&mut *tx).await?.rows_affected() == 1;
         if !fenced {
@@ -435,6 +437,17 @@ impl GatewayStore {
             sqlx::query("INSERT INTO gateway_deliveries(envelope_id,direction,transport,phase,attempt,txn_id,room_id,thread_root,owner_runtime,owner_revision) VALUES (?,'outbound','matrix','pending',0,?,?,?, ?,0)")
                 .bind(envelope.envelope_id.to_string()).bind(txn_id).bind(room_id).bind(thread_root).bind(owner)
                 .execute(&mut *tx).await?;
+            if let Some(scope) = self.recovery.as_ref() {
+                crate::storage::recovery_eligibility::writer::inserted(
+                    &mut tx,
+                    Some(scope),
+                    &crate::storage::recovery_eligibility::writer::text_identity(
+                        "gateway_envelopes",
+                        &envelope.envelope_id.to_string(),
+                    )?,
+                )
+                .await?;
+            }
         } else {
             let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gateway_envelopes e JOIN gateway_deliveries d ON d.envelope_id=e.envelope_id WHERE e.envelope_id=? AND e.canonical_json=? AND d.direction='outbound' AND d.transport='matrix' AND d.txn_id=? AND d.room_id=?")
                 .bind(envelope.envelope_id.to_string()).bind(&canonical).bind(txn_id).bind(room_id)
