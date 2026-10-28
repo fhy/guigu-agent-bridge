@@ -1,5 +1,15 @@
-#[tokio::main]
-async fn main() -> std::process::ExitCode {
+fn main() -> std::process::ExitCode {
+    let args = std::env::args_os().collect::<Vec<_>>();
+    if let Some(status) = guigu_agent_bridge::offline_identity::dispatch_before_runtime(&args) {
+        return std::process::ExitCode::from(status);
+    }
+    match tokio::runtime::Runtime::new() {
+        Ok(runtime) => runtime.block_on(run()),
+        Err(_) => std::process::ExitCode::from(1),
+    }
+}
+
+async fn run() -> std::process::ExitCode {
     match guigu_agent_bridge::run().await {
         Ok(()) => std::process::ExitCode::SUCCESS,
         Err(guigu_agent_bridge::Error::Cli(failure)) => {

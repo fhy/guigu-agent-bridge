@@ -1,0 +1,176 @@
+use std::{
+    io::{Read, Write},
+    process::{Command, Stdio},
+    time::Duration,
+};
+
+use matrix_sdk::{
+    Client, SessionMeta, SessionTokens, authentication::matrix::MatrixSession,
+    ruma::api::MatrixVersion,
+};
+use serde_json::{Value, json};
+use tokio::time::timeout;
+
+fn spawn(nonce: &str) -> std::process::Child {
+    Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        .args(["offline-identity-collector-v1", nonce])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap()
+}
+
+fn read_frame(input: &mut impl Read) -> Value {
+    let mut header = [0; 4];
+    input.read_exact(&mut header).unwrap();
+    let length = u32::from_be_bytes(header) as usize;
+    assert!(length <= 65536);
+    let mut bytes = vec![0; length];
+    input.read_exact(&mut bytes).unwrap();
+    serde_json::from_slice(&bytes).unwrap()
+}
+
+fn write_frame(output: &mut impl Write, value: Value) {
+    let bytes = serde_json::to_vec(&value).unwrap();
+    output
+        .write_all(&(bytes.len() as u32).to_be_bytes())
+        .unwrap();
+    output.write_all(&bytes).unwrap();
+    output.flush().unwrap();
+}
+
+#[test]
+fn real_collector_reaches_filtered_ready_without_credentials() {
+    let nonce = "a".repeat(64);
+    let mut child = spawn(&nonce);
+    let ready = read_frame(child.stdout.as_mut().unwrap());
+    assert_eq!(ready["nonce"], nonce);
+    assert_eq!(ready["process"], child.id());
+    assert_eq!(ready["no_new_privs"], 1);
+    assert_eq!(ready["seccomp"], 2);
+    assert_eq!(ready["policy"].as_str().unwrap().len(), 64);
+    let status = std::fs::read_to_string(format!("/proc/{}/status", child.id())).unwrap();
+    assert!(status.lines().any(|line| line == "NoNewPrivs:\t1"));
+    assert!(status.lines().any(|line| line == "Seccomp:\t2"));
+    drop(child.stdin.take());
+    assert_eq!(child.wait().unwrap().code(), Some(5));
+}
+
+#[test]
+fn collector_rejects_non_private_stdio_before_ready() {
+    let output = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        .args(["offline-identity-collector-v1", &"b".repeat(64)])
+        .env_clear()
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(5));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
+
+async fn initialize_store(
+    store: &std::path::Path,
+    server: &wiremock::MockServer,
+) -> (String, String) {
+    let client = Client::builder()
+        .homeserver_url(server.uri())
+        .server_versions([MatrixVersion::V1_11])
+        .sqlite_store(store, None)
+        .build()
+        .await
+        .unwrap();
+    client
+        .restore_session(MatrixSession {
+            meta: SessionMeta {
+                user_id: "@collector:example.test".parse().unwrap(),
+                device_id: "FIXTURE".into(),
+            },
+            tokens: SessionTokens {
+                access_token: "synthetic-secret".into(),
+                refresh_token: None,
+            },
+        })
+        .await
+        .unwrap();
+    timeout(
+        Duration::from_secs(10),
+        client.encryption().wait_for_e2ee_initialization_tasks(),
+    )
+    .await
+    .unwrap();
+    let expected_ed25519 = client.encryption().ed25519_key().await.unwrap();
+    let expected_curve25519 = client
+        .encryption()
+        .curve25519_key()
+        .await
+        .unwrap()
+        .to_base64();
+    drop(client);
+    server.reset().await;
+    (expected_ed25519, expected_curve25519)
+}
+
+fn capture_existing_store(store: std::path::PathBuf, uri: String) -> Value {
+    let nonce = "c".repeat(64);
+    let mut child = spawn(&nonce);
+    let ready = read_frame(child.stdout.as_mut().unwrap());
+    assert_eq!(ready["nonce"], nonce);
+    assert_eq!(ready["denied_probes"], json!([1, 1, 1, 1, 1, 1]));
+    write_frame(
+        child.stdin.as_mut().unwrap(),
+        json!({
+            "nonce": nonce, "homeserver": uri, "user_id": "@collector:example.test",
+            "device_id": "FIXTURE", "access_token": "synthetic-secret", "store": store,
+            "passphrase": null
+        }),
+    );
+    drop(child.stdin.take());
+    let mut header = [0; 4];
+    if let Err(error) = child.stdout.as_mut().unwrap().read_exact(&mut header) {
+        let output = child.wait_with_output().unwrap();
+        panic!(
+            "collector result: {error}; status={}; stderr={}",
+            output.status,
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    let length = u32::from_be_bytes(header) as usize;
+    assert!(length <= 65536);
+    let mut bytes = vec![0; length];
+    child
+        .stdout
+        .as_mut()
+        .unwrap()
+        .read_exact(&mut bytes)
+        .unwrap();
+    let captured: Value = serde_json::from_slice(&bytes).unwrap();
+    let output = child.wait_with_output().unwrap();
+    assert_eq!(output.status.code(), Some(0), "{:?}", output.stderr);
+    assert!(output.stderr.is_empty());
+    assert_eq!(captured["no_new_privs"], 1);
+    assert_eq!(captured["seccomp"], 2);
+    captured
+}
+
+#[tokio::test]
+async fn real_sdk_reads_existing_keys_with_egress_denied() {
+    let root = tempfile::Builder::new()
+        .prefix("r092-collector-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let store = root.path().join("sdk");
+    let server = wiremock::MockServer::start().await;
+    let (expected_ed25519, expected_curve25519) = initialize_store(&store, &server).await;
+    let uri = server.uri();
+    let result = tokio::task::spawn_blocking(move || capture_existing_store(store, uri));
+    let captured = timeout(Duration::from_secs(60), result)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(captured["ed25519"], expected_ed25519);
+    assert_eq!(captured["curve25519"], expected_curve25519);
+    assert!(server.received_requests().await.unwrap().is_empty());
+}

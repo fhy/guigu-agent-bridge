@@ -85,7 +85,11 @@ fn hash_handle(file: &mut File) -> Result<String, Failure> {
 }
 
 pub(super) fn migration_digest() -> String {
-    digest(&serde_json::to_vec(&crate::storage::migration_contract()).expect("migration contract"))
+    let contract = crate::storage::migration_contract()
+        .into_iter()
+        .filter(|entry| entry.0 <= 24)
+        .collect::<Vec<_>>();
+    digest(&serde_json::to_vec(&contract).expect("migration contract"))
 }
 
 pub(super) struct Evidence {

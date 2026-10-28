@@ -21,6 +21,7 @@ pub mod matrix;
 pub mod models;
 pub mod observer;
 pub mod offline_delivery;
+pub mod offline_identity;
 pub mod offline_preacceptance;
 pub(crate) mod offline_production_migration;
 pub mod offline_recovery;
