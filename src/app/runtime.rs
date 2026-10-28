@@ -372,20 +372,65 @@ impl AppRuntime {
                 .fetch_optional(&pool)
                 .await
                 .map_err(|_| AppError::Runtime)?;
+        let base_reliability = crate::storage::ReliabilityStore::with_owner_evidence_window(
+            pool.clone(),
+            config.bridge.owner_evidence_max_age_seconds as i64,
+        )
+        .map_err(|_| AppError::Runtime)?;
         let recovery_scope =
             match recovery_startup::classify_startup(admin_bindings, sentinel.as_deref()) {
                 recovery_startup::StartupEligibility::NonAdmin => {
-                    let context = crate::storage::recovery_eligibility::bootstrap_nonadmin(
-                        &pool,
-                        config.transports.matrix.enabled,
+                    let hold: Option<String> = sqlx::query_scalar(
+                        "SELECT restart_hold_state FROM matrix_recovery_control WHERE control_id=1",
                     )
+                    .fetch_optional(&pool)
                     .await
                     .map_err(|_| AppError::Runtime)?;
-                    Some(crate::storage::recovery_eligibility::RecoveryScope::new(
-                        context,
-                        crate::storage::recovery_eligibility::EffectDomain::Local,
-                        None,
-                    ))
+                    if hold.is_some() {
+                        return Self::compatibility_held(
+                            path,
+                            config,
+                            pool,
+                            base_reliability,
+                            maintenance_lock,
+                            "compatibility-held",
+                        )
+                        .await;
+                    }
+                    let control_rows: i64 =
+                        sqlx::query_scalar("SELECT count(*) FROM matrix_recovery_control")
+                            .fetch_one(&pool)
+                            .await
+                            .map_err(|_| AppError::Runtime)?;
+                    if !config.transports.matrix.enabled && control_rows == 0 {
+                        None
+                    } else {
+                        let context =
+                            match crate::storage::recovery_eligibility::bootstrap_nonadmin(
+                                &pool,
+                                config.transports.matrix.enabled,
+                            )
+                            .await
+                            {
+                                Ok(context) => context,
+                                Err(_) => {
+                                    return Self::compatibility_held(
+                                        path,
+                                        config,
+                                        pool,
+                                        base_reliability,
+                                        maintenance_lock,
+                                        "compatibility-held",
+                                    )
+                                    .await;
+                                }
+                            };
+                        Some(crate::storage::recovery_eligibility::RecoveryScope::new(
+                            context,
+                            crate::storage::recovery_eligibility::EffectDomain::Local,
+                            None,
+                        ))
+                    }
                 }
                 recovery_startup::StartupEligibility::Admin
                 | recovery_startup::StartupEligibility::Legacy => None,
@@ -396,11 +441,7 @@ impl AppRuntime {
         let reliability = if let Some(scope) = recovery_scope.clone() {
             crate::storage::ReliabilityStore::with_recovery(pool.clone(), scope)
         } else {
-            crate::storage::ReliabilityStore::with_owner_evidence_window(
-                pool.clone(),
-                config.bridge.owner_evidence_max_age_seconds as i64,
-            )
-            .map_err(|_| AppError::Runtime)?
+            base_reliability
         };
         let admission_guard =
             crate::runtime_admission::Guard::acquire(&config.bridge.database, &path, "startup")
