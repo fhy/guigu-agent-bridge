@@ -841,6 +841,17 @@ impl ReliabilityStore {
                 return Err(ReliabilityError::Malformed);
             }
         }
+        if let Some(scope) = self.recovery.as_ref() {
+            for (table, key) in [
+                ("tasks", task.task_id.to_string()),
+                ("task_events", event.id.to_string()),
+                ("task_admissions", task.task_id.to_string()),
+            ] {
+                let identity = super::recovery_eligibility::writer::text_identity(table, &key)?;
+                super::recovery_eligibility::writer::inserted(&mut tx, Some(scope), &identity)
+                    .await?;
+            }
+        }
         tx.commit().await?;
         Ok(ReceiptOutcome::Inserted)
     }
