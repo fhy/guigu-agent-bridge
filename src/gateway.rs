@@ -281,7 +281,9 @@ impl GatewayStore {
         thread_root: Option<&str>,
         route_generation: u64,
     ) -> Result<InboundAdmission, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         let inserted = sqlx::query("INSERT OR IGNORE INTO gateway_envelopes (envelope_id,version,direction,peer_id,sender_user_id,idempotency_key,sender_endpoint,recipient_endpoint,conversation_id,correlation_id,kind,canonical_json,payload_sha256,created_at,route_generation,state,retained_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(envelope.envelope_id.to_string()).bind(&envelope.version).bind("inbound")
             .bind(&envelope.peer_id).bind(sender_user).bind(&envelope.idempotency_key)
@@ -295,6 +297,17 @@ impl GatewayStore {
         if inserted {
             sqlx::query("INSERT INTO gateway_deliveries (envelope_id,direction,transport,phase,attempt,event_id,room_id,thread_root) VALUES (?,'inbound','matrix','transport_acked',0,?,?,?)")
                 .bind(&winner).bind(event_id).bind(room_id).bind(thread_root).execute(&mut *tx).await?;
+            if let Some(scope) = self.recovery.as_ref() {
+                crate::storage::recovery_eligibility::writer::inserted(
+                    &mut tx,
+                    Some(scope),
+                    &crate::storage::recovery_eligibility::writer::text_identity(
+                        "gateway_envelopes",
+                        &winner,
+                    )?,
+                )
+                .await?;
+            }
         }
         tx.commit().await?;
         Ok(if inserted {
