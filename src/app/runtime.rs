@@ -372,26 +372,36 @@ impl AppRuntime {
                 .fetch_optional(&pool)
                 .await
                 .map_err(|_| AppError::Runtime)?;
-        match recovery_startup::classify_startup(admin_bindings, sentinel.as_deref()) {
-            recovery_startup::StartupEligibility::NonAdmin => {
-                crate::storage::recovery_eligibility::bootstrap_nonadmin(
-                    &pool,
-                    config.transports.matrix.enabled,
-                )
-                .await
-                .map_err(|_| AppError::Runtime)?;
-            }
-            recovery_startup::StartupEligibility::Admin
-            | recovery_startup::StartupEligibility::Legacy => {}
-            recovery_startup::StartupEligibility::Refused => {
-                return Err(AppError::Runtime);
-            }
-        }
-        let reliability = crate::storage::ReliabilityStore::with_owner_evidence_window(
-            pool.clone(),
-            config.bridge.owner_evidence_max_age_seconds as i64,
-        )
-        .map_err(|_| AppError::Runtime)?;
+        let recovery_scope =
+            match recovery_startup::classify_startup(admin_bindings, sentinel.as_deref()) {
+                recovery_startup::StartupEligibility::NonAdmin => {
+                    let context = crate::storage::recovery_eligibility::bootstrap_nonadmin(
+                        &pool,
+                        config.transports.matrix.enabled,
+                    )
+                    .await
+                    .map_err(|_| AppError::Runtime)?;
+                    Some(crate::storage::recovery_eligibility::RecoveryScope::new(
+                        context,
+                        crate::storage::recovery_eligibility::EffectDomain::Local,
+                        None,
+                    ))
+                }
+                recovery_startup::StartupEligibility::Admin
+                | recovery_startup::StartupEligibility::Legacy => None,
+                recovery_startup::StartupEligibility::Refused => {
+                    return Err(AppError::Runtime);
+                }
+            };
+        let reliability = if let Some(scope) = recovery_scope.clone() {
+            crate::storage::ReliabilityStore::with_recovery(pool.clone(), scope)
+        } else {
+            crate::storage::ReliabilityStore::with_owner_evidence_window(
+                pool.clone(),
+                config.bridge.owner_evidence_max_age_seconds as i64,
+            )
+            .map_err(|_| AppError::Runtime)?
+        };
         let admission_guard =
             crate::runtime_admission::Guard::acquire(&config.bridge.database, &path, "startup")
                 .map_err(|_| AppError::Runtime)?;
@@ -505,6 +515,7 @@ impl AppRuntime {
             runtime_instance.clone(),
             owns_runtime,
             maintenance_lock.clone(),
+            recovery_scope,
             a2a_faults,
         )
         .await
@@ -536,6 +547,7 @@ impl AppRuntime {
         runtime_instance: String,
         owns_runtime: bool,
         maintenance_lock: Arc<crate::offline_production_migration::RuntimeLock>,
+        recovery_scope: Option<crate::storage::recovery_eligibility::RecoveryScope>,
         a2a_faults: Arc<dyn crate::a2a::IngressFaultInjector>,
     ) -> Result<Self, AppError> {
         let repository = Arc::new(SqliteRepository::new(pool.clone()));
@@ -559,9 +571,12 @@ impl AppRuntime {
             config.runtime.max_output_bytes,
         )
         .map_err(|_| AppError::Assembly("durable output policy failed"))?;
-        let output_store =
-            crate::storage::OutputSpoolStore::new(pool.clone(), output_policy.process_quota_bytes)
-                .map_err(|_| AppError::Assembly("durable output store failed"))?;
+        let output_store = crate::storage::OutputSpoolStore::new_scoped(
+            pool.clone(),
+            output_policy.process_quota_bytes,
+            recovery_scope,
+        )
+        .map_err(|_| AppError::Assembly("durable output store failed"))?;
         let output_spool =
             crate::acp::output::DurableOutputSpool::new(output_policy, output_store.clone());
         output_spool
@@ -1639,6 +1654,7 @@ enabled = true
             instance,
             true,
             Arc::new(crate::offline_production_migration::acquire_runtime_lock(&database).unwrap()),
+            None,
             Arc::new(crate::a2a::NoFault),
         );
         tokio::pin!(build);
@@ -1934,6 +1950,7 @@ enabled = true
             runtime_instance,
             true,
             Arc::new(crate::offline_production_migration::acquire_runtime_lock(&database).unwrap()),
+            None,
             Arc::new(crate::a2a::NoFault),
         )
         .await;

@@ -82,6 +82,7 @@ pub(crate) struct OutputSpoolStore {
 }
 
 impl OutputSpoolStore {
+    #[cfg(test)]
     pub(crate) fn new(pool: SqlitePool, quota_limit: u64) -> Result<Self, OutputStoreError> {
         Self::new_scoped(pool, quota_limit, None)
     }
