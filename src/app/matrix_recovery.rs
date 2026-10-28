@@ -13,8 +13,9 @@ pub(super) async fn prepare_sync(
     config: &Config,
     pool: &SqlitePool,
     runtime: &str,
+    recovery_scope: Option<crate::storage::recovery_eligibility::RecoveryScope>,
 ) -> Result<(MatrixClient, MatrixSync), AppError> {
-    let recovery = MatrixRecoveryStore::new(pool.clone());
+    let recovery = MatrixRecoveryStore::new_scoped(pool.clone(), recovery_scope);
     recovery
         .reconcile_restart()
         .await

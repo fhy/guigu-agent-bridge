@@ -35,11 +35,22 @@ pub struct RecoveryControl {
 #[derive(Clone)]
 pub struct MatrixRecoveryStore {
     pool: SqlitePool,
+    recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
 }
 
 impl MatrixRecoveryStore {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            recovery: None,
+        }
+    }
+
+    pub fn new_scoped(
+        pool: SqlitePool,
+        recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
+    ) -> Self {
+        Self { pool, recovery }
     }
 
     pub async fn initialize_cutover(
@@ -86,7 +97,9 @@ impl MatrixRecoveryStore {
     }
 
     pub async fn reconcile_restart(&self) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         let existing: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT restart_hold_state,restart_hold_event_id,restart_hold_reason FROM matrix_recovery_control WHERE control_id=1",
         )
@@ -201,7 +214,9 @@ impl MatrixRecoveryStore {
         now: &str,
         expires_at: &str,
     ) -> Result<i64, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         let existing = sqlx::query(
             "SELECT owner_token,epoch,state,expires_at FROM matrix_component_leases WHERE component=?",
         )
@@ -281,7 +296,9 @@ impl MatrixRecoveryStore {
         owner_epoch: i64,
         now: &str,
     ) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         let row = sqlx::query("SELECT b.previous_watermark,b.response_token,b.response_digest,b.expected_events_json,b.covered_events_json,b.state AS batch_state FROM matrix_recovery_batches b JOIN matrix_component_leases l ON l.component=b.component AND l.owner_token=b.owner_token AND l.epoch=b.owner_epoch WHERE b.batch_id=? AND b.component='MatrixSync' AND b.owner_token=? AND b.owner_epoch=? AND l.state='active' AND l.expires_at>=?")
             .bind(batch_id).bind(owner_token).bind(owner_epoch).bind(now).fetch_one(&mut *tx).await?;
         let expected: Vec<String> =

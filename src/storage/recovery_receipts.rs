@@ -50,7 +50,9 @@ impl MatrixRecoveryStore {
         batch_id: &str,
         now: &str,
     ) -> Result<BatchAdmission, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         let existing = sqlx::query("SELECT payload_digest,state FROM matrix_recovery_receipts WHERE account_id=? AND room_id=? AND event_id=? AND cutover_operation_id=?")
             .bind(account_id).bind(room_id).bind(event_id).bind(operation_id).fetch_optional(&mut *tx).await?;
         if let Some(row) = existing {

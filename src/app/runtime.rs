@@ -970,9 +970,14 @@ impl AppRuntime {
         }
 
         let matrix = if let Some(client) = matrix_client {
-            let (active, sync) =
-                super::matrix_recovery::prepare_sync(client, &config, &pool, &runtime_instance)
-                    .await?;
+            let (active, sync) = super::matrix_recovery::prepare_sync(
+                client,
+                &config,
+                &pool,
+                &runtime_instance,
+                recovery_scope.clone(),
+            )
+            .await?;
             let sdk = Arc::new(SdkMatrixSender::new(active));
             let mut sync = sync
                 .with_failure_observer(matrix_failure_observer(
