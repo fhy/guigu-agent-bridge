@@ -276,7 +276,7 @@ async fn complete_binding(req: &Request, complete: &Complete) -> Result<(), Fail
     connection.close().await.map_err(|_| Failure::Migration)
 }
 
-async fn verify_complete(
+pub(super) async fn verify_complete(
     req: &Request,
     root: &Root,
     backup: &Archive,

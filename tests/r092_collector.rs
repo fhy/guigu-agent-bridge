@@ -264,3 +264,54 @@ async fn real_sdk_reads_existing_keys_with_egress_denied() {
     assert_eq!(captured["curve25519"], expected_curve25519);
     assert!(server.received_requests().await.unwrap().is_empty());
 }
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+async fn real_parent_validates_handshake_and_reaps_successful_collector() {
+    use guigu_agent_bridge::offline_identity::{CollectorRequest, collect_from_executable};
+    use sha2::Digest;
+    let root = tempfile::Builder::new()
+        .prefix("r092-parent-success-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let original = env!("CARGO_BIN_EXE_guigu-agent-bridge");
+    let started = std::time::Instant::now();
+    let mut fingerprint = sha2::Sha256::new();
+    std::io::copy(
+        &mut std::fs::File::open(original).unwrap(),
+        &mut fingerprint,
+    )
+    .unwrap();
+    eprintln!("debug executable hash elapsed={:?}", started.elapsed());
+    let executable = root.path().join("collector");
+    let stripped = Command::new("strip")
+        .arg("--strip-debug")
+        .arg("-o")
+        .arg(&executable)
+        .arg(original)
+        .output()
+        .unwrap();
+    assert!(stripped.status.success(), "{stripped:?}");
+    let store = root.path().join("sdk");
+    let server = wiremock::MockServer::start().await;
+    let (ed25519, curve25519) = initialize_store(&store, &server).await;
+    let result = collect_from_executable(
+        CollectorRequest {
+            homeserver: server.uri(),
+            user_id: "@collector:example.test".into(),
+            device_id: "FIXTURE".into(),
+            access_token: "synthetic-secret".into(),
+            store,
+            passphrase: None,
+        },
+        executable,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.ed25519, ed25519);
+    assert_eq!(result.curve25519, curve25519);
+    assert_eq!(result.isolation.no_new_privs, 1);
+    assert_eq!(result.isolation.seccomp, 2);
+    assert!(!std::path::Path::new(&format!("/proc/{}", result.isolation.process)).exists());
+    assert!(server.received_requests().await.unwrap().is_empty());
+}

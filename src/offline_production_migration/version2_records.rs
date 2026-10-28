@@ -122,7 +122,11 @@ fn new_root(req: &Request, evidence: &Evidence, version: i64, prior: Option<Pred
     }
 }
 
-fn validate_root(req: &Request, evidence: &Evidence, root: &Root) -> Result<(), Failure> {
+pub(super) fn validate_root(
+    req: &Request,
+    evidence: &Evidence,
+    root: &Root,
+) -> Result<(), Failure> {
     if root.protocol != 2
         || root.operation != records::operation(req, evidence)
         || !matches!(root.initial_ledger, 18 | 20)

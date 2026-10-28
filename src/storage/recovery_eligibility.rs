@@ -1,4 +1,6 @@
 mod authority;
+#[cfg(test)]
+mod contract_tests;
 mod inventory;
 #[cfg(test)]
 mod tests;

@@ -114,6 +114,9 @@ pub async fn run() -> Result<(), Error> {
             status: 2,
         }));
     }
+    if all_args.get(1).and_then(|value| value.to_str()) == Some("offline-capture-matrix-identity") {
+        return offline_production_migration::dispatch_identity(&all_args[1..]).await;
+    }
     if all_args.get(1).and_then(|v| v.to_str()) == Some("offline-migrate-production") {
         let req = offline_production_migration::parse_args(&all_args[1..]).map_err(|_| {
             Error::Cli(error::CliFailure {

@@ -52,11 +52,26 @@ pub struct CollectorResult {
 pub struct CollectorRefused;
 
 pub async fn collect(request: CollectorRequest) -> Result<CollectorResult, CollectorRefused> {
+    collect_pinned(request, executable::pin).await
+}
+
+#[cfg(feature = "test-support")]
+pub async fn collect_from_executable(
+    request: CollectorRequest,
+    path: PathBuf,
+) -> Result<CollectorResult, CollectorRefused> {
+    collect_pinned(request, move || executable::pin_path(&path)).await
+}
+
+async fn collect_pinned(
+    request: CollectorRequest,
+    pin: impl FnOnce() -> Result<PinnedExecutable, CollectorRefused> + Send + 'static,
+) -> Result<CollectorResult, CollectorRefused> {
     let started = Instant::now();
     let (cancel, cancelled) = oneshot::channel::<()>();
     let (result, received) = oneshot::channel();
     tokio::spawn(async move {
-        let outcome = supervise(request, cancelled, started).await;
+        let outcome = supervise(request, cancelled, started, pin).await;
         let _ = result.send(outcome);
     });
     let outcome = received.await.map_err(|_| CollectorRefused)?;
@@ -68,9 +83,10 @@ async fn supervise(
     request: CollectorRequest,
     mut cancelled: oneshot::Receiver<()>,
     started: Instant,
+    pin: impl FnOnce() -> Result<PinnedExecutable, CollectorRefused> + Send + 'static,
 ) -> Result<CollectorResult, CollectorRefused> {
     let setup = started + Duration::from_secs(5);
-    let executable = tokio::time::timeout_at(setup, tokio::task::spawn_blocking(executable::pin))
+    let executable = tokio::time::timeout_at(setup, tokio::task::spawn_blocking(pin))
         .await
         .map_err(|_| CollectorRefused)?
         .map_err(|_| CollectorRefused)??;

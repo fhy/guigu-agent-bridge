@@ -16,6 +16,10 @@ pub(super) struct PinnedExecutable {
 
 pub(super) fn pin() -> Result<PinnedExecutable, CollectorRefused> {
     let path = std::env::current_exe().map_err(|_| CollectorRefused)?;
+    pin_path(&path)
+}
+
+pub(super) fn pin_path(path: &std::path::Path) -> Result<PinnedExecutable, CollectorRefused> {
     let mut file = OpenOptions::new()
         .read(true)
         .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)

@@ -22,6 +22,25 @@ pub struct Request {
     pub executable: PathBuf,
 }
 
+pub fn parse_identity_args(args: &[OsString]) -> Result<Request, Failure> {
+    if args.len() != 15 || args[0] != "offline-capture-matrix-identity" {
+        return Err(Failure::InvalidArguments);
+    }
+    let mut translated = args.to_vec();
+    translated[0] = "offline-migrate-production".into();
+    for pair in translated[1..].chunks_exact_mut(2) {
+        if pair[0] == "--mode" {
+            if pair[1] == "capture" {
+                pair[1] = "apply".into();
+            } else if pair[1] != "verify" {
+                return Err(Failure::InvalidArguments);
+            }
+        }
+    }
+    translated.extend(["--target-schema".into(), "25".into()]);
+    parse_args(&translated)
+}
+
 pub fn parse_args(args: &[OsString]) -> Result<Request, Failure> {
     let args = args
         .iter()
