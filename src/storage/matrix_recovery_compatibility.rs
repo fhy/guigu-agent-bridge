@@ -30,6 +30,15 @@ impl MatrixCompatibilityStore {
         enabled: bool,
         root: Option<&Path>,
     ) -> Result<CompatibilityGate, sqlx::Error> {
+        self.gate_scoped(enabled, root, None).await
+    }
+
+    pub async fn gate_scoped(
+        &self,
+        enabled: bool,
+        root: Option<&Path>,
+        recovery: Option<&crate::storage::recovery_eligibility::RecoveryScope>,
+    ) -> Result<CompatibilityGate, sqlx::Error> {
         let recorded: i64 =
             sqlx::query_scalar("SELECT count(*) FROM matrix_recovery_compatibility")
                 .fetch_one(&self.pool)
@@ -56,7 +65,7 @@ impl MatrixCompatibilityStore {
         };
         transaction.commit().await?;
         if let CompatibilityGate::Native(operation) = selected {
-            if MatrixRecoveryStore::new(self.pool.clone())
+            if MatrixRecoveryStore::new_scoped(self.pool.clone(), recovery.cloned())
                 .reconcile_restart()
                 .await
                 .is_err()

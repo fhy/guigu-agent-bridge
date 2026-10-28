@@ -447,9 +447,10 @@ impl AppRuntime {
             crate::runtime_admission::Guard::acquire(&config.bridge.database, &path, "startup")
                 .map_err(|_| AppError::Runtime)?;
         let gate = crate::storage::MatrixCompatibilityStore::new(pool.clone())
-            .gate(
+            .gate_scoped(
                 config.transports.matrix.enabled,
                 config.transports.matrix.crypto_store_path.as_deref(),
+                recovery_scope.as_ref(),
             )
             .await
             .map_err(|_| AppError::Runtime)?;
