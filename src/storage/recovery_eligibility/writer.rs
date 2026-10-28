@@ -83,6 +83,28 @@ pub(crate) fn text_identity(table: &str, key: &str) -> Result<RowIdentity, sqlx:
     })
 }
 
+pub(crate) fn composite_text_identity(
+    table: &str,
+    keys: &[&str],
+) -> Result<RowIdentity, sqlx::Error> {
+    let encoded = keys
+        .iter()
+        .map(|key| {
+            format!(
+                "text:{}",
+                key.as_bytes()
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<String>()
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok(RowIdentity {
+        table: table.into(),
+        key: serde_json::to_string(&encoded).map_err(|_| refused())?,
+    })
+}
+
 pub(crate) async fn inserted(
     connection: &mut SqliteConnection,
     scope: Option<&RecoveryScope>,

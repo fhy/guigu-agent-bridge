@@ -840,6 +840,14 @@ impl ReliabilityStore {
             if receipt.rows_affected() != 1 {
                 return Err(ReliabilityError::Malformed);
             }
+            if let Some(scope) = self.recovery.as_ref() {
+                let identity = super::recovery_eligibility::writer::composite_text_identity(
+                    "transport_receipts",
+                    &[&context.transport, &context.external_event_id],
+                )?;
+                super::recovery_eligibility::writer::inserted(&mut tx, Some(scope), &identity)
+                    .await?;
+            }
         }
         if let Some(scope) = self.recovery.as_ref() {
             for (table, key) in [
@@ -988,6 +996,15 @@ impl ReliabilityStore {
         .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 1 {
+            if let Some(scope) = self.recovery.as_ref() {
+                let identity = super::recovery_eligibility::writer::composite_text_identity(
+                    "transport_receipts",
+                    &[transport, external_event_id],
+                )?;
+                super::recovery_eligibility::writer::inserted(&mut tx, Some(scope), &identity)
+                    .await?;
+            }
+            tx.commit().await?;
             return Ok(ReceiptOutcome::Inserted);
         }
         let row = sqlx::query(
