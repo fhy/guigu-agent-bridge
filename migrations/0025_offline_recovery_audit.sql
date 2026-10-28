@@ -381,3 +381,19 @@ WHEN (SELECT json_group_array(json(value)) FROM json_each(NEW.parent_relations)
 BEGIN
     SELECT RAISE(ABORT, 'offline-recovery-parent-role-immutable');
 END;
+
+CREATE TRIGGER offline_recovery_historical_task_update BEFORE UPDATE ON tasks
+WHEN EXISTS (SELECT 1 FROM offline_recovery_rows WHERE table_name='tasks' AND canonical_pk=json_array(typeof(OLD.task_id)||':'||hex(CAST(OLD.task_id AS BLOB))) AND disposition IN ('terminal_evidenced','quarantined_no_effect','uncertain_hold','refused_hold'))
+BEGIN SELECT RAISE(ABORT, 'offline-recovery-historical-task'); END;
+
+CREATE TRIGGER offline_recovery_historical_task_delete BEFORE DELETE ON tasks
+WHEN EXISTS (SELECT 1 FROM offline_recovery_rows WHERE table_name='tasks' AND canonical_pk=json_array(typeof(OLD.task_id)||':'||hex(CAST(OLD.task_id AS BLOB))) AND disposition IN ('terminal_evidenced','quarantined_no_effect','uncertain_hold','refused_hold'))
+BEGIN SELECT RAISE(ABORT, 'offline-recovery-historical-task'); END;
+
+CREATE TRIGGER offline_recovery_historical_task_insert BEFORE INSERT ON tasks
+WHEN EXISTS (SELECT 1 FROM offline_recovery_rows WHERE table_name='tasks' AND canonical_pk=json_array(typeof(NEW.task_id)||':'||hex(CAST(NEW.task_id AS BLOB))) AND disposition IN ('terminal_evidenced','quarantined_no_effect','uncertain_hold','refused_hold'))
+BEGIN SELECT RAISE(ABORT, 'offline-recovery-historical-task'); END;
+
+CREATE TRIGGER offline_recovery_historical_task_event BEFORE INSERT ON task_events
+WHEN EXISTS (SELECT 1 FROM offline_recovery_rows WHERE table_name='tasks' AND canonical_pk=json_array(typeof(NEW.task_id)||':'||hex(CAST(NEW.task_id AS BLOB))) AND disposition IN ('terminal_evidenced','quarantined_no_effect','uncertain_hold','refused_hold'))
+BEGIN SELECT RAISE(ABORT, 'offline-recovery-historical-task'); END;

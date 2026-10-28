@@ -271,3 +271,43 @@ async fn held_context_and_missing_effectful_parent_cannot_use_anchor_escape() {
         .execute(&mut *tx).await.unwrap();
     assert!(fixture.check(&mut tx, &message).await.is_err());
 }
+
+#[tokio::test]
+async fn terminal_task_cannot_retry_update_replace_delete_or_forge_anchor_role() {
+    let fixture = Fixture::create().await;
+    let mut tx = fixture.pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) SELECT 'old-task','old-task','synthetic','synthetic',conversation_id,'retained',1,0,0,0 FROM conversations")
+        .execute(&mut *tx).await.unwrap();
+    let task = RowIdentity {
+        table: "tasks".into(),
+        key: key("old-task"),
+    };
+    let mut effectful_parent = fixture.parent.clone();
+    effectful_parent.role = ParentRole::Effectful;
+    classify(&mut tx, &task, "terminal_evidenced", &[effectful_parent]).await;
+    assert!(fixture.check(&mut tx, &task).await.is_err());
+    for statement in [
+        "UPDATE tasks SET version=version+1 WHERE task_id='old-task'",
+        "DELETE FROM tasks WHERE task_id='old-task'",
+        "INSERT OR REPLACE INTO tasks SELECT * FROM tasks WHERE task_id='old-task'",
+        "INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES('retry','old-task',1,'queued','2026-10-28T00:00:00Z','{}')",
+        "INSERT INTO offline_recovery_metadata_anchors SELECT table_name,canonical_pk,'metadata_anchor','generation','root','admin','plan',original_revision,original_digest FROM offline_recovery_rows WHERE table_name='tasks'",
+    ] {
+        assert!(
+            sqlx::query(statement).execute(&mut *tx).await.is_err(),
+            "{statement}"
+        );
+    }
+    let retained: (String, i64) =
+        sqlx::query_as("SELECT text,version FROM tasks WHERE task_id='old-task'")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(retained, ("retained".into(), 0));
+    let events: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM task_events WHERE task_id='old-task'")
+            .fetch_one(&mut *tx)
+            .await
+            .unwrap();
+    assert_eq!(events, 0);
+}
