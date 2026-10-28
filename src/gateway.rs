@@ -408,8 +408,12 @@ impl GatewayStore {
         owner_revision: i64,
     ) -> Result<bool, sqlx::Error> {
         let phase = format!("{phase:?}").to_lowercase();
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         let result = sqlx::query("UPDATE gateway_deliveries SET phase=?, owner_runtime=?, owner_revision=owner_revision+1 WHERE envelope_id=? AND owner_runtime=? AND owner_revision=?")
-            .bind(phase).bind(owner_runtime).bind(envelope_id).bind(owner_runtime).bind(owner_revision).execute(&self.pool).await?;
+            .bind(phase).bind(owner_runtime).bind(envelope_id).bind(owner_runtime).bind(owner_revision).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -477,8 +481,12 @@ impl GatewayStore {
         revision: i64,
         expected_phase: &str,
     ) -> Result<bool, sqlx::Error> {
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         let result = sqlx::query("UPDATE gateway_deliveries SET attempt=attempt+1,owner_revision=owner_revision+1 WHERE envelope_id=? AND direction='outbound' AND owner_runtime=? AND owner_revision=? AND phase=? AND attempt<2")
-            .bind(envelope_id).bind(owner).bind(revision).bind(expected_phase).execute(&self.pool).await?;
+            .bind(envelope_id).bind(owner).bind(revision).bind(expected_phase).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -490,8 +498,12 @@ impl GatewayStore {
         phase: &str,
         event_id: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         let result = sqlx::query("UPDATE gateway_deliveries SET phase=?,event_id=COALESCE(?,event_id),owner_revision=owner_revision+1 WHERE envelope_id=? AND direction='outbound' AND owner_runtime=? AND owner_revision=?")
-            .bind(phase).bind(event_id).bind(envelope_id).bind(owner).bind(revision).execute(&self.pool).await?;
+            .bind(phase).bind(event_id).bind(envelope_id).bind(owner).bind(revision).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
