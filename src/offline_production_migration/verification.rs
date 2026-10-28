@@ -40,6 +40,13 @@ pub(super) async fn open(
 }
 
 pub(super) async fn facts(connection: &mut SqliteConnection) -> Result<Facts, Failure> {
+    facts_through(connection, 20).await
+}
+
+pub(super) async fn facts_through(
+    connection: &mut SqliteConnection,
+    maximum: usize,
+) -> Result<Facts, Failure> {
     let integrity: String = sqlx::query_scalar("PRAGMA integrity_check")
         .fetch_one(&mut *connection)
         .await
@@ -51,7 +58,7 @@ pub(super) async fn facts(connection: &mut SqliteConnection) -> Result<Facts, Fa
     if integrity != "ok" || !foreign.is_empty() {
         return Err(Failure::ManualRequired);
     }
-    let version = ledger(connection).await?;
+    let version = ledger(connection, maximum).await?;
     let schema = sqlx::query("SELECT type,name,tbl_name,sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type,name")
         .fetch_all(&mut *connection).await.map_err(|_| Failure::Preflight)?;
     let mut normalized = Vec::new();
@@ -67,7 +74,10 @@ pub(super) async fn facts(connection: &mut SqliteConnection) -> Result<Facts, Fa
         ));
         if kind == "table" && name != "_sqlx_migrations" {
             let columns = columns(connection, &name).await?;
-            tables.insert(name.clone(), table(connection, &name, columns).await?);
+            tables.insert(
+                name.clone(),
+                table(connection, &name, columns, maximum == 25).await?,
+            );
         }
     }
     Ok(Facts {
@@ -77,7 +87,7 @@ pub(super) async fn facts(connection: &mut SqliteConnection) -> Result<Facts, Fa
     })
 }
 
-async fn ledger(connection: &mut SqliteConnection) -> Result<i64, Failure> {
+async fn ledger(connection: &mut SqliteConnection, maximum: usize) -> Result<i64, Failure> {
     let ledger = sqlx::query(
         "SELECT version,description,success,checksum FROM _sqlx_migrations ORDER BY version",
     )
@@ -85,7 +95,7 @@ async fn ledger(connection: &mut SqliteConnection) -> Result<i64, Failure> {
     .await
     .map_err(|_| Failure::Preflight)?;
     let contract = crate::storage::migration_contract();
-    if !(18..=20).contains(&ledger.len()) || ledger.len() > contract.len() {
+    if !(18..=maximum).contains(&ledger.len()) || ledger.len() > contract.len() {
         return Err(Failure::ManualRequired);
     }
     for (row, expected) in ledger.iter().zip(&contract) {
@@ -127,10 +137,18 @@ async fn table(
     connection: &mut SqliteConnection,
     name: &str,
     columns: Vec<String>,
+    exact: bool,
 ) -> Result<Table, Failure> {
     let expressions = columns
         .iter()
-        .map(|column| format!("quote({})", identifier(column)))
+        .map(|column| {
+            let column = identifier(column);
+            if exact {
+                format!("typeof({column})||':'||hex(CAST({column} AS BLOB))")
+            } else {
+                format!("quote({column})")
+            }
+        })
         .collect::<Vec<_>>()
         .join(",");
     let query = AssertSqlSafe(format!("SELECT {expressions} FROM {}", identifier(name)));
@@ -159,8 +177,25 @@ pub(super) async fn preserved(
     before: &Facts,
     version: i64,
 ) -> Result<(), Failure> {
+    preserved_with_encoding(connection, before, version, false).await
+}
+
+pub(super) async fn preserved_exact(
+    connection: &mut SqliteConnection,
+    before: &Facts,
+    version: i64,
+) -> Result<(), Failure> {
+    preserved_with_encoding(connection, before, version, true).await
+}
+
+async fn preserved_with_encoding(
+    connection: &mut SqliteConnection,
+    before: &Facts,
+    version: i64,
+    exact: bool,
+) -> Result<(), Failure> {
     for (name, original) in &before.tables {
-        if table(connection, name, original.columns.clone()).await? != *original {
+        if table(connection, name, original.columns.clone(), exact).await? != *original {
             return Err(Failure::ManualRequired);
         }
     }
@@ -193,7 +228,7 @@ pub(super) async fn expected_schema(version: i64) -> Result<String, Failure> {
         .run(&mut connection)
         .await
         .map_err(|_| Failure::Preflight)?;
-    let result = facts(&mut connection).await;
+    let result = facts_through(&mut connection, version as usize).await;
     connection.close().await.map_err(|_| Failure::Preflight)?;
     Ok(result?.schema_digest)
 }

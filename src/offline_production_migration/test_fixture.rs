@@ -16,7 +16,10 @@ pub(super) struct Fixture {
 
 impl Fixture {
     pub async fn new() -> Self {
-        let root = tempfile::tempdir().unwrap();
+        let root = tempfile::Builder::new()
+            .prefix("r092-offline-")
+            .tempdir_in("/tmp")
+            .unwrap();
         let database = root.path().join("state.db");
         let mut connection = SqliteConnection::connect_with(
             &SqliteConnectOptions::new()
@@ -61,6 +64,7 @@ impl Fixture {
     pub fn request(root: &Path, mode: Mode) -> Request {
         Request {
             mode,
+            target_schema: 20,
             config: root.join("config.toml"),
             database: root.join("state.db"),
             operation_id: "fixture-operation".into(),

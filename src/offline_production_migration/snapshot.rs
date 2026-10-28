@@ -85,7 +85,7 @@ async fn copy_snapshot(
     Ok(backup)
 }
 
-async fn copy(source: &mut SqliteConnection, file: &File) -> Result<(), Failure> {
+pub(super) async fn copy(source: &mut SqliteConnection, file: &File) -> Result<(), Failure> {
     let mut handle = source.lock_handle().await.map_err(|_| Failure::Preflight)?;
     let name = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
         .map_err(|_| Failure::Preflight)?;

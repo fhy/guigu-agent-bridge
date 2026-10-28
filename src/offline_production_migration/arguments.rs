@@ -13,6 +13,7 @@ pub enum Mode {
 #[derive(Debug, Clone)]
 pub struct Request {
     pub mode: Mode,
+    pub target_schema: i64,
     pub config: PathBuf,
     pub database: PathBuf,
     pub operation_id: String,
@@ -26,7 +27,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Request, Failure> {
         .iter()
         .map(|arg| arg.to_str().ok_or(Failure::InvalidArguments))
         .collect::<Result<Vec<_>, _>>()?;
-    if args.len() != 15 || args[0] != "offline-migrate-production" {
+    if !matches!(args.len(), 15 | 17) || args[0] != "offline-migrate-production" {
         return Err(Failure::InvalidArguments);
     }
     let mut values = BTreeMap::new();
@@ -35,6 +36,11 @@ pub fn parse_args(args: &[OsString]) -> Result<Request, Failure> {
             return Err(Failure::InvalidArguments);
         }
     }
+    let target_schema = match values.remove("--target-schema") {
+        None => 20,
+        Some("25") => 25,
+        Some(_) => return Err(Failure::InvalidArguments),
+    };
     let mut take = |key| values.remove(key).ok_or(Failure::InvalidArguments);
     let mode = match take("--mode")? {
         "preflight" => Mode::Preflight,
@@ -54,6 +60,7 @@ pub fn parse_args(args: &[OsString]) -> Result<Request, Failure> {
     }
     let request = Request {
         mode,
+        target_schema,
         operation_id,
         config: take("--config")?.into(),
         database: take("--database")?.into(),

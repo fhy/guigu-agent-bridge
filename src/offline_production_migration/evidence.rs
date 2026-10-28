@@ -85,9 +85,13 @@ fn hash_handle(file: &mut File) -> Result<String, Failure> {
 }
 
 pub(super) fn migration_digest() -> String {
+    migration_digest_through(24)
+}
+
+pub(super) fn migration_digest_through(version: i64) -> String {
     let contract = crate::storage::migration_contract()
         .into_iter()
-        .filter(|entry| entry.0 <= 24)
+        .filter(|entry| entry.0 <= version)
         .collect::<Vec<_>>();
     digest(&serde_json::to_vec(&contract).expect("migration contract"))
 }
@@ -209,7 +213,8 @@ fn validate(
         || provenance.version != env!("CARGO_PKG_VERSION")
         || provenance.executable != req.executable
         || provenance.executable_sha256 != executable_hash
-        || provenance.migration_set_sha256 != migration_digest()
+        || provenance.migration_set_sha256
+            != migration_digest_through(if req.target_schema == 25 { 25 } else { 24 })
         || provenance.launcher_hold.operation_id != req.operation_id
         || provenance.launcher_hold.controller.is_empty()
         || provenance.launcher_hold.prior_state != "inactive/dead/MainPID=0"

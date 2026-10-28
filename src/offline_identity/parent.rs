@@ -1,4 +1,9 @@
-use std::{path::PathBuf, process::Stdio, time::Duration};
+use std::{
+    os::{fd::AsRawFd, unix::fs::MetadataExt},
+    path::PathBuf,
+    process::Stdio,
+    time::Duration,
+};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -6,9 +11,11 @@ use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
     sync::oneshot,
+    time::Instant,
 };
 
 use super::{
+    executable::{self, PinnedExecutable},
     policy,
     protocol::{Capture, Captured, MAX_FRAME, Ready},
 };
@@ -45,10 +52,11 @@ pub struct CollectorResult {
 pub struct CollectorRefused;
 
 pub async fn collect(request: CollectorRequest) -> Result<CollectorResult, CollectorRefused> {
+    let started = Instant::now();
     let (cancel, cancelled) = oneshot::channel::<()>();
     let (result, received) = oneshot::channel();
     tokio::spawn(async move {
-        let outcome = supervise(request, cancelled).await;
+        let outcome = supervise(request, cancelled, started).await;
         let _ = result.send(outcome);
     });
     let outcome = received.await.map_err(|_| CollectorRefused)?;
@@ -59,12 +67,16 @@ pub async fn collect(request: CollectorRequest) -> Result<CollectorResult, Colle
 async fn supervise(
     request: CollectorRequest,
     mut cancelled: oneshot::Receiver<()>,
+    started: Instant,
 ) -> Result<CollectorResult, CollectorRefused> {
-    let executable = std::env::current_exe().map_err(|_| CollectorRefused)?;
-    let binary = std::fs::read(&executable).map_err(|_| CollectorRefused)?;
-    let expected = format!("{:x}", Sha256::digest(binary));
+    let setup = started + Duration::from_secs(5);
+    let executable = tokio::time::timeout_at(setup, tokio::task::spawn_blocking(executable::pin))
+        .await
+        .map_err(|_| CollectorRefused)?
+        .map_err(|_| CollectorRefused)??;
     let nonce = format!("{:x}", Sha256::digest(uuid::Uuid::now_v7().as_bytes()));
-    let mut child = Command::new(executable)
+    let path = format!("/proc/self/fd/{}", executable.file.as_raw_fd());
+    let mut child = Command::new(path)
         .args(["offline-identity-collector-v1", &nonce])
         .env_clear()
         .stdin(Stdio::piped())
@@ -76,16 +88,17 @@ async fn supervise(
     let outcome = tokio::select! {
         biased;
         _ = &mut cancelled => Err(CollectorRefused),
-        outcome = tokio::time::timeout(Duration::from_secs(60), exchange(&mut child, request, &nonce, &expected)) => {
+        outcome = tokio::time::timeout_at(started + Duration::from_secs(60), async {
+            let result = exchange(&mut child, request, &nonce, &executable, setup).await?;
+            let status = child.wait().await.map_err(|_| CollectorRefused)?;
+            if !status.success() { return Err(CollectorRefused); }
+            Ok(result)
+        }) => {
             outcome.unwrap_or(Err(CollectorRefused))
         }
     };
     if outcome.is_err() {
         let _ = child.kill().await;
-    }
-    let status = child.wait().await.map_err(|_| CollectorRefused)?;
-    if !status.success() {
-        return Err(CollectorRefused);
     }
     outcome
 }
@@ -94,16 +107,20 @@ async fn exchange(
     child: &mut Child,
     request: CollectorRequest,
     nonce: &str,
-    expected: &str,
+    executable: &PinnedExecutable,
+    setup: Instant,
 ) -> Result<CollectorResult, CollectorRefused> {
     let process = child.id().ok_or(CollectorRefused)?;
     let mut stdout = child.stdout.take().ok_or(CollectorRefused)?;
     let mut stdin = child.stdin.take().ok_or(CollectorRefused)?;
     let mut stderr = child.stderr.take().ok_or(CollectorRefused)?;
-    let ready: Ready = tokio::time::timeout(Duration::from_secs(5), read_frame(&mut stdout))
+    let ready: Ready = tokio::time::timeout_at(setup, read_frame(&mut stdout))
         .await
         .map_err(|_| CollectorRefused)??;
-    validate_ready(&ready, process, nonce, expected)?;
+    validate_ready(&ready, process, nonce, executable)?;
+    if Instant::now() >= setup {
+        return Err(CollectorRefused);
+    }
     let capture = Capture {
         nonce: nonce.to_owned(),
         homeserver: request.homeserver,
@@ -114,7 +131,7 @@ async fn exchange(
         passphrase: request.passphrase,
     };
     let mut payload = serde_json::to_vec(&capture).map_err(|_| CollectorRefused)?;
-    if payload.len() > MAX_FRAME {
+    if payload.len() > MAX_FRAME || Instant::now() >= setup {
         payload.fill(0);
         return Err(CollectorRefused);
     }
@@ -163,12 +180,12 @@ fn validate_ready(
     ready: &Ready,
     process: u32,
     nonce: &str,
-    expected: &str,
+    executable: &PinnedExecutable,
 ) -> Result<(), CollectorRefused> {
     if ready.nonce != nonce
         || ready.process != process
         || ready.policy != policy::digest()
-        || ready.executable != expected
+        || ready.executable != executable.digest
         || ready.no_new_privs != 1
         || ready.seccomp != 2
         || ready.denied_probes != [libc::EPERM; 6]
@@ -177,8 +194,11 @@ fn validate_ready(
     }
     let root = format!("/proc/{process}");
     let generation = generation(&root)?;
-    let bytes = std::fs::read(format!("{root}/exe")).map_err(|_| CollectorRefused)?;
-    if format!("{:x}", Sha256::digest(bytes)) != expected || generation != ready.generation {
+    let metadata = std::fs::metadata(format!("{root}/exe")).map_err(|_| CollectorRefused)?;
+    if metadata.dev() != executable.device
+        || metadata.ino() != executable.inode
+        || generation != ready.generation
+    {
         return Err(CollectorRefused);
     }
     let status = std::fs::read_to_string(format!("{root}/status")).map_err(|_| CollectorRefused)?;

@@ -152,6 +152,7 @@ pub(crate) mod owner_observation;
 mod pool;
 mod recovery;
 mod recovery_bridge;
+pub mod recovery_eligibility;
 mod reliability;
 mod repository;
 pub use matrix_cutover::{CutoverState, CutoverStore, cutover_digest};

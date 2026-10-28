@@ -13,6 +13,12 @@ pub async fn run(req: Request) -> Result<String, Failure> {
 }
 
 pub(super) async fn execute(req: Request, live_launcher: bool) -> Result<String, Failure> {
+    if req.target_schema == 25 {
+        return super::version2::execute(req, live_launcher).await;
+    }
+    if req.target_schema != 20 {
+        return Err(Failure::InvalidArguments);
+    }
     let mut evidence = Evidence::read(&req)?;
     launcher::check(&evidence.listeners, live_launcher, "pre-lock").await?;
     let _lock = RuntimeLock::acquire(&req.database).map_err(|_| Failure::Busy)?;

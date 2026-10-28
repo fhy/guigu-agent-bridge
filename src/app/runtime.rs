@@ -348,6 +348,8 @@ impl AppRuntime {
         config: Config,
         a2a_faults: Arc<dyn crate::a2a::IngressFaultInjector>,
     ) -> Result<Self, AppError> {
+        crate::offline_production_migration::check_runtime_discovery(&config.bridge.database)
+            .map_err(|_| AppError::Runtime)?;
         prepare_directories(&config).map_err(AppError::Health)?;
         let maintenance_lock = Arc::new(
             crate::offline_production_migration::acquire_runtime_lock(&config.bridge.database)

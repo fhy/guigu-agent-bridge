@@ -17,6 +17,11 @@ mod test_fixture;
 #[cfg(test)]
 mod tests;
 mod verification;
+mod version2;
+mod version2_archive;
+mod version2_records;
+#[cfg(test)]
+mod version2_tests;
 
 pub use arguments::{Mode, Request, parse_args};
 pub use flow::run;
@@ -37,14 +42,17 @@ pub enum Failure {
 
 pub(crate) type RuntimeLock = crate::maintenance_lock::MaintenanceLock;
 
-pub(crate) fn acquire_runtime_lock(database: &std::path::Path) -> std::io::Result<RuntimeLock> {
-    let guard = RuntimeLock::acquire(database)?;
+pub(crate) fn check_runtime_discovery(database: &std::path::Path) -> std::io::Result<()> {
     let resolved = match std::fs::canonicalize(database) {
         Ok(path) => path,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => database.to_path_buf(),
         Err(error) => return Err(error),
     };
-    records::startup_allowed(&resolved)
-        .map_err(|_| std::io::Error::other("maintenance unresolved"))?;
+    records::startup_allowed(&resolved).map_err(|_| std::io::Error::other("maintenance unresolved"))
+}
+
+pub(crate) fn acquire_runtime_lock(database: &std::path::Path) -> std::io::Result<RuntimeLock> {
+    let guard = RuntimeLock::acquire(database)?;
+    check_runtime_discovery(database)?;
     Ok(guard)
 }

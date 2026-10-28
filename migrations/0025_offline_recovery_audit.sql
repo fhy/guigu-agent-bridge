@@ -53,6 +53,7 @@ CREATE TABLE runtime_eligibility_context (
     compatibility_operation_id TEXT,
     compatibility_source_digest TEXT,
     matrix_phase TEXT NOT NULL CHECK (matrix_phase IN ('absent', 'baseline', 'active', 'refused')),
+    matrix_enabled INTEGER NOT NULL DEFAULT 0 CHECK (matrix_enabled IN (0, 1)),
     expected_b_digest TEXT,
     state TEXT NOT NULL CHECK (state IN ('ready', 'held')),
     revision INTEGER NOT NULL CHECK (revision >= 0),
@@ -72,9 +73,10 @@ CREATE TABLE offline_recovery_rows (
     origin_generation TEXT NOT NULL,
     original_revision TEXT NOT NULL,
     original_digest TEXT NOT NULL,
-    parent_relations TEXT NOT NULL CHECK (json_valid(parent_relations)),
+    parent_relations TEXT NOT NULL CHECK (json_valid(parent_relations)
+        AND json_type(parent_relations) = 'array'),
     disposition TEXT NOT NULL CHECK (disposition IN (
-        'eligible_new', 'terminal_evidenced', 'quarantined_no_effect', 'uncertain_hold', 'refused_hold'
+        'eligible_new', 'eligible_preserved', 'terminal_evidenced', 'quarantined_no_effect', 'uncertain_hold', 'refused_hold'
     )),
     evidence_digest TEXT NOT NULL,
     context_kind TEXT NOT NULL CHECK (context_kind IN ('admin', 'nonadmin')),
@@ -88,7 +90,8 @@ CREATE TABLE offline_recovery_rows (
     CHECK ((context_kind = 'admin' AND admin_operation_id IS NOT NULL AND plan_digest IS NOT NULL
         AND context_generation IS NULL) OR (context_kind = 'nonadmin'
         AND context_generation IS NOT NULL AND admin_operation_id IS NULL AND plan_digest IS NULL)),
-    CHECK (context_kind != 'nonadmin' OR origin_generation = context_generation)
+    CHECK (context_kind != 'nonadmin' OR origin_generation = context_generation),
+    CHECK (disposition != 'eligible_preserved' OR context_kind = 'nonadmin')
 ) STRICT;
 
 CREATE TABLE matrix_activation_intent (
@@ -139,4 +142,110 @@ BEFORE INSERT ON runtime_eligibility_context
 WHEN EXISTS (SELECT 1 FROM offline_recovery_binding)
 BEGIN
     SELECT RAISE(ABORT, 'offline-recovery-mixed-authority');
+END;
+
+CREATE TRIGGER offline_recovery_preserved_bootstrap_only
+BEFORE INSERT ON offline_recovery_rows
+WHEN NEW.disposition = 'eligible_preserved' AND NOT EXISTS (
+    SELECT 1 FROM runtime_eligibility_bootstrap AS bootstrap
+    JOIN runtime_eligibility_context AS context
+        ON context.bootstrap_nonce = bootstrap.bootstrap_nonce
+    WHERE bootstrap.singleton = 1 AND bootstrap.state = 'pending'
+        AND context.state = 'ready'
+        AND context.generation = NEW.context_generation
+        AND NEW.context_kind = 'nonadmin'
+        AND NEW.origin_generation = context.generation
+)
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-preserved-outside-bootstrap');
+END;
+
+CREATE TRIGGER offline_recovery_row_origin_immutable
+BEFORE UPDATE ON offline_recovery_rows
+WHEN NEW.table_name != OLD.table_name OR NEW.canonical_pk != OLD.canonical_pk
+    OR NEW.origin_generation != OLD.origin_generation
+    OR NEW.context_kind != OLD.context_kind
+    OR NEW.context_generation IS NOT OLD.context_generation
+    OR NEW.admin_operation_id IS NOT OLD.admin_operation_id
+    OR NEW.plan_digest IS NOT OLD.plan_digest
+    OR NEW.matrix_operation_id IS NOT OLD.matrix_operation_id
+    OR (NEW.disposition IN ('eligible_new', 'eligible_preserved')
+        AND NEW.disposition != OLD.disposition)
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-origin-fence');
+END;
+
+CREATE TRIGGER offline_recovery_bootstrap_fence
+BEFORE UPDATE ON runtime_eligibility_bootstrap
+WHEN OLD.state != 'pending' OR NEW.state NOT IN ('complete', 'admin_reserved')
+    OR NEW.bootstrap_nonce != OLD.bootstrap_nonce
+    OR (NEW.state = 'complete' AND NOT EXISTS (
+        SELECT 1 FROM runtime_eligibility_context AS context
+        WHERE context.generation = NEW.generation
+            AND context.bootstrap_nonce = OLD.bootstrap_nonce
+            AND context.bootstrap_inventory_digest = NEW.inventory_digest
+            AND context.state = 'ready'
+    ))
+    OR (NEW.state = 'admin_reserved' AND (
+        NEW.generation IS NOT NULL OR NEW.inventory_digest IS NOT NULL
+        OR NOT EXISTS (SELECT 1 FROM offline_recovery_binding)
+    ))
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-bootstrap-fence');
+END;
+
+CREATE TRIGGER offline_recovery_bootstrap_no_delete
+BEFORE DELETE ON runtime_eligibility_bootstrap
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-bootstrap-delete');
+END;
+
+CREATE TRIGGER offline_recovery_bootstrap_no_replace
+BEFORE INSERT ON runtime_eligibility_bootstrap
+WHEN EXISTS (SELECT 1 FROM runtime_eligibility_bootstrap)
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-bootstrap-replace');
+END;
+
+CREATE TRIGGER offline_recovery_row_no_delete
+BEFORE DELETE ON offline_recovery_rows
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-classification-delete');
+END;
+
+CREATE TRIGGER offline_recovery_row_no_replace
+BEFORE INSERT ON offline_recovery_rows
+WHEN EXISTS (SELECT 1 FROM offline_recovery_rows
+    WHERE table_name = NEW.table_name AND canonical_pk = NEW.canonical_pk)
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-classification-replace');
+END;
+
+CREATE TRIGGER offline_recovery_context_fence
+BEFORE UPDATE ON runtime_eligibility_context
+WHEN NEW.singleton != OLD.singleton OR NEW.generation != OLD.generation
+    OR NEW.bootstrap_nonce != OLD.bootstrap_nonce
+    OR NEW.bootstrap_inventory_digest != OLD.bootstrap_inventory_digest
+    OR NEW.created_at != OLD.created_at OR NEW.revision != OLD.revision + 1
+    OR OLD.state = 'held'
+    OR (OLD.provenance_kind = 'validated_native' AND (
+        NEW.provenance_kind != OLD.provenance_kind
+        OR NEW.compatibility_operation_id IS NOT OLD.compatibility_operation_id
+        OR NEW.compatibility_source_digest IS NOT OLD.compatibility_source_digest
+    ))
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-context-fence');
+END;
+
+CREATE TRIGGER offline_recovery_context_no_delete
+BEFORE DELETE ON runtime_eligibility_context
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-context-delete');
+END;
+
+CREATE TRIGGER offline_recovery_context_no_replace
+BEFORE INSERT ON runtime_eligibility_context
+WHEN EXISTS (SELECT 1 FROM runtime_eligibility_context)
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-context-replace');
 END;

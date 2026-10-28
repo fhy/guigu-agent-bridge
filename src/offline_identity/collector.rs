@@ -26,10 +26,7 @@ pub(super) fn run(args: &[OsString]) -> Result<u8, ()> {
     let ready = Ready {
         nonce: nonce.to_owned(),
         policy: policy::digest(),
-        executable: format!(
-            "{:x}",
-            Sha256::digest(fs::read("/proc/self/exe").map_err(|_| ())?)
-        ),
+        executable: executable_digest()?,
         process: std::process::id(),
         generation: generation()?,
         no_new_privs: 1,
@@ -39,6 +36,10 @@ pub(super) fn run(args: &[OsString]) -> Result<u8, ()> {
     protocol::write_frame(&mut std::io::stdout(), &ready)?;
     let request: Capture = protocol::read_frame(&mut std::io::stdin())?;
     if request.nonce != nonce {
+        return Err(());
+    }
+    let mut trailing = [0; 1];
+    if std::io::Read::read(&mut std::io::stdin(), &mut trailing).map_err(|_| ())? != 0 {
         return Err(());
     }
     if unsafe { libc::close(0) } != 0 {
@@ -58,6 +59,13 @@ pub(super) fn run(args: &[OsString]) -> Result<u8, ()> {
     policy::verify()?;
     protocol::write_frame(&mut std::io::stdout(), &captured)?;
     Ok(0)
+}
+
+fn executable_digest() -> Result<String, ()> {
+    let mut file = fs::File::open("/proc/self/exe").map_err(|_| ())?;
+    let mut hash = Sha256::new();
+    std::io::copy(&mut file, &mut hash).map_err(|_| ())?;
+    Ok(format!("{:x}", hash.finalize()))
 }
 
 fn validate_descriptors() -> Result<(), ()> {

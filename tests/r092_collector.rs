@@ -71,6 +71,96 @@ fn collector_rejects_non_private_stdio_before_ready() {
     assert!(output.stderr.is_empty());
 }
 
+#[test]
+fn collector_rejects_oversized_truncated_and_wrong_nonce_frames_before_store_access() {
+    for kind in ["oversized", "truncated", "nonce", "trailing"] {
+        let root = tempfile::Builder::new()
+            .prefix("r092-protocol-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let store = root.path().join("must-not-open");
+        std::fs::create_dir(&store).unwrap();
+        std::fs::write(store.join("sentinel"), b"preserve").unwrap();
+        let mut child = spawn(&"d".repeat(64));
+        read_frame(child.stdout.as_mut().unwrap());
+        match kind {
+            "oversized" => child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(&65537u32.to_be_bytes())
+                .unwrap(),
+            "truncated" => child
+                .stdin
+                .as_mut()
+                .unwrap()
+                .write_all(&[0, 0, 0, 10, b'{'])
+                .unwrap(),
+            _ => {
+                write_frame(
+                    child.stdin.as_mut().unwrap(),
+                    json!({
+                        "nonce": if kind == "nonce" { "e".repeat(64) } else { "d".repeat(64) },
+                        "homeserver": "http://127.0.0.1:1", "user_id": "@test:example.test",
+                        "device_id": "FIXTURE", "access_token": "synthetic-secret",
+                        "store": store, "passphrase": null
+                    }),
+                );
+                if kind == "trailing" {
+                    child.stdin.as_mut().unwrap().write_all(b"extra").unwrap();
+                }
+            }
+        }
+        drop(child.stdin.take());
+        let output = child.wait_with_output().unwrap();
+        assert_eq!(output.status.code(), Some(5), "{kind}");
+        assert!(output.stdout.is_empty(), "{kind}");
+        assert!(output.stderr.is_empty(), "{kind}");
+        assert_eq!(std::fs::read_dir(&store).unwrap().count(), 1, "{kind}");
+        assert_eq!(
+            std::fs::read(store.join("sentinel")).unwrap(),
+            b"preserve",
+            "{kind}"
+        );
+    }
+}
+
+#[test]
+fn collector_closes_an_inherited_descriptor_without_touching_parent_file() {
+    use std::os::{fd::AsRawFd, unix::process::CommandExt};
+    let root = tempfile::Builder::new()
+        .prefix("r092-inherited-")
+        .tempdir_in("/tmp")
+        .unwrap();
+    let path = root.path().join("parent-owned");
+    std::fs::write(&path, b"preserve").unwrap();
+    let file = std::fs::File::open(&path).unwrap();
+    let descriptor = file.as_raw_fd();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"));
+    command
+        .args(["offline-identity-collector-v1", &"f".repeat(64)])
+        .env_clear()
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    unsafe {
+        command.pre_exec(move || {
+            if libc::dup2(descriptor, 198) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = command.spawn().unwrap();
+    read_frame(child.stdout.as_mut().unwrap());
+    assert!(std::path::Path::new(&format!("/proc/{}/fd/1", child.id())).exists());
+    assert!(!std::path::Path::new(&format!("/proc/{}/fd/198", child.id())).exists());
+    drop(child.stdin.take());
+    assert_eq!(child.wait().unwrap().code(), Some(5));
+    assert_eq!(std::fs::read(&path).unwrap(), b"preserve");
+    assert!(file.metadata().is_ok());
+}
+
 async fn initialize_store(
     store: &std::path::Path,
     server: &wiremock::MockServer,

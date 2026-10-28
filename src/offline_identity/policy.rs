@@ -1,4 +1,7 @@
 use sha2::{Digest, Sha256};
+#[cfg(test)]
+#[path = "policy_tests.rs"]
+mod tests;
 
 const LOAD: u16 = 0x20;
 const EQ: u16 = 0x15;
