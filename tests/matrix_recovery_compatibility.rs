@@ -67,7 +67,7 @@ async fn installed_and_public_upgrade_reopen_preserve_rows_checksums_and_interru
                 .fetch_one(&pool)
                 .await
                 .unwrap(),
-            24
+            25
         );
         if version == 21 {
             assert!(matches!(
