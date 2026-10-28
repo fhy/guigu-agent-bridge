@@ -362,6 +362,31 @@ impl AppRuntime {
             pool.close().await;
             return Err(error.into());
         }
+        let admin_bindings: i64 =
+            sqlx::query_scalar("SELECT count(*) FROM offline_recovery_binding")
+                .fetch_one(&pool)
+                .await
+                .map_err(|_| AppError::Runtime)?;
+        let sentinel: Option<String> =
+            sqlx::query_scalar("SELECT state FROM runtime_eligibility_bootstrap WHERE singleton=1")
+                .fetch_optional(&pool)
+                .await
+                .map_err(|_| AppError::Runtime)?;
+        match recovery_startup::classify_startup(admin_bindings, sentinel.as_deref()) {
+            recovery_startup::StartupEligibility::NonAdmin => {
+                crate::storage::recovery_eligibility::bootstrap_nonadmin(
+                    &pool,
+                    config.transports.matrix.enabled,
+                )
+                .await
+                .map_err(|_| AppError::Runtime)?;
+            }
+            recovery_startup::StartupEligibility::Admin
+            | recovery_startup::StartupEligibility::Legacy => {}
+            recovery_startup::StartupEligibility::Refused => {
+                return Err(AppError::Runtime);
+            }
+        }
         let reliability = crate::storage::ReliabilityStore::with_owner_evidence_window(
             pool.clone(),
             config.bridge.owner_evidence_max_age_seconds as i64,

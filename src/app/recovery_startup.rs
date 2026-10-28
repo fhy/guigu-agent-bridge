@@ -1,5 +1,24 @@
 use super::*;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum StartupEligibility {
+    Admin,
+    NonAdmin,
+    Legacy,
+    Refused,
+}
+
+pub(super) fn classify_startup(admin_bindings: i64, sentinel: Option<&str>) -> StartupEligibility {
+    if admin_bindings > 0 {
+        return StartupEligibility::Admin;
+    }
+    match sentinel {
+        Some("pending") | Some("complete") => StartupEligibility::NonAdmin,
+        Some("legacy") => StartupEligibility::Legacy,
+        _ => StartupEligibility::Refused,
+    }
+}
+
 impl AppRuntime {
     pub(super) async fn compatibility_held(
         path: PathBuf,
@@ -56,5 +75,31 @@ impl AppRuntime {
             first_failure: Arc::new(Mutex::new(None)),
             _maintenance_lock: Some(maintenance_lock),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{StartupEligibility, classify_startup};
+
+    #[test]
+    fn admin_never_falls_back_to_nonadmin() {
+        assert_eq!(
+            classify_startup(1, Some("pending")),
+            StartupEligibility::Admin
+        );
+    }
+
+    #[test]
+    fn nonadmin_requires_known_sentinel() {
+        assert_eq!(
+            classify_startup(0, Some("complete")),
+            StartupEligibility::NonAdmin
+        );
+        assert_eq!(
+            classify_startup(0, Some("legacy")),
+            StartupEligibility::Legacy
+        );
+        assert_eq!(classify_startup(0, None), StartupEligibility::Refused);
     }
 }
