@@ -375,17 +375,48 @@ impl SqliteSessionStore {
         state: SessionState,
         at: DateTime<Utc>,
     ) -> Result<(), StorageError> {
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await
+                .map_err(StorageError::from)?;
+        let mutation = if self.recovery.is_some() {
+            Some(
+                crate::storage::recovery_eligibility::writer::prepare_mutation(
+                    &mut tx,
+                    self.recovery.as_ref(),
+                    &crate::storage::recovery_eligibility::writer::text_identity(
+                        "sessions", session_id,
+                    )
+                    .map_err(StorageError::from)?,
+                )
+                .await
+                .map_err(StorageError::from)?,
+            )
+        } else {
+            None
+        };
         let result = sqlx::query(UPDATE_SESSION_STATE)
             .bind(state.as_str())
             .bind(encode_timestamp(&at))
             .bind(session_id)
             .bind(encode_id(endpoint))
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(StorageError::from)?;
         if result.rows_affected() == 1 {
+            if let Some(mutation) = mutation {
+                crate::storage::recovery_eligibility::writer::complete_mutation(
+                    &mut tx,
+                    self.recovery.as_ref(),
+                    mutation,
+                )
+                .await
+                .map_err(StorageError::from)?;
+            }
+            tx.commit().await.map_err(StorageError::from)?;
             return Ok(());
         }
+        tx.rollback().await.map_err(StorageError::from)?;
         Err(StorageError::NotFound {
             entity: "session",
             id: session_id.to_owned(),
