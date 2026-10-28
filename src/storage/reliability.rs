@@ -9,6 +9,8 @@ use uuid::Uuid;
 
 #[path = "owner_lifecycle.rs"]
 mod owner_lifecycle;
+#[path = "reliability_projection.rs"]
+mod projections;
 
 pub const OWNER_EVIDENCE_MAX_AGE_SECS: i64 = 30;
 
@@ -160,6 +162,7 @@ pub struct AdmissionRecovery {
 pub struct ReliabilityStore {
     pool: SqlitePool,
     owner_evidence_max_age: i64,
+    recovery: Option<super::recovery_eligibility::RecoveryScope>,
 }
 
 impl ReliabilityStore {
@@ -174,6 +177,18 @@ impl ReliabilityStore {
         Self {
             pool,
             owner_evidence_max_age: OWNER_EVIDENCE_MAX_AGE_SECS,
+            recovery: None,
+        }
+    }
+
+    pub fn with_recovery(
+        pool: SqlitePool,
+        recovery: super::recovery_eligibility::RecoveryScope,
+    ) -> Self {
+        Self {
+            pool,
+            owner_evidence_max_age: OWNER_EVIDENCE_MAX_AGE_SECS,
+            recovery: Some(recovery),
         }
     }
 
@@ -187,6 +202,7 @@ impl ReliabilityStore {
         Ok(Self {
             pool,
             owner_evidence_max_age: seconds,
+            recovery: None,
         })
     }
 
@@ -1054,54 +1070,6 @@ impl ReliabilityStore {
             .bind(input.timestamp).bind(input.timestamp).execute(&mut *tx).await?;
         tx.commit().await?;
         Ok(ReceiptOutcome::Inserted)
-    }
-
-    pub async fn claim_projections(
-        &self,
-        owner: &str,
-        now: &str,
-        _stale_before: &str,
-        limit: u32,
-    ) -> Result<Vec<PendingProjection>, ReliabilityError> {
-        let mut claimed = Vec::new();
-        for _ in 0..limit {
-            let row=sqlx::query("UPDATE projection_outbox SET state='sending',claim_owner=?,claim_revision=COALESCE(claim_revision,0)+1,updated_at=? WHERE rowid=(SELECT rowid FROM projection_outbox WHERE state='pending' ORDER BY created_at,source_kind,source_id,projection LIMIT 1) RETURNING source_kind,source_id,projection,stable_txn_id,room_id,thread_root,reply_event_id,body,claim_revision")
-                .bind(owner).bind(now).fetch_optional(&self.pool).await?;
-            let Some(row) = row else { break };
-            claimed.push(PendingProjection {
-                source_kind: row.try_get("source_kind")?,
-                source_id: row.try_get("source_id")?,
-                projection: row.try_get("projection")?,
-                stable_txn_id: row.try_get("stable_txn_id")?,
-                room_id: row.try_get("room_id")?,
-                thread_root: row.try_get("thread_root")?,
-                reply_event_id: row.try_get("reply_event_id")?,
-                body: row.try_get("body")?,
-                claim_owner: owner.into(),
-                claim_revision: row.try_get("claim_revision")?,
-            });
-        }
-        Ok(claimed)
-    }
-
-    pub async fn mark_projection_sent(
-        &self,
-        row: &PendingProjection,
-    ) -> Result<bool, ReliabilityError> {
-        let result=sqlx::query("UPDATE projection_outbox SET state='sent',attempt_count=attempt_count+1 WHERE source_kind=? AND source_id=? AND projection=? AND state='sending' AND claim_owner=? AND claim_revision=?")
-            .bind(&row.source_kind).bind(&row.source_id).bind(&row.projection).bind(&row.claim_owner).bind(row.claim_revision).execute(&self.pool).await?;
-        Ok(result.rows_affected() == 1)
-    }
-
-    pub async fn mark_projection_abandoned(
-        &self,
-        row: &PendingProjection,
-    ) -> Result<bool, ReliabilityError> {
-        let result = sqlx::query("UPDATE projection_outbox SET state='abandoned',attempt_count=attempt_count+1,updated_at=? WHERE source_kind=? AND source_id=? AND projection=? AND state='sending' AND claim_owner=? AND claim_revision=?")
-            .bind(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
-            .bind(&row.source_kind).bind(&row.source_id).bind(&row.projection)
-            .bind(&row.claim_owner).bind(row.claim_revision).execute(&self.pool).await?;
-        Ok(result.rows_affected() == 1)
     }
 
     pub async fn claim_admission(

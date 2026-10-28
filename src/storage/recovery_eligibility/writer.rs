@@ -17,6 +17,18 @@ pub struct RecoveryScope {
 }
 
 impl RecoveryScope {
+    pub(crate) fn require_matrix_component(&self, component: &str) -> Result<(), sqlx::Error> {
+        if self.domain != EffectDomain::Matrix
+            || self
+                .fence
+                .as_ref()
+                .is_none_or(|fence| fence.component != component)
+        {
+            return Err(refused());
+        }
+        Ok(())
+    }
+
     pub fn new(
         context: EligibilityContext,
         domain: EffectDomain,

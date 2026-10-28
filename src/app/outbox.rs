@@ -34,6 +34,14 @@ impl OutboxDrain {
             .map_err(|_| ())?;
         let mut sent = 0;
         for row in rows {
+            if !self
+                .store
+                .authorize_projection_send(&row)
+                .await
+                .map_err(|_| ())?
+            {
+                return Err(());
+            }
             let send_result = self
                 .sender
                 .send_stable(

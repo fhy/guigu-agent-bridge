@@ -8,6 +8,9 @@ use crate::{
 
 use super::{EffectDomain, Fixture};
 
+#[path = "projection_writer_tests.rs"]
+mod projections;
+
 async fn new_message(fixture: &Fixture) -> Message {
     let conversation: String = sqlx::query_scalar("SELECT conversation_id FROM conversations")
         .fetch_one(&fixture.pool)
