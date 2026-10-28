@@ -1031,6 +1031,8 @@ impl ReliabilityStore {
         task_id: Option<&str>,
         now: &str,
     ) -> Result<bool, ReliabilityError> {
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let result = sqlx::query(
             "UPDATE transport_receipts SET state=?,result_code=?,task_id=?,updated_at=?
              WHERE transport=? AND external_event_id=? AND state='reserved'",
@@ -1041,8 +1043,9 @@ impl ReliabilityStore {
         .bind(now)
         .bind(transport)
         .bind(external_event_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
