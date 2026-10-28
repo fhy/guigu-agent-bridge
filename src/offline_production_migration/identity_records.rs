@@ -57,6 +57,7 @@ impl IdentityEvidence {
             || self.expires_at != self.captured_at + Duration::minutes(15)
             || now > self.expires_at
             || self.local.isolation.process == 0
+            || !valid_isolation_timeline(intent, self)
             || self.local.isolation.executable != intent.executable_digest
             || self.local.isolation.policy != crate::offline_identity::isolation_policy_digest()
             || self.local.isolation.no_new_privs != 1
@@ -70,4 +71,23 @@ impl IdentityEvidence {
             .require_continuity(&self.after, &self.local)
             .map_err(|_| Failure::ManualRequired)
     }
+}
+
+fn valid_isolation_timeline(intent: &IdentityIntent, evidence: &IdentityEvidence) -> bool {
+    let isolation = &evidence.local.isolation;
+    let timeline = &isolation.timeline;
+    let Some(exited) = timeline.child_exited else {
+        return false;
+    };
+    isolation.nonce.len() == 64
+        && isolation.nonce.bytes().all(|byte| byte.is_ascii_hexdigit())
+        && !isolation.generation.is_empty()
+        && timeline.setup_started >= intent.created_at
+        && timeline.ready_verified >= timeline.setup_started
+        && timeline.go_sent >= timeline.ready_verified
+        && timeline.go_sent - timeline.setup_started <= Duration::seconds(5)
+        && timeline.result_received >= timeline.go_sent
+        && exited >= timeline.result_received
+        && exited - timeline.setup_started <= Duration::seconds(60)
+        && evidence.captured_at >= exited
 }

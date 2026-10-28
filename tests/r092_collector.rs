@@ -312,6 +312,12 @@ async fn real_parent_validates_handshake_and_reaps_successful_collector() {
     assert_eq!(result.curve25519, curve25519);
     assert_eq!(result.isolation.no_new_privs, 1);
     assert_eq!(result.isolation.seccomp, 2);
+    assert_eq!(result.isolation.nonce.len(), 64);
+    let timeline = &result.isolation.timeline;
+    assert!(timeline.setup_started <= timeline.ready_verified);
+    assert!(timeline.ready_verified <= timeline.go_sent);
+    assert!(timeline.go_sent <= timeline.result_received);
+    assert!(timeline.result_received <= timeline.child_exited.unwrap());
     assert!(!std::path::Path::new(&format!("/proc/{}", result.isolation.process)).exists());
     assert!(server.received_requests().await.unwrap().is_empty());
 }

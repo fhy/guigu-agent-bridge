@@ -117,6 +117,102 @@ CREATE TABLE matrix_activation_intent (
     ))
 ) STRICT;
 
+CREATE TABLE offline_recovery_metadata_anchors (
+    table_name TEXT NOT NULL CHECK (table_name IN ('agents', 'conversations')),
+    canonical_pk TEXT NOT NULL,
+    role TEXT NOT NULL CHECK (role = 'metadata_anchor'),
+    db_generation TEXT NOT NULL,
+    root_digest TEXT NOT NULL,
+    admin_operation_id TEXT NOT NULL,
+    plan_digest TEXT NOT NULL,
+    original_revision TEXT NOT NULL,
+    original_digest TEXT NOT NULL,
+    PRIMARY KEY (table_name, canonical_pk),
+    FOREIGN KEY (table_name, canonical_pk)
+        REFERENCES offline_recovery_rows(table_name, canonical_pk)
+) STRICT;
+
+CREATE TRIGGER offline_recovery_anchor_binding
+BEFORE INSERT ON offline_recovery_metadata_anchors
+WHEN NOT EXISTS (
+    SELECT 1 FROM offline_recovery_binding AS binding
+    JOIN offline_recovery_rows AS classified
+        ON classified.table_name = NEW.table_name AND classified.canonical_pk = NEW.canonical_pk
+    WHERE binding.singleton = 1 AND binding.phase = 'transition_pending'
+        AND binding.db_generation = NEW.db_generation AND binding.root_digest = NEW.root_digest
+        AND binding.admin_operation_id = NEW.admin_operation_id AND binding.plan_digest = NEW.plan_digest
+        AND classified.context_kind = 'admin' AND classified.origin_generation = binding.native_operation_id
+        AND classified.matrix_operation_id = binding.native_operation_id
+        AND classified.admin_operation_id = NEW.admin_operation_id AND classified.plan_digest = NEW.plan_digest
+        AND classified.original_revision = NEW.original_revision AND classified.original_digest = NEW.original_digest
+        AND classified.disposition IN ('terminal_evidenced', 'quarantined_no_effect')
+        AND NOT EXISTS (SELECT 1 FROM offline_recovery_rows WHERE disposition IN ('uncertain_hold', 'refused_hold'))
+) OR EXISTS (SELECT 1 FROM offline_recovery_metadata_anchors
+    WHERE table_name = NEW.table_name AND canonical_pk = NEW.canonical_pk)
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-anchor-binding');
+END;
+
+CREATE TRIGGER offline_recovery_anchor_no_update
+BEFORE UPDATE ON offline_recovery_metadata_anchors
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-anchor-immutable');
+END;
+
+CREATE TRIGGER offline_recovery_anchor_no_delete
+BEFORE DELETE ON offline_recovery_metadata_anchors
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-anchor-immutable');
+END;
+
+CREATE TRIGGER offline_recovery_anchor_agents_update
+BEFORE UPDATE ON agents
+WHEN EXISTS (SELECT 1 FROM offline_recovery_metadata_anchors
+    WHERE table_name = 'agents' AND canonical_pk = json_array(typeof(OLD.endpoint_id) || ':' || hex(CAST(OLD.endpoint_id AS BLOB))))
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-anchor-metadata-write');
+END;
+
+CREATE TRIGGER offline_recovery_anchor_agents_delete
+BEFORE DELETE ON agents
+WHEN EXISTS (SELECT 1 FROM offline_recovery_metadata_anchors
+    WHERE table_name = 'agents' AND canonical_pk = json_array(typeof(OLD.endpoint_id) || ':' || hex(CAST(OLD.endpoint_id AS BLOB))))
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-anchor-metadata-write');
+END;
+
+CREATE TRIGGER offline_recovery_anchor_conversations_update
+BEFORE UPDATE ON conversations
+WHEN EXISTS (SELECT 1 FROM offline_recovery_metadata_anchors
+    WHERE table_name = 'conversations' AND canonical_pk = json_array(typeof(OLD.conversation_id) || ':' || hex(CAST(OLD.conversation_id AS BLOB))))
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-anchor-metadata-write');
+END;
+
+CREATE TRIGGER offline_recovery_anchor_agents_insert
+BEFORE INSERT ON agents
+WHEN EXISTS (SELECT 1 FROM offline_recovery_metadata_anchors
+    WHERE table_name = 'agents' AND canonical_pk = json_array(typeof(NEW.endpoint_id) || ':' || hex(CAST(NEW.endpoint_id AS BLOB))))
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-anchor-metadata-write');
+END;
+
+CREATE TRIGGER offline_recovery_anchor_conversations_insert
+BEFORE INSERT ON conversations
+WHEN EXISTS (SELECT 1 FROM offline_recovery_metadata_anchors
+    WHERE table_name = 'conversations' AND canonical_pk = json_array(typeof(NEW.conversation_id) || ':' || hex(CAST(NEW.conversation_id AS BLOB))))
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-anchor-metadata-write');
+END;
+
+CREATE TRIGGER offline_recovery_anchor_conversations_delete
+BEFORE DELETE ON conversations
+WHEN EXISTS (SELECT 1 FROM offline_recovery_metadata_anchors
+    WHERE table_name = 'conversations' AND canonical_pk = json_array(typeof(OLD.conversation_id) || ':' || hex(CAST(OLD.conversation_id AS BLOB))))
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-anchor-metadata-write');
+END;
+
 CREATE TRIGGER offline_recovery_binding_immutable
 BEFORE UPDATE ON offline_recovery_binding
 WHEN NEW.singleton != OLD.singleton OR NEW.protocol != OLD.protocol
@@ -248,4 +344,40 @@ BEFORE INSERT ON runtime_eligibility_context
 WHEN EXISTS (SELECT 1 FROM runtime_eligibility_context)
 BEGIN
     SELECT RAISE(ABORT, 'offline-recovery-context-replace');
+END;
+
+CREATE TRIGGER offline_recovery_anchor_role_insert
+BEFORE INSERT ON offline_recovery_rows
+WHEN EXISTS (
+    SELECT 1 FROM json_each(NEW.parent_relations) AS parent
+    WHERE json_extract(parent.value, '$.role') = 'metadata_anchor' AND (
+        NEW.disposition != 'eligible_new' OR NEW.context_kind != 'admin'
+        OR NEW.matrix_operation_id IS NULL OR NOT EXISTS (
+            SELECT 1 FROM offline_recovery_metadata_anchors AS anchor
+            JOIN offline_recovery_binding AS binding ON binding.singleton = 1
+            WHERE anchor.table_name = json_extract(parent.value, '$.identity.table')
+                AND anchor.canonical_pk = json_extract(parent.value, '$.identity.key')
+                AND anchor.original_revision = json_extract(parent.value, '$.revision')
+                AND anchor.original_digest = json_extract(parent.value, '$.digest')
+                AND binding.native_operation_id = NEW.origin_generation
+                AND anchor.admin_operation_id = NEW.admin_operation_id AND anchor.plan_digest = NEW.plan_digest
+                AND binding.phase = 'active' AND binding.root_digest = anchor.root_digest
+                AND binding.db_generation = anchor.db_generation
+                AND binding.admin_operation_id = anchor.admin_operation_id AND binding.plan_digest = anchor.plan_digest
+                AND binding.native_operation_id = NEW.matrix_operation_id
+        )
+    )
+)
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-anchor-role');
+END;
+
+CREATE TRIGGER offline_recovery_parent_roles_immutable
+BEFORE UPDATE OF parent_relations ON offline_recovery_rows
+WHEN EXISTS (SELECT 1 FROM json_each(NEW.parent_relations)
+    WHERE json_extract(value, '$.role') = 'metadata_anchor')
+    OR EXISTS (SELECT 1 FROM json_each(OLD.parent_relations)
+    WHERE json_extract(value, '$.role') = 'metadata_anchor')
+BEGIN
+    SELECT RAISE(ABORT, 'offline-recovery-parent-role-immutable');
 END;

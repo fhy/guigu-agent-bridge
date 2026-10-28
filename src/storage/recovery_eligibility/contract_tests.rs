@@ -5,7 +5,7 @@ use crate::{
 
 use super::{EffectDomain, EligibilityContext, LiveFence, ParentIdentity, RowIdentity, inventory};
 
-fn key(value: &str) -> String {
+pub(super) fn key(value: &str) -> String {
     let hexadecimal = value
         .as_bytes()
         .iter()
@@ -14,14 +14,14 @@ fn key(value: &str) -> String {
     serde_json::to_string(&vec![format!("text:{hexadecimal}")]).unwrap()
 }
 
-async fn classify(
+pub(super) async fn classify(
     connection: &mut sqlx::SqliteConnection,
     identity: &RowIdentity,
     disposition: &str,
     parents: &[ParentIdentity],
 ) {
     let snapshot = inventory::snapshot(connection, identity).await.unwrap();
-    sqlx::query("INSERT INTO offline_recovery_rows(table_name,canonical_pk,origin_generation,original_revision,original_digest,parent_relations,disposition,evidence_digest,context_kind,admin_operation_id,plan_digest,matrix_operation_id) VALUES(?,?,'generation',?,?,?,?,'explicit-synthetic-plan','admin','admin','plan','native')")
+    sqlx::query("INSERT INTO offline_recovery_rows(table_name,canonical_pk,origin_generation,original_revision,original_digest,parent_relations,disposition,evidence_digest,context_kind,admin_operation_id,plan_digest,matrix_operation_id) VALUES(?,?,'native',?,?,?,?,'explicit-synthetic-plan','admin','admin','plan','native')")
         .bind(&identity.table).bind(&identity.key).bind(snapshot.revision).bind(snapshot.digest)
         .bind(serde_json::to_string(parents).unwrap()).bind(disposition)
         .execute(connection).await.unwrap();
@@ -56,10 +56,12 @@ async fn admin_terminal_conversation_has_no_fresh_identity_or_eligible_parent_es
         identity: parent,
         revision: snapshot.revision,
         digest: snapshot.digest,
+        role: super::ParentRole::Effectful,
     }];
     classify(&mut tx, &child, "eligible_new", &parents).await;
     let context = EligibilityContext::Admin {
         generation: "generation".into(),
+        root: "root".into(),
         operation: "admin".into(),
         plan: "plan".into(),
         revision: 0,
@@ -91,7 +93,7 @@ async fn admin_terminal_conversation_has_no_fresh_identity_or_eligible_parent_es
     tx.rollback().await.unwrap();
 }
 
-async fn verify_canonical_identity(pool: &sqlx::SqlitePool) -> Conversation {
+pub(super) async fn verify_canonical_identity(pool: &sqlx::SqlitePool) -> Conversation {
     let repository = SqliteRepository::new(pool.clone());
     let conversation = Conversation {
         id: ConversationId::generate(),
@@ -119,7 +121,7 @@ async fn verify_canonical_identity(pool: &sqlx::SqlitePool) -> Conversation {
     conversation
 }
 
-async fn seed_admin(connection: &mut sqlx::SqliteConnection) {
+pub(super) async fn seed_admin(connection: &mut sqlx::SqliteConnection) {
     sqlx::query("INSERT INTO offline_recovery_binding(singleton,protocol,db_generation,canonical_db_digest,root_digest,admin_operation_id,schema_intent_digest,schema_complete_digest,plan_digest,identity_digest,classification_digest,transition_intent_digest,transition_complete_digest,native_operation_id,phase,revision) VALUES(1,2,'generation','database','root','admin','schema-intent','schema-complete','plan','identity','classification','transition-intent','transition-complete','native','active',0)")
         .execute(&mut *connection).await.unwrap();
     sqlx::query("UPDATE runtime_eligibility_bootstrap SET state='admin_reserved'")

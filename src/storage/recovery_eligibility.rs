@@ -2,6 +2,9 @@ mod authority;
 #[cfg(test)]
 mod contract_tests;
 mod inventory;
+mod metadata;
+#[cfg(test)]
+mod metadata_tests;
 #[cfg(test)]
 mod tests;
 
@@ -19,6 +22,16 @@ pub struct ParentIdentity {
     pub identity: RowIdentity,
     pub revision: String,
     pub digest: String,
+    #[serde(default)]
+    pub role: ParentRole,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ParentRole {
+    #[default]
+    Effectful,
+    MetadataAnchor,
 }
 
 pub async fn require_row(
@@ -45,6 +58,12 @@ pub async fn require_row(
     let mut pending = vec![(identity.clone(), None::<ParentIdentity>)];
     let mut checked = BTreeMap::<(String, String), (String, String)>::new();
     while let Some((identity, expected)) = pending.pop() {
+        if let Some(parent) = expected.as_ref()
+            && parent.role == ParentRole::MetadataAnchor
+        {
+            metadata::validate(connection, context, domain, parent).await?;
+            continue;
+        }
         if checked.len() >= 10000 {
             return Err(refused());
         }

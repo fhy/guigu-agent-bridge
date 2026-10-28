@@ -58,6 +58,14 @@ fn local(observation: &guigu_agent_bridge::offline_identity::ServerObservation) 
         ed25519: observation.ed25519.clone(),
         curve25519: observation.curve25519.clone(),
         isolation: IsolationEvidence {
+            nonce: "synthetic-not-handshake-proof".into(),
+            timeline: guigu_agent_bridge::offline_identity::CaptureTimeline {
+                setup_started: chrono::Utc::now(),
+                ready_verified: chrono::Utc::now(),
+                go_sent: chrono::Utc::now(),
+                result_received: chrono::Utc::now(),
+                child_exited: None,
+            },
             policy: "synthetic-comparison-only".into(),
             executable: "not-an-isolation-claim".into(),
             process: 0,

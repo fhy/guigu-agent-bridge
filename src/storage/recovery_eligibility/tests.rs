@@ -154,11 +154,13 @@ async fn actual_foreign_key_parent_cannot_be_omitted_from_classification() {
             identity: parent,
             revision: parent_state.revision,
             digest: parent_state.digest,
+            role: super::ParentRole::Effectful,
         },
         ParentIdentity {
             identity: identity.clone(),
             revision: own_state.revision,
             digest: own_state.digest,
+            role: super::ParentRole::Effectful,
         },
     ];
     sqlx::query("UPDATE offline_recovery_rows SET parent_relations=? WHERE table_name='tasks'")

@@ -18,6 +18,7 @@ pub enum EligibilityContext {
     },
     Admin {
         generation: String,
+        root: String,
         operation: String,
         plan: String,
         revision: i64,
@@ -63,16 +64,16 @@ impl EligibilityContext {
                     && plan.is_none()
             }
             Self::Admin {
-                generation: expected_generation,
                 operation: expected,
                 plan: expected_plan,
+                matrix_operation: expected_origin,
                 ..
             } => {
                 kind == "admin"
                     && generation.is_none()
                     && operation == Some(expected.as_str())
                     && plan == Some(expected_plan.as_str())
-                    && origin == expected_generation
+                    && origin == expected_origin
             }
         };
         if valid { Ok(()) } else { Err(refused()) }
@@ -98,14 +99,15 @@ pub(super) async fn validate(
         }
         EligibilityContext::Admin {
             generation,
+            root,
             operation,
             plan,
             revision,
             matrix_enabled,
             matrix_operation,
         } => {
-            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM offline_recovery_binding WHERE singleton=1 AND phase='active' AND db_generation=? AND admin_operation_id=? AND plan_digest=? AND revision=? AND native_operation_id=? AND transition_complete_digest IS NOT NULL AND NOT EXISTS(SELECT 1 FROM runtime_eligibility_context)")
-                .bind(generation).bind(operation).bind(plan).bind(revision).bind(matrix_operation).fetch_one(&mut *connection).await?;
+            let count: i64 = sqlx::query_scalar("SELECT count(*) FROM offline_recovery_binding WHERE singleton=1 AND phase='active' AND db_generation=? AND root_digest=? AND admin_operation_id=? AND plan_digest=? AND revision=? AND native_operation_id=? AND transition_complete_digest IS NOT NULL AND NOT EXISTS(SELECT 1 FROM runtime_eligibility_context)")
+                .bind(generation).bind(root).bind(operation).bind(plan).bind(revision).bind(matrix_operation).fetch_one(&mut *connection).await?;
             (count == 1, *matrix_enabled)
         }
     };

@@ -6,7 +6,10 @@ mod protocol;
 mod server;
 mod store;
 
-pub use parent::{CollectorRefused, CollectorRequest, CollectorResult, IsolationEvidence, collect};
+pub use parent::{
+    CaptureTimeline, CollectorRefused, CollectorRequest, CollectorResult, IsolationEvidence,
+    collect,
+};
 pub use server::{ServerObservation, observe_server};
 pub use store::{StoreGeneration, store_generation};
 

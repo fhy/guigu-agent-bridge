@@ -44,6 +44,14 @@ fn evidence(intent: &IdentityIntent) -> IdentityEvidence {
             ed25519: "ed25519".into(),
             curve25519: "curve25519".into(),
             isolation: IsolationEvidence {
+                nonce: "a".repeat(64),
+                timeline: crate::offline_identity::CaptureTimeline {
+                    setup_started: captured_at,
+                    ready_verified: captured_at,
+                    go_sent: captured_at,
+                    result_received: captured_at,
+                    child_exited: Some(captured_at),
+                },
                 policy: crate::offline_identity::isolation_policy_digest(),
                 executable: intent.executable_digest.clone(),
                 process: 1,
@@ -104,6 +112,40 @@ fn evidence_expiry_continuity_and_isolation_are_required_without_timestamp_refre
     captured.after.curve25519 = captured.before.curve25519.clone();
     captured.local.isolation.policy = "different-policy".into();
     assert!(captured.validate(&intent, now).is_err());
+}
+
+#[test]
+fn nonce_and_complete_ordered_handshake_timeline_are_required() {
+    let intent = intent();
+    for invalid in [
+        "nonce",
+        "missing-exit",
+        "setup",
+        "total",
+        "ordering",
+        "generation",
+    ] {
+        let mut captured = evidence(&intent);
+        match invalid {
+            "nonce" => captured.local.isolation.nonce = "not-a-nonce".into(),
+            "missing-exit" => captured.local.isolation.timeline.child_exited = None,
+            "setup" => captured.local.isolation.timeline.go_sent += Duration::seconds(6),
+            "total" => {
+                captured.local.isolation.timeline.child_exited =
+                    Some(captured.captured_at + Duration::seconds(61));
+                captured.captured_at += Duration::seconds(61);
+                captured.expires_at = captured.captured_at + Duration::minutes(15);
+            }
+            "ordering" => captured.local.isolation.timeline.result_received -= Duration::seconds(1),
+            _ => captured.local.isolation.generation.clear(),
+        }
+        assert!(
+            captured
+                .validate(&intent, Utc::now() + Duration::seconds(62))
+                .is_err(),
+            "{invalid}"
+        );
+    }
 }
 
 #[tokio::test]

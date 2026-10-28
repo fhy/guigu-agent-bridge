@@ -5,6 +5,7 @@ use std::{
     time::Duration,
 };
 
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::{
@@ -31,6 +32,8 @@ pub struct CollectorRequest {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct IsolationEvidence {
+    pub nonce: String,
+    pub timeline: CaptureTimeline,
     pub policy: String,
     pub executable: String,
     pub process: u32,
@@ -38,6 +41,16 @@ pub struct IsolationEvidence {
     pub no_new_privs: u8,
     pub seccomp: u8,
     pub denied_probes: [i32; 6],
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CaptureTimeline {
+    pub setup_started: DateTime<Utc>,
+    pub ready_verified: DateTime<Utc>,
+    pub go_sent: DateTime<Utc>,
+    pub result_received: DateTime<Utc>,
+    pub child_exited: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -86,6 +99,7 @@ async fn supervise(
     pin: impl FnOnce() -> Result<PinnedExecutable, CollectorRefused> + Send + 'static,
 ) -> Result<CollectorResult, CollectorRefused> {
     let setup = started + Duration::from_secs(5);
+    let setup_started = Utc::now();
     let executable = tokio::time::timeout_at(setup, tokio::task::spawn_blocking(pin))
         .await
         .map_err(|_| CollectorRefused)?
@@ -105,9 +119,10 @@ async fn supervise(
         biased;
         _ = &mut cancelled => Err(CollectorRefused),
         outcome = tokio::time::timeout_at(started + Duration::from_secs(60), async {
-            let result = exchange(&mut child, request, &nonce, &executable, setup).await?;
+            let mut result = exchange(&mut child, request, &nonce, &executable, setup, setup_started).await?;
             let status = child.wait().await.map_err(|_| CollectorRefused)?;
             if !status.success() { return Err(CollectorRefused); }
+            result.isolation.timeline.child_exited = Some(Utc::now());
             Ok(result)
         }) => {
             outcome.unwrap_or(Err(CollectorRefused))
@@ -125,6 +140,7 @@ async fn exchange(
     nonce: &str,
     executable: &PinnedExecutable,
     setup: Instant,
+    setup_started: DateTime<Utc>,
 ) -> Result<CollectorResult, CollectorRefused> {
     let process = child.id().ok_or(CollectorRefused)?;
     let mut stdout = child.stdout.take().ok_or(CollectorRefused)?;
@@ -134,9 +150,60 @@ async fn exchange(
         .await
         .map_err(|_| CollectorRefused)??;
     validate_ready(&ready, process, nonce, executable)?;
+    let ready_verified = Utc::now();
     if Instant::now() >= setup {
         return Err(CollectorRefused);
     }
+    send_capture(&mut stdin, request, nonce, setup).await?;
+    drop(stdin);
+    let go_sent = Utc::now();
+    let captured: Captured = read_frame(&mut stdout).await?;
+    let result_received = Utc::now();
+    let mut extra = [0; 1];
+    if stdout
+        .read(&mut extra)
+        .await
+        .map_err(|_| CollectorRefused)?
+        != 0
+        || stderr
+            .read(&mut extra)
+            .await
+            .map_err(|_| CollectorRefused)?
+            != 0
+        || captured.no_new_privs != 1
+        || captured.seccomp != 2
+    {
+        return Err(CollectorRefused);
+    }
+    Ok(CollectorResult {
+        ed25519: captured.ed25519,
+        curve25519: captured.curve25519,
+        isolation: IsolationEvidence {
+            nonce: nonce.to_owned(),
+            timeline: CaptureTimeline {
+                setup_started,
+                ready_verified,
+                go_sent,
+                result_received,
+                child_exited: None,
+            },
+            policy: ready.policy,
+            executable: ready.executable,
+            process,
+            generation: ready.generation,
+            no_new_privs: 1,
+            seccomp: 2,
+            denied_probes: ready.denied_probes,
+        },
+    })
+}
+
+async fn send_capture(
+    stdin: &mut tokio::process::ChildStdin,
+    request: CollectorRequest,
+    nonce: &str,
+    setup: Instant,
+) -> Result<(), CollectorRefused> {
     let capture = Capture {
         nonce: nonce.to_owned(),
         homeserver: request.homeserver,
@@ -159,37 +226,7 @@ async fn exchange(
     payload.fill(0);
     sent.map_err(|_| CollectorRefused)?;
     stdin.shutdown().await.map_err(|_| CollectorRefused)?;
-    drop(stdin);
-    let captured: Captured = read_frame(&mut stdout).await?;
-    let mut extra = [0; 1];
-    if stdout
-        .read(&mut extra)
-        .await
-        .map_err(|_| CollectorRefused)?
-        != 0
-        || stderr
-            .read(&mut extra)
-            .await
-            .map_err(|_| CollectorRefused)?
-            != 0
-        || captured.no_new_privs != 1
-        || captured.seccomp != 2
-    {
-        return Err(CollectorRefused);
-    }
-    Ok(CollectorResult {
-        ed25519: captured.ed25519,
-        curve25519: captured.curve25519,
-        isolation: IsolationEvidence {
-            policy: ready.policy,
-            executable: ready.executable,
-            process,
-            generation: ready.generation,
-            no_new_privs: 1,
-            seccomp: 2,
-            denied_probes: ready.denied_probes,
-        },
-    })
+    Ok(())
 }
 
 fn validate_ready(
