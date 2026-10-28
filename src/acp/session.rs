@@ -267,14 +267,20 @@ impl SqliteSessionStore {
         conversation: ConversationId,
         cwd: &str,
     ) -> Result<Option<StoredSession>, StorageError> {
+        let mut scoped =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await
+                .map_err(StorageError::from)?;
         let row = sqlx::query(SELECT_LIVE_SESSION_LEGACY)
             .bind(encode_id(endpoint))
             .bind(encode_id(conversation))
             .bind(cwd)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *scoped)
             .await
             .map_err(StorageError::from)?;
-        row.as_ref().map(session_from_row).transpose()
+        let result = row.as_ref().map(session_from_row).transpose();
+        scoped.commit().await.map_err(StorageError::from)?;
+        result
     }
 
     pub async fn live_session_with_workspaces(
@@ -291,6 +297,10 @@ impl SqliteSessionStore {
             cwd,
             additional_directories,
         );
+        let mut scoped =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await
+                .map_err(StorageError::from)?;
         let row = sqlx::query(SELECT_LIVE_SESSION)
             .bind(encode_id(endpoint))
             .bind(encode_id(conversation))
@@ -304,10 +314,12 @@ impl SqliteSessionStore {
             .bind(hash)
             .bind(backend_id)
             .bind(i64::from(crate::acp::PROTOCOL_VERSION))
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *scoped)
             .await
             .map_err(StorageError::from)?;
-        row.as_ref().map(session_from_row).transpose()
+        let result = row.as_ref().map(session_from_row).transpose();
+        scoped.commit().await.map_err(StorageError::from)?;
+        result
     }
 
     /// Insert a session, or refresh the row for the same session id.
