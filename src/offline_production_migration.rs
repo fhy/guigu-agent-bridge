@@ -21,6 +21,9 @@ mod snapshot;
 mod test_fixture;
 #[cfg(test)]
 mod tests;
+mod transition;
+#[cfg(test)]
+mod transition_tests;
 mod verification;
 mod version2;
 mod version2_archive;
@@ -28,7 +31,9 @@ mod version2_records;
 #[cfg(test)]
 mod version2_tests;
 
-pub use arguments::{Mode, Request, parse_args, parse_identity_args};
+pub use arguments::{
+    Mode, Request, TransitionRequest, parse_args, parse_identity_args, parse_transition_args,
+};
 pub use flow::run;
 pub use identity_capture::run as capture_identity;
 
@@ -73,6 +78,37 @@ pub(crate) async fn dispatch_identity(args: &[std::ffi::OsString]) -> Result<(),
             }))
         }
     }
+}
+
+pub(crate) async fn dispatch_transition(args: &[std::ffi::OsString]) -> Result<(), crate::Error> {
+    let request = parse_transition_args(args).map_err(|_| {
+        crate::Error::Cli(crate::error::CliFailure {
+            command: "offline-transition-matrix-compatibility",
+            category: "invalid-arguments",
+            status: 2,
+        })
+    })?;
+    let result = transition::run(request).await.map_err(|error| {
+        crate::Error::Cli(crate::error::CliFailure {
+            command: "offline-transition-matrix-compatibility",
+            category: match error {
+                Failure::InvalidArguments => "invalid-arguments",
+                Failure::Busy => "busy",
+                Failure::Preflight => "preflight",
+                Failure::ManualRequired => "manual-required",
+                Failure::Migration => "migration",
+            },
+            status: match error {
+                Failure::InvalidArguments => 2,
+                Failure::Busy => 4,
+                Failure::Preflight => 5,
+                Failure::ManualRequired => 6,
+                Failure::Migration => 7,
+            },
+        })
+    })?;
+    println!("{result}");
+    Ok(())
 }
 
 pub(crate) fn check_runtime_discovery(database: &std::path::Path) -> std::io::Result<()> {

@@ -510,3 +510,60 @@ async fn activation_requires_operation_provenance_and_reads_back_marker() {
     .unwrap();
     assert_eq!(marker, ("active".into(), "op-5".into(), "B".into()));
 }
+
+#[tokio::test]
+async fn administrative_activation_intent_prepared_recovery_and_stale_owner_refuse() {
+    use guigu_agent_bridge::storage::cutover_digest;
+    let pool = database().await;
+    sqlx::query("INSERT INTO offline_recovery_binding(singleton,protocol,db_generation,canonical_db_digest,root_digest,admin_operation_id,schema_intent_digest,schema_complete_digest,plan_digest,identity_digest,classification_digest,transition_intent_digest,transition_complete_digest,native_operation_id,phase,revision) VALUES(1,2,'generation','db','root','operation','schema','complete','plan','identity','class','intent','complete','native-op','baseline_ready',4)")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO matrix_recovery_control(control_id,cutover_operation_id,phase,watermark,updated_at) VALUES(1,'operation','baseline',NULL,'t0')")
+        .execute(&pool).await.unwrap();
+    let store = MatrixRecoveryStore::new(pool.clone());
+    assert!(
+        store
+            .begin_activation_intent("owner", 1, "attempt", &cutover_digest(b"request"), "t1")
+            .await
+            .unwrap()
+    );
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM matrix_activation_intent WHERE native_operation_id='native-op'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "inflight");
+    assert!(
+        store
+            .commit_activation_intent("operation", "owner", 1, "B", "t2")
+            .await
+            .is_err()
+    );
+    store
+        .prepare_activation_intent("owner", 1, "B", &cutover_digest(b"B"), "t3")
+        .await
+        .unwrap();
+    let prepared: (String, String, String) = sqlx::query_as("SELECT control.phase,binding.phase,intent.state FROM matrix_recovery_control control JOIN offline_recovery_binding binding ON binding.singleton=1 JOIN matrix_activation_intent intent ON intent.native_operation_id=binding.native_operation_id")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        prepared,
+        (
+            "baseline".into(),
+            "activation_prepared".into(),
+            "prepared".into()
+        )
+    );
+    assert!(
+        store
+            .prepare_activation_intent("stale", 1, "B", &cutover_digest(b"B"), "t4")
+            .await
+            .is_err()
+    );
+    store
+        .commit_activation_intent("operation", "owner", 1, "B", "t5")
+        .await
+        .unwrap();
+    let rows: (String, String, String) = sqlx::query_as("SELECT control.phase,binding.phase,intent.state FROM matrix_recovery_control control JOIN offline_recovery_binding binding ON binding.singleton=1 JOIN matrix_activation_intent intent ON intent.native_operation_id=binding.native_operation_id")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(rows, ("active".into(), "active".into(), "committed".into()));
+}

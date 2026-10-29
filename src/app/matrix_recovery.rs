@@ -59,8 +59,34 @@ pub(super) async fn prepare_sync(
     if control.operation_id.trim().is_empty() || control.restart_hold_state.is_some() {
         return Err(AppError::Runtime);
     }
+    let mut activation_epoch = None;
     match control.phase.as_str() {
         "baseline" if control.watermark.is_none() => {
+            let now = Utc::now();
+            let epoch = recovery
+                .acquire_component_lease(
+                    "MatrixSync",
+                    runtime,
+                    &now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                    &(now + chrono::Duration::seconds(60))
+                        .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                )
+                .await
+                .map_err(|_| AppError::Runtime)?;
+            activation_epoch = Some(epoch);
+            let request_digest = crate::storage::cutover_digest(
+                format!("{}:{}", control.operation_id, runtime).as_bytes(),
+            );
+            let governed = recovery
+                .begin_activation_intent(
+                    runtime,
+                    epoch,
+                    &format!("{runtime}-{epoch}"),
+                    &request_digest,
+                    &now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                )
+                .await
+                .map_err(|_| AppError::Runtime)?;
             let baseline = client
                 .baseline_sync_token()
                 .await
@@ -68,14 +94,29 @@ pub(super) async fn prepare_sync(
             if baseline.is_empty() {
                 return Err(AppError::Matrix);
             }
-            recovery
-                .activate_cutover(
-                    &control.operation_id,
-                    &baseline,
-                    &Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-                )
-                .await
-                .map_err(|_| AppError::Runtime)?;
+            let now_text = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            if governed {
+                let digest = crate::storage::cutover_digest(baseline.as_bytes());
+                recovery
+                    .prepare_activation_intent(runtime, epoch, &baseline, &digest, &now_text)
+                    .await
+                    .map_err(|_| AppError::Runtime)?;
+                recovery
+                    .commit_activation_intent(
+                        &control.operation_id,
+                        runtime,
+                        epoch,
+                        &baseline,
+                        &now_text,
+                    )
+                    .await
+                    .map_err(|_| AppError::Runtime)?;
+            } else {
+                recovery
+                    .activate_cutover(&control.operation_id, &baseline, &now_text)
+                    .await
+                    .map_err(|_| AppError::Runtime)?;
+            }
         }
         "active"
             if control
@@ -85,16 +126,18 @@ pub(super) async fn prepare_sync(
         _ => return Err(AppError::Runtime),
     }
     let now = Utc::now();
-    let epoch = recovery
-        .acquire_component_lease(
-            "MatrixSync",
-            runtime,
-            &now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-            &(now + chrono::Duration::seconds(60))
-                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-        )
-        .await
-        .map_err(|_| AppError::Runtime)?;
+    let epoch = activation_epoch.unwrap_or(
+        recovery
+            .acquire_component_lease(
+                "MatrixSync",
+                runtime,
+                &now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                &(now + chrono::Duration::seconds(60))
+                    .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            )
+            .await
+            .map_err(|_| AppError::Runtime)?,
+    );
     if let Some(scope) = recovery_scope.as_ref() {
         scope
             .install_matrix_fence(crate::storage::recovery_eligibility::LiveFence {
