@@ -618,7 +618,7 @@ impl AppRuntime {
         });
         let repository_trait: Arc<dyn Repository> = repository.clone();
         let sessions = SqliteSessionStore::new_scoped(pool.clone(), recovery_scope.clone());
-        let runtime_store = SqliteRuntimeStore::new(pool.clone());
+        let runtime_store = SqliteRuntimeStore::new_scoped(pool.clone(), recovery_scope.clone());
         let metrics = Arc::new(RuntimeMetrics::default());
         let projection_metrics = Arc::new(ProjectionMetrics::default());
         let health_state = Arc::new(HealthState::new(
@@ -658,7 +658,7 @@ impl AppRuntime {
         );
         let recovery_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         output_spool
-            .recover_cleanup(&recovery_at)
+            .recover_local_cleanup(&recovery_at)
             .await
             .map_err(|_| AppError::Assembly("durable output cleanup recovery failed"))?;
         output_store
@@ -1004,8 +1004,9 @@ impl AppRuntime {
             Clock::system(),
             dispatchers,
         )
-        .lifecycle(Arc::new(crate::runtime::SqliteTaskLifecycle::new(
+        .lifecycle(Arc::new(crate::runtime::SqliteTaskLifecycle::new_scoped(
             pool.clone(),
+            recovery_scope.clone(),
         )))
         .config(WorkerConfig {
             limits: crate::bus::LoopLimits::from_bridge(&config.bridge),
@@ -1043,6 +1044,10 @@ impl AppRuntime {
                 recovery_scope.clone(),
             )
             .await?;
+            output_spool
+                .recover_cleanup(&Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
+                .await
+                .map_err(|_| AppError::Assembly("durable Matrix output cleanup recovery failed"))?;
             let sdk = Arc::new(SdkMatrixSender::new(active));
             let mut sync = sync
                 .with_failure_observer(matrix_failure_observer(
@@ -1094,7 +1099,13 @@ impl AppRuntime {
             }
             let outbox_sender: Arc<dyn crate::matrix::MatrixOutboxSender> = sdk.clone();
             let durable_sender: Arc<dyn crate::matrix::DurableMatrixSender> = sdk.clone();
-            let outbox = crate::app::OutboxDrain::new(reliability.clone(), outbox_sender, 64);
+            let outbox_store = super::matrix_recovery::outbox_store(
+                &pool,
+                &runtime_instance,
+                recovery_scope.clone(),
+            )
+            .await?;
+            let outbox = crate::app::OutboxDrain::new(outbox_store, outbox_sender, 64);
             let outbox_owner = outbox.clone().start(Duration::from_secs(1));
             let output_owner = crate::app::output_drain::OutputSetDrain::new(
                 output_store.clone(),
@@ -1241,6 +1252,7 @@ impl AppRuntime {
     pub async fn shutdown(mut self) -> Result<(), AppError> {
         self.health_state.matrix().stop();
         let mut shutdown_error = None;
+        let mut matrix_lease = None;
         self.health_state.set_owner(OwnerState::Stopping);
         if let Some(token) = self.runtime_instance.as_deref() {
             let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
@@ -1258,16 +1270,17 @@ impl AppRuntime {
             heartbeat.abort();
             let _ = heartbeat.await;
         }
-        if let Some(sync) = self.matrix_sync.take()
-            && let Err(error) = sync.shutdown_bounded(self.shutdown_timeout).await
-        {
-            retain_failure(
-                &self.first_failure,
-                RequiredOwnerFailure {
-                    component: "matrix-sync",
-                    class: matrix_error_class(&error),
-                },
-            );
+        if let Some(sync) = self.matrix_sync.take() {
+            match sync.shutdown_bounded_deferred(self.shutdown_timeout).await {
+                Ok(lease) => matrix_lease = lease,
+                Err(error) => retain_failure(
+                    &self.first_failure,
+                    RequiredOwnerFailure {
+                        component: "matrix-sync",
+                        class: matrix_error_class(&error),
+                    },
+                ),
+            }
         }
         if let Some(ingress) = self.ingress.take() {
             ingress.shutdown().await;
@@ -1332,6 +1345,18 @@ impl AppRuntime {
             && output.shutdown().await.is_err()
         {
             shutdown_error.get_or_insert(AppError::Assembly("durable output owner join failed"));
+        }
+        let owners_healthy = self
+            .first_failure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_none();
+        if shutdown_error.is_none()
+            && owners_healthy
+            && let Some(lease) = matrix_lease
+            && lease.release().await.is_err()
+        {
+            shutdown_error = Some(AppError::Assembly("Matrix component release failed"));
         }
         self.gateway.take();
         if let Some(health) = self.health.take()

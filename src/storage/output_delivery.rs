@@ -53,8 +53,16 @@ impl OutputSpoolStore {
         set_id: &str,
         now: &str,
     ) -> Result<bool, OutputStoreError> {
+        let mut tx = self.transaction().await?;
+        let mutation = self
+            .prepare_row(&mut tx, "acp_output_sets", set_id, None)
+            .await?;
         let result=sqlx::query("UPDATE acp_output_sets SET state='sealed',updated_at=? WHERE set_id=? AND state='prepared' AND EXISTS(SELECT 1 FROM task_events e WHERE e.task_id=acp_output_sets.task_id AND e.status='completed' AND e.seq=(SELECT MAX(e2.seq) FROM task_events e2 WHERE e2.task_id=e.task_id))")
-            .bind(now).bind(set_id).execute(&self.pool).await?;
+            .bind(now).bind(set_id).execute(&mut *tx).await?;
+        if result.rows_affected() == 1 {
+            self.finish_row(&mut tx, mutation).await?;
+            tx.commit().await?;
+        }
         Ok(result.rows_affected() == 1)
     }
 
@@ -65,20 +73,27 @@ impl OutputSpoolStore {
         stale_before: &str,
     ) -> Result<Option<ClaimedOutputSet>, OutputStoreError> {
         let mut tx = self.transaction().await?;
+        let mutation = if self.recovery.is_some() {
+            let selected: Option<String> = sqlx::query_scalar("SELECT set_id FROM acp_output_sets WHERE state='sealed' ORDER BY created_at LIMIT 1")
+                .fetch_optional(&mut *tx).await?;
+            match selected {
+                Some(selected) => {
+                    self.prepare_row(&mut tx, "acp_output_sets", &selected, None)
+                        .await?
+                }
+                None => None,
+            }
+        } else {
+            None
+        };
         let query = if self.recovery.is_some() {
             sqlx::query("UPDATE acp_output_sets SET state='delivering',claim_owner=?,claim_revision=claim_revision+1,updated_at=? WHERE rowid=(SELECT rowid FROM acp_output_sets WHERE state='sealed' ORDER BY created_at LIMIT 1) RETURNING set_id,room_id,thread_root,reply_event_id,acknowledged_cursor,segment_count,claim_revision,attempt_count").bind(owner).bind(now)
         } else {
             sqlx::query("UPDATE acp_output_sets SET state='delivering',claim_owner=?,claim_revision=claim_revision+1,updated_at=? WHERE rowid=(SELECT rowid FROM acp_output_sets WHERE state='sealed' OR (state='delivering' AND updated_at<=?) ORDER BY created_at LIMIT 1) RETURNING set_id,room_id,thread_root,reply_event_id,acknowledged_cursor,segment_count,claim_revision,attempt_count").bind(owner).bind(now).bind(stale_before)
         };
         let row = query.fetch_optional(&mut *tx).await?;
-        if let Some(row) = &row {
-            self.prepare_row(
-                &mut tx,
-                "acp_output_sets",
-                &row.try_get::<String, _>("set_id")?,
-                None,
-            )
-            .await?;
+        if row.is_some() {
+            self.finish_row(&mut tx, mutation).await?;
         }
         tx.commit().await?;
         row.map(|row| {
@@ -135,9 +150,17 @@ impl OutputSpoolStore {
         } else {
             "delivering"
         };
+        let mut tx = self.transaction().await?;
+        let mutation = self
+            .prepare_row(&mut tx, "acp_output_sets", &set.set_id, None)
+            .await?;
         let result = sqlx::query("UPDATE acp_output_sets SET acknowledged_cursor=?,state=?,attempt_count=0,updated_at=? WHERE set_id=? AND state='delivering' AND claim_owner=? AND claim_revision=? AND acknowledged_cursor=?")
             .bind(index).bind(state).bind(now).bind(&set.set_id).bind(&set.claim_owner)
-            .bind(set.claim_revision).bind(index - 1).execute(&self.pool).await?;
+            .bind(set.claim_revision).bind(index - 1).execute(&mut *tx).await?;
+        if result.rows_affected() == 1 {
+            self.finish_row(&mut tx, mutation).await?;
+            tx.commit().await?;
+        }
         Ok(result.rows_affected() == 1)
     }
 

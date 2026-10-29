@@ -8,7 +8,8 @@ pub enum EffectDomain {
     Matrix,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum EligibilityContext {
     NonAdmin {
         generation: String,
@@ -27,7 +28,8 @@ pub enum EligibilityContext {
     },
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct LiveFence {
     pub component: String,
     pub owner: String,

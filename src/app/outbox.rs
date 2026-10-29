@@ -26,6 +26,10 @@ impl OutboxDrain {
         let stale = now - chrono::Duration::minutes(5);
         let owner = uuid::Uuid::now_v7().to_string();
         let now = now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        self.store
+            .renew_outbox_component(&now)
+            .await
+            .map_err(|_| ())?;
         let stale = stale.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         let rows = self
             .store
@@ -89,6 +93,9 @@ impl OutboxDrain {
                     biased;
                     changed = receiver.changed() => {
                         let _ = changed;
+                        if self.store.release_outbox_component().await.is_err() {
+                            tracing::warn!("outbox component lease retained after release refusal");
+                        }
                         break;
                     }
                     _ = tokio::time::sleep(interval) => {}

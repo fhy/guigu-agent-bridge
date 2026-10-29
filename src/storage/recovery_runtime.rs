@@ -11,11 +11,31 @@ impl MatrixRecoveryStore {
         batch: &str,
         now: &str,
     ) -> Result<(), sqlx::Error> {
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
+        let identity = crate::storage::recovery_eligibility::writer::composite_text_identity(
+            "matrix_recovery_receipts",
+            &[account, room, event, operation],
+        )?;
+        let mutation = crate::storage::recovery_eligibility::writer::prepare_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            &identity,
+        )
+        .await?;
         let result = sqlx::query("UPDATE matrix_recovery_receipts SET state='processing',updated_at=? WHERE account_id=? AND room_id=? AND event_id=? AND cutover_operation_id=? AND batch_id=? AND state='pending' AND EXISTS (SELECT 1 FROM matrix_recovery_batches b JOIN matrix_component_leases l ON l.component=b.component AND l.owner_token=b.owner_token AND l.epoch=b.owner_epoch WHERE b.batch_id=? AND b.state='processing' AND l.state='active' AND l.expires_at>=?)")
-            .bind(now).bind(account).bind(room).bind(event).bind(operation).bind(batch).bind(batch).bind(now).execute(&self.pool).await?;
+            .bind(now).bind(account).bind(room).bind(event).bind(operation).bind(batch).bind(batch).bind(now).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Err(sqlx::Error::Protocol("pre-effect fence failed".into()));
         }
+        crate::storage::recovery_eligibility::writer::complete_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            mutation,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 

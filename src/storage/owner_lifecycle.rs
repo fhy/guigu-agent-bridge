@@ -1,5 +1,19 @@
 use super::*;
 use crate::storage::owner_observation::{FinalObservation, fresh_timestamp};
+use crate::storage::recovery_eligibility::{RowIdentity, writer};
+
+pub(super) async fn evidence_identity(
+    connection: &mut sqlx::SqliteConnection,
+    token: &str,
+    revision: i64,
+) -> Result<RowIdentity, sqlx::Error> {
+    let key = sqlx::query_scalar("SELECT json_array('text:'||hex(CAST(instance_token AS BLOB)),'integer:'||hex(CAST(runtime_generation AS BLOB)),'integer:'||hex(CAST(evidence_revision AS BLOB))) FROM runtime_owner_evidence WHERE instance_token=? AND evidence_revision=?")
+        .bind(token).bind(revision).fetch_one(connection).await?;
+    Ok(RowIdentity {
+        table: "runtime_owner_evidence".into(),
+        key,
+    })
+}
 
 #[cfg(test)]
 #[path = "owner_lifecycle_tests.rs"]
@@ -34,24 +48,36 @@ impl ReliabilityStore {
         if !valid_owner_clock(evidence, now) || fingerprint.trim().is_empty() {
             return Ok(false);
         }
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut transaction = writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let inserted = sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES(?,?,?,'active',?) ON CONFLICT DO NOTHING")
             .bind(token).bind(now).bind(now).bind(fingerprint).execute(&mut *transaction).await?;
         if inserted.rows_affected() != 1 {
             transaction.rollback().await?;
             return Ok(false);
         }
+        let owner_identity = writer::text_identity("runtime_instances", token)?;
+        writer::inserted(&mut transaction, self.recovery.as_ref(), &owner_identity).await?;
         sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current,max_age_seconds) VALUES(?,1,1,'live',?,?,?,?,?,?,0,'open',0,'inaccessible','{}',1,?)")
             .bind(token).bind(evidence.pid).bind(evidence.proc_starttime).bind(fingerprint)
             .bind(&evidence.boot_id).bind(evidence.boottime_ns).bind(now).bind(self.owner_evidence_max_age)
             .execute(&mut *transaction).await?;
+        let identity = evidence_identity(&mut transaction, token, 1).await?;
+        writer::inserted(&mut transaction, self.recovery.as_ref(), &identity).await?;
         transaction.commit().await?;
         Ok(true)
     }
 
     pub async fn stop_runtime(&self, token: &str, now: &str) -> Result<bool, ReliabilityError> {
+        let mut transaction = writer::begin(&self.pool, self.recovery.as_ref()).await?;
+        let identity = writer::text_identity("runtime_instances", token)?;
+        let mutation =
+            writer::prepare_mutation(&mut transaction, self.recovery.as_ref(), &identity).await?;
         let result = sqlx::query("UPDATE runtime_instances SET state='stopped',heartbeat_at=? WHERE instance_token=? AND state IN ('active','stopping')")
-            .bind(now).bind(token).execute(&self.pool).await?;
+            .bind(now).bind(token).execute(&mut *transaction).await?;
+        if result.rows_affected() == 1 {
+            writer::complete_mutation(&mut transaction, self.recovery.as_ref(), mutation).await?;
+        }
+        transaction.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -62,7 +88,7 @@ impl ReliabilityStore {
         now: &str,
         evidence: &RuntimeOwnerEvidence,
     ) -> Result<bool, ReliabilityError> {
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut transaction = writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let current = sqlx::query("SELECT e.* FROM runtime_owner_evidence e JOIN runtime_instances r USING(instance_token) WHERE e.instance_token=? AND e.is_current=1 AND e.state='live' AND r.state='active'")
             .bind(token).fetch_optional(&mut *transaction).await?;
         let Some(current) = current else {
@@ -79,15 +105,27 @@ impl ReliabilityStore {
             .get::<i64, _>("evidence_revision")
             .checked_add(1)
             .ok_or(ReliabilityError::Malformed)?;
+        let owner_identity = writer::text_identity("runtime_instances", token)?;
+        let owner_mutation =
+            writer::prepare_mutation(&mut transaction, self.recovery.as_ref(), &owner_identity)
+                .await?;
+        let identity = evidence_identity(&mut transaction, token, revision - 1).await?;
+        let mutation =
+            writer::prepare_mutation(&mut transaction, self.recovery.as_ref(), &identity).await?;
         sqlx::query("UPDATE runtime_owner_evidence SET is_current=0 WHERE instance_token=? AND is_current=1")
             .bind(token).execute(&mut *transaction).await?;
+        writer::complete_mutation(&mut transaction, self.recovery.as_ref(), mutation).await?;
         sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current,max_age_seconds) SELECT instance_token,runtime_generation,?,?,pid,proc_starttime,process_fingerprint,boot_id,?, ?,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,1,max_age_seconds FROM runtime_owner_evidence WHERE instance_token=? AND evidence_revision=?")
             .bind(revision).bind(if valid { "live" } else { "unknown" })
             .bind(if valid { evidence.boottime_ns } else { current.get("boottime_ns") })
             .bind(now).bind(token).bind(revision - 1).execute(&mut *transaction).await?;
+        let identity = evidence_identity(&mut transaction, token, revision).await?;
+        writer::inserted(&mut transaction, self.recovery.as_ref(), &identity).await?;
         if valid {
             sqlx::query("UPDATE runtime_instances SET heartbeat_at=? WHERE instance_token=? AND state='active'")
                 .bind(now).bind(token).execute(&mut *transaction).await?;
+            writer::complete_mutation(&mut transaction, self.recovery.as_ref(), owner_mutation)
+                .await?;
         }
         transaction.commit().await?;
         Ok(valid)
@@ -130,7 +168,7 @@ impl ReliabilityStore {
         evidence: &RuntimeOwnerEvidence,
         observation: &FinalObservation,
     ) -> Result<bool, ReliabilityError> {
-        let mut transaction = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut transaction = writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let row = sqlx::query("SELECT e.* FROM runtime_owner_evidence e JOIN runtime_instances r USING(instance_token) WHERE e.instance_token=? AND e.is_current=1 AND e.state='scan_pending' AND r.state='stopping'")
             .bind(token).fetch_optional(&mut *transaction).await?;
         let Some(row) = row else {
@@ -150,16 +188,27 @@ impl ReliabilityStore {
         let next_revision = revision.checked_add(1).ok_or(ReliabilityError::Malformed)?;
         let snapshot =
             serde_json::to_string(observation).map_err(|_| ReliabilityError::Malformed)?;
+        let owner_identity = writer::text_identity("runtime_instances", token)?;
+        let owner_mutation =
+            writer::prepare_mutation(&mut transaction, self.recovery.as_ref(), &owner_identity)
+                .await?;
+        let identity = evidence_identity(&mut transaction, token, revision).await?;
+        let mutation =
+            writer::prepare_mutation(&mut transaction, self.recovery.as_ref(), &identity).await?;
         sqlx::query("UPDATE runtime_owner_evidence SET is_current=0 WHERE instance_token=? AND is_current=1")
             .bind(token).execute(&mut *transaction).await?;
+        writer::complete_mutation(&mut transaction, self.recovery.as_ref(), mutation).await?;
         sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current,max_age_seconds) SELECT instance_token,runtime_generation,?,'reaped',pid,proc_starttime,process_fingerprint,boot_id,?,?,?,'closed_joined',0,'complete_zero_escaped',?,1,max_age_seconds FROM runtime_owner_evidence WHERE instance_token=? AND evidence_revision=?")
             .bind(next_revision).bind(evidence.boottime_ns).bind(now).bind(observation.epoch).bind(snapshot).bind(token).bind(revision)
             .execute(&mut *transaction).await?;
+        let identity = evidence_identity(&mut transaction, token, next_revision).await?;
+        writer::inserted(&mut transaction, self.recovery.as_ref(), &identity).await?;
         let stopped = sqlx::query("UPDATE runtime_instances SET state='stopped',heartbeat_at=? WHERE instance_token=? AND state='stopping'")
             .bind(now).bind(token).execute(&mut *transaction).await?;
         if stopped.rows_affected() != 1 {
             return Ok(false);
         }
+        writer::complete_mutation(&mut transaction, self.recovery.as_ref(), owner_mutation).await?;
         transaction.commit().await?;
         Ok(true)
     }

@@ -318,18 +318,39 @@ impl DurableOutputSpool {
     }
 
     pub(crate) async fn recover_cleanup(&self, now: &str) -> Result<usize, OutputSpoolError> {
+        self.recover_cleanup_phase(now, false).await
+    }
+
+    pub(crate) async fn recover_local_cleanup(&self, now: &str) -> Result<usize, OutputSpoolError> {
+        self.recover_cleanup_phase(now, true).await
+    }
+
+    async fn recover_cleanup_phase(
+        &self,
+        now: &str,
+        local_only: bool,
+    ) -> Result<usize, OutputSpoolError> {
         let pending = self.store.cleanup_sets().await?;
+        let mut cleaned = 0;
         for set_id in &pending {
+            if local_only && !self.store.cleanup_is_local(set_id).await? {
+                continue;
+            }
             let segments = self.store.begin_cleanup(set_id, now).await?;
             self.cleanup_files(set_id, &segments)?;
             self.store.finish_cleanup(set_id, now).await?;
+            cleaned += 1;
         }
         let abandoned = self.store.abandoned_sets().await?;
         for set_id in &abandoned {
+            if local_only && !self.store.cleanup_is_local(set_id).await? {
+                continue;
+            }
             let segments = self.store.abandoned_segments(set_id).await?;
             self.cleanup_files(set_id, &segments)?;
             self.store.finish_abandon(set_id, now).await?;
+            cleaned += 1;
         }
-        Ok(pending.len() + abandoned.len())
+        Ok(cleaned)
     }
 }

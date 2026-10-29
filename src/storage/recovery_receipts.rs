@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::recovery_eligibility::writer;
 
 impl MatrixRecoveryStore {
     #[allow(clippy::too_many_arguments)]
@@ -53,9 +54,17 @@ impl MatrixRecoveryStore {
         let mut tx =
             crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
                 .await?;
+        let receipt_identity = writer::composite_text_identity(
+            "matrix_recovery_receipts",
+            &[account_id, room_id, event_id, operation_id],
+        )?;
+        let batch_identity = writer::text_identity("matrix_recovery_batches", batch_id)?;
+        let batch_mutation =
+            writer::prepare_mutation(&mut tx, self.recovery.as_ref(), &batch_identity).await?;
         let existing = sqlx::query("SELECT payload_digest,state FROM matrix_recovery_receipts WHERE account_id=? AND room_id=? AND event_id=? AND cutover_operation_id=?")
             .bind(account_id).bind(room_id).bind(event_id).bind(operation_id).fetch_optional(&mut *tx).await?;
         if let Some(row) = existing {
+            writer::require(&mut tx, self.recovery.as_ref(), &receipt_identity).await?;
             let digest: String = row.try_get("payload_digest")?;
             if digest != payload_digest {
                 return Err(sqlx::Error::Protocol("receipt digest mismatch".into()));
@@ -64,6 +73,7 @@ impl MatrixRecoveryStore {
             if state == "dispositioned" {
                 sqlx::query("UPDATE matrix_recovery_batches SET covered_events_json=json_insert(covered_events_json,'$[#]',?),state='processing',updated_at=? WHERE batch_id=? AND state IN ('pending','processing') AND EXISTS (SELECT 1 FROM json_each(expected_events_json) WHERE value=?) AND NOT EXISTS (SELECT 1 FROM json_each(covered_events_json) WHERE value=?)")
                     .bind(event_id).bind(now).bind(batch_id).bind(event_id).bind(event_id).execute(&mut *tx).await?;
+                writer::complete_mutation(&mut tx, self.recovery.as_ref(), batch_mutation).await?;
                 tx.commit().await?;
                 return Ok(BatchAdmission::Duplicate);
             }
@@ -92,6 +102,8 @@ impl MatrixRecoveryStore {
                 .bind(serde_json::to_string(&covered).map_err(|error| sqlx::Error::Protocol(error.to_string()))?)
                 .bind(now).bind(batch_id).execute(&mut *tx).await?;
         }
+        writer::complete_mutation(&mut tx, self.recovery.as_ref(), batch_mutation).await?;
+        writer::inserted(&mut tx, self.recovery.as_ref(), &receipt_identity).await?;
         tx.commit().await?;
         Ok(BatchAdmission::New)
     }
@@ -108,13 +120,21 @@ impl MatrixRecoveryStore {
         owner_epoch: i64,
         now: &str,
     ) -> Result<(), sqlx::Error> {
+        let mut tx = writer::begin(&self.pool, self.recovery.as_ref()).await?;
+        let identity = writer::composite_text_identity(
+            "matrix_recovery_receipts",
+            &[account_id, room_id, event_id, operation_id],
+        )?;
+        let mutation = writer::prepare_mutation(&mut tx, self.recovery.as_ref(), &identity).await?;
         let result = sqlx::query("UPDATE matrix_recovery_receipts SET state='dispositioned',updated_at=? WHERE account_id=? AND room_id=? AND event_id=? AND cutover_operation_id=? AND batch_id=? AND state IN ('pending','processing') AND EXISTS (SELECT 1 FROM matrix_recovery_batches b JOIN matrix_component_leases l ON l.component=b.component AND l.owner_token=b.owner_token AND l.epoch=b.owner_epoch WHERE b.batch_id=? AND b.owner_token=? AND b.owner_epoch=? AND b.state='processing' AND l.state='active' AND l.expires_at>=?)")
-            .bind(now).bind(account_id).bind(room_id).bind(event_id).bind(operation_id).bind(batch_id).bind(batch_id).bind(owner_token).bind(owner_epoch).bind(now).execute(&self.pool).await?;
+            .bind(now).bind(account_id).bind(room_id).bind(event_id).bind(operation_id).bind(batch_id).bind(batch_id).bind(owner_token).bind(owner_epoch).bind(now).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Err(sqlx::Error::Protocol(
                 "receipt disposition fence failed".into(),
             ));
         }
+        writer::complete_mutation(&mut tx, self.recovery.as_ref(), mutation).await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -131,13 +151,21 @@ impl MatrixRecoveryStore {
         code: &str,
         now: &str,
     ) -> Result<(), sqlx::Error> {
+        let mut tx = writer::begin(&self.pool, self.recovery.as_ref()).await?;
+        let identity = writer::composite_text_identity(
+            "matrix_recovery_receipts",
+            &[account_id, room_id, event_id, operation_id],
+        )?;
+        let mutation = writer::prepare_mutation(&mut tx, self.recovery.as_ref(), &identity).await?;
         let result = sqlx::query("UPDATE matrix_recovery_receipts SET state='refused',refusal_code=?,updated_at=? WHERE account_id=? AND room_id=? AND event_id=? AND cutover_operation_id=? AND batch_id=? AND state IN ('pending','processing') AND EXISTS (SELECT 1 FROM matrix_recovery_batches b JOIN matrix_component_leases l ON l.component=b.component AND l.owner_token=b.owner_token AND l.epoch=b.owner_epoch WHERE b.batch_id=? AND b.owner_token=? AND b.owner_epoch=? AND b.state='processing' AND l.state='active' AND l.expires_at>=?)")
-            .bind(code).bind(now).bind(account_id).bind(room_id).bind(event_id).bind(operation_id).bind(batch_id).bind(batch_id).bind(owner_token).bind(owner_epoch).bind(now).execute(&self.pool).await?;
+            .bind(code).bind(now).bind(account_id).bind(room_id).bind(event_id).bind(operation_id).bind(batch_id).bind(batch_id).bind(owner_token).bind(owner_epoch).bind(now).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Err(sqlx::Error::Protocol(
                 "refusal disposition fence failed".into(),
             ));
         }
+        writer::complete_refused_receipt(&mut tx, self.recovery.as_ref(), mutation).await?;
+        tx.commit().await?;
         Ok(())
     }
 }

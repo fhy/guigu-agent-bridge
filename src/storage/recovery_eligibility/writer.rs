@@ -1,6 +1,6 @@
 use sqlx::{SqliteConnection, SqlitePool};
 use std::sync::{
-    Arc,
+    Arc, OnceLock,
     atomic::{AtomicI64, Ordering},
 };
 use tokio::sync::Mutex;
@@ -10,12 +10,19 @@ use super::{
     authority, inventory, metadata, refused, require_row,
 };
 
+mod effect_scope;
 mod mutation;
 mod native_control;
+mod native_lease;
 mod transaction;
-pub(crate) use mutation::{Mutation, complete_mutation, prepare_mutation};
+mod workspace;
+pub(crate) use mutation::{
+    Mutation, complete_mutation, complete_refused_receipt, prepare_mutation,
+};
 pub(crate) use native_control::{complete_control, prepare_control};
+pub(crate) use native_lease::{complete_expired_lease, complete_lease, prepare_lease};
 pub(crate) use transaction::ScopedTransaction;
+pub(crate) use workspace::delete_workspace;
 
 #[derive(Debug, Clone)]
 pub struct RecoveryScope {
@@ -25,9 +32,20 @@ pub struct RecoveryScope {
     anchors: Vec<RowIdentity>,
     revision: Arc<AtomicI64>,
     serial: Arc<Mutex<()>>,
+    matrix_fence: Arc<OnceLock<LiveFence>>,
 }
 
 impl RecoveryScope {
+    pub(crate) fn component_fence(&self) -> Option<&LiveFence> {
+        self.fence.as_ref()
+    }
+
+    pub(crate) fn for_component(&self, fence: LiveFence) -> Self {
+        let mut scope = self.clone();
+        scope.domain = EffectDomain::Matrix;
+        scope.fence = Some(fence);
+        scope
+    }
     pub(crate) fn require_matrix_component(&self, component: &str) -> Result<(), sqlx::Error> {
         if self.domain != EffectDomain::Matrix
             || self
@@ -56,6 +74,7 @@ impl RecoveryScope {
             anchors: Vec::new(),
             revision: Arc::new(AtomicI64::new(revision)),
             serial: Arc::new(Mutex::new(())),
+            matrix_fence: Arc::new(OnceLock::new()),
         }
     }
 
@@ -68,6 +87,17 @@ impl RecoveryScope {
             }
         }
         context
+    }
+
+    pub(crate) fn install_matrix_fence(&self, fence: LiveFence) -> Result<(), sqlx::Error> {
+        let installed = self.matrix_fence.get_or_init(|| fence.clone());
+        if installed.component != fence.component
+            || installed.owner != fence.owner
+            || installed.epoch != fence.epoch
+        {
+            return Err(refused());
+        }
+        Ok(())
     }
 
     pub fn with_metadata_anchor(mut self, identity: RowIdentity) -> Self {
@@ -149,6 +179,8 @@ pub(crate) async fn inserted(
     let Some(scope) = scope else {
         return Ok(());
     };
+    let routed = effect_scope::resolve(connection, scope, identity).await?;
+    let scope = &routed;
     authority::validate(
         connection,
         &scope.context(),
@@ -293,6 +325,8 @@ pub(crate) async fn require(
     identity: &RowIdentity,
 ) -> Result<(), sqlx::Error> {
     if let Some(scope) = scope {
+        let routed = effect_scope::resolve(connection, scope, identity).await?;
+        let scope = &routed;
         require_row(
             connection,
             &scope.context(),
@@ -313,6 +347,8 @@ pub(crate) async fn route(
     let Some(scope) = scope else {
         return Ok(());
     };
+    let routed = effect_scope::resolve(connection, scope, identity).await?;
+    let scope = &routed;
     if scope.anchors.contains(identity) {
         authority::validate(
             connection,

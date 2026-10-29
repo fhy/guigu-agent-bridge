@@ -1,5 +1,7 @@
 //! Durable runtime control for exclusive execution and bounded continuation.
 
+mod recovery_audit;
+
 use crate::{
     acp::{AcpDispatcher, TurnResult},
     bus::{
@@ -182,6 +184,7 @@ pub struct RecoverySnapshot {
 #[derive(Clone)]
 pub struct SqliteRuntimeStore {
     pool: SqlitePool,
+    recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
 }
 
 fn path_components(path: &Path) -> Result<Vec<String>, RuntimeError> {
@@ -207,7 +210,17 @@ fn overlaps(left: &[String], right: &[String]) -> bool {
 
 impl SqliteRuntimeStore {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            recovery: None,
+        }
+    }
+
+    pub(crate) fn new_scoped(
+        pool: SqlitePool,
+        recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
+    ) -> Self {
+        Self { pool, recovery }
     }
 
     pub async fn lease_for_task(
@@ -235,13 +248,16 @@ impl SqliteRuntimeStore {
     ) -> Result<AcquireOutcome, RuntimeError> {
         let owner = Uuid::now_v7();
         let expires = add(now, ttl)?;
-        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+        let mut tx = match self.transaction().await {
             Ok(value) => value,
             Err(error) if error.to_string().contains("database is locked") => {
                 return Ok(AcquireOutcome::Busy);
             }
             Err(error) => return Err(error.into()),
         };
+        let mutation = self
+            .prepare_existing_lease(&mut tx, &resource.to_string())
+            .await?;
         let inserted = match sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES(?,?,?,1,'active',?,?,?) ON CONFLICT(resource_key) DO NOTHING")
             .bind(resource.to_string()).bind(task_id.to_string()).bind(owner.to_string()).bind(ts(now)).bind(ts(now)).bind(ts(expires)).execute(&mut *tx).await {
             Ok(value) => value,
@@ -249,6 +265,8 @@ impl SqliteRuntimeStore {
             Err(error) => return Err(error.into()),
         };
         if inserted.rows_affected() == 1 {
+            self.insert(&mut tx, "execution_leases", &resource.to_string())
+                .await?;
             if let Err(error) = tx.commit().await {
                 if error.to_string().contains("database is locked") {
                     return Ok(AcquireOutcome::Busy);
@@ -327,6 +345,8 @@ impl SqliteRuntimeStore {
         } else {
             return Err(RuntimeError::Malformed);
         };
+        self.complete_or_insert(&mut tx, "execution_leases", &resource.to_string(), mutation)
+            .await?;
         if let Err(error) = tx.commit().await {
             if error.to_string().contains("database is locked") {
                 return Ok(AcquireOutcome::Busy);
@@ -346,12 +366,18 @@ impl SqliteRuntimeStore {
             return Err(RuntimeError::Expired);
         }
         let expires = add(now, ttl)?;
+        let mut tx = self.transaction().await?;
+        let mutation = self
+            .prepare(&mut tx, "execution_leases", &lease.resource.to_string())
+            .await?;
         let result=sqlx::query("UPDATE execution_leases SET heartbeat_at=?,expires_at=? WHERE resource_key=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
-            .bind(ts(now)).bind(ts(expires)).bind(lease.resource.to_string()).bind(lease.owner.to_string()).bind(to_i64(lease.fence)?).bind(ts(now)).execute(&self.pool).await?;
+            .bind(ts(now)).bind(ts(expires)).bind(lease.resource.to_string()).bind(lease.owner.to_string()).bind(to_i64(lease.fence)?).bind(ts(now)).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Err(RuntimeError::Fenced);
         }
         let mut next = lease.clone();
+        self.complete(&mut tx, mutation).await?;
+        tx.commit().await?;
         next.expires_at = expires;
         Ok(next)
     }
@@ -365,7 +391,7 @@ impl SqliteRuntimeStore {
         for path in paths {
             candidates.push((path.to_string_lossy().into_owned(), path_components(path)?));
         }
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.transaction().await?;
         let rows = sqlx::query(
             "SELECT canonical_path,path_components_json FROM workspace_claims WHERE state='active'",
         )
@@ -384,10 +410,12 @@ impl SqliteRuntimeStore {
             }
         }
         for (path, components) in candidates {
+            let claim_id = Uuid::now_v7().to_string();
             sqlx::query("INSERT INTO workspace_claims(claim_id,runtime_owner,task_id,canonical_path,path_components_json,owner_fence,revision,state,created_at,updated_at) VALUES(?,?,?,?,?,?,1,'active',?,?)")
-                .bind(Uuid::now_v7().to_string()).bind(lease.owner.to_string()).bind(lease.task_id.to_string())
+                .bind(&claim_id).bind(lease.owner.to_string()).bind(lease.task_id.to_string())
                 .bind(path).bind(serde_json::to_string(&components).map_err(|_| RuntimeError::Malformed)?)
                 .bind(to_i64(lease.fence)?).bind(ts(lease.expires_at)).bind(ts(lease.expires_at)).execute(&mut *tx).await?;
+            self.insert(&mut tx, "workspace_claims", &claim_id).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -403,19 +431,23 @@ impl SqliteRuntimeStore {
             ReleaseDisposition::Released => "released",
             ReleaseDisposition::RecoveryNeeded => "recovery_needed",
         };
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.transaction().await?;
+        let mutation = self
+            .prepare(&mut tx, "execution_leases", &lease.resource.to_string())
+            .await?;
         let result=sqlx::query("UPDATE execution_leases SET state=?,heartbeat_at=?,expires_at=? WHERE resource_key=? AND owner_token=? AND fence=? AND state='active'")
             .bind(state).bind(ts(now)).bind(ts(now)).bind(lease.resource.to_string()).bind(lease.owner.to_string()).bind(to_i64(lease.fence)?).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Err(RuntimeError::Fenced);
         }
-        if disposition == ReleaseDisposition::Released {
-            sqlx::query("DELETE FROM workspace_claims WHERE runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'")
-                .bind(lease.owner.to_string()).bind(lease.task_id.to_string()).bind(to_i64(lease.fence)?).execute(&mut *tx).await?;
-        } else {
-            sqlx::query("UPDATE workspace_claims SET state='recovery_needed',revision=revision+1,updated_at=? WHERE runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'")
-                .bind(ts(now)).bind(lease.owner.to_string()).bind(lease.task_id.to_string()).bind(to_i64(lease.fence)?).execute(&mut *tx).await?;
-        }
+        self.complete(&mut tx, mutation).await?;
+        self.release_workspaces(
+            &mut tx,
+            lease,
+            disposition == ReleaseDisposition::Released,
+            now,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -428,9 +460,13 @@ impl SqliteRuntimeStore {
         now: DateTime<Utc>,
     ) -> Result<(), RuntimeError> {
         let prompt = bounded_prompt(prompt)?;
+        let mut tx = self.transaction().await?;
         let result=sqlx::query("INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes) SELECT ?,?,?,?,1,'ready',1,0,0,?,?,?,?,0 FROM execution_leases l WHERE l.resource_key=? AND l.task_id=? AND l.owner_token=? AND l.fence=? AND l.state='active' AND l.expires_at>?")
-            .bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(delivery_id.to_string()).bind(to_i64(lease.fence)?).bind(prompt).bind(ts(now)).bind(ts(now)).bind(ts(now)).bind(lease.resource.to_string()).bind(lease.task_id.to_string()).bind(lease.owner.to_string()).bind(to_i64(lease.fence)?).bind(ts(now)).execute(&self.pool).await?;
+            .bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(delivery_id.to_string()).bind(to_i64(lease.fence)?).bind(prompt).bind(ts(now)).bind(ts(now)).bind(ts(now)).bind(lease.resource.to_string()).bind(lease.task_id.to_string()).bind(lease.owner.to_string()).bind(to_i64(lease.fence)?).bind(ts(now)).execute(&mut *tx).await?;
         if result.rows_affected() == 1 {
+            self.insert(&mut tx, "task_continuations", &lease.task_id.to_string())
+                .await?;
+            tx.commit().await?;
             Ok(())
         } else {
             Err(RuntimeError::Fenced)
@@ -500,7 +536,10 @@ impl SqliteRuntimeStore {
         if current.as_deref() != Some(generation) {
             return Err(RuntimeError::Fenced);
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.transaction().await?;
+        let mutation = self
+            .prepare(&mut tx, "task_continuations", &lease.task_id.to_string())
+            .await?;
         let result = sqlx::query("UPDATE task_continuations SET state='in_flight',revision=revision+1,heartbeat_at=? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='ready' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
             .bind(ts(now)).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(generation).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
@@ -511,6 +550,7 @@ impl SqliteRuntimeStore {
             .fetch_one(&mut *tx)
             .await?;
         let continuation = decode_continuation(&row)?;
+        self.complete(&mut tx, mutation).await?;
         tx.commit().await?;
         Ok(continuation)
     }
@@ -605,7 +645,7 @@ impl SqliteRuntimeStore {
             continuation.revision
         );
         let hash = Uuid::new_v5(&OUTBOX_BODY_NAMESPACE, response.as_bytes()).to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.transaction().await?;
         let inserted = sqlx::query("INSERT INTO continuation_response_receipts(idempotency_key,task_id,delivery_id,resource_key,lease_fence,continuation_revision,response_hash,outcome,output_bytes,runtime_generation,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(idempotency_key) DO NOTHING")
             .bind(&key).bind(continuation.task_id.to_string()).bind(continuation.delivery_id.to_string()).bind(continuation.resource.to_string())
             .bind(to_i64(continuation.lease_fence)?).bind(to_i64(continuation.revision)?).bind(&hash).bind(outcome)
@@ -622,6 +662,8 @@ impl SqliteRuntimeStore {
                 return Err(RuntimeError::Continuation);
             }
         }
+        self.insert(&mut tx, "continuation_response_receipts", &key)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -634,9 +676,15 @@ impl SqliteRuntimeStore {
         observed_bytes: u64,
         now: DateTime<Utc>,
     ) -> Result<(), RuntimeError> {
+        let mut tx = self.transaction().await?;
+        let mutation = self
+            .prepare(&mut tx, "task_continuations", &lease.task_id.to_string())
+            .await?;
         let result=sqlx::query("UPDATE task_continuations SET heartbeat_at=?,observed_output_bytes=observed_output_bytes+? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='in_flight' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
-            .bind(ts(now)).bind(to_i64(observed_bytes)?).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(generation).bind(lease.owner.to_string()).bind(ts(now)).execute(&self.pool).await?;
+            .bind(ts(now)).bind(to_i64(observed_bytes)?).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(generation).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
         if result.rows_affected() == 1 {
+            self.complete(&mut tx, mutation).await?;
+            tx.commit().await?;
             Ok(())
         } else {
             Err(RuntimeError::Fenced)
@@ -748,7 +796,10 @@ impl SqliteRuntimeStore {
         if current.as_deref() != Some(generation) {
             return Ok(FinalizeResult::Fenced);
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.transaction().await?;
+        let continuation_mutation = self
+            .prepare(&mut tx, "task_continuations", &lease.task_id.to_string())
+            .await?;
         let envelope = sqlx::query(
             "SELECT a.reply_room,a.reply_thread_root,a.reply_event_id,a.monitor_room,
                     a.monitor_generation,COALESCE(a.render_version,'v1') AS render_version,
@@ -765,6 +816,7 @@ impl SqliteRuntimeStore {
         if continuation.rows_affected() != 1 {
             return Ok(FinalizeResult::Fenced);
         }
+        self.complete(&mut tx, continuation_mutation).await?;
         let terminal_response =
             serde_json::to_string(&event.payload).map_err(|_| RuntimeError::Malformed)?;
         let terminal_hash =
@@ -786,6 +838,8 @@ impl SqliteRuntimeStore {
                 return Ok(FinalizeResult::RecoveryNeeded);
             }
         }
+        self.insert(&mut tx, "continuation_response_receipts", &receipt_key)
+            .await?;
         let latest: Option<i64> =
             sqlx::query_scalar("SELECT MAX(seq) FROM task_events WHERE task_id=?")
                 .bind(event.task_id.to_string())
@@ -799,6 +853,9 @@ impl SqliteRuntimeStore {
             return Ok(FinalizeResult::Stale);
         }
         let expected_version = event.seq.checked_sub(2).ok_or(RuntimeError::Malformed)?;
+        let task_mutation = self
+            .prepare(&mut tx, "tasks", &event.task_id.to_string())
+            .await?;
         let version =
             sqlx::query("UPDATE tasks SET version=version+1 WHERE task_id=? AND version=?")
                 .bind(event.task_id.to_string())
@@ -808,6 +865,7 @@ impl SqliteRuntimeStore {
         if version.rows_affected() != 1 {
             return Ok(FinalizeResult::Stale);
         }
+        self.complete(&mut tx, task_mutation).await?;
         let status = match event.status {
             crate::models::TaskStatus::Completed => "completed",
             crate::models::TaskStatus::Failed => "failed",
@@ -816,7 +874,7 @@ impl SqliteRuntimeStore {
             _ => return Err(RuntimeError::Malformed),
         };
         let now_text = ts(now);
-        crate::terminal_closure::apply(
+        crate::terminal_closure::apply_scoped(
             &mut tx,
             crate::terminal_closure::ClosureContext {
                 task_id: &event.task_id.to_string(),
@@ -833,6 +891,7 @@ impl SqliteRuntimeStore {
                 fence: to_i64(lease.fence)?,
                 now: &now_text,
             },
+            self.recovery.as_ref(),
         )
         .await
         .map_err(|error| match error {
@@ -846,13 +905,8 @@ impl SqliteRuntimeStore {
         } else {
             "released"
         };
-        if claim_state == "released" {
-            sqlx::query("DELETE FROM workspace_claims WHERE runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'")
-                .bind(lease.owner.to_string()).bind(lease.task_id.to_string()).bind(to_i64(lease.fence)?).execute(&mut *tx).await?;
-        } else {
-            sqlx::query("UPDATE workspace_claims SET state='recovery_needed',revision=revision+1,updated_at=? WHERE runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'")
-                .bind(ts(now)).bind(lease.owner.to_string()).bind(lease.task_id.to_string()).bind(to_i64(lease.fence)?).execute(&mut *tx).await?;
-        }
+        self.release_workspaces(&mut tx, lease, claim_state == "released", now)
+            .await?;
         let render_version: String = envelope.try_get("render_version")?;
         if let Some(room) = envelope.try_get::<Option<String>, _>("reply_room")? {
             let body = terminal_reply_body(&event.payload).ok_or(RuntimeError::Malformed)?;
@@ -871,6 +925,7 @@ impl SqliteRuntimeStore {
                 &render_version,
                 &body,
                 now,
+                self.recovery.as_ref(),
             )
             .await?;
         }
@@ -909,6 +964,7 @@ impl SqliteRuntimeStore {
                 &render_version,
                 &body,
                 now,
+                self.recovery.as_ref(),
             )
             .await?;
         }
@@ -963,11 +1019,22 @@ impl SqliteRuntimeStore {
 #[derive(Clone)]
 pub struct SqliteTaskLifecycle {
     pool: SqlitePool,
+    recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
 }
 
 impl SqliteTaskLifecycle {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            recovery: None,
+        }
+    }
+
+    pub(crate) fn new_scoped(
+        pool: SqlitePool,
+        recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
+    ) -> Self {
+        Self { pool, recovery }
     }
 }
 
@@ -1069,9 +1136,8 @@ impl TaskLifecycle for SqliteTaskLifecycle {
             // Take the write lock before reading replay identity. A deferred WAL
             // snapshot cannot be promoted while another writer is active, even
             // with busy_timeout; that would fail-stop the worker on a valid event.
-            let mut tx = self
-                .pool
-                .begin_with("BEGIN IMMEDIATE")
+            use crate::storage::recovery_eligibility::writer;
+            let mut tx = writer::begin(&self.pool, self.recovery.as_ref())
                 .await
                 .map_err(runtime_dispatch_error)?;
             let replay: Option<i64> = sqlx::query_scalar(
@@ -1084,8 +1150,22 @@ impl TaskLifecycle for SqliteTaskLifecycle {
             .await
             .map_err(runtime_dispatch_error)?;
             if replay.is_some() {
+                let identity = writer::text_identity("task_events", &event.id.to_string())
+                    .map_err(runtime_dispatch_error)?;
+                writer::require(&mut tx, self.recovery.as_ref(), &identity)
+                    .await
+                    .map_err(runtime_dispatch_error)?;
                 return Ok(LifecycleResult::Replay);
             }
+            let task_identity = writer::text_identity("tasks", &event.task_id.to_string())
+                .map_err(runtime_dispatch_error)?;
+            let admission_identity =
+                writer::text_identity("task_admissions", &event.task_id.to_string())
+                    .map_err(runtime_dispatch_error)?;
+            let task_mutation =
+                writer::prepare_mutation(&mut tx, self.recovery.as_ref(), &task_identity)
+                    .await
+                    .map_err(runtime_dispatch_error)?;
             let expected = event.seq.checked_sub(2).ok_or_else(|| {
                 runtime_dispatch_error("durable lifecycle does not own queued events")
             })?;
@@ -1099,6 +1179,13 @@ impl TaskLifecycle for SqliteTaskLifecycle {
             if version.rows_affected() != 1 {
                 return Ok(LifecycleResult::Stale);
             }
+            writer::complete_mutation(&mut tx, self.recovery.as_ref(), task_mutation)
+                .await
+                .map_err(runtime_dispatch_error)?;
+            let admission_mutation =
+                writer::prepare_mutation(&mut tx, self.recovery.as_ref(), &admission_identity)
+                    .await
+                    .map_err(runtime_dispatch_error)?;
             let (status, from_state, to_state) = lifecycle_transition(event.status)
                 .ok_or_else(|| runtime_dispatch_error("invalid lifecycle transition"))?;
             let admission = sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -1114,6 +1201,9 @@ impl TaskLifecycle for SqliteTaskLifecycle {
             if admission.rows_affected() != 1 {
                 return Ok(LifecycleResult::Stale);
             }
+            writer::complete_mutation(&mut tx, self.recovery.as_ref(), admission_mutation)
+                .await
+                .map_err(runtime_dispatch_error)?;
             let payload = serde_json::to_string(&event.payload).map_err(runtime_dispatch_error)?;
             sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES (?,?,?,?,?,?)")
                 .bind(event.id.to_string())
@@ -1123,6 +1213,11 @@ impl TaskLifecycle for SqliteTaskLifecycle {
                 .bind(ts(event.timestamp))
                 .bind(payload)
                 .execute(&mut *tx)
+                .await
+                .map_err(runtime_dispatch_error)?;
+            let event_identity = writer::text_identity("task_events", &event.id.to_string())
+                .map_err(runtime_dispatch_error)?;
+            writer::inserted(&mut tx, self.recovery.as_ref(), &event_identity)
                 .await
                 .map_err(runtime_dispatch_error)?;
             tx.commit().await.map_err(runtime_dispatch_error)?;
@@ -2516,7 +2611,7 @@ fn bounded_outbox(mut body: String) -> String {
 
 #[allow(clippy::too_many_arguments)]
 async fn insert_terminal_projection(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut sqlx::SqliteConnection,
     event: &crate::models::TaskEvent,
     projection: &str,
     room: &str,
@@ -2526,12 +2621,14 @@ async fn insert_terminal_projection(
     render_version: &str,
     body: &str,
     now: DateTime<Utc>,
+    recovery: Option<&crate::storage::recovery_eligibility::RecoveryScope>,
 ) -> Result<(), RuntimeError> {
+    use crate::storage::recovery_eligibility::writer;
     if projection == "terminal_reply"
         && let crate::models::TaskEventPayload::Completed { .. } = &event.payload
     {
         let existing=sqlx::query("SELECT set_id,room_id,thread_root,reply_event_id,render_version,state FROM acp_output_sets WHERE task_id=? AND state IN ('prepared','sealed','delivering','delivered','partial','cleaning','cleaned') ORDER BY turn DESC LIMIT 1")
-            .bind(event.task_id.to_string()).fetch_optional(&mut **tx).await?;
+            .bind(event.task_id.to_string()).fetch_optional(&mut *tx).await?;
         if let Some(existing) = existing {
             if existing.try_get::<String, _>("room_id")? != room
                 || existing
@@ -2547,10 +2644,16 @@ async fn insert_terminal_projection(
                 return Err(RuntimeError::Malformed);
             }
             if existing.try_get::<String, _>("state")? == "prepared" {
-                let changed=sqlx::query("UPDATE acp_output_sets SET state='sealed',updated_at=? WHERE set_id=? AND state='prepared'").bind(ts(now)).bind(existing.try_get::<String,_>("set_id")?).execute(&mut **tx).await?;
+                let identity = writer::text_identity(
+                    "acp_output_sets",
+                    &existing.try_get::<String, _>("set_id")?,
+                )?;
+                let mutation = writer::prepare_mutation(tx, recovery, &identity).await?;
+                let changed=sqlx::query("UPDATE acp_output_sets SET state='sealed',updated_at=? WHERE set_id=? AND state='prepared'").bind(ts(now)).bind(existing.try_get::<String,_>("set_id")?).execute(&mut *tx).await?;
                 if changed.rows_affected() != 1 {
                     return Err(RuntimeError::Malformed);
                 }
+                writer::complete_mutation(tx, recovery, mutation).await?;
             }
             return Ok(());
         }
@@ -2562,14 +2665,16 @@ async fn insert_terminal_projection(
         let inserted = sqlx::query("INSERT INTO acp_output_sets(set_id,task_id,attempt,turn,runtime_fence,room_id,thread_root,reply_event_id,render_version,state,created_at,updated_at) SELECT ?,c.task_id,d.attempt,c.completed_turns,c.runtime_generation,?,?,?,?, 'assembling',?,? FROM task_continuations c JOIN deliveries d ON d.delivery_id=c.delivery_id WHERE c.task_id=? ON CONFLICT(task_id,attempt,turn) DO NOTHING")
             .bind(&set_id).bind(room).bind(thread).bind(reply).bind(render_version)
             .bind(ts(now)).bind(ts(now)).bind(event.task_id.to_string())
-            .execute(&mut **tx).await?;
+            .execute(&mut *tx).await?;
         if inserted.rows_affected() != 1 {
             let existing: Option<String> = sqlx::query_scalar("SELECT set_id FROM acp_output_sets WHERE task_id=? AND state IN ('assembling','sealed','delivering','delivered','partial','cleaning','cleaned') ORDER BY turn DESC LIMIT 1")
-                .bind(event.task_id.to_string()).fetch_optional(&mut **tx).await?;
+                .bind(event.task_id.to_string()).fetch_optional(&mut *tx).await?;
             if existing.as_deref() != Some(set_id.as_str()) {
                 return Err(RuntimeError::Malformed);
             }
         }
+        let identity = writer::text_identity("acp_output_sets", &set_id)?;
+        writer::inserted(tx, recovery, &identity).await?;
         return Ok(());
     }
     let stable_txn_id = Uuid::new_v5(
@@ -2591,8 +2696,13 @@ async fn insert_terminal_projection(
         .bind(body_hash)
         .bind(ts(now))
         .bind(ts(now))
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
+    let identity = writer::composite_text_identity(
+        "projection_outbox",
+        &["task_event", &event.id.to_string(), projection],
+    )?;
+    writer::inserted(tx, recovery, &identity).await?;
     Ok(())
 }
 

@@ -12,6 +12,44 @@ pub(crate) struct Mutation {
     parents: String,
 }
 
+pub(crate) async fn complete_refused_receipt(
+    connection: &mut SqliteConnection,
+    scope: Option<&RecoveryScope>,
+    mutation: Option<Mutation>,
+) -> Result<(), sqlx::Error> {
+    let (Some(scope), Some(mutation)) = (scope, mutation) else {
+        return Ok(());
+    };
+    if mutation.identity.table != "matrix_recovery_receipts" {
+        return Err(refused());
+    }
+    let snapshot = inventory::snapshot(connection, &mutation.identity).await?;
+    let declared: Vec<ParentIdentity> =
+        serde_json::from_str(&mutation.parents).map_err(|_| refused())?;
+    if declared.len() != snapshot.parents.len()
+        || snapshot
+            .parents
+            .iter()
+            .any(|parent| !declared.iter().any(|previous| previous.identity == *parent))
+    {
+        return Err(refused());
+    }
+    let row = sqlx::query("SELECT original_revision,original_digest,parent_relations,disposition,context_kind,context_generation,admin_operation_id,plan_digest,matrix_operation_id,origin_generation FROM offline_recovery_rows WHERE table_name=? AND canonical_pk=?")
+        .bind(&mutation.identity.table).bind(&mutation.identity.key).fetch_one(&mut *connection).await?;
+    scope.context().matches_classification(&row)?;
+    let refused_rows: i64 = sqlx::query_scalar("SELECT count(*) FROM matrix_recovery_receipts WHERE json_array('text:'||hex(CAST(account_id AS BLOB)),'text:'||hex(CAST(room_id AS BLOB)),'text:'||hex(CAST(event_id AS BLOB)),'text:'||hex(CAST(cutover_operation_id AS BLOB)))=? AND state='refused'")
+        .bind(&mutation.identity.key).fetch_one(&mut *connection).await?;
+    if refused_rows != 1 {
+        return Err(refused());
+    }
+    let changed = sqlx::query("UPDATE offline_recovery_rows SET original_revision=?,original_digest=?,disposition='refused_hold' WHERE table_name=? AND canonical_pk=? AND original_revision=? AND original_digest=? AND parent_relations=? AND disposition IN ('eligible_new','eligible_preserved')")
+        .bind(snapshot.revision).bind(snapshot.digest).bind(&mutation.identity.table).bind(&mutation.identity.key).bind(mutation.revision).bind(mutation.digest).bind(mutation.parents).execute(connection).await?;
+    if changed.rows_affected() != 1 {
+        return Err(refused());
+    }
+    Ok(())
+}
+
 pub(crate) async fn prepare_mutation(
     connection: &mut SqliteConnection,
     scope: Option<&RecoveryScope>,
@@ -20,6 +58,8 @@ pub(crate) async fn prepare_mutation(
     let Some(scope) = scope else {
         return Ok(None);
     };
+    let routed = super::effect_scope::resolve(connection, scope, identity).await?;
+    let scope = &routed;
     require_row(
         connection,
         &scope.context(),
@@ -46,6 +86,8 @@ pub(crate) async fn complete_mutation(
     let (Some(scope), Some(mutation)) = (scope, mutation) else {
         return Ok(());
     };
+    let routed = super::effect_scope::resolve(connection, scope, &mutation.identity).await?;
+    let scope = &routed;
     authority::validate(
         connection,
         &scope.context(),
@@ -88,7 +130,7 @@ async fn refresh_references(
     mutation: &Mutation,
     snapshot: &inventory::Snapshot,
 ) -> Result<(), sqlx::Error> {
-    let rows = sqlx::query("SELECT original_revision,original_digest,parent_relations,disposition,context_kind,context_generation,admin_operation_id,plan_digest,matrix_operation_id,origin_generation,table_name,canonical_pk FROM offline_recovery_rows WHERE disposition IN ('eligible_new','eligible_preserved')")
+    let rows = sqlx::query("SELECT original_revision,original_digest,parent_relations,disposition,context_kind,context_generation,admin_operation_id,plan_digest,matrix_operation_id,origin_generation,table_name,canonical_pk FROM offline_recovery_rows AS classification WHERE disposition IN ('eligible_new','eligible_preserved') AND NOT EXISTS (SELECT 1 FROM offline_recovery_workspace_deletions AS deletion WHERE deletion.table_name=classification.table_name AND deletion.canonical_pk=classification.canonical_pk)")
         .fetch_all(&mut *connection).await?;
     for row in rows {
         let encoded: String = row.try_get("parent_relations")?;

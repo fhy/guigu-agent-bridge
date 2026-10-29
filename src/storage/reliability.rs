@@ -166,6 +166,31 @@ pub struct ReliabilityStore {
 }
 
 impl ReliabilityStore {
+    pub(crate) async fn release_outbox_component(&self) -> Result<(), ReliabilityError> {
+        let Some(scope) = self.recovery.as_ref() else {
+            return Ok(());
+        };
+        scope.require_matrix_component("OutboxDrain")?;
+        let fence = scope.component_fence().ok_or(ReliabilityError::Malformed)?;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        super::MatrixRecoveryStore::new_scoped(self.pool.clone(), Some(scope.clone()))
+            .release_component_lease("OutboxDrain", &fence.owner, fence.epoch, &now)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn renew_outbox_component(&self, now: &str) -> Result<(), ReliabilityError> {
+        let Some(scope) = self.recovery.as_ref() else {
+            return Ok(());
+        };
+        scope.require_matrix_component("OutboxDrain")?;
+        let fence = scope.component_fence().ok_or(ReliabilityError::Malformed)?;
+        super::MatrixRecoveryStore::new_scoped(self.pool.clone(), Some(scope.clone()))
+            .renew_component_lease("OutboxDrain", &fence.owner, fence.epoch, now)
+            .await?;
+        Ok(())
+    }
+
     pub(crate) async fn runtime_generation(
         &self,
         instance_token: &str,
@@ -840,14 +865,6 @@ impl ReliabilityStore {
             if receipt.rows_affected() != 1 {
                 return Err(ReliabilityError::Malformed);
             }
-            if let Some(scope) = self.recovery.as_ref() {
-                let identity = super::recovery_eligibility::writer::composite_text_identity(
-                    "transport_receipts",
-                    &[&context.transport, &context.external_event_id],
-                )?;
-                super::recovery_eligibility::writer::inserted(&mut tx, Some(scope), &identity)
-                    .await?;
-            }
         }
         if let Some(scope) = self.recovery.as_ref() {
             for (table, key) in [
@@ -856,6 +873,14 @@ impl ReliabilityStore {
                 ("task_admissions", task.task_id.to_string()),
             ] {
                 let identity = super::recovery_eligibility::writer::text_identity(table, &key)?;
+                super::recovery_eligibility::writer::inserted(&mut tx, Some(scope), &identity)
+                    .await?;
+            }
+            if let Some(context) = context {
+                let identity = super::recovery_eligibility::writer::composite_text_identity(
+                    "transport_receipts",
+                    &[&context.transport, &context.external_event_id],
+                )?;
                 super::recovery_eligibility::writer::inserted(&mut tx, Some(scope), &identity)
                     .await?;
             }
@@ -898,6 +923,15 @@ impl ReliabilityStore {
             .execute(&mut *tx).await?;
         sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state) VALUES(?,?,?,'prepared')")
             .bind(delivery_id).bind(task_id).bind(i64::from(attempt)).execute(&mut *tx).await?;
+        for table in ["deliveries", "delivery_dispositions"] {
+            let identity = super::recovery_eligibility::writer::text_identity(table, delivery_id)?;
+            super::recovery_eligibility::writer::inserted(
+                &mut tx,
+                self.recovery.as_ref(),
+                &identity,
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -910,13 +944,43 @@ impl ReliabilityStore {
     ) -> Result<bool, ReliabilityError> {
         let mut tx =
             super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
+        let identity =
+            super::recovery_eligibility::writer::text_identity("deliveries", delivery_id)?;
+        let mutation = super::recovery_eligibility::writer::prepare_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            &identity,
+        )
+        .await?;
         let delivery = sqlx::query("UPDATE deliveries SET acknowledged_at=? WHERE delivery_id=? AND acknowledged_at IS NULL")
             .bind(now).bind(delivery_id).execute(&mut *tx).await?;
+        super::recovery_eligibility::writer::complete_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            mutation,
+        )
+        .await?;
+        let identity = super::recovery_eligibility::writer::text_identity(
+            "delivery_dispositions",
+            delivery_id,
+        )?;
+        let mutation = super::recovery_eligibility::writer::prepare_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            &identity,
+        )
+        .await?;
         let disposition = sqlx::query("UPDATE delivery_dispositions SET state='acknowledged',session_id=? WHERE delivery_id=? AND state='prepared'")
             .bind(session_id).bind(delivery_id).execute(&mut *tx).await?;
         if delivery.rows_affected() != disposition.rows_affected() {
             return Err(ReliabilityError::Malformed);
         }
+        super::recovery_eligibility::writer::complete_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            mutation,
+        )
+        .await?;
         if delivery.rows_affected() == 0 {
             let acknowledged: Option<i64> = sqlx::query_scalar("SELECT 1 FROM delivery_dispositions WHERE delivery_id=? AND state='acknowledged' AND session_id=?")
                 .bind(delivery_id).bind(session_id).fetch_optional(&mut *tx).await?;
@@ -941,13 +1005,43 @@ impl ReliabilityStore {
         }
         let mut tx =
             super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
+        let identity =
+            super::recovery_eligibility::writer::text_identity("deliveries", delivery_id)?;
+        let mutation = super::recovery_eligibility::writer::prepare_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            &identity,
+        )
+        .await?;
         let delivery = sqlx::query("UPDATE deliveries SET acknowledged_at=? WHERE delivery_id=? AND acknowledged_at IS NULL")
             .bind(now).bind(delivery_id).execute(&mut *tx).await?;
+        super::recovery_eligibility::writer::complete_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            mutation,
+        )
+        .await?;
+        let identity = super::recovery_eligibility::writer::text_identity(
+            "delivery_dispositions",
+            delivery_id,
+        )?;
+        let mutation = super::recovery_eligibility::writer::prepare_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            &identity,
+        )
+        .await?;
         let disposition = sqlx::query("UPDATE delivery_dispositions SET state='acknowledged',session_id=? WHERE delivery_id=? AND state='prepared'")
             .bind(session_id).bind(delivery_id).execute(&mut *tx).await?;
         if delivery.rows_affected() != disposition.rows_affected() {
             return Err(ReliabilityError::Malformed);
         }
+        super::recovery_eligibility::writer::complete_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            mutation,
+        )
+        .await?;
         if delivery.rows_affected() == 0 {
             let acknowledged: Option<i64> = sqlx::query_scalar("SELECT 1 FROM delivery_dispositions WHERE delivery_id=? AND state='acknowledged' AND session_id=?")
                 .bind(delivery_id).bind(session_id).fetch_optional(&mut *tx).await?;
@@ -963,6 +1057,12 @@ impl ReliabilityStore {
             .bind(binding.owner_fence).bind(binding.child_pid).bind(binding.child_starttime).bind(&binding.executable_fingerprint)
             .bind(&binding.boot_id).bind(binding.domain_device).bind(binding.domain_inode).bind(binding.binding_revision)
             .bind(binding.state).bind(&binding.created_at).bind(&binding.updated_at).execute(&mut *tx).await?;
+        let identity = super::recovery_eligibility::writer::text_identity(
+            "session_owner_bindings",
+            &binding.binding_id,
+        )?;
+        super::recovery_eligibility::writer::inserted(&mut tx, self.recovery.as_ref(), &identity)
+            .await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -1193,27 +1293,76 @@ impl ReliabilityStore {
         fingerprint: &str,
         now: &str,
     ) -> Result<bool, ReliabilityError> {
+        let mut transaction =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let result=sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES (?,?,?,'active',?) ON CONFLICT DO NOTHING")
-            .bind(token).bind(now).bind(now).bind(fingerprint).execute(&self.pool).await?;
+            .bind(token).bind(now).bind(now).bind(fingerprint).execute(&mut *transaction).await?;
+        if result.rows_affected() == 1 {
+            let identity =
+                super::recovery_eligibility::writer::text_identity("runtime_instances", token)?;
+            super::recovery_eligibility::writer::inserted(
+                &mut transaction,
+                self.recovery.as_ref(),
+                &identity,
+            )
+            .await?;
+        }
+        transaction.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
     pub async fn stopping_runtime(&self, token: &str, now: &str) -> Result<bool, ReliabilityError> {
         let mut transaction =
             super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
+        let identity =
+            super::recovery_eligibility::writer::text_identity("runtime_instances", token)?;
+        let mutation = super::recovery_eligibility::writer::prepare_mutation(
+            &mut transaction,
+            self.recovery.as_ref(),
+            &identity,
+        )
+        .await?;
         let result=sqlx::query("UPDATE runtime_instances SET state='stopping',heartbeat_at=? WHERE instance_token=? AND state='active'")
             .bind(now).bind(token).execute(&mut *transaction).await?;
         if result.rows_affected() != 1 {
             return Ok(false);
         }
+        super::recovery_eligibility::writer::complete_mutation(
+            &mut transaction,
+            self.recovery.as_ref(),
+            mutation,
+        )
+        .await?;
         let current: Option<i64> = sqlx::query_scalar("SELECT evidence_revision FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1 AND state='live'")
             .bind(token).fetch_optional(&mut *transaction).await?;
         if let Some(revision) = current {
             let next = revision.checked_add(1).ok_or(ReliabilityError::Malformed)?;
+            let identity =
+                owner_lifecycle::evidence_identity(&mut transaction, token, revision).await?;
+            let mutation = super::recovery_eligibility::writer::prepare_mutation(
+                &mut transaction,
+                self.recovery.as_ref(),
+                &identity,
+            )
+            .await?;
             sqlx::query("UPDATE runtime_owner_evidence SET is_current=0 WHERE instance_token=? AND is_current=1")
                 .bind(token).execute(&mut *transaction).await?;
+            super::recovery_eligibility::writer::complete_mutation(
+                &mut transaction,
+                self.recovery.as_ref(),
+                mutation,
+            )
+            .await?;
             sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current,max_age_seconds) SELECT instance_token,runtime_generation,?,'scan_pending',pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,1,max_age_seconds FROM runtime_owner_evidence WHERE instance_token=? AND evidence_revision=?")
                 .bind(next).bind(token).bind(revision).execute(&mut *transaction).await?;
+            let identity =
+                owner_lifecycle::evidence_identity(&mut transaction, token, next).await?;
+            super::recovery_eligibility::writer::inserted(
+                &mut transaction,
+                self.recovery.as_ref(),
+                &identity,
+            )
+            .await?;
         }
         transaction.commit().await?;
         Ok(result.rows_affected() == 1)

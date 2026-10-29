@@ -4,6 +4,7 @@ mod bootstrap;
 mod bootstrap_tests;
 #[cfg(test)]
 mod contract_tests;
+mod deletion;
 mod inventory;
 mod metadata;
 #[cfg(test)]
@@ -101,6 +102,11 @@ async fn validate_node(
     identity: &RowIdentity,
     expected: Option<ParentIdentity>,
 ) -> Result<(String, String, Vec<ParentIdentity>), sqlx::Error> {
+    let deleted: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM offline_recovery_workspace_deletions WHERE table_name=? AND canonical_pk=?)")
+        .bind(&identity.table).bind(&identity.key).fetch_one(&mut *connection).await?;
+    if deleted {
+        return Err(refused());
+    }
     let row = sqlx::query("SELECT original_revision,original_digest,parent_relations,disposition,context_kind,context_generation,admin_operation_id,plan_digest,matrix_operation_id,origin_generation FROM offline_recovery_rows WHERE table_name=? AND canonical_pk=?")
             .bind(&identity.table).bind(&identity.key).fetch_optional(&mut *connection).await?
             .ok_or_else(refused)?;

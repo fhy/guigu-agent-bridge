@@ -382,6 +382,61 @@ BEGIN
     SELECT RAISE(ABORT, 'offline-recovery-parent-role-immutable');
 END;
 
+CREATE TABLE offline_recovery_workspace_deletions (
+    table_name TEXT NOT NULL CHECK (table_name = 'workspace_claims'),
+    canonical_pk TEXT NOT NULL,
+    classification_json TEXT NOT NULL CHECK (json_valid(classification_json)),
+    snapshot_json TEXT NOT NULL CHECK (json_valid(snapshot_json)),
+    context_json TEXT NOT NULL CHECK (json_valid(context_json)),
+    authority_fence_json TEXT NOT NULL CHECK (json_valid(authority_fence_json)),
+    receipt_digest TEXT NOT NULL CHECK (length(receipt_digest) = 64),
+    runtime_owner TEXT NOT NULL,
+    task_id TEXT NOT NULL,
+    owner_fence INTEGER NOT NULL CHECK (owner_fence >= 1),
+    PRIMARY KEY (table_name, canonical_pk),
+    FOREIGN KEY (table_name, canonical_pk) REFERENCES offline_recovery_rows(table_name, canonical_pk)
+) STRICT;
+
+CREATE TRIGGER offline_recovery_workspace_deletion_no_update
+BEFORE UPDATE ON offline_recovery_workspace_deletions
+BEGIN SELECT RAISE(ABORT, 'offline-recovery-deletion-update'); END;
+
+CREATE TRIGGER offline_recovery_workspace_deletion_no_delete
+BEFORE DELETE ON offline_recovery_workspace_deletions
+BEGIN SELECT RAISE(ABORT, 'offline-recovery-deletion-delete'); END;
+
+CREATE TRIGGER offline_recovery_workspace_deletion_no_replace
+BEFORE INSERT ON offline_recovery_workspace_deletions
+WHEN EXISTS (SELECT 1 FROM offline_recovery_workspace_deletions
+    WHERE table_name=NEW.table_name AND canonical_pk=NEW.canonical_pk)
+BEGIN SELECT RAISE(ABORT, 'offline-recovery-deletion-replace'); END;
+
+CREATE TRIGGER offline_recovery_workspace_deletion_requires_live_claim
+BEFORE INSERT ON offline_recovery_workspace_deletions
+WHEN NOT EXISTS (SELECT 1 FROM workspace_claims
+    WHERE json_array(typeof(claim_id)||':'||hex(CAST(claim_id AS BLOB)))=NEW.canonical_pk
+    AND runtime_owner=NEW.runtime_owner AND task_id=NEW.task_id
+    AND owner_fence=NEW.owner_fence AND state='active')
+BEGIN SELECT RAISE(ABORT, 'offline-recovery-deletion-without-claim'); END;
+
+CREATE TRIGGER offline_recovery_workspace_no_resurrection
+BEFORE INSERT ON workspace_claims
+WHEN EXISTS (SELECT 1 FROM offline_recovery_workspace_deletions
+    WHERE canonical_pk=json_array(typeof(NEW.claim_id)||':'||hex(CAST(NEW.claim_id AS BLOB))))
+BEGIN SELECT RAISE(ABORT, 'offline-recovery-deletion-resurrection'); END;
+
+CREATE TRIGGER offline_recovery_workspace_no_identity_reuse
+BEFORE UPDATE OF claim_id ON workspace_claims
+WHEN EXISTS (SELECT 1 FROM offline_recovery_workspace_deletions
+    WHERE canonical_pk=json_array(typeof(NEW.claim_id)||':'||hex(CAST(NEW.claim_id AS BLOB))))
+BEGIN SELECT RAISE(ABORT, 'offline-recovery-deletion-resurrection'); END;
+
+CREATE TRIGGER offline_recovery_deleted_classification_immutable
+BEFORE UPDATE ON offline_recovery_rows
+WHEN EXISTS (SELECT 1 FROM offline_recovery_workspace_deletions
+    WHERE table_name=OLD.table_name AND canonical_pk=OLD.canonical_pk)
+BEGIN SELECT RAISE(ABORT, 'offline-recovery-deleted-classification-update'); END;
+
 CREATE TRIGGER offline_recovery_historical_task_update BEFORE UPDATE ON tasks
 WHEN EXISTS (SELECT 1 FROM offline_recovery_rows WHERE table_name='tasks' AND canonical_pk=json_array(typeof(OLD.task_id)||':'||hex(CAST(OLD.task_id AS BLOB))) AND disposition IN ('terminal_evidenced','quarantined_no_effect','uncertain_hold','refused_hold'))
 BEGIN SELECT RAISE(ABORT, 'offline-recovery-historical-task'); END;

@@ -36,6 +36,16 @@ impl OutputSpoolStore {
             .fetch_all(&self.pool).await?)
     }
 
+    pub(crate) async fn cleanup_is_local(&self, set_id: &str) -> Result<bool, OutputStoreError> {
+        if self.recovery.is_none() {
+            return Ok(true);
+        }
+        let identity = super::output_recovery::identity("acp_output_sets", set_id, None)?;
+        let matrix: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM offline_recovery_rows WHERE table_name=? AND canonical_pk=? AND matrix_operation_id IS NOT NULL)")
+            .bind(identity.table).bind(identity.key).fetch_one(&self.pool).await?;
+        Ok(!matrix)
+    }
+
     pub(crate) async fn abandoned_segments(
         &self,
         set_id: &str,
@@ -84,7 +94,7 @@ impl OutputSpoolStore {
         let set_change = self
             .prepare_row(&mut tx, "acp_output_sets", set_id, None)
             .await?;
-        let segment_changes = self.prepare_segments(&mut tx, set_id).await?;
+        self.prepare_segments(&mut tx, set_id).await?;
         let changed=sqlx::query("UPDATE acp_output_sets SET state='cleaning',claim_revision=claim_revision+1,updated_at=? WHERE set_id=? AND state IN ('delivered','cleaning')")
             .bind(now).bind(set_id).execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {
@@ -97,7 +107,6 @@ impl OutputSpoolStore {
             .into_iter()
             .map(decode_segment)
             .collect::<Result<Vec<_>, _>>()?;
-        self.finish_segments(&mut tx, segment_changes).await?;
         self.finish_row(&mut tx, set_change).await?;
         tx.commit().await?;
         Ok(result)
@@ -116,12 +125,15 @@ impl OutputSpoolStore {
         let bytes: i64=sqlx::query_scalar("SELECT COALESCE(SUM(byte_length),0) FROM acp_output_segments WHERE set_id=? AND state='landed'").bind(set_id).fetch_one(&mut *tx).await?;
         sqlx::query("UPDATE acp_output_segments SET state='cleaned',revision=revision+1,updated_at=? WHERE set_id=? AND state='landed'").bind(now).bind(set_id).execute(&mut *tx).await?;
         let quota=sqlx::query("UPDATE acp_output_quota SET landed_bytes=landed_bytes-?,revision=revision+1 WHERE singleton=1 AND landed_bytes>=?").bind(bytes).bind(bytes).execute(&mut *tx).await?;
-        let set=sqlx::query("UPDATE acp_output_sets SET state='cleaned',claim_owner=NULL,updated_at=? WHERE set_id=? AND state='cleaning'").bind(now).bind(set_id).execute(&mut *tx).await?;
-        if quota.rows_affected() != 1 || set.rows_affected() != 1 {
+        if quota.rows_affected() != 1 {
             tx.rollback().await?;
             return Err(OutputStoreError::Conflict);
         }
         self.finish_segments(&mut tx, segment_changes).await?;
+        let set=sqlx::query("UPDATE acp_output_sets SET state='cleaned',claim_owner=NULL,updated_at=? WHERE set_id=? AND state='cleaning'").bind(now).bind(set_id).execute(&mut *tx).await?;
+        if set.rows_affected() != 1 {
+            return Err(OutputStoreError::Conflict);
+        }
         self.finish_row(&mut tx, set_change).await?;
         tx.commit().await?;
         Ok(())

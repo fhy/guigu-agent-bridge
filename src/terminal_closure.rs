@@ -5,6 +5,7 @@
 //! transaction.
 
 use crate::models::{TaskEvent, TaskStatus};
+use crate::storage::recovery_eligibility::{RecoveryScope, writer};
 use sqlx::SqliteConnection;
 use thiserror::Error;
 
@@ -76,6 +77,15 @@ pub(crate) async fn apply(
     context: ClosureContext<'_>,
     lease_mode: LeaseMode<'_>,
 ) -> Result<(), ClosureError> {
+    apply_scoped(c, context, lease_mode, None).await
+}
+
+pub(crate) async fn apply_scoped(
+    c: &mut SqliteConnection,
+    context: ClosureContext<'_>,
+    lease_mode: LeaseMode<'_>,
+    recovery: Option<&RecoveryScope>,
+) -> Result<(), ClosureError> {
     if context.event.task_id.to_string() != context.task_id
         || !matches!(
             context.event.status,
@@ -104,6 +114,8 @@ pub(crate) async fn apply(
     match context.task_version {
         TaskVersionMode::LiveAlreadyAdvanced => {}
         TaskVersionMode::OfflineExpected(expected) => {
+            let identity = writer::text_identity("tasks", context.task_id)?;
+            let mutation = writer::prepare_mutation(c, recovery, &identity).await?;
             let update =
                 sqlx::query("UPDATE tasks SET version=version+1 WHERE task_id=? AND version=?")
                     .bind(context.task_id)
@@ -113,6 +125,7 @@ pub(crate) async fn apply(
             if update.rows_affected() != 1 {
                 return Err(ClosureError::Fenced);
             }
+            writer::complete_mutation(c, recovery, mutation).await?;
         }
     }
 
@@ -125,7 +138,11 @@ pub(crate) async fn apply(
         .bind(payload)
         .execute(&mut *c)
         .await?;
+    let identity = writer::text_identity("task_events", &context.event.id.to_string())?;
+    writer::inserted(c, recovery, &identity).await?;
 
+    let identity = writer::text_identity("task_admissions", context.task_id)?;
+    let mutation = writer::prepare_mutation(c, recovery, &identity).await?;
     let admission = match context.admission {
         AdmissionMode::Live => sqlx::query("UPDATE task_admissions SET state='terminal',revision=revision+1,updated_at=? WHERE task_id=? AND state IN ('enqueued','dispatching','running')")
             .bind(context.now).bind(context.task_id).execute(&mut *c).await?,
@@ -138,32 +155,50 @@ pub(crate) async fn apply(
             AdmissionMode::Offline { .. } => ClosureError::Fenced,
         });
     }
+    writer::complete_mutation(c, recovery, mutation).await?;
 
-    let (ack, disposition) = match context.delivery {
+    let delivery_id: String = match context.delivery {
         DeliveryBinding::LiveContinuation => {
-            let ack = sqlx::query("UPDATE deliveries SET acknowledged_at=? WHERE delivery_id=(SELECT delivery_id FROM task_continuations WHERE task_id=?) AND task_id=? AND acknowledged_at IS NULL")
-                .bind(context.now).bind(context.task_id).bind(context.task_id).execute(&mut *c).await?;
-            let disposition = sqlx::query("UPDATE delivery_dispositions SET state='terminal',reason_code=NULL WHERE delivery_id=(SELECT delivery_id FROM task_continuations WHERE task_id=?) AND task_id=? AND state IN ('prepared','acknowledged','outcome_unknown')")
-                .bind(context.task_id).bind(context.task_id).execute(&mut *c).await?;
-            (ack, disposition)
+            sqlx::query_scalar("SELECT delivery_id FROM task_continuations WHERE task_id=?")
+                .bind(context.task_id)
+                .fetch_one(&mut *c)
+                .await?
+        }
+        DeliveryBinding::OfflineExact { delivery_id, .. } => delivery_id.into(),
+    };
+    let identity = writer::text_identity("deliveries", &delivery_id)?;
+    let delivery_mutation = writer::prepare_mutation(c, recovery, &identity).await?;
+    let ack = match context.delivery {
+        DeliveryBinding::LiveContinuation => {
+            sqlx::query("UPDATE deliveries SET acknowledged_at=? WHERE delivery_id=(SELECT delivery_id FROM task_continuations WHERE task_id=?) AND task_id=? AND acknowledged_at IS NULL")
+                .bind(context.now).bind(context.task_id).bind(context.task_id).execute(&mut *c).await?
         }
         DeliveryBinding::OfflineExact {
             delivery_id,
             attempt,
         } => {
-            let ack = sqlx::query("UPDATE deliveries SET acknowledged_at=? WHERE delivery_id=? AND task_id=? AND attempt=? AND acknowledged_at IS NULL")
-                .bind(context.now).bind(delivery_id).bind(context.task_id).bind(attempt).execute(&mut *c).await?;
-            let disposition = sqlx::query("UPDATE delivery_dispositions SET state='terminal',reason_code=? WHERE delivery_id=? AND task_id=? AND attempt=? AND state='prepared' AND session_id IS NULL AND child_fingerprint IS NULL")
-                .bind(context.disposition_reason.unwrap_or("pre_acceptance_auth_failure")).bind(delivery_id).bind(context.task_id).bind(attempt).execute(&mut *c).await?;
-            (ack, disposition)
+            sqlx::query("UPDATE deliveries SET acknowledged_at=? WHERE delivery_id=? AND task_id=? AND attempt=? AND acknowledged_at IS NULL")
+                .bind(context.now).bind(delivery_id).bind(context.task_id).bind(attempt).execute(&mut *c).await?
         }
+    };
+    writer::complete_mutation(c, recovery, delivery_mutation).await?;
+    let identity = writer::text_identity("delivery_dispositions", &delivery_id)?;
+    let disposition_mutation = writer::prepare_mutation(c, recovery, &identity).await?;
+    let disposition = match context.delivery {
+        DeliveryBinding::LiveContinuation => sqlx::query("UPDATE delivery_dispositions SET state='terminal',reason_code=NULL WHERE delivery_id=(SELECT delivery_id FROM task_continuations WHERE task_id=?) AND task_id=? AND state IN ('prepared','acknowledged','outcome_unknown')")
+            .bind(context.task_id).bind(context.task_id).execute(&mut *c).await?,
+        DeliveryBinding::OfflineExact { delivery_id, attempt } => sqlx::query("UPDATE delivery_dispositions SET state='terminal',reason_code=? WHERE delivery_id=? AND task_id=? AND attempt=? AND state='prepared' AND session_id IS NULL AND child_fingerprint IS NULL")
+            .bind(context.disposition_reason.unwrap_or("pre_acceptance_auth_failure")).bind(delivery_id).bind(context.task_id).bind(attempt).execute(&mut *c).await?,
     };
     if matches!(context.delivery, DeliveryBinding::OfflineExact { .. })
         && (ack.rows_affected() != 1 || disposition.rows_affected() != 1)
     {
         return Err(ClosureError::Fenced);
     }
+    writer::complete_mutation(c, recovery, disposition_mutation).await?;
 
+    let identity = writer::text_identity("execution_leases", context.resource_key)?;
+    let mutation = writer::prepare_mutation(c, recovery, &identity).await?;
     let lease = match lease_mode {
         LeaseMode::LiveActive { owner, fence, now } => sqlx::query("UPDATE execution_leases SET state='released',heartbeat_at=?,expires_at=? WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
             .bind(now).bind(now).bind(context.resource_key).bind(context.task_id).bind(owner).bind(fence).bind(now).execute(&mut *c).await?,
@@ -173,5 +208,6 @@ pub(crate) async fn apply(
     if lease.rows_affected() != 1 {
         return Err(ClosureError::Fenced);
     }
+    writer::complete_mutation(c, recovery, mutation).await?;
     Ok(())
 }

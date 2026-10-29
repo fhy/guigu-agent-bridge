@@ -4,6 +4,9 @@
 #[path = "support/r084.rs"]
 mod support;
 
+#[path = "support/r092_runtime_route.rs"]
+mod route;
+
 use guigu_agent_bridge::{
     matrix::MatrixClient,
     storage::{CompatibilityGate, MatrixCompatibilityStore},
@@ -98,7 +101,7 @@ async fn seed_device(fixture: &support::Fixture, server: &MockServer) {
     let upload: serde_json::Value = serde_json::from_slice(&upload.body).unwrap();
     Mock::given(method("POST")).and(path_regex("/_matrix/client/.*/keys/query"))
         .respond_with(ResponseTemplate::new(200).set_body_json(json!({"failures":{},"device_keys":{"@bridge:example.test":{"R084":upload["device_keys"]}}})))
-        .mount(server).await;
+        .with_priority(1).mount(server).await;
 }
 
 #[tokio::test]

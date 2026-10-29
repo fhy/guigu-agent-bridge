@@ -8,6 +8,37 @@ use chrono::Utc;
 use sqlx::SqlitePool;
 use std::sync::Arc;
 
+pub(super) async fn outbox_store(
+    pool: &SqlitePool,
+    owner: &str,
+    scope: Option<crate::storage::recovery_eligibility::RecoveryScope>,
+) -> Result<crate::storage::ReliabilityStore, AppError> {
+    let Some(scope) = scope else {
+        return Ok(crate::storage::ReliabilityStore::new(pool.clone()));
+    };
+    let recovery = MatrixRecoveryStore::new_scoped(pool.clone(), Some(scope.clone()));
+    let now = Utc::now();
+    let epoch = recovery
+        .acquire_component_lease(
+            "OutboxDrain",
+            owner,
+            &now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+            &(now + chrono::Duration::seconds(60))
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+        )
+        .await
+        .map_err(|_| AppError::Runtime)?;
+    let scope = scope.for_component(crate::storage::recovery_eligibility::LiveFence {
+        component: "OutboxDrain".into(),
+        owner: owner.into(),
+        epoch,
+    });
+    Ok(crate::storage::ReliabilityStore::with_recovery(
+        pool.clone(),
+        scope,
+    ))
+}
+
 pub(super) async fn prepare_sync(
     client: MatrixClient,
     config: &Config,
@@ -15,7 +46,7 @@ pub(super) async fn prepare_sync(
     runtime: &str,
     recovery_scope: Option<crate::storage::recovery_eligibility::RecoveryScope>,
 ) -> Result<(MatrixClient, MatrixSync), AppError> {
-    let recovery = MatrixRecoveryStore::new_scoped(pool.clone(), recovery_scope);
+    let recovery = MatrixRecoveryStore::new_scoped(pool.clone(), recovery_scope.clone());
     recovery
         .reconcile_restart()
         .await
@@ -64,6 +95,15 @@ pub(super) async fn prepare_sync(
         )
         .await
         .map_err(|_| AppError::Runtime)?;
+    if let Some(scope) = recovery_scope.as_ref() {
+        scope
+            .install_matrix_fence(crate::storage::recovery_eligibility::LiveFence {
+                component: "MatrixSync".into(),
+                owner: runtime.into(),
+                epoch,
+            })
+            .map_err(|_| AppError::Runtime)?;
+    }
     let active = client
         .isolated_active()
         .await

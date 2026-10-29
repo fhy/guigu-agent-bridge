@@ -48,10 +48,27 @@ pub(super) async fn inventory(
     context: &EligibilityContext,
 ) -> Result<(), sqlx::Error> {
     let identities = snapshots::identities(connection).await?;
+    let deleted = super::super::deletion::validate(connection, context, &identities).await?;
     let rows = sqlx::query("SELECT original_revision,original_digest,parent_relations,disposition,context_kind,context_generation,admin_operation_id,plan_digest,matrix_operation_id,origin_generation,table_name,canonical_pk FROM offline_recovery_rows ORDER BY table_name,canonical_pk")
         .fetch_all(&mut *connection).await?;
-    if rows.len() != identities.len() {
+    if rows.len() != identities.len() + deleted.len() {
         return Err(refused());
+    }
+    for identity in &deleted {
+        let row = rows
+            .iter()
+            .find(|row| {
+                row.get::<&str, _>("table_name") == identity.table
+                    && row.get::<&str, _>("canonical_pk") == identity.key
+            })
+            .ok_or_else(refused)?;
+        context.matches_classification(row)?;
+        if row
+            .try_get::<Option<&str>, _>("matrix_operation_id")?
+            .is_some_and(|operation| Some(operation) != context.matrix_operation())
+        {
+            return Err(refused());
+        }
     }
     for identity in identities {
         let row = rows

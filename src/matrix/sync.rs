@@ -2,7 +2,10 @@
 
 #[path = "sync_owner.rs"]
 mod owner;
+#[path = "sync_shutdown.rs"]
+mod shutdown;
 use owner::classify_sdk_error;
+pub(crate) use shutdown::MatrixSyncLease;
 
 #[path = "sync_batch.rs"]
 mod batch;
@@ -136,6 +139,7 @@ pub struct MatrixSync {
     initial_response: Mutex<Option<matrix_sdk::sync::SyncResponse>>,
     initial_token: Mutex<Option<String>>,
     in_flight: AtomicBool,
+    processing: AtomicBool,
     first_sync: AtomicBool,
     failure_observer: Option<FailureObserver>,
     #[cfg(test)]
@@ -181,6 +185,7 @@ impl MatrixSync {
             initial_response: Mutex::new(None),
             initial_token: Mutex::new(None),
             in_flight: AtomicBool::new(false),
+            processing: AtomicBool::new(false),
             first_sync: AtomicBool::new(true),
             failure_observer: None,
             #[cfg(test)]
@@ -370,6 +375,8 @@ impl MatrixSync {
                 return Err(error);
             }
         };
+        self.processing.store(true, Ordering::Release);
+        let _processing = RequestOwner(&self.processing);
         let result = self
             .process_batch(response, token.as_deref(), events, dispositions)
             .await;
@@ -385,6 +392,7 @@ pub struct MatrixSyncHandle {
     shutdown_tx: watch::Sender<bool>,
     join: JoinHandle<Result<(), MatrixError>>,
     alive: Arc<AtomicBool>,
+    recovery_lease: Option<MatrixSyncLease>,
 }
 
 impl std::fmt::Debug for MatrixSyncHandle {
@@ -400,13 +408,30 @@ impl MatrixSyncHandle {
     /// Request shutdown and wait until the owner has released its request/task.
     pub async fn shutdown(self) -> Result<(), MatrixError> {
         let _ = self.shutdown_tx.send(true);
-        self.join.await.map_err(|_| MatrixError::Join)?
+        self.join.await.map_err(|_| MatrixError::Join)??;
+        if let Some(lease) = self.recovery_lease {
+            lease.release().await?;
+        }
+        Ok(())
     }
 
-    pub async fn shutdown_bounded(mut self, timeout: Duration) -> Result<(), MatrixError> {
+    pub async fn shutdown_bounded(self, timeout: Duration) -> Result<(), MatrixError> {
+        if let Some(lease) = self.shutdown_bounded_deferred(timeout).await? {
+            lease.release().await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn shutdown_bounded_deferred(
+        mut self,
+        timeout: Duration,
+    ) -> Result<Option<MatrixSyncLease>, MatrixError> {
         let _ = self.shutdown_tx.send(true);
         match tokio::time::timeout(timeout, &mut self.join).await {
-            Ok(result) => result.map_err(|_| MatrixError::Join)?,
+            Ok(result) => {
+                result.map_err(|_| MatrixError::Join)??;
+                Ok(self.recovery_lease)
+            }
             Err(_) => {
                 self.join.abort();
                 let _ = self.join.await;

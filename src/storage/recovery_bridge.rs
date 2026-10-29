@@ -214,12 +214,51 @@ impl MatrixRecoveryStore {
         let expires = chrono::DateTime::parse_from_rfc3339(now)
             .map_err(|_| sqlx::Error::Protocol("invalid lease clock".into()))?
             + chrono::Duration::seconds(60);
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
+        let mutation = crate::storage::recovery_eligibility::writer::prepare_lease(
+            &mut tx,
+            self.recovery.as_ref(),
+            component,
+        )
+        .await?;
         let result = sqlx::query("UPDATE matrix_component_leases SET expires_at=?,updated_at=? WHERE component=? AND owner_token=? AND epoch=? AND state='active' AND expires_at>=?")
-            .bind(expires.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)).bind(now).bind(component).bind(owner).bind(epoch).bind(now).execute(&self.pool).await?;
+            .bind(expires.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)).bind(now).bind(component).bind(owner).bind(epoch).bind(now).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Err(sqlx::Error::Protocol("component lease expired".into()));
         }
+        crate::storage::recovery_eligibility::writer::complete_lease(
+            &mut tx,
+            self.recovery.as_ref(),
+            component,
+            mutation,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
+    }
+
+    pub(crate) async fn release_component_lease(
+        &self,
+        component: &str,
+        owner: &str,
+        epoch: i64,
+        now: &str,
+    ) -> Result<(), sqlx::Error> {
+        use crate::storage::recovery_eligibility::writer;
+        let mut tx = writer::begin(&self.pool, self.recovery.as_ref()).await?;
+        let mutation = writer::prepare_lease(&mut tx, self.recovery.as_ref(), component).await?;
+        let changed = sqlx::query("UPDATE matrix_component_leases SET expires_at=?,updated_at=? WHERE component=? AND owner_token=? AND epoch=? AND state='active'")
+            .bind(now).bind(now).bind(component).bind(owner).bind(epoch).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            return Err(sqlx::Error::Protocol(
+                "component lease release fenced".into(),
+            ));
+        }
+        writer::complete_expired_lease(&mut tx, self.recovery.as_ref(), component, mutation)
+            .await?;
+        tx.commit().await
     }
 
     pub async fn acquire_component_lease(
@@ -238,6 +277,12 @@ impl MatrixRecoveryStore {
         .bind(component)
         .fetch_optional(&mut *tx)
         .await?;
+        let mutation = crate::storage::recovery_eligibility::writer::prepare_lease(
+            &mut tx,
+            self.recovery.as_ref(),
+            component,
+        )
+        .await?;
         let epoch = match existing {
             None => 1,
             Some(row) => {
@@ -247,12 +292,30 @@ impl MatrixRecoveryStore {
                 if state == "active" && current != owner_token && expires.as_str() > now {
                     return Err(sqlx::Error::Protocol("component lease is owned".into()));
                 }
-                row.try_get::<i64, _>("epoch")? + 1
+                row.try_get::<i64, _>("epoch")?
+                    .checked_add(1)
+                    .ok_or_else(|| sqlx::Error::Protocol("component epoch overflow".into()))?
             }
         };
         sqlx::query("INSERT INTO matrix_component_leases(component,owner_token,epoch,state,expires_at,updated_at) VALUES(?,?,?,'active',?,?) ON CONFLICT(component) DO UPDATE SET owner_token=excluded.owner_token,epoch=excluded.epoch,state='active',expires_at=excluded.expires_at,updated_at=excluded.updated_at")
             .bind(component).bind(owner_token).bind(epoch).bind(expires_at).bind(now).execute(&mut *tx).await?;
+        crate::storage::recovery_eligibility::writer::complete_lease(
+            &mut tx,
+            self.recovery.as_ref(),
+            component,
+            mutation,
+        )
+        .await?;
         tx.commit().await?;
+        if component == "MatrixSync"
+            && let Some(scope) = self.recovery.as_ref()
+        {
+            scope.install_matrix_fence(crate::storage::recovery_eligibility::LiveFence {
+                component: component.into(),
+                owner: owner_token.into(),
+                epoch,
+            })?;
+        }
         Ok(epoch)
     }
 
@@ -269,10 +332,13 @@ impl MatrixRecoveryStore {
         expected_events: &[String],
         now: &str,
     ) -> Result<(), sqlx::Error> {
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         let active: Option<String> = sqlx::query_scalar(
             "SELECT watermark FROM matrix_recovery_control WHERE control_id=1 AND phase='active'",
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         if active.as_deref() != Some(previous_watermark)
             || (request_token != Some(previous_watermark)
@@ -283,7 +349,7 @@ impl MatrixRecoveryStore {
             ));
         }
         let lease: Option<(String, i64)> = sqlx::query_as("SELECT owner_token,epoch FROM matrix_component_leases WHERE component='MatrixSync' AND state='active' AND expires_at>=?")
-            .bind(now).fetch_optional(&self.pool).await?;
+            .bind(now).fetch_optional(&mut *tx).await?;
         if lease.as_ref() != Some(&(owner_token.to_owned(), owner_epoch)) {
             return Err(sqlx::Error::Protocol("stale component lease".into()));
         }
@@ -292,14 +358,25 @@ impl MatrixRecoveryStore {
         )
         .bind(response_token)
         .bind(previous_watermark)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?) && existing_digest != response_digest {
             return Err(sqlx::Error::Protocol("response digest mismatch".into()));
         }
         sqlx::query("INSERT INTO matrix_recovery_batches(batch_id,request_token,previous_watermark,response_token,response_digest,component,owner_token,owner_epoch,expected_events_json,covered_events_json,state,created_at,updated_at) VALUES(?,?,?,?,?,'MatrixSync',?,?,?,'[]','processing',?,?)")
             .bind(batch_id).bind(request_token).bind(previous_watermark).bind(response_token).bind(response_digest).bind(owner_token).bind(owner_epoch)
             .bind(serde_json::to_string(expected_events).map_err(|error| sqlx::Error::Protocol(error.to_string()))?)
-            .bind(now).bind(now).execute(&self.pool).await?;
+            .bind(now).bind(now).execute(&mut *tx).await?;
+        let identity = crate::storage::recovery_eligibility::writer::text_identity(
+            "matrix_recovery_batches",
+            batch_id,
+        )?;
+        crate::storage::recovery_eligibility::writer::inserted(
+            &mut tx,
+            self.recovery.as_ref(),
+            &identity,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -354,6 +431,16 @@ impl MatrixRecoveryStore {
                 "checkpoint is not batch response token".into(),
             ));
         }
+        let identity = crate::storage::recovery_eligibility::writer::text_identity(
+            "matrix_recovery_batches",
+            batch_id,
+        )?;
+        let batch_mutation = crate::storage::recovery_eligibility::writer::prepare_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            &identity,
+        )
+        .await?;
         let batch_update = sqlx::query(
             "UPDATE matrix_recovery_batches SET state='terminal',updated_at=? WHERE batch_id=? AND previous_watermark=? AND owner_token=? AND owner_epoch=? AND response_digest=? AND state='processing'",
         )
@@ -364,6 +451,12 @@ impl MatrixRecoveryStore {
                 "batch completion fence failed".into(),
             ));
         }
+        crate::storage::recovery_eligibility::writer::complete_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            batch_mutation,
+        )
+        .await?;
         let watermark_update = sqlx::query("UPDATE matrix_recovery_control SET watermark=?,updated_at=? WHERE control_id=1 AND phase='active' AND watermark=?")
             .bind(checkpoint).bind(now).bind(&previous).execute(&mut *tx).await?;
         if watermark_update.rows_affected() != 1 {
