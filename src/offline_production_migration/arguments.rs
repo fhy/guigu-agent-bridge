@@ -81,45 +81,6 @@ pub fn parse_transition_args(args: &[OsString]) -> Result<TransitionRequest, Fai
     Ok(request)
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn args() -> Vec<OsString> {
-        [
-            "offline-transition-matrix-compatibility",
-            "--mode",
-            "preflight",
-            "--config",
-            "/config",
-            "--database",
-            "/db",
-            "--operation-id",
-            "op-1",
-            "--manifest-dir",
-            "/manifest",
-            "--transition-plan",
-            "/plan",
-            "--release-provenance",
-            "/release",
-            "--executable",
-            "/bin/bridge",
-        ]
-        .into_iter()
-        .map(OsString::from)
-        .collect()
-    }
-
-    #[test]
-    fn transition_arguments_require_exact_contract() {
-        assert!(parse_transition_args(&args()).is_ok());
-        let mut malformed = args();
-        malformed[2] = "apply".into();
-        malformed.push("--extra".into());
-        assert!(parse_transition_args(&malformed).is_err());
-    }
-}
-
 pub fn parse_identity_args(args: &[OsString]) -> Result<Request, Failure> {
     if args.len() != 15 || args[0] != "offline-capture-matrix-identity" {
         return Err(Failure::InvalidArguments);
@@ -189,4 +150,43 @@ pub fn parse_args(args: &[OsString]) -> Result<Request, Failure> {
         return Err(Failure::InvalidArguments);
     }
     Ok(request)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args() -> Vec<OsString> {
+        [
+            "offline-transition-matrix-compatibility",
+            "--mode",
+            "preflight",
+            "--config",
+            "/config",
+            "--database",
+            "/db",
+            "--operation-id",
+            "op-1",
+            "--manifest-dir",
+            "/manifest",
+            "--transition-plan",
+            "/plan",
+            "--release-provenance",
+            "/release",
+            "--executable",
+            "/bin/bridge",
+        ]
+        .into_iter()
+        .map(OsString::from)
+        .collect()
+    }
+
+    #[test]
+    fn transition_arguments_require_exact_contract() {
+        assert!(parse_transition_args(&args()).is_ok());
+        let mut malformed = args();
+        malformed[2] = "apply".into();
+        malformed.push("--extra".into());
+        assert!(parse_transition_args(&malformed).is_err());
+    }
 }
