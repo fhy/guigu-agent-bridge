@@ -130,6 +130,65 @@ async fn all_legacy_cutover_states_hold_at_real_startup_without_mutation() {
 }
 
 #[tokio::test]
+async fn native_baseline_null_hold_bootstraps_disabled_without_sdk() {
+    let fixture = Fixture::new().await;
+    let server = MockServer::start().await;
+    let CompatibilityGate::Native(operation) = MatrixCompatibilityStore::new(fixture.pool.clone())
+        .gate(true, Some(&fixture.store()))
+        .await
+        .unwrap()
+    else {
+        panic!("native required")
+    };
+    let mut config = fixture.config(false, &server.uri());
+    config.agents.get_mut("worker").unwrap().enabled = false;
+    let runtime = fixture.start(config).await;
+    let control: (String, String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT cutover_operation_id,phase,watermark,restart_hold_state FROM matrix_recovery_control",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(control, (operation, "baseline".into(), None, None));
+    let state: String = sqlx::query_scalar("SELECT state FROM runtime_eligibility_bootstrap")
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "complete");
+    assert_eq!(fixture.count("runtime_eligibility_context").await, 1);
+    runtime.shutdown().await.unwrap();
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn durable_nonnull_hold_refuses_before_bootstrap_and_sdk() {
+    let server = MockServer::start().await;
+    for state in ["pending", "processing", "unknown", "refused"] {
+        let fixture = Fixture::new().await;
+        MatrixCompatibilityStore::new(fixture.pool.clone())
+            .gate(true, Some(&fixture.store()))
+            .await
+            .unwrap();
+        sqlx::query("UPDATE matrix_recovery_control SET restart_hold_state=?")
+            .bind(state)
+            .execute(&fixture.pool)
+            .await
+            .unwrap();
+        let runtime = fixture.start(fixture.config(true, &server.uri())).await;
+        fixture.assert_no_owners().await;
+        let held: Option<String> =
+            sqlx::query_scalar("SELECT restart_hold_state FROM matrix_recovery_control")
+                .fetch_one(&fixture.pool)
+                .await
+                .unwrap();
+        assert_eq!(held.as_deref(), Some(state));
+        assert_eq!(fixture.count("runtime_eligibility_context").await, 0);
+        runtime.shutdown().await.unwrap();
+    }
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
 async fn native_disabled_restart_preserves_identity_and_b_despite_sdk_progress() {
     let fixture = Fixture::new().await;
     let store = MatrixCompatibilityStore::new(fixture.pool.clone());

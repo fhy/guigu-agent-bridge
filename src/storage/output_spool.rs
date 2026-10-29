@@ -301,7 +301,7 @@ impl OutputSpoolStore {
 }
 
 async fn validate_segments(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut super::recovery_eligibility::writer::ScopedTransaction<'_>,
     set_id: &str,
     total: i64,
 ) -> Result<(), OutputStoreError> {

@@ -113,10 +113,24 @@ async fn real_app_runtime_activates_bound_native_operation_and_processes_full_st
     else {
         panic!("native")
     };
+    let hold: Option<String> = sqlx::query_scalar(
+        "SELECT restart_hold_state FROM matrix_recovery_control WHERE control_id=1",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(hold, None);
     seed_device(&fixture, &server).await;
     let mut config = fixture.config(true, &server.uri());
     config.agents.get_mut("worker").unwrap().enabled = false;
     let runtime = fixture.start(config).await;
+    let bootstrap: String =
+        sqlx::query_scalar("SELECT state FROM runtime_eligibility_bootstrap WHERE singleton=1")
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(bootstrap, "complete");
+    assert_eq!(fixture.count("runtime_eligibility_context").await, 1);
     tokio::time::timeout(std::time::Duration::from_secs(20), async {
         loop {
             let state: (String, String, Option<String>) = sqlx::query_as(

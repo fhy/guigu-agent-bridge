@@ -1,4 +1,4 @@
-use sqlx::{Sqlite, SqliteConnection, Transaction};
+use sqlx::SqliteConnection;
 
 use super::{
     output_spool::{OutputSpoolStore, OutputStoreError},
@@ -72,7 +72,9 @@ impl OutputSpoolStore {
         self.prepare_row(connection, "acp_output_segments", set_id, Some(index))
             .await
     }
-    pub(super) async fn transaction(&self) -> Result<Transaction<'_, Sqlite>, OutputStoreError> {
+    pub(super) async fn transaction(
+        &self,
+    ) -> Result<writer::ScopedTransaction<'_>, OutputStoreError> {
         Ok(writer::begin(&self.pool, self.recovery.as_ref()).await?)
     }
 

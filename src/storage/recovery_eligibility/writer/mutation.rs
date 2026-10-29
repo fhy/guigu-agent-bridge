@@ -22,7 +22,7 @@ pub(crate) async fn prepare_mutation(
     };
     require_row(
         connection,
-        &scope.context,
+        &scope.context(),
         scope.domain,
         scope.fence.as_ref(),
         identity,
@@ -48,7 +48,7 @@ pub(crate) async fn complete_mutation(
     };
     authority::validate(
         connection,
-        &scope.context,
+        &scope.context(),
         scope.domain,
         scope.fence.as_ref(),
     )
@@ -74,7 +74,7 @@ pub(crate) async fn complete_mutation(
     refresh_references(connection, scope, &mutation, &snapshot).await?;
     require_row(
         connection,
-        &scope.context,
+        &scope.context(),
         scope.domain,
         scope.fence.as_ref(),
         &mutation.identity,

@@ -591,7 +591,7 @@ impl ReliabilityStore {
 
     async fn admit_workflow_tx(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        tx: &mut super::recovery_eligibility::writer::ScopedTransaction<'_>,
         input: WorkflowAdmission<'_>,
     ) -> Result<ReceiptOutcome, ReliabilityError> {
         if let Some(auth) = &input.authorization {

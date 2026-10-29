@@ -1,4 +1,9 @@
-use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
+use sqlx::{SqliteConnection, SqlitePool};
+use std::sync::{
+    Arc,
+    atomic::{AtomicI64, Ordering},
+};
+use tokio::sync::Mutex;
 
 use super::{
     EffectDomain, EligibilityContext, LiveFence, ParentIdentity, ParentRole, RowIdentity,
@@ -6,7 +11,11 @@ use super::{
 };
 
 mod mutation;
+mod native_control;
+mod transaction;
 pub(crate) use mutation::{Mutation, complete_mutation, prepare_mutation};
+pub(crate) use native_control::{complete_control, prepare_control};
+pub(crate) use transaction::ScopedTransaction;
 
 #[derive(Debug, Clone)]
 pub struct RecoveryScope {
@@ -14,6 +23,8 @@ pub struct RecoveryScope {
     domain: EffectDomain,
     fence: Option<LiveFence>,
     anchors: Vec<RowIdentity>,
+    revision: Arc<AtomicI64>,
+    serial: Arc<Mutex<()>>,
 }
 
 impl RecoveryScope {
@@ -34,12 +45,29 @@ impl RecoveryScope {
         domain: EffectDomain,
         fence: Option<LiveFence>,
     ) -> Self {
+        let revision = match &context {
+            EligibilityContext::NonAdmin { revision, .. }
+            | EligibilityContext::Admin { revision, .. } => *revision,
+        };
         Self {
             context,
             domain,
             fence,
             anchors: Vec::new(),
+            revision: Arc::new(AtomicI64::new(revision)),
+            serial: Arc::new(Mutex::new(())),
         }
+    }
+
+    fn context(&self) -> EligibilityContext {
+        let mut context = self.context.clone();
+        match &mut context {
+            EligibilityContext::NonAdmin { revision, .. }
+            | EligibilityContext::Admin { revision, .. } => {
+                *revision = self.revision.load(Ordering::Acquire);
+            }
+        }
+        context
     }
 
     pub fn with_metadata_anchor(mut self, identity: RowIdentity) -> Self {
@@ -51,12 +79,16 @@ impl RecoveryScope {
 pub(crate) async fn begin<'pool>(
     pool: &'pool SqlitePool,
     scope: Option<&RecoveryScope>,
-) -> Result<Transaction<'pool, Sqlite>, sqlx::Error> {
+) -> Result<ScopedTransaction<'pool>, sqlx::Error> {
+    let guard = match scope {
+        Some(scope) => Some(scope.serial.clone().lock_owned().await),
+        None => None,
+    };
     let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
     if let Some(scope) = scope {
         authority::validate(
             &mut transaction,
-            &scope.context,
+            &scope.context(),
             scope.domain,
             scope.fence.as_ref(),
         )
@@ -68,7 +100,11 @@ pub(crate) async fn begin<'pool>(
             return Err(refused());
         }
     }
-    Ok(transaction)
+    Ok(ScopedTransaction::new(
+        transaction,
+        scope.map(|scope| scope.revision.clone()),
+        guard,
+    ))
 }
 
 pub(crate) fn text_identity(table: &str, key: &str) -> Result<RowIdentity, sqlx::Error> {
@@ -115,7 +151,7 @@ pub(crate) async fn inserted(
     };
     authority::validate(
         connection,
-        &scope.context,
+        &scope.context(),
         scope.domain,
         scope.fence.as_ref(),
     )
@@ -130,7 +166,7 @@ pub(crate) async fn inserted(
     if exists != 0 {
         return require_row(
             connection,
-            &scope.context,
+            &scope.context(),
             scope.domain,
             scope.fence.as_ref(),
             identity,
@@ -151,7 +187,7 @@ pub(crate) async fn inserted(
     insert_classification(connection, scope, identity, &snapshot, &encoded, matrix).await?;
     require_row(
         connection,
-        &scope.context,
+        &scope.context(),
         scope.domain,
         scope.fence.as_ref(),
         identity,
@@ -180,11 +216,11 @@ async fn parents(
             role,
         };
         if role == ParentRole::MetadataAnchor {
-            metadata::validate(connection, &scope.context, scope.domain, &reference).await?;
+            metadata::validate(connection, &scope.context(), scope.domain, &reference).await?;
         } else if parent != identity {
             require_row(
                 connection,
-                &scope.context,
+                &scope.context(),
                 scope.domain,
                 scope.fence.as_ref(),
                 parent,
@@ -259,7 +295,7 @@ pub(crate) async fn require(
     if let Some(scope) = scope {
         require_row(
             connection,
-            &scope.context,
+            &scope.context(),
             scope.domain,
             scope.fence.as_ref(),
             identity,
@@ -280,7 +316,7 @@ pub(crate) async fn route(
     if scope.anchors.contains(identity) {
         authority::validate(
             connection,
-            &scope.context,
+            &scope.context(),
             scope.domain,
             scope.fence.as_ref(),
         )
@@ -288,7 +324,7 @@ pub(crate) async fn route(
         let snapshot = inventory::snapshot(connection, identity).await?;
         metadata::validate(
             connection,
-            &scope.context,
+            &scope.context(),
             scope.domain,
             &ParentIdentity {
                 identity: identity.clone(),
@@ -301,7 +337,7 @@ pub(crate) async fn route(
     } else {
         require_row(
             connection,
-            &scope.context,
+            &scope.context(),
             scope.domain,
             scope.fence.as_ref(),
             identity,
