@@ -2,6 +2,10 @@ use sqlx::{Row, SqliteConnection};
 
 use super::{EligibilityContext, RecoveryScope, RowIdentity, authority, inventory, refused};
 
+#[cfg(test)]
+#[path = "native_lease_tests.rs"]
+mod tests;
+
 pub(crate) struct LeaseMutation {
     identity: RowIdentity,
     revision: String,
@@ -11,6 +15,7 @@ pub(crate) struct LeaseMutation {
 async fn validate(
     connection: &mut SqliteConnection,
     scope: &RecoveryScope,
+    component: &str,
 ) -> Result<(), sqlx::Error> {
     let context = scope.context();
     authority::validate(connection, &context, scope.domain, scope.fence.as_ref()).await?;
@@ -21,8 +26,19 @@ async fn validate(
     if !enabled {
         return Err(refused());
     }
-    let active: i64 = sqlx::query_scalar("SELECT count(*) FROM matrix_recovery_control WHERE control_id=1 AND cutover_operation_id=? AND phase='active' AND watermark IS NOT NULL AND restart_hold_state IS NULL")
-        .bind(context.matrix_operation().ok_or_else(refused)?).fetch_one(connection).await?;
+    let baseline = component == "MatrixSync"
+        && scope.domain == super::EffectDomain::Local
+        && scope.fence.is_none()
+        && matches!(
+            context,
+            EligibilityContext::NonAdmin {
+                matrix_enabled: true,
+                matrix_operation: Some(_),
+                ..
+            }
+        );
+    let active: i64 = sqlx::query_scalar("SELECT count(*) FROM matrix_recovery_control WHERE control_id=1 AND cutover_operation_id=? AND restart_hold_state IS NULL AND ((phase='active' AND watermark IS NOT NULL AND length(watermark)>0) OR (? AND phase='baseline' AND watermark IS NULL AND NOT EXISTS(SELECT 1 FROM matrix_recovery_batches) AND NOT EXISTS(SELECT 1 FROM matrix_recovery_receipts)))")
+        .bind(context.matrix_operation().ok_or_else(refused)?).bind(baseline).fetch_one(connection).await?;
     if active != 1 {
         return Err(refused());
     }
@@ -35,7 +51,7 @@ pub(crate) async fn prepare_lease(
     component: &str,
 ) -> Result<Option<LeaseMutation>, sqlx::Error> {
     let Some(scope) = scope else { return Ok(None) };
-    validate(connection, scope).await?;
+    validate(connection, scope, component).await?;
     let exists: bool = sqlx::query_scalar(
         "SELECT EXISTS(SELECT 1 FROM matrix_component_leases WHERE component=?)",
     )
@@ -76,7 +92,7 @@ pub(crate) async fn complete_lease(
     mutation: Option<LeaseMutation>,
 ) -> Result<(), sqlx::Error> {
     let Some(scope) = scope else { return Ok(()) };
-    validate(connection, scope).await?;
+    validate(connection, scope, component).await?;
     let identity = super::text_identity("matrix_component_leases", component)?;
     let snapshot = inventory::snapshot(connection, &identity).await?;
     if !snapshot.parents.is_empty() {

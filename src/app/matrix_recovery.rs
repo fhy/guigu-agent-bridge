@@ -126,8 +126,9 @@ pub(super) async fn prepare_sync(
         _ => return Err(AppError::Runtime),
     }
     let now = Utc::now();
-    let epoch = activation_epoch.unwrap_or(
-        recovery
+    let epoch = match activation_epoch {
+        Some(epoch) => epoch,
+        None => recovery
             .acquire_component_lease(
                 "MatrixSync",
                 runtime,
@@ -137,7 +138,7 @@ pub(super) async fn prepare_sync(
             )
             .await
             .map_err(|_| AppError::Runtime)?,
-    );
+    };
     if let Some(scope) = recovery_scope.as_ref() {
         scope
             .install_matrix_fence(crate::storage::recovery_eligibility::LiveFence {

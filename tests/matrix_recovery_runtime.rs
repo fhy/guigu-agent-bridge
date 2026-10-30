@@ -153,7 +153,15 @@ async fn real_app_runtime_activates_bound_native_operation_and_processes_full_st
     .await
     .unwrap();
     assert_eq!(fixture.count("matrix_recovery_receipts").await, 0);
-    assert_eq!(fixture.count("matrix_component_leases").await, 1);
+    let leases: Vec<(String, i64)> =
+        sqlx::query_as("SELECT component,epoch FROM matrix_component_leases ORDER BY component")
+            .fetch_all(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        leases,
+        vec![("MatrixSync".into(), 1), ("OutboxDrain".into(), 1)]
+    );
     runtime.shutdown().await.unwrap();
     let requests = server.received_requests().await.unwrap();
     assert!(requests.iter().any(|request| {
