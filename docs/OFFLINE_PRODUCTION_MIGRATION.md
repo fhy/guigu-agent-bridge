@@ -70,11 +70,27 @@ after acquiring the persistent per-database advisory lock and before mutation.
 Unknown state is refusal, not absence. This protects cooperative supported
 writers, not arbitrary same-UID/root processes bypassing the operation window.
 
+A masked fragment may be reported as literal `/dev/null` or as the current
+manager's runtime unit symlink to `/dev/null`. The latter is authenticated under
+`XDG_RUNTIME_DIR/systemd/user`: every directory is pinned without following
+symlinks, ownership and write permissions are checked, and the single-link,
+current-UID unit symlink must name exactly `/dev/null`. Its conventional symlink
+mode `0777` is not permission to replace it; parent-directory permissions govern
+replacement. This representation check does not replace any state, process,
+listener, job, reverse-launcher or maintenance-lock check.
+
 Normal new-release startup takes the same lock before opening/migrating SQLite,
 refuses unresolved operation records, and retains the lock until shutdown closes
 the pool. Supported administrative mutation routes take it before their existing
 admission/restore guards. Lock order is maintenance, existing guard, SQLite.
 The inode is never unlinked for recovery; process exit releases the kernel lock.
+
+Startup discovery does not create SQLite sidecars. An existing WAL is inspected
+through the read-only VFS, never ignored. For a fully closed database without a
+WAL or rollback journal, discovery can hold SQLite's actual exclusive database
+lock and inspect an immutable read-only view until that lock is released. The
+lock handle opens an existing database without creating or writing it; if that
+exclusion or a consistent WAL-aware view is unavailable, startup refuses.
 
 ## Durable operation protocol
 

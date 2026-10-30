@@ -1,6 +1,8 @@
 use super::Failure;
 use std::{collections::BTreeMap, net::SocketAddr, time::Duration};
 
+mod mask;
+
 const UNIT: &str = "guigu-agent-bridge-observer.service";
 
 pub(super) async fn check(
@@ -11,7 +13,7 @@ pub(super) async fn check(
     if !live {
         return fixture_check(phase);
     }
-    let show = query(&["show", UNIT, "--no-pager"]).await?;
+    let show = query(&["show", UNIT, "--all", "--no-pager"]).await?;
     validate_show(&show)?;
     let jobs = query(&["list-jobs", "--no-legend", "--no-pager"]).await?;
     let reverse = query(&[
@@ -122,7 +124,6 @@ pub(super) fn validate_show(show: &str) -> Result<(), Failure> {
         ("SubState", "dead"),
         ("MainPID", "0"),
         ("ControlPID", "0"),
-        ("FragmentPath", "/dev/null"),
         ("Job", ""),
         ("TriggeredBy", ""),
     ] {
@@ -130,5 +131,6 @@ pub(super) fn validate_show(show: &str) -> Result<(), Failure> {
             return Err(Failure::Busy);
         }
     }
+    mask::validate(fields.get("FragmentPath").copied().ok_or(Failure::Busy)?)?;
     Ok(())
 }

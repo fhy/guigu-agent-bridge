@@ -31,14 +31,21 @@ struct A2a {
 }
 
 pub(super) fn listeners(req: &Request) -> Result<Vec<SocketAddr>, Failure> {
-    let text = fs::read_to_string(&req.config).map_err(|_| Failure::Preflight)?;
+    listeners_at(&req.config, &req.database)
+}
+
+pub(super) fn listeners_at(
+    path: &std::path::Path,
+    expected_database: &std::path::Path,
+) -> Result<Vec<SocketAddr>, Failure> {
+    let text = fs::read_to_string(path).map_err(|_| Failure::Preflight)?;
     let config: Configuration = toml::from_str(&text).map_err(|_| Failure::Preflight)?;
     let database = if let Ok(rest) = config.bridge.database.strip_prefix("~") {
         PathBuf::from(std::env::var_os("HOME").ok_or(Failure::Preflight)?).join(rest)
     } else {
         config.bridge.database
     };
-    if database != req.database {
+    if database != expected_database {
         return Err(Failure::Preflight);
     }
     let mut addresses = Vec::new();

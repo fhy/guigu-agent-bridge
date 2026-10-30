@@ -63,3 +63,7 @@ impl MaintenanceLock {
         Ok(Self { _file: file })
     }
 }
+
+#[cfg(test)]
+#[path = "maintenance_lock_tests.rs"]
+mod tests;

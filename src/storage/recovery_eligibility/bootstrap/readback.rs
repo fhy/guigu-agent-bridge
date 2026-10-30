@@ -43,7 +43,7 @@ pub(super) async fn context(
     })
 }
 
-pub(super) async fn inventory(
+pub(crate) async fn inventory(
     connection: &mut SqliteConnection,
     context: &EligibilityContext,
 ) -> Result<(), sqlx::Error> {

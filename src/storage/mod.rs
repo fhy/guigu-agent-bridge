@@ -144,7 +144,7 @@ mod event_consumer;
 mod matrix_cutover;
 mod matrix_cutover_receipts;
 mod matrix_recovery_compatibility;
-mod matrix_recovery_snapshot;
+pub(crate) mod matrix_recovery_snapshot;
 mod matrix_store_evidence;
 mod output_cleanup;
 mod output_delivery;

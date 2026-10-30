@@ -515,14 +515,31 @@ async fn activation_requires_operation_provenance_and_reads_back_marker() {
 async fn administrative_activation_intent_prepared_recovery_and_stale_owner_refuse() {
     use guigu_agent_bridge::storage::cutover_digest;
     let pool = database().await;
+    let now = chrono::Utc::now();
+    let now_text = now.to_rfc3339();
     sqlx::query("INSERT INTO offline_recovery_binding(singleton,protocol,db_generation,canonical_db_digest,root_digest,admin_operation_id,schema_intent_digest,schema_complete_digest,plan_digest,identity_digest,classification_digest,transition_intent_digest,transition_complete_digest,native_operation_id,phase,revision) VALUES(1,2,'generation','db','root','operation','schema','complete','plan','identity','class','intent','complete','native-op','baseline_ready',4)")
         .execute(&pool).await.unwrap();
-    sqlx::query("INSERT INTO matrix_recovery_control(control_id,cutover_operation_id,phase,watermark,updated_at) VALUES(1,'operation','baseline',NULL,'t0')")
+    sqlx::query(
+        "UPDATE runtime_eligibility_bootstrap SET state='admin_reserved' WHERE singleton=1",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO matrix_recovery_control(control_id,cutover_operation_id,phase,watermark,updated_at) VALUES(1,'native-op','baseline',NULL,'t0')")
         .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO matrix_recovery_compatibility(singleton,decision,source_schema_version,source_state_digest,native_operation_id,reason_code,created_at) VALUES(1,'native',24,'fixture','native-op','administrative-transition','fixture')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO matrix_component_leases(component,owner_token,epoch,state,expires_at,updated_at) VALUES('MatrixSync','owner',1,'active',?,?)")
+        .bind((now+chrono::Duration::minutes(1)).to_rfc3339()).bind(&now_text).execute(&pool).await.unwrap();
     let store = MatrixRecoveryStore::new(pool.clone());
     assert!(
         store
-            .begin_activation_intent("owner", 1, "attempt", &cutover_digest(b"request"), "t1")
+            .begin_activation_intent(
+                "owner",
+                1,
+                "attempt",
+                &cutover_digest(b"request"),
+                &now_text
+            )
             .await
             .unwrap()
     );
@@ -535,12 +552,12 @@ async fn administrative_activation_intent_prepared_recovery_and_stale_owner_refu
     assert_eq!(state, "inflight");
     assert!(
         store
-            .commit_activation_intent("operation", "owner", 1, "B", "t2")
+            .commit_activation_intent("native-op", "owner", 1, "B", &now_text)
             .await
             .is_err()
     );
     store
-        .prepare_activation_intent("owner", 1, "B", &cutover_digest(b"B"), "t3")
+        .prepare_activation_intent("owner", 1, "B", &cutover_digest(b"B"), &now_text)
         .await
         .unwrap();
     let prepared: (String, String, String) = sqlx::query_as("SELECT control.phase,binding.phase,intent.state FROM matrix_recovery_control control JOIN offline_recovery_binding binding ON binding.singleton=1 JOIN matrix_activation_intent intent ON intent.native_operation_id=binding.native_operation_id")
@@ -555,12 +572,12 @@ async fn administrative_activation_intent_prepared_recovery_and_stale_owner_refu
     );
     assert!(
         store
-            .prepare_activation_intent("stale", 1, "B", &cutover_digest(b"B"), "t4")
+            .prepare_activation_intent("stale", 1, "B", &cutover_digest(b"B"), &now_text)
             .await
             .is_err()
     );
     store
-        .commit_activation_intent("operation", "owner", 1, "B", "t5")
+        .commit_activation_intent("native-op", "owner", 1, "B", &now_text)
         .await
         .unwrap();
     let rows: (String, String, String) = sqlx::query_as("SELECT control.phase,binding.phase,intent.state FROM matrix_recovery_control control JOIN offline_recovery_binding binding ON binding.singleton=1 JOIN matrix_activation_intent intent ON intent.native_operation_id=binding.native_operation_id")

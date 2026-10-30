@@ -139,6 +139,9 @@ pub(crate) fn startup_allowed(database: &Path) -> Result<(), Failure> {
     if !present(&path)? {
         return Ok(());
     }
+    if super::version2_records::load::<super::version2_records::Root>(&path).is_ok() {
+        return super::administrative_startup::files(database).map(|_| ());
+    }
     let operation: Operation = load(&path)?;
     if operation.database != database || operation.database_identity != Identity::of(database)? {
         return Err(Failure::ManualRequired);

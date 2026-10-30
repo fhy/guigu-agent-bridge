@@ -1,3 +1,4 @@
+use sqlx::Connection;
 use std::os::unix::fs::PermissionsExt;
 
 use crate::{
@@ -91,4 +92,48 @@ async fn failed_rooted_capture_retains_redacted_audit_and_pending_binding_withou
     ));
     assert_eq!(std::fs::read(failure_path).unwrap(), bytes);
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[path = "identity_cli_tests.rs"]
+mod cli;
+#[path = "identity_cli_environment.rs"]
+mod environment;
+
+#[tokio::test]
+async fn rooted_identity_cli_child_reports_binding_result() {
+    cli::execute().await;
+}
+
+#[tokio::test]
+async fn rooted_ambiguous_activation_refuses_retry() {
+    cli::execute_case("ambiguous").await;
+}
+
+#[tokio::test]
+async fn rooted_prepared_crash_recovers_without_rebaseline() {
+    cli::execute_case("prepared").await;
+}
+
+#[tokio::test]
+async fn rooted_committed_crash_recovers_without_rebaseline() {
+    cli::execute_case("committed").await;
+}
+
+#[tokio::test]
+async fn rooted_changed_online_identity_refuses_activation() {
+    cli::execute_case("identity").await;
+}
+
+#[tokio::test]
+async fn administrative_runtime_child_entry() {
+    let Some(path) = std::env::var_os("R092_ACTIVE_CHILD_CONFIG") else {
+        return;
+    };
+    let runtime = crate::app::AppRuntime::start(std::path::PathBuf::from(path))
+        .await
+        .unwrap();
+    let mut terminate =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()).unwrap();
+    terminate.recv().await;
+    runtime.shutdown().await.unwrap();
 }

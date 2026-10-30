@@ -4,6 +4,13 @@ mod receipts;
 #[path = "recovery_runtime.rs"]
 mod runtime_impl;
 
+#[path = "recovery_administrative.rs"]
+mod administrative;
+
+#[cfg(test)]
+#[path = "recovery_administrative_tests.rs"]
+mod administrative_tests;
+
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 
@@ -177,97 +184,6 @@ impl MatrixRecoveryStore {
         .await?;
         tx.commit().await?;
         Ok(())
-    }
-
-    pub async fn begin_activation_intent(
-        &self,
-        owner: &str,
-        epoch: i64,
-        attempt_id: &str,
-        request_digest: &str,
-        now: &str,
-    ) -> Result<bool, sqlx::Error> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let binding: Option<(String, String, String, String)> = sqlx::query_as("SELECT native_operation_id,plan_digest,identity_digest,phase FROM offline_recovery_binding WHERE singleton=1")
-            .fetch_optional(&mut *tx).await?;
-        let Some((native, plan, identity, phase)) = binding else {
-            tx.commit().await?;
-            return Ok(false);
-        };
-        if phase != "baseline_ready" {
-            return Err(sqlx::Error::Protocol(
-                "activation binding is not baseline_ready".into(),
-            ));
-        }
-        sqlx::query("INSERT INTO matrix_activation_intent(native_operation_id,plan_digest,identity_digest,attempt_id,component_owner,component_epoch,request_digest,state,revision,created_at) VALUES(?,?,?,?,?,?,?,'inflight',0,?) ON CONFLICT(native_operation_id) DO NOTHING")
-            .bind(&native).bind(&plan).bind(&identity).bind(attempt_id).bind(owner).bind(epoch).bind(request_digest).bind(now)
-            .execute(&mut *tx).await?;
-        let state: String = sqlx::query_scalar("SELECT state FROM matrix_activation_intent WHERE native_operation_id=? AND component_owner=? AND component_epoch=? AND request_digest=?")
-            .bind(&native).bind(owner).bind(epoch).bind(request_digest).fetch_one(&mut *tx).await?;
-        if state == "refused" {
-            return Err(sqlx::Error::Protocol("activation intent refused".into()));
-        }
-        tx.commit().await?;
-        Ok(true)
-    }
-
-    pub async fn prepare_activation_intent(
-        &self,
-        owner: &str,
-        epoch: i64,
-        token: &str,
-        response_digest: &str,
-        now: &str,
-    ) -> Result<bool, sqlx::Error> {
-        if token.is_empty() || response_digest.is_empty() {
-            return Err(sqlx::Error::Protocol("invalid baseline response".into()));
-        }
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let changed = sqlx::query("UPDATE matrix_activation_intent SET response_digest=?,response_token=?,response_at=?,state='prepared',revision=revision+1 WHERE native_operation_id=(SELECT native_operation_id FROM offline_recovery_binding WHERE singleton=1) AND component_owner=? AND component_epoch=? AND state='inflight'")
-            .bind(response_digest).bind(token).bind(now).bind(owner).bind(epoch).execute(&mut *tx).await?;
-        if changed.rows_affected() == 1 {
-            let binding = sqlx::query("UPDATE offline_recovery_binding SET phase='activation_prepared',revision=revision+1 WHERE singleton=1 AND phase='baseline_ready' AND native_operation_id=(SELECT native_operation_id FROM matrix_activation_intent WHERE state='prepared')")
-                .execute(&mut *tx).await?;
-            if binding.rows_affected() != 1 {
-                return Err(sqlx::Error::Protocol(
-                    "activation binding prepare fenced".into(),
-                ));
-            }
-            tx.commit().await?;
-            Ok(true)
-        } else {
-            tx.rollback().await?;
-            Err(sqlx::Error::Protocol(
-                "activation intent owner fenced".into(),
-            ))
-        }
-    }
-
-    pub async fn commit_activation_intent(
-        &self,
-        operation_id: &str,
-        owner: &str,
-        epoch: i64,
-        token: &str,
-        now: &str,
-    ) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let changed = sqlx::query("UPDATE matrix_recovery_control SET phase='active',watermark=?,updated_at=? WHERE control_id=1 AND cutover_operation_id=? AND phase='baseline'")
-            .bind(token).bind(now).bind(operation_id).execute(&mut *tx).await?;
-        if changed.rows_affected() != 1 {
-            return Err(sqlx::Error::Protocol("control activation fenced".into()));
-        }
-        let intent = sqlx::query("UPDATE matrix_activation_intent SET state='committed',revision=revision+1 WHERE native_operation_id=(SELECT native_operation_id FROM offline_recovery_binding WHERE singleton=1) AND component_owner=? AND component_epoch=? AND response_token=? AND state='prepared'")
-            .bind(owner).bind(epoch).bind(token).execute(&mut *tx).await?;
-        if intent.rows_affected() != 1 {
-            return Err(sqlx::Error::Protocol("prepared activation missing".into()));
-        }
-        let binding = sqlx::query("UPDATE offline_recovery_binding SET phase='active',revision=revision+1 WHERE singleton=1 AND phase='activation_prepared' AND native_operation_id=(SELECT native_operation_id FROM matrix_activation_intent WHERE state='committed')")
-            .execute(&mut *tx).await?;
-        if binding.rows_affected() != 1 {
-            return Err(sqlx::Error::Protocol("binding activation fenced".into()));
-        }
-        tx.commit().await
     }
 
     pub async fn ensure_active(

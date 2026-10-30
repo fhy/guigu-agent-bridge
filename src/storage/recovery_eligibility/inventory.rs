@@ -50,7 +50,7 @@ pub struct RowIdentity {
     pub key: String,
 }
 
-pub(super) struct Snapshot {
+pub(crate) struct Snapshot {
     pub revision: String,
     pub digest: String,
     pub matrix: bool,
@@ -66,7 +66,7 @@ pub(super) fn encoded(name: &str) -> String {
     format!("typeof({column})||':'||hex(CAST({column} AS BLOB))")
 }
 
-pub(super) async fn snapshot(
+pub(crate) async fn snapshot(
     connection: &mut SqliteConnection,
     identity: &RowIdentity,
 ) -> Result<Snapshot, sqlx::Error> {
@@ -97,7 +97,7 @@ pub(super) async fn snapshot(
     })
 }
 
-pub(super) async fn values(
+pub(crate) async fn values(
     connection: &mut SqliteConnection,
     identity: &RowIdentity,
 ) -> Result<(Vec<String>, Vec<String>), sqlx::Error> {
@@ -157,7 +157,7 @@ pub(super) async fn values(
     Ok((names, values))
 }
 
-pub(super) async fn identities(
+pub(crate) async fn identities(
     connection: &mut SqliteConnection,
 ) -> Result<Vec<RowIdentity>, sqlx::Error> {
     let mut identities = Vec::new();

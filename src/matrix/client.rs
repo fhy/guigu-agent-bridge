@@ -3,9 +3,10 @@
 use matrix_sdk::{
     Client, SessionTokens,
     authentication::matrix::MatrixSession,
-    config::SyncSettings,
+    config::{RequestConfig, SyncSettings},
     ruma::{
-        DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceId, OwnedUserId, api::client::keys::get_keys,
+        DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceId, OwnedUserId,
+        api::client::{keys::get_keys, sync::sync_events},
     },
 };
 use std::collections::BTreeMap;
@@ -199,11 +200,28 @@ impl MatrixClient {
     }
 
     pub(crate) async fn baseline_sync_token(&self) -> Result<String, MatrixError> {
-        self.inner
-            .sync_once(SyncSettings::new().timeout(std::time::Duration::from_secs(10)))
+        let mut request = sync_events::v3::Request::new();
+        request.timeout = Some(std::time::Duration::from_secs(10));
+        let response = self
+            .inner
+            .send(request)
+            .with_request_config(
+                RequestConfig::new()
+                    .retry_limit(0)
+                    .timeout(std::time::Duration::from_secs(60)),
+            )
             .await
-            .map(|response| response.next_batch)
-            .map_err(|_| MatrixError::Transport)
+            .map_err(|_| MatrixError::Transport)?;
+        if response.next_batch.is_empty()
+            || response
+                .rooms
+                .join
+                .values()
+                .any(|room| room.timeline.limited)
+        {
+            return Err(MatrixError::CutoverRefused);
+        }
+        Ok(response.next_batch)
     }
 }
 

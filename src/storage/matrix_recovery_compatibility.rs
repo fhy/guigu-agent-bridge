@@ -125,7 +125,7 @@ impl MatrixCompatibilityStore {
         Ok(selected)
     }
 
-    async fn persist_record(
+    pub(crate) async fn persist_record(
         connection: &mut sqlx::SqliteConnection,
         legacy: &super::matrix_recovery_snapshot::LegacySnapshot,
         operation: Option<&str>,

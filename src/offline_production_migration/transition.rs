@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::path::Path;
 
 use serde::{Deserialize, Serialize};
 use sqlx::Connection;
@@ -34,31 +34,30 @@ pub(super) struct Classification {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct TransitionIntent {
-    protocol: u8,
-    operation_id: String,
-    plan_digest: String,
-    identity_digest: String,
-    classification_digest: String,
-    native_operation_id: String,
+pub(super) struct TransitionIntent {
+    pub protocol: u8,
+    pub operation_id: String,
+    pub plan_digest: String,
+    pub identity_digest: String,
+    pub classification_digest: String,
+    pub native_operation_id: String,
+    pub source_state_digest: String,
+    pub original_compatibility: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-struct TransitionComplete {
-    intent_digest: String,
-    plan_digest: String,
-    classification_digest: String,
-    native_operation_id: String,
+pub(super) struct TransitionComplete {
+    pub intent_digest: String,
+    pub plan_digest: String,
+    pub classification_digest: String,
+    pub native_operation_id: String,
 }
 
 impl Plan {
-    fn load(path: &Path) -> Result<Self, Failure> {
-        evidence::canonical(path).map_err(|_| Failure::ManualRequired)?;
-        let bytes = fs::read(path).map_err(|_| Failure::ManualRequired)?;
-        let plan: Self = serde_json::from_slice(&bytes).map_err(|_| Failure::ManualRequired)?;
-        if serde_json::to_vec(&plan).map_err(|_| Failure::Preflight)? != bytes
-            || plan.protocol != 1
+    pub(super) fn load(path: &Path) -> Result<Self, Failure> {
+        let plan: Self = super::version2_records::load(path)?;
+        if plan.protocol != 1
             || plan.plan_digest.is_empty()
             || plan.root_digest.is_empty()
             || plan.schema_complete_digest.is_empty()
@@ -108,6 +107,27 @@ pub(super) async fn run(req: TransitionRequest) -> Result<String, Failure> {
     if req.mode == Mode::Preflight {
         return Ok("offline-transition-matrix-compatibility result=preflight".into());
     }
+    let intent_path = req.manifest_dir.join("transition-intent-v1.json");
+    let existing = if intent_path.exists() {
+        Some(records::load::<TransitionIntent>(&intent_path)?)
+    } else {
+        None
+    };
+    let mut source = verification::open(&req.database, true).await?;
+    let legacy = crate::storage::matrix_recovery_snapshot::snapshot(&mut source)
+        .await
+        .map_err(|_| Failure::ManualRequired)?;
+    if existing
+        .as_ref()
+        .is_some_and(|intent| intent.source_state_digest != legacy.digest)
+    {
+        return Err(Failure::ManualRequired);
+    }
+    let original = match &existing {
+        Some(intent) => intent.original_compatibility.clone(),
+        None => super::transition_native::original(&mut source).await?,
+    };
+    source.close().await.map_err(|_| Failure::Migration)?;
     let intent = TransitionIntent {
         protocol: 1,
         operation_id: req.operation_id.clone(),
@@ -115,14 +135,19 @@ pub(super) async fn run(req: TransitionRequest) -> Result<String, Failure> {
         identity_digest: plan.identity_digest.clone(),
         classification_digest: plan.classification_digest.clone(),
         native_operation_id: plan.native_operation_id.clone(),
+        source_state_digest: existing
+            .as_ref()
+            .map_or(legacy.digest, |intent| intent.source_state_digest.clone()),
+        original_compatibility: original,
     };
-    let intent_path = req.manifest_dir.join("transition-intent-v1.json");
     if intent_path.exists() {
         if records::load::<TransitionIntent>(&intent_path)? != intent {
             return Err(Failure::ManualRequired);
         }
     } else if req.mode == Mode::Apply {
         records::publish(&intent_path, &intent)?;
+    } else {
+        return Err(Failure::ManualRequired);
     }
     super::flow::fault("transition-after-intent");
     let mut connection = verification::open(&req.database, false).await?;
@@ -147,6 +172,14 @@ pub(super) async fn run(req: TransitionRequest) -> Result<String, Failure> {
         if classification_digest != plan.classification_digest {
             return Err(Failure::ManualRequired);
         }
+        super::transition_rows::validate(&mut tx, &plan).await?;
+        super::transition_native::apply(
+            &mut tx,
+            &plan.native_operation_id,
+            &intent.original_compatibility,
+            &intent.source_state_digest,
+        )
+        .await?;
         for classification in &plan.classifications {
             sqlx::query("INSERT INTO offline_recovery_rows(table_name,canonical_pk,origin_generation,original_revision,original_digest,parent_relations,disposition,evidence_digest,context_kind,admin_operation_id,plan_digest,matrix_operation_id) VALUES(?,?,?,?,?,?,?,?, 'admin',?,?,?)")
                 .bind(&classification.table_name)
@@ -175,6 +208,7 @@ pub(super) async fn run(req: TransitionRequest) -> Result<String, Failure> {
         if changed.rows_affected() != 1 {
             return Err(Failure::ManualRequired);
         }
+        super::transition_rows::anchors(&mut tx, &plan, &req.operation_id).await?;
         phase = "transition_pending".into();
     } else if phase != "transition_pending" && phase != "baseline_ready" && phase != "active"
         || row.get::<Option<String>, _>(5).as_deref() != Some(&plan.plan_digest)
@@ -224,7 +258,41 @@ pub(super) async fn run(req: TransitionRequest) -> Result<String, Failure> {
         connection.close().await.map_err(|_| Failure::Migration)?;
         super::flow::fault("transition-after-cas");
     }
+    verify_receipts(&req, &plan, &intent).await?;
     Ok(format!(
         "offline-transition-matrix-compatibility result=phase-{phase}"
     ))
+}
+
+async fn verify_receipts(
+    req: &TransitionRequest,
+    plan: &Plan,
+    intent: &TransitionIntent,
+) -> Result<(), Failure> {
+    let complete: TransitionComplete =
+        super::version2_records::load(&req.manifest_dir.join("transition-complete-v1.json"))?;
+    let intent_digest = records::encoded_digest(intent)?;
+    if complete.intent_digest != intent_digest
+        || complete.plan_digest != plan.plan_digest
+        || complete.classification_digest != plan.classification_digest
+        || complete.native_operation_id != plan.native_operation_id
+    {
+        return Err(Failure::ManualRequired);
+    }
+    let mut connection = verification::open(&req.database, true).await?;
+    let active: bool =
+        sqlx::query_scalar("SELECT phase='active' FROM offline_recovery_binding WHERE singleton=1")
+            .fetch_one(&mut connection)
+            .await
+            .map_err(|_| Failure::ManualRequired)?;
+    super::transition_rows::readback(&mut connection, plan, &req.operation_id, active).await?;
+    let valid: i64 = sqlx::query_scalar("SELECT count(*) FROM offline_recovery_binding WHERE singleton=1 AND phase IN ('baseline_ready','active') AND transition_intent_digest=? AND transition_complete_digest=? AND plan_digest=? AND classification_digest=? AND native_operation_id=?")
+        .bind(intent_digest).bind(records::encoded_digest(&complete)?)
+        .bind(&plan.plan_digest).bind(&plan.classification_digest).bind(&plan.native_operation_id)
+        .fetch_one(&mut connection).await.map_err(|_| Failure::ManualRequired)?;
+    connection.close().await.map_err(|_| Failure::Migration)?;
+    if valid != 1 {
+        return Err(Failure::ManualRequired);
+    }
+    Ok(())
 }

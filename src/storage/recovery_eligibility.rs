@@ -1,11 +1,12 @@
+pub(crate) mod administrative;
 mod authority;
-mod bootstrap;
+pub(crate) mod bootstrap;
 #[cfg(test)]
 mod bootstrap_tests;
 #[cfg(test)]
 mod contract_tests;
 mod deletion;
-mod inventory;
+pub(crate) mod inventory;
 mod metadata;
 #[cfg(test)]
 mod metadata_tests;

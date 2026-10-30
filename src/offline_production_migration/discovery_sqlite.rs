@@ -9,14 +9,19 @@ use libsqlite3_sys as sqlite;
 pub(super) struct ReadOnly {
     handle: *mut sqlite::sqlite3,
     deadline: Box<Instant>,
+    _exclusive: Option<super::discovery_snapshot::Exclusive>,
 }
 
 impl ReadOnly {
     pub fn open(path: &Path) -> Result<Self, ()> {
+        let exclusive = super::discovery_snapshot::Exclusive::acquire(path).ok();
         let mut uri = url::Url::from_file_path(path).map_err(|_| ())?;
         uri.query_pairs_mut()
             .append_pair("mode", "ro")
             .append_pair("readonly_shm", "1");
+        if exclusive.is_some() {
+            uri.query_pairs_mut().append_pair("immutable", "1");
+        }
         let uri = CString::new(uri.as_str()).map_err(|_| ())?;
         let vfs = super::discovery_vfs::name()?;
         let mut handle = std::ptr::null_mut();
@@ -29,6 +34,7 @@ impl ReadOnly {
         let mut connection = Self {
             handle,
             deadline: Box::new(Instant::now() + Duration::from_secs(5)),
+            _exclusive: exclusive,
         };
         if status != sqlite::SQLITE_OK || handle.is_null() {
             return Err(());
@@ -109,5 +115,85 @@ impl Drop for ReadOnly {
                 sqlite::sqlite3_close(self.handle);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::Connection;
+
+    fn snapshot(root: &Path) -> std::collections::BTreeMap<std::ffi::OsString, Vec<u8>> {
+        std::fs::read_dir(root)
+            .unwrap()
+            .map(|entry| {
+                let entry = entry.unwrap();
+                (entry.file_name(), std::fs::read(entry.path()).unwrap())
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn closed_wal_reads_without_creating_files_and_releases_exclusive_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        let pool = crate::storage::connect(&database).await.unwrap();
+        sqlx::query("CREATE TABLE probe(value INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO probe VALUES(7)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let before = snapshot(root.path());
+        let reader = ReadOnly::open(&database).unwrap();
+        assert!(reader._exclusive.is_some());
+        assert_eq!(
+            reader
+                .rows(c"SELECT CAST(value AS TEXT) FROM probe")
+                .unwrap(),
+            vec![vec!["7".to_owned()]]
+        );
+        assert!(super::super::discovery_snapshot::Exclusive::acquire(&database).is_err());
+        assert_eq!(before, snapshot(root.path()));
+        drop(reader);
+        assert!(super::super::discovery_snapshot::Exclusive::acquire(&database).is_ok());
+        assert_eq!(before, snapshot(root.path()));
+    }
+
+    #[tokio::test]
+    async fn existing_wal_is_never_replaced_by_an_immutable_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        let mut writer = sqlx::SqliteConnection::connect_with(
+            &sqlx::sqlite::SqliteConnectOptions::new()
+                .filename(&database)
+                .create_if_missing(true)
+                .journal_mode(sqlx::sqlite::SqliteJournalMode::Wal),
+        )
+        .await
+        .unwrap();
+        sqlx::query("CREATE TABLE probe(value INTEGER)")
+            .execute(&mut writer)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO probe VALUES(9)")
+            .execute(&mut writer)
+            .await
+            .unwrap();
+        let before = snapshot(root.path());
+        let reader = ReadOnly::open(&database).unwrap();
+        assert!(reader._exclusive.is_none());
+        assert_eq!(
+            reader
+                .rows(c"SELECT CAST(value AS TEXT) FROM probe")
+                .unwrap(),
+            vec![vec!["9".to_owned()]]
+        );
+        drop(reader);
+        assert_eq!(before, snapshot(root.path()));
+        writer.close().await.unwrap();
     }
 }

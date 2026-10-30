@@ -1,5 +1,5 @@
-mod lineage;
-mod readback;
+pub(crate) mod lineage;
+pub(crate) mod readback;
 
 use sha2::{Digest, Sha256};
 use sqlx::{SqliteConnection, SqlitePool};

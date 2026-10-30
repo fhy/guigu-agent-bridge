@@ -1,9 +1,11 @@
+pub(crate) mod administrative_startup;
 mod arguments;
 pub(crate) mod cli_exclusion;
 mod configuration;
 #[cfg(test)]
 mod crash_tests;
 mod discovery;
+mod discovery_snapshot;
 mod discovery_sqlite;
 mod discovery_vfs;
 mod evidence;
@@ -22,6 +24,9 @@ mod test_fixture;
 #[cfg(test)]
 mod tests;
 mod transition;
+mod transition_guard;
+mod transition_native;
+mod transition_rows;
 #[cfg(test)]
 mod transition_tests;
 mod verification;
@@ -88,7 +93,7 @@ pub(crate) async fn dispatch_transition(args: &[std::ffi::OsString]) -> Result<(
             status: 2,
         })
     })?;
-    let result = transition::run(request).await.map_err(|error| {
+    let result = transition_guard::execute(request).await.map_err(|error| {
         crate::Error::Cli(crate::error::CliFailure {
             command: "offline-transition-matrix-compatibility",
             category: match error {

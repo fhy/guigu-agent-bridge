@@ -210,6 +210,23 @@ async fn transition_publishes_intent_then_complete_and_is_idempotent() {
             .exists()
     );
     drop(connection);
+    let complete_path = fixture
+        .request
+        .manifest_dir
+        .join("transition-complete-v1.json");
+    let complete_bytes = fs::read(&complete_path).unwrap();
+    let mut complete: transition::TransitionComplete = records::load(&complete_path).unwrap();
+    complete.plan_digest = "0".repeat(64);
+    fs::write(&complete_path, serde_json::to_vec(&complete).unwrap()).unwrap();
+    assert!(
+        transition::run(TransitionRequest {
+            mode: Mode::Resume,
+            ..request.clone()
+        })
+        .await
+        .is_err()
+    );
+    fs::write(&complete_path, complete_bytes).unwrap();
     let plan_path = fixture.request.manifest_dir.join("plan.json");
     let mut drifted: transition::Plan =
         serde_json::from_slice(&fs::read(&plan_path).unwrap()).unwrap();
@@ -224,4 +241,88 @@ async fn transition_publishes_intent_then_complete_and_is_idempotent() {
     .await
     .unwrap_err();
     assert!(matches!(drift_error, super::Failure::ManualRequired));
+}
+
+#[tokio::test]
+async fn transition_binds_real_historical_inventory_and_refuses_classification_drift() {
+    let (fixture, request) = prepared_transition().await;
+    historical_plan(&fixture, &request).await;
+    transition::run(request.clone()).await.unwrap();
+    transition::run(TransitionRequest {
+        mode: Mode::Resume,
+        ..request.clone()
+    })
+    .await
+    .unwrap();
+    let mut connection = super::verification::open(&fixture.request.database, false)
+        .await
+        .unwrap();
+    let disposition: String = sqlx::query_scalar(
+        "SELECT disposition FROM offline_recovery_rows WHERE table_name='conversations'",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+    assert_eq!(disposition, "quarantined_no_effect");
+    let historical: String = sqlx::query_scalar(
+        "SELECT participants_json FROM conversations WHERE conversation_id='historical'",
+    )
+    .fetch_one(&mut connection)
+    .await
+    .unwrap();
+    assert_eq!(historical, "[]");
+    sqlx::query(
+        "UPDATE offline_recovery_rows SET original_digest=? WHERE table_name='conversations'",
+    )
+    .bind("0".repeat(64))
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    connection.close().await.unwrap();
+    assert!(
+        transition::run(TransitionRequest {
+            mode: Mode::Resume,
+            ..request
+        })
+        .await
+        .is_err()
+    );
+}
+
+async fn historical_plan(fixture: &Fixture, request: &TransitionRequest) {
+    let mut connection = super::verification::open(&fixture.request.database, false)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO conversations(conversation_id,participants_json) VALUES('historical','[]')",
+    )
+    .execute(&mut connection)
+    .await
+    .unwrap();
+    let identities = crate::storage::recovery_eligibility::inventory::identities(&mut connection)
+        .await
+        .unwrap();
+    assert_eq!(identities.len(), 1);
+    let identity = &identities[0];
+    let snapshot =
+        crate::storage::recovery_eligibility::inventory::snapshot(&mut connection, identity)
+            .await
+            .unwrap();
+    assert!(snapshot.parents.is_empty());
+    let mut plan = transition::Plan::load(&request.transition_plan).unwrap();
+    plan.classifications.push(transition::Classification {
+        table_name: identity.table.clone(),
+        canonical_pk: identity.key.clone(),
+        origin_generation: plan.native_operation_id.clone(),
+        original_revision: snapshot.revision,
+        original_digest: snapshot.digest,
+        parent_relations: serde_json::json!([]),
+        disposition: "quarantined_no_effect".into(),
+        evidence_digest: "a".repeat(64),
+        matrix_operation_id: plan.native_operation_id.clone(),
+    });
+    plan.classification_digest = records::encoded_digest(&plan.classifications).unwrap();
+    plan.plan_digest = transition::plan_digest(&plan).unwrap();
+    fs::write(&request.transition_plan, serde_json::to_vec(&plan).unwrap()).unwrap();
+    connection.close().await.unwrap();
 }

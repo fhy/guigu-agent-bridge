@@ -377,6 +377,7 @@ impl AppRuntime {
             config.bridge.owner_evidence_max_age_seconds as i64,
         )
         .map_err(|_| AppError::Runtime)?;
+        let runtime_instance = uuid::Uuid::now_v7().to_string();
         let recovery_scope =
             match recovery_startup::classify_startup(admin_bindings, sentinel.as_deref()) {
                 recovery_startup::StartupEligibility::NonAdmin => {
@@ -452,8 +453,17 @@ impl AppRuntime {
                         ))
                     }
                 }
-                recovery_startup::StartupEligibility::Admin
-                | recovery_startup::StartupEligibility::Legacy => None,
+                recovery_startup::StartupEligibility::Admin => Some(
+                    crate::offline_production_migration::administrative_startup::prepare(
+                        &path,
+                        &config,
+                        &pool,
+                        &runtime_instance,
+                    )
+                    .await
+                    .map_err(|_| AppError::Runtime)?,
+                ),
+                recovery_startup::StartupEligibility::Legacy => None,
                 recovery_startup::StartupEligibility::Refused => {
                     return Err(AppError::Runtime);
                 }
@@ -486,7 +496,6 @@ impl AppRuntime {
             )
             .await;
         }
-        let runtime_instance = uuid::Uuid::now_v7().to_string();
         let process_fingerprint =
             crate::storage::RuntimeOwnerEvidence::fingerprint().ok_or(AppError::Runtime)?;
         let startup_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);

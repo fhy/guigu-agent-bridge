@@ -2,7 +2,7 @@ use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{Row, SqliteConnection};
 
-pub(super) type LegacyCutover = (
+pub(crate) type LegacyCutover = (
     String,
     String,
     Option<String>,
@@ -13,14 +13,14 @@ pub(super) type LegacyCutover = (
     String,
 );
 
-pub(super) struct LegacySnapshot {
+pub(crate) struct LegacySnapshot {
     pub digest: String,
     pub cutover: Option<LegacyCutover>,
     pub legacy_rows: i64,
     pub work_rows: i64,
 }
 
-pub(super) async fn snapshot(
+pub(crate) async fn snapshot(
     connection: &mut SqliteConnection,
 ) -> Result<LegacySnapshot, sqlx::Error> {
     let required: Vec<String> =

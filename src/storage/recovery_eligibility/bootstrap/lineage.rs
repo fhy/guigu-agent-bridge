@@ -170,7 +170,7 @@ fn disposition(
     }
 }
 
-async fn row_disposition(
+pub(crate) async fn row_disposition(
     connection: &mut SqliteConnection,
     identity: &super::RowIdentity,
     names: &[String],
