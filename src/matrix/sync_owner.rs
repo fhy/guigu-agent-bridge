@@ -118,26 +118,19 @@ impl MatrixSync {
         loop {
             let request = self.sync_with_dispositions(&events, &mut dispositions);
             tokio::pin!(request);
-            let mut stopping = false;
             let response = tokio::select! {
                 biased;
                 changed = shutdown.changed() => {
                     let _ = changed;
-                    if self.processing.load(Ordering::Acquire) {
-                        stopping = true;
-                        request.await
-                    } else {
                     return Ok(());
-                    }
                 }
                 response = &mut request => response,
             };
             match response {
-                Ok(_) if stopping => return Ok(()),
                 Ok(_) => {
                     failures = 0;
                 }
-                Err(MatrixError::Transport) if failures < 2 && !stopping => {
+                Err(MatrixError::Transport) if failures < 2 => {
                     failures += 1;
                     tokio::select! {
                         biased;

@@ -82,7 +82,22 @@ async fn scoped_native_activation_and_checkpoint_keep_authority_and_audit_in_syn
         .execute(&pool)
         .await
         .unwrap();
-    assert!(store.reconcile_restart().await.is_err());
+    assert!(
+        store
+            .begin_batch(
+                "tampered-batch",
+                Some("tampered"),
+                "C2",
+                "digest",
+                "tampered",
+                "owner",
+                epoch,
+                &[],
+                &timestamp,
+            )
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
@@ -180,7 +195,12 @@ async fn scoped_native_revision_publishes_to_clones_only_after_commit() {
     activation.unwrap();
     readback.unwrap();
     shared.reconcile_restart().await.unwrap();
-    assert!(detached.reconcile_restart().await.is_err());
+    assert!(
+        detached
+            .acquire_component_lease("MatrixSync", "detached", "t2", "t3")
+            .await
+            .is_err()
+    );
 }
 
 #[tokio::test]
