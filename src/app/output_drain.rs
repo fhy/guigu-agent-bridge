@@ -222,8 +222,12 @@ mod tests {
         std::fs::create_dir(&root).unwrap();
         let temp = Temp(root.clone());
         let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
-        sqlx::raw_sql("CREATE TABLE tasks(task_id TEXT PRIMARY KEY) STRICT; INSERT INTO tasks VALUES('task');").execute(&pool).await.unwrap();
-        sqlx::raw_sql(include_str!("../../migrations/0015_durable_acp_output.sql"))
+        crate::storage::migrate(&pool).await.unwrap();
+        sqlx::query("INSERT INTO conversations(conversation_id,participants_json) VALUES('conversation','[]')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES('task','task','from','to','conversation','text',1,0,0,0)")
             .execute(&pool)
             .await
             .unwrap();
