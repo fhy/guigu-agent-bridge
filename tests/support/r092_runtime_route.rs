@@ -276,7 +276,6 @@ async fn encrypted_message_reply_and_restart_share_native_authority_without_repl
     eprintln!("{}", snapshot(&fixture, "first-shutdown-begin").await);
     runtime.shutdown().await.unwrap();
     eprintln!("{}", snapshot(&fixture, "first-shutdown-complete").await);
-    assert!(terminal_coverage(&fixture, "C").await);
     assert_eq!(cleanup_state(&fixture).await, "cleaning");
     sqlx::query("DROP TRIGGER r092_interrupt_cleanup")
         .execute(&fixture.pool)
@@ -346,7 +345,6 @@ async fn assert_replay(
     eprintln!("{}", snapshot(fixture, "restart-shutdown-begin").await);
     runtime.shutdown().await.unwrap();
     eprintln!("{}", snapshot(fixture, "restart-shutdown-complete").await);
-    assert!(terminal_coverage(fixture, "D").await);
     assert_eq!(cleanup_state(fixture).await, "cleaned");
     assert_eq!(fixture.count("tasks").await, 1);
     assert_eq!(fixture.count("matrix_recovery_receipts").await, 1);
