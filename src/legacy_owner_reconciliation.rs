@@ -1445,6 +1445,7 @@ pub async fn reconcile(path: impl AsRef<Path>) -> Result<Outcome, Error> {
                 .execute(&mut c)
                 .await
                 .map_err(|_| Error::Database)?;
+            c.close().await.map_err(|_| Error::Database)?;
             sidecars.revalidate(Path::new(&m.database))?;
             #[cfg(debug_assertions)]
             if std::env::var_os("T050_RECONCILE_TEST_LOSE_EVIDENCE").is_some() {
@@ -1467,9 +1468,15 @@ pub async fn reconcile(path: impl AsRef<Path>) -> Result<Outcome, Error> {
             Ok(v)
         }
         Err(e) => {
-            let _ = sqlx::query("ROLLBACK").execute(&mut c).await;
-            sidecars.revalidate(Path::new(&m.database))?;
-            Err(e)
+            let rollback = sqlx::query("ROLLBACK").execute(&mut c).await;
+            let close = c.close().await;
+            let sidecar_validation = sidecars.revalidate(Path::new(&m.database));
+            if rollback.is_err() || close.is_err() {
+                Err(Error::Database)
+            } else {
+                sidecar_validation?;
+                Err(e)
+            }
         }
     }
 }
