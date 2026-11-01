@@ -91,6 +91,10 @@ async fn seed_device(fixture: &support::Fixture, server: &MockServer) {
         .await
         .unwrap();
     client.sync_once(SyncSettings::new()).await.unwrap();
+    client
+        .encryption()
+        .wait_for_e2ee_initialization_tasks()
+        .await;
     let upload = server
         .received_requests()
         .await

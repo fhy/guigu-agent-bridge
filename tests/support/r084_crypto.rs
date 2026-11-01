@@ -107,6 +107,10 @@ pub async fn seed_key(fixture: &super::support::Fixture, server: &MockServer) ->
         .await
         .unwrap();
     std::fs::remove_file(file).unwrap();
+    client
+        .encryption()
+        .wait_for_e2ee_initialization_tasks()
+        .await;
     let public_key = client.encryption().ed25519_key().await.unwrap();
     drop(client);
     let event = json!({"type":"m.room.encrypted","content":serde_json::to_value(encrypted).unwrap(),"event_id":"$cipher","sender":"@alice:example.test","origin_server_ts":2,"unsigned":{}});
