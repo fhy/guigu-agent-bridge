@@ -47,6 +47,9 @@ async fn seeded() -> (Fixture, ReliabilityStore) {
     )
     .await
     .unwrap();
+    writer::complete_lease(&mut transaction, Some(&scope), "OutboxDrain", None)
+        .await
+        .unwrap();
     transaction.commit().await.unwrap();
     let store = ReliabilityStore::with_recovery(fixture.pool.clone(), scope);
     (fixture, store)
