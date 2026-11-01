@@ -196,4 +196,36 @@ mod tests {
         assert_eq!(before, snapshot(root.path()));
         writer.close().await.unwrap();
     }
+
+    #[tokio::test]
+    async fn repeated_closed_database_probe_releases_snapshot_and_lock() {
+        let root = tempfile::tempdir().unwrap();
+        let database = root.path().join("state.db");
+        let pool = crate::storage::connect(&database).await.unwrap();
+        sqlx::query("CREATE TABLE probe(value INTEGER)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO probe VALUES(11)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        pool.close().await;
+        let before = snapshot(root.path());
+
+        for _ in 0..2 {
+            assert!(super::super::discovery_snapshot::Exclusive::acquire(&database).is_ok());
+            let reader = ReadOnly::open(&database).expect("sqlite3_open_v2 stage");
+            assert_eq!(
+                reader
+                    .rows(c"SELECT CAST(value AS TEXT) FROM probe")
+                    .expect("prepare/step stage"),
+                vec![vec!["11".to_owned()]]
+            );
+            assert!(super::super::discovery_snapshot::Exclusive::acquire(&database).is_err());
+            drop(reader);
+            assert!(super::super::discovery_snapshot::Exclusive::acquire(&database).is_ok());
+            assert_eq!(before, snapshot(root.path()));
+        }
+    }
 }
