@@ -56,9 +56,26 @@ async fn snapshot(fixture: &support::Fixture, stage: &str) -> String {
             .fetch_all(&fixture.pool)
             .await
             .unwrap();
-    format!(
-        "stage={stage} authority={authority:?} control={control:?} receipts={receipts:?} counts={counts:?} task_events={task_events:?}"
+    let batches: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT batch_id,response_token,state,expected_events_json,covered_events_json FROM matrix_recovery_batches ORDER BY created_at,batch_id",
     )
+    .fetch_all(&fixture.pool)
+    .await
+    .unwrap();
+    format!(
+        "stage={stage} authority={authority:?} control={control:?} batches={batches:?} receipts={receipts:?} counts={counts:?} task_events={task_events:?}"
+    )
+}
+
+async fn terminal_coverage(fixture: &support::Fixture, watermark: &str) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS(SELECT 1 FROM matrix_recovery_control WHERE phase='active' AND watermark=? AND restart_hold_state IS NULL) AND EXISTS(SELECT 1 FROM matrix_recovery_batches WHERE response_token=? AND state='terminal') AND NOT EXISTS(SELECT 1 FROM matrix_recovery_batches WHERE state<>'terminal') AND EXISTS(SELECT 1 FROM matrix_recovery_receipts WHERE state='dispositioned') AND NOT EXISTS(SELECT 1 FROM matrix_recovery_receipts WHERE state<>'dispositioned')",
+    )
+    .bind(watermark)
+    .bind(watermark)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap()
 }
 
 async fn encrypted_sends(server: &MockServer, seed_requests: usize) -> usize {
@@ -72,7 +89,7 @@ async fn encrypted_sends(server: &MockServer, seed_requests: usize) -> usize {
         .count()
 }
 
-async fn wait_reply(
+async fn wait_reply_and_coverage(
     fixture: &support::Fixture,
     server: &MockServer,
     seed_requests: usize,
@@ -85,7 +102,10 @@ async fn wait_reply(
                     .fetch_one(&fixture.pool)
                     .await
                     .unwrap();
-            if terminal == 1 && encrypted_sends(server, seed_requests).await > 0 {
+            if terminal == 1
+                && encrypted_sends(server, seed_requests).await > 0
+                && terminal_coverage(fixture, "C").await
+            {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -95,7 +115,7 @@ async fn wait_reply(
     assert!(
         result.is_ok(),
         "{} health={:?}",
-        snapshot(fixture, "message-reply").await,
+        snapshot(fixture, "message-reply-terminal-coverage").await,
         runtime.health_state().snapshot().await
     );
 }
@@ -252,10 +272,11 @@ async fn encrypted_message_reply_and_restart_share_native_authority_without_repl
         .execute(&fixture.pool).await.unwrap();
     let runtime = start(&fixture, config.clone(), "startup").await;
     eprintln!("R092 phase=runtime-started");
-    wait_reply(&fixture, &server, seed_requests, &runtime).await;
-    eprintln!("R092 phase=encrypted-reply-observed");
+    wait_reply_and_coverage(&fixture, &server, seed_requests, &runtime).await;
+    eprintln!("{}", snapshot(&fixture, "first-shutdown-begin").await);
     runtime.shutdown().await.unwrap();
-    eprintln!("R092 phase=first-shutdown-complete");
+    eprintln!("{}", snapshot(&fixture, "first-shutdown-complete").await);
+    assert!(terminal_coverage(&fixture, "C").await);
     assert_eq!(cleanup_state(&fixture).await, "cleaning");
     sqlx::query("DROP TRIGGER r092_interrupt_cleanup")
         .execute(&fixture.pool)
@@ -310,12 +331,7 @@ async fn assert_replay(
     eprintln!("R092 phase=runtime-restarted");
     let advanced = tokio::time::timeout(std::time::Duration::from_secs(20), async {
         loop {
-            let control: Option<String> =
-                sqlx::query_scalar("SELECT watermark FROM matrix_recovery_control")
-                    .fetch_one(&fixture.pool)
-                    .await
-                    .unwrap();
-            if control.as_deref() == Some("D") {
+            if terminal_coverage(fixture, "D").await {
                 break;
             }
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
@@ -327,8 +343,10 @@ async fn assert_replay(
         "{}",
         snapshot(fixture, "restart-replay").await
     );
+    eprintln!("{}", snapshot(fixture, "restart-shutdown-begin").await);
     runtime.shutdown().await.unwrap();
-    eprintln!("R092 phase=restart-shutdown-complete");
+    eprintln!("{}", snapshot(fixture, "restart-shutdown-complete").await);
+    assert!(terminal_coverage(fixture, "D").await);
     assert_eq!(cleanup_state(fixture).await, "cleaned");
     assert_eq!(fixture.count("tasks").await, 1);
     assert_eq!(fixture.count("matrix_recovery_receipts").await, 1);
