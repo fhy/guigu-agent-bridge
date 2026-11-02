@@ -187,7 +187,7 @@ pub(super) async fn insert_anchors(
              (table_name,canonical_pk,role,db_generation,root_digest,
               admin_operation_id,plan_digest,original_revision,original_digest)
              SELECT ?,?,'metadata_anchor',db_generation,root_digest,
-                    admin_operation_id,plan_digest,?,?,?
+                    admin_operation_id,plan_digest,?,?
              FROM offline_recovery_binding
              WHERE singleton=1 AND phase='transition_pending'
                AND admin_operation_id=? AND plan_digest=?",

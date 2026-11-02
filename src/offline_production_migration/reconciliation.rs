@@ -218,12 +218,16 @@ async fn run_locked(
         .map_err(|_| Failure::Migration)?;
     let binding = load_binding(&mut tx).await?;
     let marker = reconciliation_sql::schema_state(&mut tx).await?;
-    let state = reconciliation_sql::marker(&mut tx, &authenticated.plan.operation_id).await?;
+    let state = match marker {
+        reconciliation_sql::SchemaState::None => None,
+        reconciliation_sql::SchemaState::Partial => return Err(Failure::ManualRequired),
+        reconciliation_sql::SchemaState::Complete => {
+            reconciliation_sql::marker(&mut tx, &authenticated.plan.operation_id).await?
+        }
+    };
     if binding.phase == "identity_ready" && state.is_none() {
         if marker == reconciliation_sql::SchemaState::None {
             reconciliation_sql::create_schema(&mut tx).await?;
-        } else if marker == reconciliation_sql::SchemaState::Partial {
-            return Err(Failure::ManualRequired);
         }
         reconciliation_graph::validate_plan(&mut tx, &authenticated.plan).await?;
         reconciliation_sql::insert_audit(&mut tx, &authenticated.plan).await?;
@@ -293,7 +297,10 @@ async fn run_locked(
         classification_digest: authenticated.plan.classification_digest.clone(),
         native_operation_id: authenticated.plan.native_operation_id.clone(),
         committed_graph_digest: graph_digest.clone(),
-        committed_binding_revision: binding.revision,
+        committed_binding_revision: state
+            .as_ref()
+            .map(|marker| marker.3)
+            .unwrap_or(binding.revision),
     };
     if authenticated.complete_path.exists() {
         if rec::load::<Completion>(&authenticated.complete_path)? != completion {
