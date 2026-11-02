@@ -173,7 +173,9 @@ async fn mount_route(fixture: &support::Fixture, server: &MockServer) -> Arc<Ato
                     .set_body_json(crypto::response("D", ciphertext.clone()))
                     .set_delay(std::time::Duration::from_millis(500))
             } else {
-                ResponseTemplate::new(404)
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"next_batch":"C"}))
+                    .set_delay(std::time::Duration::from_secs(5))
             }
         })
         .with_priority(1)
