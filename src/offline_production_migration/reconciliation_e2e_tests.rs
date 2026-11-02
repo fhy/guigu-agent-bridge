@@ -336,6 +336,12 @@ async fn protocol2_disposable_fixture_covers_resume_states_and_final_cas() {
             std::env::set_var("R094_GRANT_PATH", &fixture.grant_path);
         }
         let output = fixture.child(phase);
+        eprintln!(
+            "{phase}: child status={:?} stdout={} stderr={}",
+            output.status.code(),
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
         assert_eq!(output.status.code(), Some(86), "{phase}: {output:?}");
         let (expected_phase, expected_marker, expected_intent, expected_complete) = expected;
         assert_eq!(
