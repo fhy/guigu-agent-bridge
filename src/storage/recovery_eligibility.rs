@@ -11,6 +11,8 @@ mod metadata;
 #[cfg(test)]
 mod metadata_tests;
 mod native_context;
+#[cfg(test)]
+mod r070_inventory_diagnostic;
 mod semantic;
 #[cfg(test)]
 mod tests;
