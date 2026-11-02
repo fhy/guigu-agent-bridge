@@ -316,6 +316,12 @@ pub(super) fn publish<T: Serialize>(path: &Path, value: &T) -> Result<(), Failur
 pub(super) fn plan_digest(plan: &Plan) -> Result<String, Failure> {
     let mut copy = plan.clone();
     copy.plan_digest.clear();
+    for classification in &mut copy.classifications {
+        classification.plan_digest = None;
+    }
+    for classification in &mut copy.inserted_classifications {
+        classification.plan_digest = None;
+    }
     records::encoded_digest(&copy)
 }
 

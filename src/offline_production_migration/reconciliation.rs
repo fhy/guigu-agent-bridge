@@ -16,6 +16,18 @@ pub(super) fn discriminator(path: &Path) -> Result<bool, Failure> {
 }
 
 pub(super) async fn execute(request: TransitionRequest) -> Result<String, Failure> {
+    execute_with_launcher(request, true).await
+}
+
+#[cfg(test)]
+pub(super) async fn execute_fixture(request: TransitionRequest) -> Result<String, Failure> {
+    execute_with_launcher(request, false).await
+}
+
+async fn execute_with_launcher(
+    request: TransitionRequest,
+    live_launcher: bool,
+) -> Result<String, Failure> {
     let migration = super::Request {
         mode: request.mode,
         target_schema: 25,
@@ -27,13 +39,23 @@ pub(super) async fn execute(request: TransitionRequest) -> Result<String, Failur
         executable: request.executable.clone(),
     };
     let mut evidence = Evidence::read(&migration)?;
-    launcher::check(&evidence.listeners, true, "transition-v2-pre-lock").await?;
+    launcher::check(&evidence.listeners, live_launcher, "transition-v2-pre-lock").await?;
     let lock = RuntimeLock::acquire(&request.database).map_err(|_| Failure::Busy)?;
-    launcher::check(&evidence.listeners, true, "transition-v2-post-lock").await?;
+    launcher::check(
+        &evidence.listeners,
+        live_launcher,
+        "transition-v2-post-lock",
+    )
+    .await?;
     evidence.recheck(&migration)?;
     let authenticated = authenticate(&request, &migration, &evidence)?;
     evidence.recheck(&migration)?;
-    launcher::check(&evidence.listeners, true, "transition-v2-pre-write").await?;
+    launcher::check(
+        &evidence.listeners,
+        live_launcher,
+        "transition-v2-pre-write",
+    )
+    .await?;
     if request.mode == Mode::Preflight || request.mode == Mode::Verify {
         let result = verify_readonly(&request, &authenticated).await;
         drop(lock);
