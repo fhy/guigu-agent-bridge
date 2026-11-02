@@ -15,6 +15,10 @@ mod flow;
 mod identity_capture;
 mod identity_records;
 mod launcher;
+mod reconciliation;
+mod reconciliation_graph;
+mod reconciliation_records;
+mod reconciliation_sql;
 mod records;
 #[cfg(test)]
 mod refusal_tests;
@@ -93,7 +97,31 @@ pub(crate) async fn dispatch_transition(args: &[std::ffi::OsString]) -> Result<(
             status: 2,
         })
     })?;
-    let result = transition_guard::execute(request).await.map_err(|error| {
+    let protocol2 = reconciliation::discriminator(&request.transition_plan).map_err(|error| {
+        crate::Error::Cli(crate::error::CliFailure {
+            command: "offline-transition-matrix-compatibility",
+            category: match error {
+                Failure::InvalidArguments => "invalid-arguments",
+                Failure::Busy => "busy",
+                Failure::ManualRequired => "manual-required",
+                Failure::Preflight => "preflight",
+                Failure::Migration => "migration",
+            },
+            status: match error {
+                Failure::InvalidArguments => 2,
+                Failure::Busy => 4,
+                Failure::Preflight => 5,
+                Failure::ManualRequired => 6,
+                Failure::Migration => 7,
+            },
+        })
+    })?;
+    let result = if protocol2 {
+        reconciliation::execute(request).await
+    } else {
+        transition_guard::execute(request).await
+    }
+    .map_err(|error| {
         crate::Error::Cli(crate::error::CliFailure {
             command: "offline-transition-matrix-compatibility",
             category: match error {

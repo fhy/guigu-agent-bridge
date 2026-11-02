@@ -2,12 +2,12 @@ use sqlx::SqliteConnection;
 
 use super::Failure;
 
-pub(super) async fn original(connection: &mut SqliteConnection) -> Result<Option<String>, Failure> {
+pub(crate) async fn original(connection: &mut SqliteConnection) -> Result<Option<String>, Failure> {
     sqlx::query_scalar("SELECT json_array(singleton,decision,source_schema_version,source_state_digest,legacy_operation_id,legacy_phase,legacy_baseline,legacy_baseline_digest,legacy_watermark,legacy_revision,legacy_binding,legacy_archive_digest,native_operation_id,reason_code,created_at) FROM matrix_recovery_compatibility WHERE singleton=1")
         .fetch_optional(connection).await.map_err(|_| Failure::ManualRequired)
 }
 
-pub(super) async fn apply(
+pub(crate) async fn apply(
     connection: &mut SqliteConnection,
     operation: &str,
     original_record: &Option<String>,
