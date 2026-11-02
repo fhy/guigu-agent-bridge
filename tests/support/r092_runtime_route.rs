@@ -168,14 +168,13 @@ async fn mount_route(fixture: &support::Fixture, server: &MockServer) -> Arc<Ato
         .and(path_regex("/_matrix/client/.*/sync"))
         .and(query_param("since", "C"))
         .respond_with(move |_: &Request| {
-            let body = if replay.load(Ordering::Acquire) {
-                crypto::response("D", ciphertext.clone())
+            if replay.load(Ordering::Acquire) {
+                ResponseTemplate::new(200)
+                    .set_body_json(crypto::response("D", ciphertext.clone()))
+                    .set_delay(std::time::Duration::from_millis(500))
             } else {
-                json!({"next_batch":"C"})
-            };
-            ResponseTemplate::new(200)
-                .set_body_json(body)
-                .set_delay(std::time::Duration::from_millis(500))
+                ResponseTemplate::new(404)
+            }
         })
         .with_priority(1)
         .mount(server)
