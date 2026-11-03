@@ -374,6 +374,78 @@ pub(super) async fn graph_digest(
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
 
+pub(super) async fn verify_expected_graph(
+    connection: &mut SqliteConnection,
+    plan: &Plan,
+) -> Result<(), Failure> {
+    let allowed = plan
+        .classifications
+        .iter()
+        .chain(&plan.inserted_classifications)
+        .map(|item| (item.table_name.clone(), item.canonical_pk.clone()))
+        .collect::<BTreeSet<_>>();
+    let mut expected = BTreeSet::new();
+    for action in &plan.actions {
+        let key = (action.table_name.clone(), action.canonical_pk.clone());
+        if !allowed.contains(&key) || !expected.insert(key.clone()) {
+            return Err(Failure::ManualRequired);
+        }
+        let actual = inventory::values(
+            connection,
+            &inventory::RowIdentity {
+                table: key.0.clone(),
+                key: key.1.clone(),
+            },
+        )
+        .await
+        .map_err(|_| Failure::ManualRequired)?;
+        let expected_image = match action.action_type.as_str() {
+            "insert" => action.after.as_ref(),
+            "update" | "preserve" => action.after.as_ref().or(action.before.as_ref()),
+            "delete" => None,
+            _ => return Err(Failure::ManualRequired),
+        };
+        if let Some(image) = expected_image
+            && (image.names != actual.0 || image.values != actual.1)
+        {
+            return Err(Failure::ManualRequired);
+        }
+    }
+    let actual = inventory::identities(connection)
+        .await
+        .map_err(|_| Failure::ManualRequired)?
+        .into_iter()
+        .map(|identity| (identity.table, identity.key))
+        .collect::<BTreeSet<_>>();
+    if !expected.is_subset(&actual) {
+        return Err(Failure::ManualRequired);
+    }
+    for classification in plan
+        .classifications
+        .iter()
+        .chain(&plan.inserted_classifications)
+    {
+        let identity = inventory::RowIdentity {
+            table: classification.table_name.clone(),
+            key: classification.canonical_pk.clone(),
+        };
+        let snapshot = inventory::snapshot(connection, &identity)
+            .await
+            .map_err(|_| Failure::ManualRequired)?;
+        let parents =
+            serde_json::from_value::<Vec<ParentIdentity>>(classification.parent_relations.clone())
+                .map_err(|_| Failure::ManualRequired)?;
+        if parents.len() != snapshot.parents.len()
+            || parents
+                .iter()
+                .any(|parent| !snapshot.parents.contains(&parent.identity))
+        {
+            return Err(Failure::ManualRequired);
+        }
+    }
+    Ok(())
+}
+
 pub(super) fn hex_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }

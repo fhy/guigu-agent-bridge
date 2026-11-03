@@ -258,6 +258,7 @@ async fn run_locked(
         )
         .await?;
         reconciliation_graph::verify_actions(&mut tx, &authenticated.plan).await?;
+        reconciliation_graph::verify_expected_graph(&mut tx, &authenticated.plan).await?;
         let graph_digest = reconciliation_graph::graph_digest(&mut tx, &authenticated.plan).await?;
         let commit_digest = records::encoded_digest(&(
             &authenticated.intent,
@@ -291,6 +292,7 @@ async fn run_locked(
         &authenticated.plan.operation_id,
     )
     .await?;
+    reconciliation_graph::verify_expected_graph(&mut reader, &authenticated.plan).await?;
     let graph_digest = reconciliation_graph::graph_digest(&mut reader, &authenticated.plan).await?;
     reader.close().await.map_err(|_| Failure::Migration)?;
     let completion = Completion {
