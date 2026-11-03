@@ -27,37 +27,69 @@ pub(super) struct PreTransitionGraph {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct ExpectedPostGraph {
+pub(super) struct ExpectedPostGraph {
     rows: BTreeSet<(String, String, String)>,
 }
 
 impl PreTransitionGraph {
     pub(super) async fn capture(connection: &mut SqliteConnection) -> Result<Self, Failure> {
-        let rows: Vec<(String, String, String)> = sqlx::query_as(
-            "SELECT table_name,canonical_pk,original_digest FROM offline_recovery_rows ORDER BY table_name,canonical_pk",
-        )
-        .fetch_all(&mut *connection)
-        .await
-        .map_err(|_| Failure::ManualRequired)?;
-        Ok(Self {
-            rows: rows.into_iter().collect(),
-        })
+        let mut rows = BTreeSet::new();
+        let inventory: Vec<(String, String, String)> = sqlx::query_as("SELECT table_name,canonical_pk,original_digest FROM offline_recovery_rows ORDER BY table_name,canonical_pk").fetch_all(&mut *connection).await.map_err(|_| Failure::ManualRequired)?;
+        rows.extend(
+            inventory
+                .into_iter()
+                .map(|(table, key, digest)| ("inventory".into(), format!("{table}:{key}"), digest)),
+        );
+        let binding: Vec<BindingGraphRow> = sqlx::query_as("SELECT singleton,phase,admin_operation_id,revision,plan_digest,transition_intent_digest,transition_complete_digest FROM offline_recovery_binding ORDER BY singleton").fetch_all(&mut *connection).await.map_err(|_| Failure::ManualRequired)?;
+        for row in binding {
+            rows.insert((
+                "binding".into(),
+                row.0.to_string(),
+                serde_json::to_string(&row).map_err(|_| Failure::Preflight)?,
+            ));
+        }
+        let control: Vec<(i64,String,String,Option<String>)> = sqlx::query_as("SELECT control_id,cutover_operation_id,phase,watermark FROM matrix_recovery_control ORDER BY control_id").fetch_all(&mut *connection).await.map_err(|_| Failure::ManualRequired)?;
+        for row in control {
+            rows.insert((
+                "control".into(),
+                row.0.to_string(),
+                serde_json::to_string(&row).map_err(|_| Failure::Preflight)?,
+            ));
+        }
+        let audit: Vec<AuditGraphRow> = sqlx::query_as("SELECT operation_id,action_id,action_type,table_name,canonical_pk,pre_digest,post_digest,evidence_digest,original_digest FROM r093_reconciliation_audit ORDER BY operation_id,action_id").fetch_all(&mut *connection).await.map_err(|_| Failure::ManualRequired)?;
+        for row in audit {
+            rows.insert((
+                "audit".into(),
+                format!("{}:{}", row.0, row.1),
+                serde_json::to_string(&row).map_err(|_| Failure::Preflight)?,
+            ));
+        }
+        Ok(Self { rows })
     }
 }
 
 impl ExpectedPostGraph {
-    fn from_pre_state(pre: &PreTransitionGraph) -> Self {
+    pub(super) fn from_pre_state(pre: &PreTransitionGraph) -> Self {
         Self {
             rows: pre.rows.clone(),
         }
     }
 
-    fn matches(&self, actual: &BTreeSet<(String, String, String)>) -> bool {
+    pub(super) fn matches(&self, actual: &BTreeSet<(String, String, String)>) -> bool {
         &self.rows == actual
     }
 }
 
 type ControlRow = (i64, String, String, Option<String>);
+type BindingGraphRow = (
+    i64,
+    String,
+    String,
+    i64,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+);
 
 fn expected_compatibility(original: &str, operation: &str) -> Result<serde_json::Value, Failure> {
     let mut value: serde_json::Value =
@@ -467,16 +499,11 @@ pub(super) async fn graph_digest(
 pub(super) async fn verify_expected_graph(
     connection: &mut SqliteConnection,
     plan: &Plan,
-    pre_state: Option<&PreTransitionGraph>,
+    expected: Option<&ExpectedPostGraph>,
 ) -> Result<(), Failure> {
-    if let Some(pre_state) = pre_state {
-        let expected_graph = ExpectedPostGraph::from_pre_state(pre_state);
+    if let Some(expected_graph) = expected {
         let current = PreTransitionGraph::capture(connection).await?;
-        let unchanged = plan
-            .actions
-            .iter()
-            .all(|action| action.action_type != "preserve");
-        if unchanged && !pre_state.rows.is_empty() && !expected_graph.matches(&current.rows) {
+        if !expected_graph.matches(&current.rows) {
             return Err(Failure::ManualRequired);
         }
     }

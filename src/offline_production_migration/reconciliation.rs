@@ -259,8 +259,14 @@ async fn run_locked(
         )
         .await?;
         reconciliation_graph::verify_actions(&mut tx, &authenticated.plan).await?;
-        reconciliation_graph::verify_expected_graph(&mut tx, &authenticated.plan, Some(&pre_graph))
-            .await?;
+        reconciliation_graph::verify_expected_graph(
+            &mut tx,
+            &authenticated.plan,
+            Some(&reconciliation_graph::ExpectedPostGraph::from_pre_state(
+                &pre_graph,
+            )),
+        )
+        .await?;
         let graph_digest = reconciliation_graph::graph_digest(&mut tx, &authenticated.plan).await?;
         let commit_digest = records::encoded_digest(&(
             &authenticated.intent,
