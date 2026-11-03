@@ -9,6 +9,18 @@ use super::{
 };
 use crate::storage::recovery_eligibility::{ParentIdentity, ParentRole, inventory};
 
+type AuditGraphRow = (
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+    String,
+);
+
 pub(super) async fn validate_plan(
     connection: &mut SqliteConnection,
     plan: &Plan,
@@ -167,7 +179,11 @@ async fn validate_decisions(connection: &mut SqliteConnection, plan: &Plan) -> R
     .fetch_one(&mut *connection)
     .await
     .map_err(|_| Failure::ManualRequired)?;
-    if uncertain > 0 && plan.d1_unknown_chain.is_none() {
+    if uncertain > 0
+        && plan.d1_unknown_chain.as_ref().is_none_or(|decision| {
+            decision.decision_id.is_empty() || decision.references.is_empty()
+        })
+    {
         return Err(Failure::ManualRequired);
     }
     let owner_count: i64 = sqlx::query_scalar(
@@ -186,12 +202,17 @@ async fn validate_decisions(connection: &mut SqliteConnection, plan: &Plan) -> R
         .filter(|item| item.disposition == "quarantined_no_effect")
         .count();
     if quarantined == 7
-        && plan.d1_quarantined.is_none()
-        && plan
-            .d1_unknown_chain
-            .as_ref()
-            .is_none_or(|decision| decision.references.len() != 7)
+        && plan.d1_quarantined.as_ref().is_none_or(|decision| {
+            decision.decision_id.is_empty() || decision.references.len() != 7
+        })
     {
+        return Err(Failure::ManualRequired);
+    }
+    if plan.d1_unknown_chain.as_ref().is_some_and(|chain| {
+        plan.d1_quarantined
+            .as_ref()
+            .is_some_and(|quarantine| chain.decision_id == quarantine.decision_id)
+    }) {
         return Err(Failure::ManualRequired);
     }
     for proof in &plan.d2_owner {
@@ -327,25 +348,27 @@ pub(super) async fn graph_digest(
             row
         ]));
     }
-    let audit_count: i64 = sqlx::query_scalar("SELECT count(*) FROM r093_reconciliation_audit")
-        .fetch_one(&mut *connection)
-        .await
-        .map_err(|_| Failure::ManualRequired)?;
-    let anchor_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM offline_recovery_metadata_anchors")
-            .fetch_one(&mut *connection)
-            .await
-            .map_err(|_| Failure::ManualRequired)?;
-    let all_rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
-        "SELECT table_name,canonical_pk,disposition,original_revision,original_digest
-         FROM offline_recovery_rows ORDER BY table_name,canonical_pk",
+    let audit_rows: Vec<AuditGraphRow> = sqlx::query_as(
+        "SELECT operation_id,action_id,action_type,table_name,canonical_pk,pre_digest,post_digest,evidence_digest,original_digest
+         FROM r093_reconciliation_audit ORDER BY operation_id,action_id",
+    ).fetch_all(&mut *connection).await.map_err(|_| Failure::ManualRequired)?;
+    let anchor_rows: Vec<(String, String, String, String, String, String)> = sqlx::query_as(
+        "SELECT table_name,canonical_pk,role,db_generation,root_digest,plan_digest
+         FROM offline_recovery_metadata_anchors ORDER BY table_name,canonical_pk",
     )
     .fetch_all(&mut *connection)
     .await
     .map_err(|_| Failure::ManualRequired)?;
-    rows.push(serde_json::json!(["__audit__", "count", audit_count]));
-    rows.push(serde_json::json!(["__anchors__", "count", anchor_count]));
-    rows.push(serde_json::json!(["__all_recovery_rows__", all_rows]));
+    let receipt_rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT table_name,canonical_pk,receipt_digest,runtime_owner,task_id
+         FROM offline_recovery_workspace_deletions ORDER BY table_name,canonical_pk",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(|_| Failure::ManualRequired)?;
+    rows.push(serde_json::json!(["__audit__", audit_rows]));
+    rows.push(serde_json::json!(["__anchors__", anchor_rows]));
+    rows.push(serde_json::json!(["__receipts__", receipt_rows]));
     rows.sort_by_key(|row| row[0].as_str().unwrap_or_default().to_owned());
     let bytes = serde_json::to_vec(&rows).map_err(|_| Failure::Preflight)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
