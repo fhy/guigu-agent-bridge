@@ -262,7 +262,8 @@ async fn run_locked(
         reconciliation_graph::verify_actions(&mut tx, &authenticated.plan).await?;
         expected_graph = Some(reconciliation_graph::ExpectedPostGraph::from_pre_state(
             &pre_graph,
-        ));
+            &authenticated.plan,
+        )?);
         reconciliation_graph::verify_expected_graph(
             &mut tx,
             &authenticated.plan,

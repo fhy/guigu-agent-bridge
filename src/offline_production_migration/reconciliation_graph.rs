@@ -69,10 +69,96 @@ impl PreTransitionGraph {
 }
 
 impl ExpectedPostGraph {
-    pub(super) fn from_pre_state(pre: &PreTransitionGraph) -> Self {
-        Self {
-            rows: pre.rows.clone(),
+    pub(super) fn from_pre_state(pre: &PreTransitionGraph, plan: &Plan) -> Result<Self, Failure> {
+        let mut rows = pre.rows.clone();
+        let mut inventory = rows
+            .iter()
+            .filter(|(kind, _, _)| kind == "inventory")
+            .map(|(_, key, value)| (("inventory".to_owned(), key.clone()), value.clone()))
+            .collect::<std::collections::BTreeMap<_, _>>();
+        for action in &plan.actions {
+            let key = (
+                "inventory".to_owned(),
+                format!("{}:{}", action.table_name, action.canonical_pk),
+            );
+            match action.action_type.as_str() {
+                "delete" => {
+                    inventory.remove(&key);
+                }
+                "insert" | "update" | "preserve" => {
+                    let image = action
+                        .after
+                        .as_ref()
+                        .or(action.before.as_ref())
+                        .ok_or(Failure::ManualRequired)?;
+                    inventory.insert(
+                        key,
+                        serde_json::to_string(image).map_err(|_| Failure::Preflight)?,
+                    );
+                }
+                _ => return Err(Failure::ManualRequired),
+            }
         }
+        rows.retain(|(kind, _, _)| kind != "inventory");
+        rows.extend(
+            inventory
+                .into_iter()
+                .map(|((kind, key), value)| (kind, key, value)),
+        );
+
+        let binding_key = ("binding".to_owned(), "1".to_owned());
+        if let Some((_, _, encoded)) = rows
+            .iter()
+            .find(|(kind, key, _)| (kind, key) == (&binding_key.0, &binding_key.1))
+        {
+            let mut value: serde_json::Value =
+                serde_json::from_str(encoded).map_err(|_| Failure::ManualRequired)?;
+            let fields = value.as_array_mut().ok_or(Failure::ManualRequired)?;
+            fields[1] = serde_json::Value::String("transition_pending".into());
+            fields[3] = serde_json::json!(plan.original_binding.revision + 1);
+            fields[4] = serde_json::json!(plan.plan_digest);
+            fields[5] = serde_json::json!(plan.original_binding.transition_intent_digest);
+            fields[6] = serde_json::Value::Null;
+            rows.retain(|row| !(row.0 == binding_key.0 && row.1 == binding_key.1));
+            rows.insert((
+                binding_key.0,
+                binding_key.1,
+                serde_json::to_string(&value).map_err(|_| Failure::Preflight)?,
+            ));
+        }
+
+        rows.insert((
+            "control".into(),
+            "1".into(),
+            serde_json::to_string(&(
+                1_i64,
+                plan.native_operation_id.clone(),
+                "baseline".to_owned(),
+                Option::<String>::None,
+            ))
+            .map_err(|_| Failure::Preflight)?,
+        ));
+        for action in &plan.actions {
+            let pre = super::reconciliation_sql::image_digest(action.before.as_ref())?;
+            let post = super::reconciliation_sql::image_digest(action.after.as_ref())?;
+            rows.insert((
+                "audit".into(),
+                format!("{}:{}", plan.operation_id, action.action_id),
+                serde_json::to_string(&(
+                    plan.operation_id.clone(),
+                    action.action_id.clone(),
+                    action.action_type.clone(),
+                    action.table_name.clone(),
+                    action.canonical_pk.clone(),
+                    pre,
+                    post,
+                    action.evidence_digest.clone(),
+                    action.original_digest.clone(),
+                ))
+                .map_err(|_| Failure::Preflight)?,
+            ));
+        }
+        Ok(Self { rows })
     }
 
     pub(super) fn matches(&self, actual: &BTreeSet<(String, String, String)>) -> bool {
