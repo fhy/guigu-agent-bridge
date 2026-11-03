@@ -422,8 +422,13 @@ async fn load_binding(connection: &mut SqliteConnection) -> Result<Binding, Fail
 }
 
 async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(), Failure> {
-    if plan.d1_unknown_chain.is_none() {
-        return Ok(());
+    let decision = match plan.d1_unknown_chain.as_ref() {
+        None => return Ok(()),
+        Some(decision) if decision.references.len() == 11 => decision,
+        Some(_) => return Err(Failure::ManualRequired),
+    };
+    if decision.evidence_digest.is_empty() {
+        return Err(Failure::ManualRequired);
     }
     let lease = sqlx::query(
         "SELECT l.resource_key,l.task_id,l.owner_token,l.fence,
@@ -479,6 +484,23 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
     let attempt: i64 = lease
         .try_get("attempt")
         .map_err(|_| Failure::ManualRequired)?;
+    let references = &decision.references;
+    let frozen = [
+        resource.clone(),
+        task.clone(),
+        delivery.clone(),
+        owner.clone(),
+        fence.to_string(),
+        task_version.to_string(),
+        admission_revision.to_string(),
+        continuation_revision.to_string(),
+        generation.clone(),
+        session_id.clone(),
+        attempt.to_string(),
+    ];
+    if references != &frozen || decision.decision_id != plan.native_operation_id {
+        return Err(Failure::ManualRequired);
+    }
     let session_digest = records::encoded_digest(&session_id)?;
     let before_digest = records::encoded_digest(&(
         task_version,

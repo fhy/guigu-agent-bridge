@@ -47,7 +47,8 @@ fn expected_compatibility(original: &str, operation: &str) -> Result<serde_json:
 fn verify_compatibility(actual: &str, original: &str, operation: &str) -> Result<(), Failure> {
     let actual: serde_json::Value =
         serde_json::from_str(actual).map_err(|_| Failure::ManualRequired)?;
-    if actual != expected_compatibility(original, operation)? {
+    let expected = expected_compatibility(original, operation)?;
+    if actual != expected {
         return Err(Failure::ManualRequired);
     }
     Ok(())
