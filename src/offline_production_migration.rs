@@ -18,8 +18,10 @@ mod launcher;
 mod reconciliation;
 #[cfg(test)]
 mod reconciliation_e2e_tests;
+mod reconciliation_files;
 mod reconciliation_graph;
 mod reconciliation_records;
+mod reconciliation_schema;
 mod reconciliation_sql;
 mod records;
 #[cfg(test)]

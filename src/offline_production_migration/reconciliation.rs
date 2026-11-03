@@ -82,7 +82,7 @@ fn authenticate(
     evidence: &Evidence,
 ) -> Result<Authenticated, Failure> {
     let grant_path = rec::grant_path(&request.operation_id);
-    let grant: Grant = rec::load(&grant_path)?;
+    let grant: Grant = rec::load_grant(&grant_path)?;
     validate_grant(&grant, request)?;
     let plan: Plan = rec::load(&request.transition_plan)?;
     if rec::plan_digest(&plan)? != plan.plan_digest

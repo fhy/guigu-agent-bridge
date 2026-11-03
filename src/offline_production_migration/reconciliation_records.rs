@@ -1,16 +1,9 @@
+use super::{Failure, evidence, records};
+use serde::{Deserialize, Serialize};
 use std::{
-    fs::{self, OpenOptions},
-    io::{Read, Write},
-    os::unix::{
-        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
-        io::AsRawFd,
-    },
+    fs,
     path::{Path, PathBuf},
 };
-
-use serde::{Deserialize, Serialize, de::DeserializeOwned};
-
-use super::{Failure, evidence, records};
 
 pub(super) const GRANT_ROOT: &str = "/etc/guigu-agent-bridge/recovery-successors";
 
@@ -240,142 +233,7 @@ pub(super) fn discriminator(path: &Path) -> Result<bool, Failure> {
     }
 }
 
-pub(super) fn load<T>(path: &Path) -> Result<T, Failure>
-where
-    T: DeserializeOwned + Serialize,
-{
-    let bytes = protected_bytes(path)?;
-    let value = serde_json::from_slice(&bytes).map_err(|_| Failure::ManualRequired)?;
-    if serde_json::to_vec(&value).map_err(|_| Failure::ManualRequired)? != bytes {
-        return Err(Failure::ManualRequired);
-    }
-    Ok(value)
-}
-
-pub(super) fn protected_bytes(path: &Path) -> Result<Vec<u8>, Failure> {
-    let ancestors = protected_ancestors(path)?;
-    let metadata = fs::symlink_metadata(path).map_err(|_| Failure::ManualRequired)?;
-    if !metadata.is_file()
-        || metadata.nlink() != 1
-        || metadata.uid() != unsafe { libc::geteuid() }
-        || metadata.permissions().mode() & 0o077 != 0
-    {
-        return Err(Failure::ManualRequired);
-    }
-    let mut file = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(path)
-        .map_err(|_| Failure::ManualRequired)?;
-    let opened = file.metadata().map_err(|_| Failure::ManualRequired)?;
-    if opened.dev() != metadata.dev() || opened.ino() != metadata.ino() {
-        return Err(Failure::ManualRequired);
-    }
-    let mut bytes = Vec::new();
-    file.read_to_end(&mut bytes)
-        .map_err(|_| Failure::Preflight)?;
-    use std::io::{Seek, SeekFrom};
-    file.seek(SeekFrom::Start(0))
-        .map_err(|_| Failure::Preflight)?;
-    let mut reread = Vec::new();
-    file.read_to_end(&mut reread)
-        .map_err(|_| Failure::Preflight)?;
-    if reread != bytes {
-        return Err(Failure::ManualRequired);
-    }
-    if protected_ancestors(path)? != ancestors {
-        return Err(Failure::ManualRequired);
-    }
-    Ok(bytes)
-}
-
-fn protected_ancestors(path: &Path) -> Result<Vec<(u64, u64, u32)>, Failure> {
-    let mut current = path.parent().ok_or(Failure::ManualRequired)?;
-    let mut result = Vec::new();
-    loop {
-        let metadata = fs::symlink_metadata(current).map_err(|_| Failure::ManualRequired)?;
-        if !metadata.is_dir()
-            || (metadata.uid() != unsafe { libc::geteuid() } && metadata.uid() != 0)
-        {
-            return Err(Failure::ManualRequired);
-        }
-        result.push((
-            metadata.dev(),
-            metadata.ino(),
-            metadata.permissions().mode() & 0o777,
-        ));
-        if current.parent().is_none() {
-            break;
-        }
-        current = current.parent().ok_or(Failure::ManualRequired)?;
-    }
-    Ok(result)
-}
-
-pub(super) fn publish<T: Serialize>(path: &Path, value: &T) -> Result<(), Failure> {
-    let bytes = serde_json::to_vec(value).map_err(|_| Failure::Preflight)?;
-    if path.exists() {
-        return if protected_bytes(path)? == bytes {
-            Ok(())
-        } else {
-            Err(Failure::ManualRequired)
-        };
-    }
-    let parent = path.parent().ok_or(Failure::Preflight)?;
-    let temporary = parent.join(format!(
-        ".{}.pending",
-        path.file_name()
-            .ok_or(Failure::Preflight)?
-            .to_string_lossy()
-    ));
-    let mut file = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
-        .open(&temporary)
-        .map_err(|_| Failure::ManualRequired)?;
-    file.write_all(&bytes).map_err(|_| Failure::Preflight)?;
-    file.sync_all().map_err(|_| Failure::Preflight)?;
-    let directory = OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
-        .open(parent)
-        .map_err(|_| Failure::Preflight)?;
-    let source = std::ffi::CString::new(
-        temporary
-            .file_name()
-            .ok_or(Failure::Preflight)?
-            .as_encoded_bytes(),
-    )
-    .map_err(|_| Failure::Preflight)?;
-    let target = std::ffi::CString::new(
-        path.file_name()
-            .ok_or(Failure::Preflight)?
-            .as_encoded_bytes(),
-    )
-    .map_err(|_| Failure::Preflight)?;
-    let result = unsafe {
-        libc::syscall(
-            libc::SYS_renameat2,
-            directory.as_raw_fd(),
-            source.as_ptr(),
-            directory.as_raw_fd(),
-            target.as_ptr(),
-            libc::RENAME_NOREPLACE,
-        )
-    };
-    if result != 0 {
-        return Err(
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
-                Failure::ManualRequired
-            } else {
-                Failure::Preflight
-            },
-        );
-    }
-    directory.sync_all().map_err(|_| Failure::Preflight)
-}
+pub(super) use super::reconciliation_files::{load, load_grant, protected_bytes, publish};
 
 pub(super) fn plan_digest(plan: &Plan) -> Result<String, Failure> {
     let mut copy = plan.clone();
