@@ -75,7 +75,45 @@ pub(super) async fn schema_state(
             .iter()
             .any(|name| name == "r093_reconciliation_marker")
     {
-        Ok(SchemaState::Complete)
+        let marker_columns: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT name,type,\"notnull\" FROM pragma_table_info('r093_reconciliation_marker')",
+        )
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|_| Failure::Migration)?;
+        let audit_columns: Vec<(String, String, i64)> = sqlx::query_as(
+            "SELECT name,type,\"notnull\" FROM pragma_table_info('r093_reconciliation_audit')",
+        )
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|_| Failure::Migration)?;
+        let marker_required = [
+            ("singleton", "INTEGER"),
+            ("protocol", "INTEGER"),
+            ("operation_id", "TEXT"),
+            ("state", "TEXT"),
+            ("committed_graph_digest", "TEXT"),
+            ("committed_binding_revision", "INTEGER"),
+            ("commit_digest", "TEXT"),
+        ];
+        let audit_required = [
+            ("operation_id", "TEXT"),
+            ("action_id", "TEXT"),
+            ("pre_digest", "TEXT"),
+            ("post_digest", "TEXT"),
+        ];
+        let has = |columns: &[(String, String, i64)], required: &[(&str, &str)]| {
+            required.iter().all(|(name, ty)| {
+                columns.iter().any(|(actual, actual_type, notnull)| {
+                    actual == name && actual_type.eq_ignore_ascii_case(ty) && *notnull == 1
+                })
+            })
+        };
+        if has(&marker_columns, &marker_required) && has(&audit_columns, &audit_required) {
+            Ok(SchemaState::Complete)
+        } else {
+            Ok(SchemaState::Partial)
+        }
     } else {
         Ok(SchemaState::Partial)
     }

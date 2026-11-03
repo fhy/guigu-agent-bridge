@@ -321,7 +321,11 @@ pub(super) async fn graph_digest(
         )
         .await
         .map_err(|_| Failure::ManualRequired)?;
-        rows.push(serde_json::json!([&identity.table_name, &identity.canonical_pk, row]));
+        rows.push(serde_json::json!([
+            &identity.table_name,
+            &identity.canonical_pk,
+            row
+        ]));
     }
     let marker: Option<(String, String, String)> = sqlx::query_as(
         "SELECT state,committed_graph_digest,commit_digest FROM r093_reconciliation_marker WHERE singleton=1",
@@ -333,13 +337,22 @@ pub(super) async fn graph_digest(
         .fetch_one(&mut *connection)
         .await
         .map_err(|_| Failure::ManualRequired)?;
-    let anchor_count: i64 = sqlx::query_scalar("SELECT count(*) FROM offline_recovery_metadata_anchors")
-        .fetch_one(&mut *connection)
-        .await
-        .map_err(|_| Failure::ManualRequired)?;
+    let anchor_count: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM offline_recovery_metadata_anchors")
+            .fetch_one(&mut *connection)
+            .await
+            .map_err(|_| Failure::ManualRequired)?;
+    let all_rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT table_name,canonical_pk,disposition,original_revision,original_digest
+         FROM offline_recovery_rows ORDER BY table_name,canonical_pk",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(|_| Failure::ManualRequired)?;
     rows.push(serde_json::json!(["__marker__", "singleton", marker]));
     rows.push(serde_json::json!(["__audit__", "count", audit_count]));
     rows.push(serde_json::json!(["__anchors__", "count", anchor_count]));
+    rows.push(serde_json::json!(["__all_recovery_rows__", all_rows]));
     rows.sort_by_key(|row| row[0].as_str().unwrap_or_default().to_owned());
     let bytes = serde_json::to_vec(&rows).map_err(|_| Failure::Preflight)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
