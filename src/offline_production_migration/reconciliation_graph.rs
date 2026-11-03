@@ -397,18 +397,31 @@ pub(super) async fn verify_expected_graph(
                 key: key.1.clone(),
             },
         )
-        .await
-        .map_err(|_| Failure::ManualRequired)?;
+        .await;
         let expected_image = match action.action_type.as_str() {
             "insert" => action.after.as_ref(),
             "update" | "preserve" => action.after.as_ref().or(action.before.as_ref()),
             "delete" => None,
             _ => return Err(Failure::ManualRequired),
         };
-        if let Some(image) = expected_image
-            && (image.names != actual.0 || image.values != actual.1)
-        {
-            return Err(Failure::ManualRequired);
+        match (action.action_type.as_str(), expected_image, actual) {
+            ("delete", None, Err(_)) => {
+                let receipt_count: i64 = sqlx::query_scalar(
+                    "SELECT count(*) FROM offline_recovery_workspace_deletions
+                     WHERE canonical_pk=? AND snapshot_json IS NOT NULL",
+                )
+                .bind(&key.1)
+                .fetch_one(&mut *connection)
+                .await
+                .map_err(|_| Failure::ManualRequired)?;
+                if receipt_count != 1 {
+                    return Err(Failure::ManualRequired);
+                }
+            }
+            (_, Some(image), Ok(actual)) if image.names == actual.0 && image.values == actual.1 => {
+            }
+            ("delete", _, Ok(_)) | (_, Some(_), Err(_)) => return Err(Failure::ManualRequired),
+            _ => {}
         }
     }
     let actual = inventory::identities(connection)
@@ -417,7 +430,7 @@ pub(super) async fn verify_expected_graph(
         .into_iter()
         .map(|identity| (identity.table, identity.key))
         .collect::<BTreeSet<_>>();
-    if !expected.is_subset(&actual) {
+    if !plan.inserted_classifications.is_empty() && actual != allowed {
         return Err(Failure::ManualRequired);
     }
     for classification in plan
@@ -441,6 +454,14 @@ pub(super) async fn verify_expected_graph(
                 .any(|parent| !snapshot.parents.contains(&parent.identity))
         {
             return Err(Failure::ManualRequired);
+        }
+        for parent in parents {
+            let parent_snapshot = inventory::snapshot(connection, &parent.identity)
+                .await
+                .map_err(|_| Failure::ManualRequired)?;
+            if parent_snapshot.revision.is_empty() || parent_snapshot.digest.is_empty() {
+                return Err(Failure::ManualRequired);
+            }
         }
     }
     Ok(())
