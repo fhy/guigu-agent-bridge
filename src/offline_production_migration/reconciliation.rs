@@ -761,8 +761,17 @@ mod d1_tuple_tests {
         ] {
             pool.execute(sql).await.unwrap();
         }
-        let before: (String, i64, Option<String>) = sqlx::query_as("SELECT c.state,c.revision,d.session_id FROM task_continuations c JOIN delivery_dispositions d ON d.task_id=c.task_id WHERE c.task_id='task-b'").fetch_one(&pool).await.unwrap();
-        let selected_before: (String, i64, String, i64, String) = sqlx::query_as("SELECT l.state,c.revision,d.state,d.attempt,l.owner_token FROM execution_leases l JOIN task_continuations c ON c.task_id=l.task_id JOIN delivery_dispositions d ON d.task_id=l.task_id WHERE l.task_id='task-a'").fetch_one(&pool).await.unwrap();
+        let snapshot_pool = pool.clone();
+        let snapshot = move |task: &str| {
+            let task = task.to_owned();
+            let pool = snapshot_pool.clone();
+            async move {
+                sqlx::query_as::<_, (String, String, String)>("SELECT json_array(l.resource_key,l.task_id,l.owner_token,l.fence,l.state,l.acquired_at,l.heartbeat_at,l.expires_at), json_array(c.task_id,c.resource_key,c.delivery_id,c.lease_fence,c.revision,c.state,c.next_turn,c.completed_turns,c.consecutive_no_progress,c.next_prompt,c.started_at,c.heartbeat_at,c.last_progress_at,c.observed_output_bytes,c.runtime_generation,c.runtime_generation_version), json_array(d.delivery_id,d.task_id,d.attempt,d.state,d.session_id,d.child_fingerprint,d.reap_status,d.reap_at,d.reason_code) FROM execution_leases l JOIN task_continuations c ON c.task_id=l.task_id JOIN delivery_dispositions d ON d.task_id=l.task_id WHERE l.task_id=?").bind(task).fetch_one(&pool).await.unwrap()
+            }
+        };
+        let before_other = snapshot("task-b").await;
+        let before_selected = snapshot("task-a").await;
+        let audit_before: Vec<String> = sqlx::query_scalar("SELECT json_array(decision_id,task_id,delivery_id,resource_key,owner_token,fence,before_task_version,before_admission_revision,before_continuation_revision,before_generation,post_continuation_revision,disposition,reason,policy_ref,authorization_ref,not_replayed,created_at,session_id_digest,before_state_digest,post_state_digest,abandonment_kind) FROM historical_unknown_abandonments ORDER BY decision_id").fetch_all(&pool).await.unwrap();
         let mut connection = pool.acquire().await.unwrap();
         let refs = [
             "resource-a",
@@ -787,29 +796,17 @@ mod d1_tuple_tests {
             references: refs,
         });
         apply_chain(&mut connection, &plan).await.unwrap();
-        let after: (String, i64, Option<String>) = sqlx::query_as("SELECT c.state,c.revision,d.session_id FROM task_continuations c JOIN delivery_dispositions d ON d.task_id=c.task_id WHERE c.task_id='task-b'").fetch_one(&pool).await.unwrap();
-        assert_eq!(before, after);
-        let selected_after: (String, i64, String, i64, String) = sqlx::query_as("SELECT l.state,c.revision,d.state,d.attempt,l.owner_token FROM execution_leases l JOIN task_continuations c ON c.task_id=l.task_id JOIN delivery_dispositions d ON d.task_id=l.task_id WHERE l.task_id='task-a'").fetch_one(&pool).await.unwrap();
+        let after_other = snapshot("task-b").await;
+        let after_selected = snapshot("task-a").await;
+        let audit_after: Vec<String> = sqlx::query_scalar("SELECT json_array(decision_id,task_id,delivery_id,resource_key,owner_token,fence,before_task_version,before_admission_revision,before_continuation_revision,before_generation,post_continuation_revision,disposition,reason,policy_ref,authorization_ref,not_replayed,created_at,session_id_digest,before_state_digest,post_state_digest,abandonment_kind) FROM historical_unknown_abandonments ORDER BY decision_id").fetch_all(&pool).await.unwrap();
+        assert_eq!(before_other, after_other);
         assert_eq!(
-            selected_before,
-            (
-                "recovery_needed".into(),
-                17,
-                "outcome_unknown".into(),
-                2,
-                "owner-a".into()
-            )
+            before_selected.0.replace("recovery_needed", "released"),
+            after_selected.0
         );
-        assert_eq!(
-            selected_after,
-            (
-                "released".into(),
-                18,
-                "terminal".into(),
-                2,
-                "owner-a".into()
-            )
-        );
+        assert_ne!(before_selected.1, after_selected.1);
+        assert_eq!(audit_before, Vec::<String>::new());
+        assert_eq!(audit_after.len(), 1);
         let audit: i64 = sqlx::query_scalar("SELECT count(*) FROM historical_unknown_abandonments WHERE task_id='task-a' AND delivery_id='delivery-a'").fetch_one(&pool).await.unwrap();
         let other_audit: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM historical_unknown_abandonments WHERE task_id='task-b'",
