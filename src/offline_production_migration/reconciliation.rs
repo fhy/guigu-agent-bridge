@@ -535,7 +535,7 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
           before_generation,post_continuation_revision,disposition,reason,policy_ref,
           authorization_ref,not_replayed,created_at,session_id_digest,before_state_digest,
           post_state_digest,abandonment_kind)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,'manual_abandonment',?,?,?,?,1,datetime('now'),?,?,?,'historical_unknown_abandoned')",
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,'manual_abandonment',?,?,?,1,datetime('now'),?,?,?,'historical_unknown_abandoned')",
     )
     .bind(&plan.native_operation_id)
     .bind(&task).bind(&delivery).bind(&resource).bind(&owner).bind(fence)
@@ -654,7 +654,58 @@ impl D1ChainTuple {
 
 #[cfg(test)]
 mod d1_tuple_tests {
-    use super::D1ChainTuple;
+    use super::{D1ChainTuple, apply_chain};
+    use crate::offline_production_migration::reconciliation_records::{Binding, Decision, Plan};
+    use sqlx::Executor;
+
+    fn fixture_plan() -> Plan {
+        Plan {
+            protocol: 2,
+            plan_digest: "plan".into(),
+            operation_id: "operation".into(),
+            root_digest: "root".into(),
+            original_provenance_digest: "prov".into(),
+            original_executable_digest: "orig".into(),
+            archive_digest: "archive".into(),
+            schema_complete_digest: "schema".into(),
+            identity_digest: "identity".into(),
+            grant_digest: "grant".into(),
+            successor_executable_digest: "succ".into(),
+            successor_package_digest: "pkg".into(),
+            successor_source: "source".into(),
+            successor_review: "review".into(),
+            native_operation_id: "native".into(),
+            source_state_digest: "state".into(),
+            original_binding: Binding {
+                db_generation: "generation".into(),
+                canonical_db_digest: "db".into(),
+                root_digest: "root".into(),
+                admin_operation_id: "operation".into(),
+                schema_intent_digest: "intent".into(),
+                schema_complete_digest: None,
+                plan_digest: None,
+                identity_digest: None,
+                classification_digest: None,
+                transition_intent_digest: None,
+                transition_complete_digest: None,
+                native_operation_id: None,
+                phase: "identity_ready".into(),
+                revision: 4,
+            },
+            classifications: vec![],
+            inserted_classifications: vec![],
+            actions: vec![],
+            d1_unknown_chain: None,
+            d1_quarantined: None,
+            d2_owner: vec![],
+            anchors: vec![],
+            workspaces: vec![],
+            native_at: "now".into(),
+            abandonment_at: "t".into(),
+            action_digest: "action".into(),
+            classification_digest: "classification".into(),
+        }
+    }
 
     #[test]
     fn rejects_non_selected_chain_tuple() {
@@ -689,5 +740,84 @@ mod d1_tuple_tests {
         let selected = D1ChainTuple::parse(&selected).unwrap();
         let other = D1ChainTuple::parse(&non_selected).unwrap();
         assert_ne!(selected.task, other.task);
+    }
+
+    #[tokio::test]
+    async fn migration_two_chain_apply_preserves_non_selected() {
+        let root = tempfile::tempdir().unwrap();
+        let pool = crate::storage::connect(root.path().join("d1.db"))
+            .await
+            .unwrap();
+        crate::storage::migrate(&pool).await.unwrap();
+        for sql in [
+            "INSERT INTO agents VALUES('agent-a','a','acp',1,NULL,'[]'),('agent-b','b','acp',1,NULL,'[]')",
+            "INSERT INTO conversations VALUES('conversation',NULL,NULL,NULL,'[]')",
+            "INSERT INTO tasks VALUES('task-a','task-a',NULL,'agent-a','agent-b','conversation',NULL,'fixture',5,0,0,NULL,11),('task-b','task-b',NULL,'agent-a','agent-b','conversation',NULL,'fixture',5,0,0,NULL,12)",
+            "INSERT INTO deliveries VALUES('delivery-a','task-a',1,'agent-b','t','t'),('delivery-b','task-b',1,'agent-b','t','t')",
+            "INSERT INTO task_admissions(task_id,state,revision,created_at,updated_at) VALUES('task-a','recovery_needed',13,'t','t'),('task-b','recovery_needed',14,'t','t')",
+            "INSERT INTO execution_leases VALUES('resource-a','task-a','owner-a',7,'recovery_needed','t','t','later'),('resource-b','task-b','owner-b',8,'recovery_needed','t','t','later')",
+            "INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes,runtime_generation,runtime_generation_version) VALUES('task-a','resource-a','delivery-a',7,17,'recovery_needed',1,0,0,'','t','t','t',0,'generation-a',1),('task-b','resource-b','delivery-b',8,18,'recovery_needed',1,0,0,'','t','t','t',0,'generation-b',1)",
+            "INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state,session_id) VALUES('delivery-a','task-a',2,'outcome_unknown','session-a'),('delivery-b','task-b',1,'outcome_unknown','session-b')",
+        ] {
+            pool.execute(sql).await.unwrap();
+        }
+        let before: (String, i64, Option<String>) = sqlx::query_as("SELECT c.state,c.revision,d.session_id FROM task_continuations c JOIN delivery_dispositions d ON d.task_id=c.task_id WHERE c.task_id='task-b'").fetch_one(&pool).await.unwrap();
+        let selected_before: (String, i64, String, i64, String) = sqlx::query_as("SELECT l.state,c.revision,d.state,d.attempt,l.owner_token FROM execution_leases l JOIN task_continuations c ON c.task_id=l.task_id JOIN delivery_dispositions d ON d.task_id=l.task_id WHERE l.task_id='task-a'").fetch_one(&pool).await.unwrap();
+        let mut connection = pool.acquire().await.unwrap();
+        let refs = [
+            "resource-a",
+            "task-a",
+            "delivery-a",
+            "owner-a",
+            "7",
+            "11",
+            "13",
+            "17",
+            "generation-a",
+            "session-a",
+            "2",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let mut plan = fixture_plan();
+        plan.d1_unknown_chain = Some(Decision {
+            decision_id: "native".into(),
+            evidence_digest: "evidence".into(),
+            references: refs,
+        });
+        apply_chain(&mut connection, &plan).await.unwrap();
+        let after: (String, i64, Option<String>) = sqlx::query_as("SELECT c.state,c.revision,d.session_id FROM task_continuations c JOIN delivery_dispositions d ON d.task_id=c.task_id WHERE c.task_id='task-b'").fetch_one(&pool).await.unwrap();
+        assert_eq!(before, after);
+        let selected_after: (String, i64, String, i64, String) = sqlx::query_as("SELECT l.state,c.revision,d.state,d.attempt,l.owner_token FROM execution_leases l JOIN task_continuations c ON c.task_id=l.task_id JOIN delivery_dispositions d ON d.task_id=l.task_id WHERE l.task_id='task-a'").fetch_one(&pool).await.unwrap();
+        assert_eq!(
+            selected_before,
+            (
+                "recovery_needed".into(),
+                17,
+                "outcome_unknown".into(),
+                2,
+                "owner-a".into()
+            )
+        );
+        assert_eq!(
+            selected_after,
+            (
+                "released".into(),
+                18,
+                "terminal".into(),
+                2,
+                "owner-a".into()
+            )
+        );
+        let audit: i64 = sqlx::query_scalar("SELECT count(*) FROM historical_unknown_abandonments WHERE task_id='task-a' AND delivery_id='delivery-a'").fetch_one(&pool).await.unwrap();
+        let other_audit: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM historical_unknown_abandonments WHERE task_id='task-b'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(audit, 1);
+        assert_eq!(other_audit, 0);
     }
 }
