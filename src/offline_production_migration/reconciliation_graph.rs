@@ -22,7 +22,7 @@ type AuditGraphRow = (
 );
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct PreTransitionGraph {
+pub(super) struct PreTransitionGraph {
     rows: BTreeSet<(String, String, String)>,
 }
 
@@ -32,8 +32,16 @@ struct ExpectedPostGraph {
 }
 
 impl PreTransitionGraph {
-    fn from_rows(rows: BTreeSet<(String, String, String)>) -> Self {
-        Self { rows }
+    pub(super) async fn capture(connection: &mut SqliteConnection) -> Result<Self, Failure> {
+        let rows: Vec<(String, String, String)> = sqlx::query_as(
+            "SELECT table_name,canonical_pk,original_digest FROM offline_recovery_rows ORDER BY table_name,canonical_pk",
+        )
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|_| Failure::ManualRequired)?;
+        Ok(Self {
+            rows: rows.into_iter().collect(),
+        })
     }
 }
 
@@ -459,10 +467,19 @@ pub(super) async fn graph_digest(
 pub(super) async fn verify_expected_graph(
     connection: &mut SqliteConnection,
     plan: &Plan,
+    pre_state: Option<&PreTransitionGraph>,
 ) -> Result<(), Failure> {
-    let pre_graph = PreTransitionGraph::from_rows(BTreeSet::new());
-    let expected_graph = ExpectedPostGraph::from_pre_state(&pre_graph);
-    let _graph_seam_ready = expected_graph.matches(&BTreeSet::new());
+    if let Some(pre_state) = pre_state {
+        let expected_graph = ExpectedPostGraph::from_pre_state(pre_state);
+        let current = PreTransitionGraph::capture(connection).await?;
+        let unchanged = plan
+            .actions
+            .iter()
+            .all(|action| action.action_type != "preserve");
+        if unchanged && !pre_state.rows.is_empty() && !expected_graph.matches(&current.rows) {
+            return Err(Failure::ManualRequired);
+        }
+    }
     if plan.native_operation_id.is_empty() {
         return Err(Failure::ManualRequired);
     }

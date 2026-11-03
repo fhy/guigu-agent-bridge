@@ -234,6 +234,7 @@ async fn run_locked(
         if marker == reconciliation_sql::SchemaState::None {
             reconciliation_sql::create_schema(&mut tx).await?;
         }
+        let pre_graph = reconciliation_graph::PreTransitionGraph::capture(&mut tx).await?;
         reconciliation_graph::validate_plan(&mut tx, &authenticated.plan).await?;
         reconciliation_sql::insert_audit(&mut tx, &authenticated.plan).await?;
         apply_chain(&mut tx, &authenticated.plan).await?;
@@ -258,7 +259,8 @@ async fn run_locked(
         )
         .await?;
         reconciliation_graph::verify_actions(&mut tx, &authenticated.plan).await?;
-        reconciliation_graph::verify_expected_graph(&mut tx, &authenticated.plan).await?;
+        reconciliation_graph::verify_expected_graph(&mut tx, &authenticated.plan, Some(&pre_graph))
+            .await?;
         let graph_digest = reconciliation_graph::graph_digest(&mut tx, &authenticated.plan).await?;
         let commit_digest = records::encoded_digest(&(
             &authenticated.intent,
@@ -292,7 +294,7 @@ async fn run_locked(
         &authenticated.plan.operation_id,
     )
     .await?;
-    reconciliation_graph::verify_expected_graph(&mut reader, &authenticated.plan).await?;
+    reconciliation_graph::verify_expected_graph(&mut reader, &authenticated.plan, None).await?;
     let graph_digest = reconciliation_graph::graph_digest(&mut reader, &authenticated.plan).await?;
     reader.close().await.map_err(|_| Failure::Migration)?;
     let completion = Completion {
