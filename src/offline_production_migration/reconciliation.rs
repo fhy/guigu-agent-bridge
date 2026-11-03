@@ -417,23 +417,22 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
     if plan.d1_unknown_chain.is_none() {
         return Ok(());
     }
-    let count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM execution_leases l
+    let lease = sqlx::query(
+        "SELECT l.resource_key,l.task_id,l.owner_token,l.fence,
+                t.version AS task_version,a.revision AS admission_revision,
+                c.delivery_id,c.revision AS continuation_revision,c.lease_fence,
+                t.root_task_id
+         FROM execution_leases l
+         JOIN tasks t ON t.task_id=l.task_id
          JOIN task_admissions a ON a.task_id=l.task_id
          JOIN task_continuations c ON c.task_id=l.task_id
-         JOIN delivery_dispositions d ON d.delivery_id=c.delivery_id
+         JOIN delivery_dispositions d ON d.delivery_id=c.delivery_id AND d.task_id=c.task_id
          WHERE l.state='recovery_needed' AND a.state='recovery_needed'
-           AND c.state='recovery_needed' AND d.state='outcome_unknown'",
-    )
-    .fetch_one(&mut *connection)
-    .await
-    .map_err(|_| Failure::ManualRequired)?;
-    if count != 1 {
-        return Err(Failure::ManualRequired);
-    }
-    let lease = sqlx::query(
-        "SELECT resource_key,task_id,owner_token,fence FROM execution_leases
-         WHERE state='recovery_needed'",
+           AND c.state='recovery_needed' AND d.state='outcome_unknown'
+           AND c.resource_key=l.resource_key AND c.lease_fence=l.fence
+           AND NOT EXISTS (SELECT 1 FROM historical_unknown_abandonments h
+                           WHERE h.task_id=l.task_id AND h.delivery_id=c.delivery_id
+                             AND h.resource_key=l.resource_key)",
     )
     .fetch_one(&mut *connection)
     .await
@@ -450,6 +449,48 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
     let fence: i64 = lease
         .try_get("fence")
         .map_err(|_| Failure::ManualRequired)?;
+    let delivery: String = lease
+        .try_get("delivery_id")
+        .map_err(|_| Failure::ManualRequired)?;
+    let task_version: i64 = lease
+        .try_get("task_version")
+        .map_err(|_| Failure::ManualRequired)?;
+    let admission_revision: i64 = lease
+        .try_get("admission_revision")
+        .map_err(|_| Failure::ManualRequired)?;
+    let continuation_revision: i64 = lease
+        .try_get("continuation_revision")
+        .map_err(|_| Failure::ManualRequired)?;
+    let generation: String = lease
+        .try_get("root_task_id")
+        .map_err(|_| Failure::ManualRequired)?;
+    let before_digest = records::encoded_digest(&(
+        task_version,
+        admission_revision,
+        continuation_revision,
+        &generation,
+        &resource,
+        &task,
+        &delivery,
+    ))?;
+    sqlx::query(
+        "INSERT INTO historical_unknown_abandonments
+         (decision_id,task_id,delivery_id,resource_key,owner_token,fence,
+          before_task_version,before_admission_revision,before_continuation_revision,
+          before_generation,post_continuation_revision,disposition,reason,policy_ref,
+          authorization_ref,not_replayed,created_at,session_id_digest,before_state_digest,
+          post_state_digest,abandonment_kind)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,'manual_abandonment',?,?,?,?,1,datetime('now'),?,?,?,'historical_unknown_abandoned')",
+    )
+    .bind(&plan.native_operation_id)
+    .bind(&task).bind(&delivery).bind(&resource).bind(&owner).bind(fence)
+    .bind(task_version).bind(admission_revision).bind(continuation_revision)
+    .bind(&generation).bind(continuation_revision + 1)
+    .bind("offline protocol-2 D1 reconciliation")
+    .bind("R093-D1").bind(&plan.operation_id).bind(&plan.native_operation_id)
+    .bind(&before_digest).bind(&before_digest)
+    .bind(&before_digest)
+    .execute(&mut *connection).await.map_err(|_| Failure::ManualRequired)?;
     let changed = sqlx::query(
         "UPDATE execution_leases SET state='released',heartbeat_at=?
          WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=?
@@ -469,12 +510,13 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
     let changed = sqlx::query(
         "UPDATE task_continuations
          SET state='terminal',revision=revision+1,heartbeat_at=?
-         WHERE task_id=? AND resource_key=? AND lease_fence=? AND state='recovery_needed'",
+         WHERE task_id=? AND resource_key=? AND lease_fence=? AND state='recovery_needed' AND revision=?",
     )
     .bind(&plan.abandonment_at)
     .bind(&task)
     .bind(&resource)
     .bind(fence)
+    .bind(continuation_revision)
     .execute(&mut *connection)
     .await
     .map_err(|_| Failure::ManualRequired)?;
@@ -484,9 +526,10 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
     let changed = sqlx::query(
         "UPDATE delivery_dispositions
          SET state='terminal',reason_code='historical-unknown-abandoned'
-         WHERE task_id=? AND state='outcome_unknown'",
+         WHERE task_id=? AND delivery_id=? AND state='outcome_unknown'",
     )
     .bind(&task)
+    .bind(&delivery)
     .execute(&mut *connection)
     .await
     .map_err(|_| Failure::ManualRequired)?;

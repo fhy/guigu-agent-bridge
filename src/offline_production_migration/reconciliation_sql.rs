@@ -356,16 +356,23 @@ pub(super) async fn final_binding(
         "UPDATE offline_recovery_binding
          SET transition_complete_digest=?,phase='baseline_ready',revision=revision+1
          WHERE singleton=1 AND protocol=2 AND phase='transition_pending'
-           AND root_digest=? AND admin_operation_id=? AND plan_digest=?
-           AND classification_digest=? AND native_operation_id=?
+           AND root_digest=? AND admin_operation_id=? AND schema_intent_digest=?
+           AND schema_complete_digest=? AND identity_digest=? AND plan_digest=?
+           AND classification_digest=? AND transition_intent_digest IS ?
+           AND native_operation_id=? AND revision=?
            AND transition_complete_digest IS NULL",
     )
     .bind(completion_digest)
     .bind(&plan.root_digest)
     .bind(&plan.operation_id)
+    .bind(&plan.original_binding.schema_intent_digest)
+    .bind(&plan.schema_complete_digest)
+    .bind(&plan.identity_digest)
     .bind(&plan.plan_digest)
     .bind(&plan.classification_digest)
+    .bind(&plan.original_binding.transition_intent_digest)
     .bind(&plan.native_operation_id)
+    .bind(plan.original_binding.revision)
     .execute(&mut *connection)
     .await
     .map_err(|_| Failure::Migration)?;

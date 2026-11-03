@@ -1,7 +1,10 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io::{Read, Write},
-    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+    os::unix::{
+        fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
+        io::AsRawFd,
+    },
     path::{Path, PathBuf},
 };
 
@@ -108,7 +111,7 @@ pub(super) struct Classification {
     pub matrix_operation_id: Option<String>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct RowImage {
     pub names: Vec<String>,
@@ -305,12 +308,44 @@ pub(super) fn publish<T: Serialize>(path: &Path, value: &T) -> Result<(), Failur
         .map_err(|_| Failure::ManualRequired)?;
     file.write_all(&bytes).map_err(|_| Failure::Preflight)?;
     file.sync_all().map_err(|_| Failure::Preflight)?;
-    fs::hard_link(&temporary, path).map_err(|_| Failure::ManualRequired)?;
-    File::open(parent)
-        .and_then(|directory| directory.sync_all())
+    let directory = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_CLOEXEC)
+        .open(parent)
         .map_err(|_| Failure::Preflight)?;
-    fs::remove_file(temporary).map_err(|_| Failure::Preflight)?;
-    Ok(())
+    let source = std::ffi::CString::new(
+        temporary
+            .file_name()
+            .ok_or(Failure::Preflight)?
+            .as_encoded_bytes(),
+    )
+    .map_err(|_| Failure::Preflight)?;
+    let target = std::ffi::CString::new(
+        path.file_name()
+            .ok_or(Failure::Preflight)?
+            .as_encoded_bytes(),
+    )
+    .map_err(|_| Failure::Preflight)?;
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_renameat2,
+            directory.as_raw_fd(),
+            source.as_ptr(),
+            directory.as_raw_fd(),
+            target.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result != 0 {
+        return Err(
+            if std::io::Error::last_os_error().raw_os_error() == Some(libc::EEXIST) {
+                Failure::ManualRequired
+            } else {
+                Failure::Preflight
+            },
+        );
+    }
+    directory.sync_all().map_err(|_| Failure::Preflight)
 }
 
 pub(super) fn plan_digest(plan: &Plan) -> Result<String, Failure> {

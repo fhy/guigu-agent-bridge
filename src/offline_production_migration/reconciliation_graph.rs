@@ -359,6 +359,9 @@ pub(super) async fn verify_actions(
         if !action_images_equal(action, &actual) {
             return Err(Failure::ManualRequired);
         }
+        if action.action_type == "preserve" && action.after.as_ref() != action.before.as_ref() {
+            return Err(Failure::ManualRequired);
+        }
     }
     Ok(())
 }
