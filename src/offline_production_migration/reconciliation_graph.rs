@@ -5,7 +5,7 @@ use sqlx::{Row, SqliteConnection};
 
 use super::{
     Failure,
-    reconciliation_records::{Action, Classification, Plan, RowImage},
+    reconciliation_records::{Classification, Plan, RowImage},
 };
 use crate::storage::recovery_eligibility::{ParentIdentity, ParentRole, inventory};
 
@@ -355,21 +355,11 @@ pub(super) fn hex_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }
 
-pub(super) fn action_images_equal(action: &Action, actual: &(Vec<String>, Vec<String>)) -> bool {
-    action
-        .before
-        .as_ref()
-        .is_some_and(|image| image.names == actual.0 && image.values == actual.1)
-}
-
 pub(super) async fn verify_actions(
     connection: &mut SqliteConnection,
     plan: &Plan,
 ) -> Result<(), Failure> {
     for action in &plan.actions {
-        if action.action_type != "preserve" {
-            continue;
-        }
         let actual = inventory::values(
             connection,
             &inventory::RowIdentity {
@@ -379,7 +369,14 @@ pub(super) async fn verify_actions(
         )
         .await
         .map_err(|_| Failure::ManualRequired)?;
-        if !action_images_equal(action, &actual) {
+        let expected = match action.action_type.as_str() {
+            "preserve" => action.before.as_ref(),
+            "update" => action.after.as_ref(),
+            _ => None,
+        };
+        if expected.is_some()
+            && !expected.is_some_and(|image| image.names == actual.0 && image.values == actual.1)
+        {
             return Err(Failure::ManualRequired);
         }
         if action.action_type == "preserve" && action.after.as_ref() != action.before.as_ref() {
