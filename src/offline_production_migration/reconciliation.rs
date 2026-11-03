@@ -38,7 +38,12 @@ async fn execute_with_launcher(
         release_provenance: request.release_provenance.clone(),
         executable: request.executable.clone(),
     };
-    let mut evidence = Evidence::read(&migration)?;
+    let protocol2 = rec::discriminator(&rec::grant_path(&request.operation_id))?;
+    let mut evidence = if protocol2 {
+        Evidence::read_original(&migration)?
+    } else {
+        Evidence::read(&migration)?
+    };
     launcher::check(&evidence.listeners, live_launcher, "transition-v2-pre-lock").await?;
     let lock = RuntimeLock::acquire(&request.database).map_err(|_| Failure::Busy)?;
     launcher::check(

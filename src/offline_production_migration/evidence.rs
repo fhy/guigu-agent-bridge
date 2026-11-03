@@ -98,6 +98,7 @@ pub(super) fn migration_digest_through(version: i64) -> String {
 
 pub(super) struct Evidence {
     executable: File,
+    executable_path: std::path::PathBuf,
     executable_stamp: (u64, i64, i64, i64, i64),
     executable_identity: Identity,
     pub provenance_digest: String,
@@ -160,6 +161,50 @@ impl Evidence {
         Ok(Self {
             executable_stamp: stamp(&meta),
             executable,
+            executable_path: req.executable.clone(),
+            executable_identity,
+            provenance_digest: digest(&bytes),
+            config_digest,
+            database_identity: Identity::of(&req.database)?,
+            listeners,
+        })
+    }
+
+    pub fn read_original(req: &Request) -> Result<Self, Failure> {
+        for path in [
+            &req.config,
+            &req.database,
+            &req.manifest_dir,
+            &req.release_provenance,
+        ] {
+            canonical(path)?;
+        }
+        let bytes = fs::read(&req.release_provenance).map_err(|_| Failure::Preflight)?;
+        let provenance: Provenance =
+            serde_json::from_slice(&bytes).map_err(|_| Failure::Preflight)?;
+        canonical(&provenance.executable)?;
+        let mut executable = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC)
+            .open(&provenance.executable)
+            .map_err(|_| Failure::Preflight)?;
+        let meta = executable.metadata().map_err(|_| Failure::Preflight)?;
+        let executable_identity = Identity {
+            device: meta.dev(),
+            inode: meta.ino(),
+        };
+        let mut elf = [0u8; 64];
+        executable
+            .read_exact(&mut elf)
+            .map_err(|_| Failure::Preflight)?;
+        let executable_hash = hash_handle(&mut executable)?;
+        validate_original(&provenance, req, &elf, &executable_hash)?;
+        let config_digest = hash_file(&req.config)?;
+        let listeners = super::configuration::listeners(req)?;
+        Ok(Self {
+            executable_stamp: stamp(&meta),
+            executable,
+            executable_path: provenance.executable,
             executable_identity,
             provenance_digest: digest(&bytes),
             config_digest,
@@ -174,21 +219,21 @@ impl Evidence {
             &req.database,
             &req.manifest_dir,
             &req.release_provenance,
-            &req.executable,
+            &self.executable_path,
         ] {
             canonical(path)?;
         }
         if hash_file(&req.release_provenance)? != self.provenance_digest
             || hash_file(&req.config)? != self.config_digest
             || Identity::of(&req.database)? != self.database_identity
-            || Identity::of(&req.executable)? != self.executable_identity
+            || Identity::of(&self.executable_path)? != self.executable_identity
             || stamp(
                 &self
                     .executable
                     .metadata()
                     .map_err(|_| Failure::ManualRequired)?,
             ) != self.executable_stamp
-            || stamp(&fs::metadata(&req.executable).map_err(|_| Failure::ManualRequired)?)
+            || stamp(&fs::metadata(&self.executable_path).map_err(|_| Failure::ManualRequired)?)
                 != self.executable_stamp
         {
             return Err(Failure::ManualRequired);
@@ -220,6 +265,36 @@ fn validate(
         || provenance.launcher_hold.prior_state != "inactive/dead/MainPID=0"
         || !hexadecimal(&provenance.launcher_hold.prior_show_sha256, 64)
         || provenance.launcher_hold.executable != req.executable
+        || provenance.launcher_hold.config != req.config
+        || !provenance.launcher_hold.manual_launchers_excluded
+    {
+        return Err(Failure::ManualRequired);
+    }
+    Ok(())
+}
+
+fn validate_original(
+    provenance: &Provenance,
+    req: &Request,
+    elf: &[u8],
+    executable_hash: &str,
+) -> Result<(), Failure> {
+    if !elf.starts_with(b"\x7fELF")
+        || provenance.elf_sha256 != digest(elf)
+        || !hexadecimal(&provenance.source_commit, 40)
+        || provenance.publication.is_empty()
+        || provenance.review.is_empty()
+        || !hexadecimal(&provenance.package_sha256, 64)
+        || provenance.package != "guigu-agent-bridge"
+        || provenance.version != env!("CARGO_PKG_VERSION")
+        || provenance.executable_sha256 != executable_hash
+        || provenance.migration_set_sha256
+            != migration_digest_through(if req.target_schema == 25 { 25 } else { 24 })
+        || provenance.launcher_hold.operation_id != req.operation_id
+        || provenance.launcher_hold.controller.is_empty()
+        || provenance.launcher_hold.prior_state != "inactive/dead/MainPID=0"
+        || !hexadecimal(&provenance.launcher_hold.prior_show_sha256, 64)
+        || provenance.launcher_hold.executable != provenance.executable
         || provenance.launcher_hold.config != req.config
         || !provenance.launcher_hold.manual_launchers_excluded
     {

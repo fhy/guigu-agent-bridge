@@ -9,7 +9,7 @@ use super::{
 
 pub(super) async fn execute(req: Request, live_launcher: bool) -> Result<String, Failure> {
     use std::os::unix::fs::MetadataExt;
-    let mut evidence = Evidence::read(&req)?;
+    let mut evidence = Evidence::read_original(&req)?;
     if std::fs::metadata(&req.manifest_dir)
         .map_err(|_| Failure::Preflight)?
         .uid()

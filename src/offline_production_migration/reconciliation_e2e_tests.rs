@@ -38,8 +38,47 @@ impl Protocol2Fixture {
             serde_json::to_vec(&provenance).unwrap(),
         )
         .unwrap();
-        flow::execute(fixture.request.clone(), false).await.unwrap();
+        let output = Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "offline_production_migration::reconciliation_e2e_tests::child_entry",
+                "--nocapture",
+            ])
+            .env(CHILD_ROOT, fixture.root.path())
+            .env(CHILD_PHASE, "bootstrap")
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(86), "bootstrap: {output:?}");
 
+        let original_executable = fixture.root.path().join("original-executable");
+        fs::copy(&fixture.request.executable, &original_executable).unwrap();
+        let original_executable_digest = evidence::hash_file(&original_executable).unwrap();
+        provenance["executable"] = original_executable.to_string_lossy().into_owned().into();
+        provenance["executable_sha256"] = original_executable_digest.clone().into();
+        provenance["launcher_hold"]["executable"] =
+            original_executable.to_string_lossy().into_owned().into();
+        fs::write(
+            &fixture.request.release_provenance,
+            serde_json::to_vec(&provenance).unwrap(),
+        )
+        .unwrap();
+        let provenance_digest = evidence::hash_file(&fixture.request.release_provenance).unwrap();
+        let root_path = records::anchor(&fixture.request.database);
+        let mut root: version2_records::Root = rec::load(&root_path).unwrap();
+        root.operation.provenance_digest = provenance_digest.clone();
+        fs::write(&root_path, serde_json::to_vec(&root).unwrap()).unwrap();
+        fs::set_permissions(&root_path, fs::Permissions::from_mode(0o600)).unwrap();
+        let archive_path = fixture.request.manifest_dir.join("archive-v2.json");
+        assert_eq!(root.operation.provenance_digest, provenance_digest);
+        assert_eq!(
+            evidence::hash_file(&original_executable).unwrap(),
+            original_executable_digest
+        );
+        let mut resume_request = fixture.request.clone();
+        resume_request.mode = Mode::Resume;
+        flow::execute(resume_request, false)
+            .await
+            .unwrap_or_else(|error| panic!("resume bootstrap: {error:?}"));
         let identity_digest = "1".repeat(64);
         let mut connection = verification::open(&fixture.request.database, false)
             .await
@@ -71,11 +110,9 @@ impl Protocol2Fixture {
         .await
         .unwrap();
         let binding = binding(&mut connection).await;
-        let root: version2_records::Root =
-            rec::load(&records::anchor(&fixture.request.database)).unwrap();
+        let root: version2_records::Root = rec::load(&root_path).unwrap();
         let root_digest = records::encoded_digest(&root).unwrap();
-        let archive: version2_records::Archive =
-            rec::load(&fixture.request.manifest_dir.join("archive-v2.json")).unwrap();
+        let archive: version2_records::Archive = rec::load(&archive_path).unwrap();
         let archive_digest = records::encoded_digest(&archive).unwrap();
         let source_state_digest =
             crate::storage::matrix_recovery_snapshot::snapshot(&mut connection)
@@ -120,17 +157,17 @@ impl Protocol2Fixture {
         }
         connection.close().await.unwrap();
 
-        let executable_digest = evidence::hash_file(&fixture.request.executable).unwrap();
+        let successor_executable_digest = evidence::hash_file(&fixture.request.executable).unwrap();
         let grant = Grant {
             version: 1,
             operation_id: fixture.request.operation_id.clone(),
             root_digest: root_digest.clone(),
             original_provenance_digest: root.operation.provenance_digest.clone(),
-            original_executable_digest: executable_digest.clone(),
+            original_executable_digest: original_executable_digest.clone(),
             archive_digest: archive_digest.clone(),
             schema_complete_digest: binding.schema_complete_digest.clone().unwrap(),
             identity_digest: identity_digest.clone(),
-            successor_executable_digest: executable_digest.clone(),
+            successor_executable_digest: successor_executable_digest.clone(),
             successor_package_digest: "3".repeat(64),
             successor_source: "fixture-source".into(),
             successor_review: "fixture-review".into(),
@@ -164,12 +201,12 @@ impl Protocol2Fixture {
             operation_id: fixture.request.operation_id.clone(),
             root_digest,
             original_provenance_digest: root.operation.provenance_digest,
-            original_executable_digest: executable_digest.clone(),
+            original_executable_digest: original_executable_digest.clone(),
             archive_digest,
             schema_complete_digest: binding.schema_complete_digest.clone().unwrap(),
             identity_digest,
             grant_digest,
-            successor_executable_digest: executable_digest,
+            successor_executable_digest,
             successor_package_digest: grant.successor_package_digest.clone(),
             successor_source: grant.successor_source.clone(),
             successor_review: grant.successor_review.clone(),
@@ -383,9 +420,18 @@ async fn child_entry() {
     let Some(root) = std::env::var_os(CHILD_ROOT) else {
         return;
     };
+    let phase = std::env::var_os(CHILD_PHASE).unwrap();
+    if phase == "bootstrap" {
+        let mut request = Fixture::request(Path::new(&root), Mode::Apply);
+        request.target_schema = 25;
+        unsafe {
+            std::env::set_var("R071_TEST_CRASH", "v2-after-root");
+        }
+        flow::execute(request, false).await.unwrap();
+        return;
+    }
     let manifest = std::env::var_os(CHILD_MANIFEST).unwrap();
     let grant = std::env::var_os(CHILD_GRANT).unwrap();
-    let phase = std::env::var_os(CHILD_PHASE).unwrap();
     unsafe {
         std::env::set_var("R094_GRANT_PATH", grant);
         std::env::set_var("R071_TEST_CRASH", phase);
