@@ -382,6 +382,24 @@ pub(super) async fn verify_expected_graph(
     connection: &mut SqliteConnection,
     plan: &Plan,
 ) -> Result<(), Failure> {
+    let compatibility: Option<String> = sqlx::query_scalar(
+        "SELECT json_array(singleton,decision,source_schema_version,source_state_digest,legacy_operation_id,legacy_phase,legacy_baseline,legacy_baseline_digest,legacy_watermark,legacy_revision,legacy_binding,legacy_archive_digest,native_operation_id,reason_code,created_at)
+         FROM matrix_recovery_compatibility WHERE singleton=1",
+    ).fetch_optional(&mut *connection).await.map_err(|_| Failure::ManualRequired)?;
+    if plan.native_operation_id.is_empty() || compatibility.is_none() {
+        return Err(Failure::ManualRequired);
+    }
+    let control: Option<(i64, String, String, Option<String>)> = sqlx::query_as(
+        "SELECT control_id,cutover_operation_id,phase,watermark FROM matrix_recovery_control",
+    )
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|_| Failure::ManualRequired)?;
+    if control.as_ref().is_none_or(|row| {
+        row.0 != 1 || row.1 != plan.native_operation_id || row.2 != "baseline" || row.3.is_some()
+    }) {
+        return Err(Failure::ManualRequired);
+    }
     let allowed = plan
         .classifications
         .iter()
