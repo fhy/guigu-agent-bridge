@@ -329,7 +329,13 @@ async fn run_locked(
         .map_err(|_| Failure::Migration)?;
     let binding = load_binding(&mut tx).await?;
     if binding.phase == "transition_pending" {
-        reconciliation_sql::final_binding(&mut tx, &authenticated.plan, &completion_digest).await?;
+        reconciliation_sql::final_binding(
+            &mut tx,
+            &authenticated.plan,
+            &completion.intent_digest,
+            &completion_digest,
+        )
+        .await?;
     } else if binding.phase != "baseline_ready" {
         return Err(Failure::ManualRequired);
     }

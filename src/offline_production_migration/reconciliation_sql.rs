@@ -350,6 +350,7 @@ pub(super) async fn insert_marker(
 pub(super) async fn final_binding(
     connection: &mut SqliteConnection,
     plan: &Plan,
+    intent_digest: &str,
     completion_digest: &str,
 ) -> Result<(), Failure> {
     let changed = sqlx::query(
@@ -370,9 +371,9 @@ pub(super) async fn final_binding(
     .bind(&plan.identity_digest)
     .bind(&plan.plan_digest)
     .bind(&plan.classification_digest)
-    .bind(&plan.original_binding.transition_intent_digest)
+    .bind(intent_digest)
     .bind(&plan.native_operation_id)
-    .bind(plan.original_binding.revision)
+    .bind(plan.original_binding.revision + 1)
     .execute(&mut *connection)
     .await
     .map_err(|_| Failure::Migration)?;
