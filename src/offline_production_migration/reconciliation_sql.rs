@@ -104,8 +104,8 @@ pub(super) async fn schema_state(
         ];
         let has = |columns: &[(String, String, i64)], required: &[(&str, &str)]| {
             required.iter().all(|(name, ty)| {
-                columns.iter().any(|(actual, actual_type, notnull)| {
-                    actual == name && actual_type.eq_ignore_ascii_case(ty) && *notnull == 1
+                columns.iter().any(|(actual, actual_type, _notnull)| {
+                    actual == name && actual_type.eq_ignore_ascii_case(ty)
                 })
             })
         };
