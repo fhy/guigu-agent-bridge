@@ -230,6 +230,7 @@ async fn run_locked(
             reconciliation_sql::marker(&mut tx, &authenticated.plan.operation_id).await?
         }
     };
+    let mut expected_graph: Option<reconciliation_graph::ExpectedPostGraph> = None;
     if binding.phase == "identity_ready" && state.is_none() {
         if marker == reconciliation_sql::SchemaState::None {
             reconciliation_sql::create_schema(&mut tx).await?;
@@ -259,12 +260,13 @@ async fn run_locked(
         )
         .await?;
         reconciliation_graph::verify_actions(&mut tx, &authenticated.plan).await?;
+        expected_graph = Some(reconciliation_graph::ExpectedPostGraph::from_pre_state(
+            &pre_graph,
+        ));
         reconciliation_graph::verify_expected_graph(
             &mut tx,
             &authenticated.plan,
-            Some(&reconciliation_graph::ExpectedPostGraph::from_pre_state(
-                &pre_graph,
-            )),
+            expected_graph.as_ref(),
         )
         .await?;
         let graph_digest = reconciliation_graph::graph_digest(&mut tx, &authenticated.plan).await?;
@@ -300,7 +302,12 @@ async fn run_locked(
         &authenticated.plan.operation_id,
     )
     .await?;
-    reconciliation_graph::verify_expected_graph(&mut reader, &authenticated.plan, None).await?;
+    reconciliation_graph::verify_expected_graph(
+        &mut reader,
+        &authenticated.plan,
+        expected_graph.as_ref(),
+    )
+    .await?;
     let graph_digest = reconciliation_graph::graph_digest(&mut reader, &authenticated.plan).await?;
     reader.close().await.map_err(|_| Failure::Migration)?;
     let completion = Completion {
