@@ -64,7 +64,8 @@ impl Protocol2Fixture {
         .unwrap();
         let provenance_digest = evidence::hash_file(&fixture.request.release_provenance).unwrap();
         let root_path = records::anchor(&fixture.request.database);
-        let mut root: version2_records::Root = rec::load(&root_path).unwrap();
+        let mut root: version2_records::Root =
+            serde_json::from_slice(&fs::read(&root_path).unwrap()).unwrap();
         root.operation.provenance_digest = provenance_digest.clone();
         fs::write(&root_path, serde_json::to_vec(&root).unwrap()).unwrap();
         fs::set_permissions(&root_path, fs::Permissions::from_mode(0o600)).unwrap();
