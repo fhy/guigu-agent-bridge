@@ -21,6 +21,55 @@ type AuditGraphRow = (
     String,
 );
 
+type ControlRow = (i64, String, String, Option<String>);
+
+fn expected_compatibility(original: &str, operation: &str) -> Result<serde_json::Value, Failure> {
+    let mut value: serde_json::Value =
+        serde_json::from_str(original).map_err(|_| Failure::ManualRequired)?;
+    let fields = value.as_array_mut().ok_or(Failure::ManualRequired)?;
+    if fields.len() != 15 {
+        return Err(Failure::ManualRequired);
+    }
+    let was_held = fields[1] == "held";
+    fields[1] = serde_json::Value::String("native".into());
+    fields[12] = serde_json::Value::String(operation.into());
+    fields[13] = serde_json::Value::String(
+        if was_held {
+            "administrative-transition"
+        } else {
+            "pristine-native"
+        }
+        .into(),
+    );
+    Ok(value)
+}
+
+fn verify_compatibility(actual: &str, original: &str, operation: &str) -> Result<(), Failure> {
+    let actual: serde_json::Value =
+        serde_json::from_str(actual).map_err(|_| Failure::ManualRequired)?;
+    if actual != expected_compatibility(original, operation)? {
+        return Err(Failure::ManualRequired);
+    }
+    Ok(())
+}
+
+fn verify_controls(actual: &[ControlRow], operation: &str) -> Result<(), Failure> {
+    if actual != [(1, operation.into(), "baseline".into(), None)] {
+        return Err(Failure::ManualRequired);
+    }
+    Ok(())
+}
+
+fn verify_inventory(
+    actual: &BTreeSet<(String, String)>,
+    expected: &BTreeSet<(String, String)>,
+) -> Result<(), Failure> {
+    if actual != expected {
+        return Err(Failure::ManualRequired);
+    }
+    Ok(())
+}
+
 pub(super) async fn validate_plan(
     connection: &mut SqliteConnection,
     plan: &Plan,
@@ -392,46 +441,20 @@ pub(super) async fn verify_expected_graph(
     .await
     .map_err(|_| Failure::ManualRequired)?;
     let original = original.ok_or(Failure::ManualRequired)?;
-    let mut expected_compatibility: serde_json::Value =
-        serde_json::from_str(&original).map_err(|_| Failure::ManualRequired)?;
-    let fields = expected_compatibility
-        .as_array_mut()
-        .ok_or(Failure::ManualRequired)?;
-    if fields.len() != 15 {
-        return Err(Failure::ManualRequired);
-    }
-    let was_held = fields[1] == "held";
-    fields[1] = serde_json::Value::String("native".into());
-    fields[12] = serde_json::Value::String(plan.native_operation_id.clone());
-    fields[13] = serde_json::Value::String(
-        if was_held {
-            "administrative-transition"
-        } else {
-            "pristine-native"
-        }
-        .into(),
-    );
     let actual_compatibility: String = sqlx::query_scalar(
         "SELECT json_array(singleton,decision,source_schema_version,source_state_digest,legacy_operation_id,legacy_phase,legacy_baseline,legacy_baseline_digest,legacy_watermark,legacy_revision,legacy_binding,legacy_archive_digest,native_operation_id,reason_code,created_at) FROM matrix_recovery_compatibility WHERE singleton=1",
     )
     .fetch_one(&mut *connection)
     .await
     .map_err(|_| Failure::ManualRequired)?;
-    if serde_json::from_str::<serde_json::Value>(&actual_compatibility)
-        .map_err(|_| Failure::ManualRequired)?
-        != serde_json::Value::Array(fields.clone())
-    {
-        return Err(Failure::ManualRequired);
-    }
-    let controls: Vec<(i64, String, String, Option<String>)> = sqlx::query_as(
+    verify_compatibility(&actual_compatibility, &original, &plan.native_operation_id)?;
+    let controls: Vec<ControlRow> = sqlx::query_as(
         "SELECT control_id,cutover_operation_id,phase,watermark FROM matrix_recovery_control ORDER BY control_id",
     )
     .fetch_all(&mut *connection)
     .await
     .map_err(|_| Failure::ManualRequired)?;
-    if controls != vec![(1, plan.native_operation_id.clone(), "baseline".into(), None)] {
-        return Err(Failure::ManualRequired);
-    }
+    verify_controls(&controls, &plan.native_operation_id)?;
     let mut allowed = plan
         .classifications
         .iter()
@@ -485,9 +508,7 @@ pub(super) async fn verify_expected_graph(
         .into_iter()
         .map(|identity| (identity.table, identity.key))
         .collect::<BTreeSet<_>>();
-    if actual != allowed {
-        return Err(Failure::ManualRequired);
-    }
+    verify_inventory(&actual, &allowed)?;
     for classification in plan
         .classifications
         .iter()
@@ -583,4 +604,66 @@ pub(super) async fn verify_actions(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn original(decision: &str) -> String {
+        serde_json::json!([
+            1,
+            decision,
+            24,
+            "source",
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            null,
+            "pristine-native",
+            "created"
+        ])
+        .to_string()
+    }
+
+    #[test]
+    fn rejects_wrong_native_compatibility_value() {
+        let expected = expected_compatibility(&original("native"), "operation").unwrap();
+        let mut wrong = expected.clone();
+        wrong[1] = serde_json::Value::String("held".into());
+        assert!(matches!(
+            verify_compatibility(&wrong.to_string(), &original("native"), "operation"),
+            Err(Failure::ManualRequired)
+        ));
+    }
+
+    #[test]
+    fn rejects_extra_native_control_row() {
+        let controls = vec![
+            (1, "operation".into(), "baseline".into(), None),
+            (2, "other".into(), "baseline".into(), None),
+        ];
+        assert!(matches!(
+            verify_controls(&controls, "operation"),
+            Err(Failure::ManualRequired)
+        ));
+    }
+
+    #[test]
+    fn rejects_unrelated_inventory_row() {
+        let expected = BTreeSet::from([(String::from("agents"), String::from("agent-1"))]);
+        let actual = BTreeSet::from([
+            (String::from("agents"), String::from("agent-1")),
+            (String::from("agents"), String::from("unrelated")),
+        ]);
+        assert!(matches!(
+            verify_inventory(&actual, &expected),
+            Err(Failure::ManualRequired)
+        ));
+    }
 }
