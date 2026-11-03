@@ -327,12 +327,6 @@ pub(super) async fn graph_digest(
             row
         ]));
     }
-    let marker: Option<(String, String, String)> = sqlx::query_as(
-        "SELECT state,committed_graph_digest,commit_digest FROM r093_reconciliation_marker WHERE singleton=1",
-    )
-    .fetch_optional(&mut *connection)
-    .await
-    .map_err(|_| Failure::ManualRequired)?;
     let audit_count: i64 = sqlx::query_scalar("SELECT count(*) FROM r093_reconciliation_audit")
         .fetch_one(&mut *connection)
         .await
@@ -349,7 +343,6 @@ pub(super) async fn graph_digest(
     .fetch_all(&mut *connection)
     .await
     .map_err(|_| Failure::ManualRequired)?;
-    rows.push(serde_json::json!(["__marker__", "singleton", marker]));
     rows.push(serde_json::json!(["__audit__", "count", audit_count]));
     rows.push(serde_json::json!(["__anchors__", "count", anchor_count]));
     rows.push(serde_json::json!(["__all_recovery_rows__", all_rows]));
