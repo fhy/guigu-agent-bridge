@@ -532,13 +532,15 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
     let changed = sqlx::query(
         "UPDATE execution_leases SET state='released',heartbeat_at=?
          WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=?
-           AND state='recovery_needed'",
+           AND state='recovery_needed'
+           AND EXISTS (SELECT 1 FROM tasks WHERE task_id=execution_leases.task_id AND version=?)",
     )
     .bind(&plan.abandonment_at)
     .bind(&resource)
     .bind(&task)
     .bind(&owner)
     .bind(fence)
+    .bind(task_version)
     .execute(&mut *connection)
     .await
     .map_err(|_| Failure::ManualRequired)?;
@@ -548,7 +550,9 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
     let changed = sqlx::query(
         "UPDATE task_continuations
          SET state='terminal',revision=revision+1,heartbeat_at=?
-         WHERE task_id=? AND resource_key=? AND delivery_id=? AND lease_fence=? AND runtime_generation=? AND state='recovery_needed' AND revision=?",
+         WHERE task_id=? AND resource_key=? AND delivery_id=? AND lease_fence=? AND runtime_generation=?
+           AND state='recovery_needed' AND revision=?
+           AND EXISTS (SELECT 1 FROM task_admissions WHERE task_id=task_continuations.task_id AND revision=?)",
     )
     .bind(&plan.abandonment_at)
     .bind(&task)
@@ -557,6 +561,7 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
     .bind(fence)
     .bind(&generation)
     .bind(continuation_revision)
+    .bind(admission_revision)
     .execute(&mut *connection)
     .await
     .map_err(|_| Failure::ManualRequired)?;
@@ -566,11 +571,12 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
     let changed = sqlx::query(
         "UPDATE delivery_dispositions
          SET state='terminal',reason_code='historical-unknown-abandoned'
-         WHERE task_id=? AND delivery_id=? AND attempt=? AND state='outcome_unknown'",
+         WHERE task_id=? AND delivery_id=? AND attempt=? AND session_id=? AND state='outcome_unknown'",
     )
     .bind(&task)
     .bind(&delivery)
     .bind(attempt)
+    .bind(&session_id)
     .execute(&mut *connection)
     .await
     .map_err(|_| Failure::ManualRequired)?;
