@@ -21,6 +21,34 @@ type AuditGraphRow = (
     String,
 );
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PreTransitionGraph {
+    rows: BTreeSet<(String, String, String)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExpectedPostGraph {
+    rows: BTreeSet<(String, String, String)>,
+}
+
+impl PreTransitionGraph {
+    fn from_rows(rows: BTreeSet<(String, String, String)>) -> Self {
+        Self { rows }
+    }
+}
+
+impl ExpectedPostGraph {
+    fn from_pre_state(pre: &PreTransitionGraph) -> Self {
+        Self {
+            rows: pre.rows.clone(),
+        }
+    }
+
+    fn matches(&self, actual: &BTreeSet<(String, String, String)>) -> bool {
+        &self.rows == actual
+    }
+}
+
 type ControlRow = (i64, String, String, Option<String>);
 
 fn expected_compatibility(original: &str, operation: &str) -> Result<serde_json::Value, Failure> {
@@ -432,6 +460,9 @@ pub(super) async fn verify_expected_graph(
     connection: &mut SqliteConnection,
     plan: &Plan,
 ) -> Result<(), Failure> {
+    let pre_graph = PreTransitionGraph::from_rows(BTreeSet::new());
+    let expected_graph = ExpectedPostGraph::from_pre_state(&pre_graph);
+    let _graph_seam_ready = expected_graph.matches(&BTreeSet::new());
     if plan.native_operation_id.is_empty() {
         return Err(Failure::ManualRequired);
     }

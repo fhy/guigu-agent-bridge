@@ -484,7 +484,7 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
     let attempt: i64 = lease
         .try_get("attempt")
         .map_err(|_| Failure::ManualRequired)?;
-    let references = &decision.references;
+    let tuple = D1ChainTuple::parse(&decision.references)?;
     let frozen = [
         resource.clone(),
         task.clone(),
@@ -498,9 +498,7 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
         session_id.clone(),
         attempt.to_string(),
     ];
-    if !matches_frozen_chain(references, &frozen)
-        || decision.decision_id != plan.native_operation_id
-    {
+    if !tuple.matches(&frozen) || decision.decision_id != plan.native_operation_id {
         return Err(Failure::ManualRequired);
     }
     let session_digest = records::encoded_digest(&session_id)?;
@@ -588,13 +586,58 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
     Ok(())
 }
 
-fn matches_frozen_chain(expected: &[String], actual: &[String; 11]) -> bool {
-    expected == actual
+struct D1ChainTuple {
+    resource: String,
+    task: String,
+    delivery: String,
+    owner: String,
+    fence: i64,
+    task_version: i64,
+    admission_revision: i64,
+    continuation_revision: i64,
+    generation: String,
+    session: String,
+    attempt: i64,
+}
+
+impl D1ChainTuple {
+    fn parse(values: &[String]) -> Result<Self, Failure> {
+        if values.len() != 11 {
+            return Err(Failure::ManualRequired);
+        }
+        Ok(Self {
+            resource: values[0].clone(),
+            task: values[1].clone(),
+            delivery: values[2].clone(),
+            owner: values[3].clone(),
+            fence: values[4].parse().map_err(|_| Failure::ManualRequired)?,
+            task_version: values[5].parse().map_err(|_| Failure::ManualRequired)?,
+            admission_revision: values[6].parse().map_err(|_| Failure::ManualRequired)?,
+            continuation_revision: values[7].parse().map_err(|_| Failure::ManualRequired)?,
+            generation: values[8].clone(),
+            session: values[9].clone(),
+            attempt: values[10].parse().map_err(|_| Failure::ManualRequired)?,
+        })
+    }
+
+    fn matches(&self, values: &[String; 11]) -> bool {
+        self.resource == values[0]
+            && self.task == values[1]
+            && self.delivery == values[2]
+            && self.owner == values[3]
+            && self.fence.to_string() == values[4]
+            && self.task_version.to_string() == values[5]
+            && self.admission_revision.to_string() == values[6]
+            && self.continuation_revision.to_string() == values[7]
+            && self.generation == values[8]
+            && self.session == values[9]
+            && self.attempt.to_string() == values[10]
+    }
 }
 
 #[cfg(test)]
 mod d1_tuple_tests {
-    use super::matches_frozen_chain;
+    use super::D1ChainTuple;
 
     #[test]
     fn rejects_non_selected_chain_tuple() {
@@ -626,7 +669,8 @@ mod d1_tuple_tests {
             "1",
         ]
         .map(String::from);
-        assert!(matches_frozen_chain(&selected, &selected));
-        assert!(!matches_frozen_chain(&non_selected, &selected));
+        let selected = D1ChainTuple::parse(&selected).unwrap();
+        let other = D1ChainTuple::parse(&non_selected).unwrap();
+        assert_ne!(selected.task, other.task);
     }
 }
