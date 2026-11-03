@@ -273,11 +273,11 @@ pub(super) fn protected_bytes(path: &Path) -> Result<Vec<u8>, Failure> {
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
         .map_err(|_| Failure::Preflight)?;
-    let after = fs::symlink_metadata(path).map_err(|_| Failure::ManualRequired)?;
-    if after.dev() != metadata.dev()
-        || after.ino() != metadata.ino()
-        || after.len() != metadata.len()
-    {
+    use std::io::{Seek, SeekFrom};
+    file.seek(SeekFrom::Start(0)).map_err(|_| Failure::Preflight)?;
+    let mut reread = Vec::new();
+    file.read_to_end(&mut reread).map_err(|_| Failure::Preflight)?;
+    if reread != bytes {
         return Err(Failure::ManualRequired);
     }
     Ok(bytes)

@@ -306,7 +306,7 @@ pub(super) async fn graph_digest(
     connection: &mut SqliteConnection,
     plan: &Plan,
 ) -> Result<String, Failure> {
-    let mut rows = Vec::new();
+    let mut rows: Vec<serde_json::Value> = Vec::new();
     for identity in plan
         .classifications
         .iter()
@@ -321,9 +321,26 @@ pub(super) async fn graph_digest(
         )
         .await
         .map_err(|_| Failure::ManualRequired)?;
-        rows.push((&identity.table_name, &identity.canonical_pk, row));
+        rows.push(serde_json::json!([&identity.table_name, &identity.canonical_pk, row]));
     }
-    rows.sort_by(|left, right| (left.0, left.1).cmp(&(right.0, right.1)));
+    let marker: Option<(String, String, String)> = sqlx::query_as(
+        "SELECT state,committed_graph_digest,commit_digest FROM r093_reconciliation_marker WHERE singleton=1",
+    )
+    .fetch_optional(&mut *connection)
+    .await
+    .map_err(|_| Failure::ManualRequired)?;
+    let audit_count: i64 = sqlx::query_scalar("SELECT count(*) FROM r093_reconciliation_audit")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|_| Failure::ManualRequired)?;
+    let anchor_count: i64 = sqlx::query_scalar("SELECT count(*) FROM offline_recovery_metadata_anchors")
+        .fetch_one(&mut *connection)
+        .await
+        .map_err(|_| Failure::ManualRequired)?;
+    rows.push(serde_json::json!(["__marker__", "singleton", marker]));
+    rows.push(serde_json::json!(["__audit__", "count", audit_count]));
+    rows.push(serde_json::json!(["__anchors__", "count", anchor_count]));
+    rows.sort_by_key(|row| row[0].as_str().unwrap_or_default().to_owned());
     let bytes = serde_json::to_vec(&rows).map_err(|_| Failure::Preflight)?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
 }
