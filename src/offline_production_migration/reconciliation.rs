@@ -432,6 +432,7 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
     if decision.evidence_digest.is_empty() {
         return Err(Failure::ManualRequired);
     }
+    let tuple = D1ChainTuple::parse(&decision.references)?;
     let lease = sqlx::query(
         "SELECT l.resource_key,l.task_id,l.owner_token,l.fence,
                 t.version AS task_version,a.revision AS admission_revision,
@@ -442,7 +443,10 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
          JOIN task_admissions a ON a.task_id=l.task_id
          JOIN task_continuations c ON c.task_id=l.task_id
          JOIN delivery_dispositions d ON d.delivery_id=c.delivery_id AND d.task_id=c.task_id
-         WHERE l.state='recovery_needed' AND a.state='recovery_needed'
+         WHERE l.resource_key=? AND l.task_id=? AND l.owner_token=? AND l.fence=?
+           AND t.version=? AND a.revision=? AND c.delivery_id=? AND c.revision=?
+           AND c.lease_fence=? AND c.runtime_generation=? AND d.session_id=? AND d.attempt=?
+           AND l.state='recovery_needed' AND a.state='recovery_needed'
            AND c.state='recovery_needed' AND d.state='outcome_unknown'
            AND c.resource_key=l.resource_key AND c.lease_fence=l.fence
            AND d.session_id IS NOT NULL
@@ -450,6 +454,18 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
                            WHERE h.task_id=l.task_id AND h.delivery_id=c.delivery_id
                              AND h.resource_key=l.resource_key)",
     )
+    .bind(&tuple.resource)
+    .bind(&tuple.task)
+    .bind(&tuple.owner)
+    .bind(tuple.fence)
+    .bind(tuple.task_version)
+    .bind(tuple.admission_revision)
+    .bind(&tuple.delivery)
+    .bind(tuple.continuation_revision)
+    .bind(tuple.fence)
+    .bind(&tuple.generation)
+    .bind(&tuple.session)
+    .bind(tuple.attempt)
     .fetch_one(&mut *connection)
     .await
     .map_err(|_| Failure::ManualRequired)?;
@@ -486,7 +502,6 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
     let attempt: i64 = lease
         .try_get("attempt")
         .map_err(|_| Failure::ManualRequired)?;
-    let tuple = D1ChainTuple::parse(&decision.references)?;
     let frozen = [
         resource.clone(),
         task.clone(),
