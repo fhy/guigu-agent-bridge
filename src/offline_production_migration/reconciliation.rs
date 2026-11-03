@@ -498,7 +498,9 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
         session_id.clone(),
         attempt.to_string(),
     ];
-    if references != &frozen || decision.decision_id != plan.native_operation_id {
+    if !matches_frozen_chain(references, &frozen)
+        || decision.decision_id != plan.native_operation_id
+    {
         return Err(Failure::ManualRequired);
     }
     let session_digest = records::encoded_digest(&session_id)?;
@@ -584,4 +586,47 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
         return Err(Failure::ManualRequired);
     }
     Ok(())
+}
+
+fn matches_frozen_chain(expected: &[String], actual: &[String; 11]) -> bool {
+    expected == actual
+}
+
+#[cfg(test)]
+mod d1_tuple_tests {
+    use super::matches_frozen_chain;
+
+    #[test]
+    fn rejects_non_selected_chain_tuple() {
+        let selected = [
+            "resource-a",
+            "task-a",
+            "delivery-a",
+            "owner-a",
+            "7",
+            "11",
+            "13",
+            "17",
+            "generation-a",
+            "session-a",
+            "2",
+        ]
+        .map(String::from);
+        let non_selected = [
+            "resource-b",
+            "task-b",
+            "delivery-b",
+            "owner-b",
+            "8",
+            "12",
+            "14",
+            "18",
+            "generation-b",
+            "session-b",
+            "1",
+        ]
+        .map(String::from);
+        assert!(matches_frozen_chain(&selected, &selected));
+        assert!(!matches_frozen_chain(&non_selected, &selected));
+    }
 }
