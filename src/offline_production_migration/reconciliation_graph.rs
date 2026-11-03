@@ -358,14 +358,18 @@ pub(super) async fn graph_digest(
     )
     .fetch_all(&mut *connection)
     .await
-    .map_err(|_| Failure::ManualRequired)?;
+    .map_err(|_| Failure::ManualRequired)?
+    .into_iter()
+    .collect();
     let receipt_rows: Vec<(String, String, String, String, String)> = sqlx::query_as(
         "SELECT table_name,canonical_pk,receipt_digest,runtime_owner,task_id
          FROM offline_recovery_workspace_deletions ORDER BY table_name,canonical_pk",
     )
     .fetch_all(&mut *connection)
     .await
-    .map_err(|_| Failure::ManualRequired)?;
+    .map_err(|_| Failure::ManualRequired)?
+    .into_iter()
+    .collect();
     rows.push(serde_json::json!(["__audit__", audit_rows]));
     rows.push(serde_json::json!(["__anchors__", anchor_rows]));
     rows.push(serde_json::json!(["__receipts__", receipt_rows]));
@@ -430,7 +434,7 @@ pub(super) async fn verify_expected_graph(
         .into_iter()
         .map(|identity| (identity.table, identity.key))
         .collect::<BTreeSet<_>>();
-    if !plan.inserted_classifications.is_empty() && actual != allowed {
+    if actual != allowed && !plan.inserted_classifications.is_empty() {
         return Err(Failure::ManualRequired);
     }
     for classification in plan
@@ -459,10 +463,38 @@ pub(super) async fn verify_expected_graph(
             let parent_snapshot = inventory::snapshot(connection, &parent.identity)
                 .await
                 .map_err(|_| Failure::ManualRequired)?;
-            if parent_snapshot.revision.is_empty() || parent_snapshot.digest.is_empty() {
+            if parent_snapshot.revision != parent.revision
+                || parent_snapshot.digest != parent.digest
+                || parent.role != ParentRole::Effectful
+            {
                 return Err(Failure::ManualRequired);
             }
         }
+    }
+    let expected_receipts = plan
+        .workspaces
+        .iter()
+        .map(|workspace| {
+            (
+                "workspace_claims".to_owned(),
+                workspace.canonical_pk.clone(),
+                workspace.receipt_digest.clone(),
+                workspace.runtime_owner.clone(),
+                workspace.task_id.clone(),
+            )
+        })
+        .collect::<BTreeSet<_>>();
+    let actual_receipts: BTreeSet<(String, String, String, String, String)> = sqlx::query_as(
+        "SELECT table_name,canonical_pk,receipt_digest,runtime_owner,task_id
+         FROM offline_recovery_workspace_deletions ORDER BY table_name,canonical_pk",
+    )
+    .fetch_all(&mut *connection)
+    .await
+    .map_err(|_| Failure::ManualRequired)?
+    .into_iter()
+    .collect();
+    if actual_receipts != expected_receipts {
+        return Err(Failure::ManualRequired);
     }
     Ok(())
 }
