@@ -64,6 +64,30 @@ impl PreTransitionGraph {
                 serde_json::to_string(&row).map_err(|_| Failure::Preflight)?,
             ));
         }
+        let anchors: Vec<(String, String, String, String, String, String)> = sqlx::query_as(
+            "SELECT table_name,canonical_pk,role,db_generation,root_digest,plan_digest
+             FROM offline_recovery_metadata_anchors ORDER BY table_name,canonical_pk",
+        )
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|_| Failure::ManualRequired)?;
+        rows.insert((
+            "anchors".into(),
+            "set".into(),
+            serde_json::to_string(&anchors).map_err(|_| Failure::Preflight)?,
+        ));
+        let receipts: Vec<(String, String, String, String, String)> = sqlx::query_as(
+            "SELECT table_name,canonical_pk,receipt_digest,runtime_owner,task_id
+             FROM offline_recovery_workspace_deletions ORDER BY table_name,canonical_pk",
+        )
+        .fetch_all(&mut *connection)
+        .await
+        .map_err(|_| Failure::ManualRequired)?;
+        rows.insert((
+            "receipts".into(),
+            "set".into(),
+            serde_json::to_string(&receipts).map_err(|_| Failure::Preflight)?,
+        ));
         Ok(Self { rows })
     }
 }
@@ -158,6 +182,43 @@ impl ExpectedPostGraph {
                 .map_err(|_| Failure::Preflight)?,
             ));
         }
+        let anchors = plan
+            .anchors
+            .iter()
+            .map(|anchor| {
+                (
+                    &anchor.table_name,
+                    &anchor.canonical_pk,
+                    "metadata_anchor",
+                    &plan.original_binding.db_generation,
+                    &plan.original_binding.root_digest,
+                    &plan.plan_digest,
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.insert((
+            "anchors".into(),
+            "set".into(),
+            serde_json::to_string(&anchors).map_err(|_| Failure::Preflight)?,
+        ));
+        let receipts = plan
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                (
+                    "workspace_claims".to_owned(),
+                    workspace.canonical_pk.clone(),
+                    workspace.receipt_digest.clone(),
+                    workspace.runtime_owner.clone(),
+                    workspace.task_id.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.insert((
+            "receipts".into(),
+            "set".into(),
+            serde_json::to_string(&receipts).map_err(|_| Failure::Preflight)?,
+        ));
         Ok(Self { rows })
     }
 
