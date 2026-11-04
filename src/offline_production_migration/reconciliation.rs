@@ -2,6 +2,17 @@ use std::path::{Path, PathBuf};
 
 use sqlx::{Connection, Row, SqliteConnection};
 
+#[path = "reconciliation_chain_guard.rs"]
+mod chain_guard;
+
+#[cfg(test)]
+#[path = "reconciliation_terminal_tests.rs"]
+mod terminal_tests;
+
+#[cfg(test)]
+#[path = "reconciliation_terminal_negative_tests.rs"]
+mod terminal_negative_tests;
+
 use super::{
     Failure, RuntimeLock, TransitionRequest,
     arguments::Mode,
@@ -528,6 +539,7 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
         return Err(Failure::ManualRequired);
     }
     let tuple = D1ChainTuple::parse(&decision.references)?;
+    let guard = chain_guard::Guard::capture(connection, plan, &tuple).await?;
     let lease = sqlx::query(
         "SELECT l.resource_key,l.task_id,l.owner_token,l.fence,
                 t.version AS task_version,a.revision AS admission_revision,
@@ -536,15 +548,24 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
          FROM execution_leases l
          JOIN tasks t ON t.task_id=l.task_id
          JOIN task_admissions a ON a.task_id=l.task_id
+         JOIN runtime_instances r ON r.instance_token=a.runtime_instance
          JOIN task_continuations c ON c.task_id=l.task_id
          JOIN delivery_dispositions d ON d.delivery_id=c.delivery_id AND d.task_id=c.task_id
+         JOIN deliveries v ON v.delivery_id=d.delivery_id AND v.task_id=d.task_id AND v.attempt=d.attempt
          WHERE l.resource_key=? AND l.task_id=? AND l.owner_token=? AND l.fence=?
            AND t.version=? AND a.revision=? AND c.delivery_id=? AND c.revision=?
            AND c.lease_fence=? AND c.runtime_generation=? AND d.session_id=? AND d.attempt=?
-           AND l.state='recovery_needed' AND a.state='recovery_needed'
+           AND l.state='recovery_needed' AND a.state=?
+           AND r.state='stopped' AND length(trim(r.process_fingerprint))>0
            AND c.state='recovery_needed' AND d.state='outcome_unknown'
            AND c.resource_key=l.resource_key AND c.lease_fence=l.fence
            AND d.session_id IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM execution_leases other
+                           WHERE other.task_id=l.task_id AND other.resource_key<>l.resource_key
+                             AND other.state='recovery_needed')
+           AND NOT EXISTS (SELECT 1 FROM delivery_dispositions other
+                           WHERE other.task_id=d.task_id AND other.delivery_id<>d.delivery_id
+                             AND other.state='outcome_unknown')
            AND NOT EXISTS (SELECT 1 FROM historical_unknown_abandonments h
                            WHERE h.task_id=l.task_id AND h.delivery_id=c.delivery_id
                              AND h.resource_key=l.resource_key)",
@@ -561,6 +582,7 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
     .bind(&tuple.generation)
     .bind(&tuple.session)
     .bind(tuple.attempt)
+    .bind(guard.admission_state)
     .fetch_one(&mut *connection)
     .await
     .map_err(|_| Failure::ManualRequired)?;
@@ -644,11 +666,14 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
     if audit.rows_affected() != 1 {
         return Err(Failure::ManualRequired);
     }
+    guard.verify(connection, 0).await?;
+    guard.verify_audit(connection).await?;
     let changed = sqlx::query(
         "UPDATE execution_leases SET state='released',heartbeat_at=?
          WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=?
            AND state='recovery_needed'
-           AND EXISTS (SELECT 1 FROM tasks WHERE task_id=execution_leases.task_id AND version=?)",
+           AND EXISTS (SELECT 1 FROM tasks WHERE task_id=execution_leases.task_id AND version=?)
+           AND EXISTS (SELECT 1 FROM task_admissions WHERE task_id=execution_leases.task_id AND revision=? AND state=?)",
     )
     .bind(&plan.abandonment_at)
     .bind(&resource)
@@ -656,18 +681,22 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
     .bind(&owner)
     .bind(fence)
     .bind(task_version)
+    .bind(admission_revision)
+    .bind(guard.admission_state)
     .execute(&mut *connection)
     .await
     .map_err(|_| Failure::ManualRequired)?;
     if changed.rows_affected() != 1 {
         return Err(Failure::ManualRequired);
     }
+    guard.verify(connection, 1).await?;
     let changed = sqlx::query(
         "UPDATE task_continuations
          SET state='terminal',revision=revision+1,heartbeat_at=?
          WHERE task_id=? AND resource_key=? AND delivery_id=? AND lease_fence=? AND runtime_generation=?
            AND state='recovery_needed' AND revision=?
-           AND EXISTS (SELECT 1 FROM task_admissions WHERE task_id=task_continuations.task_id AND revision=?)",
+           AND EXISTS (SELECT 1 FROM task_admissions WHERE task_id=task_continuations.task_id AND revision=? AND state=?)
+           AND EXISTS (SELECT 1 FROM tasks WHERE task_id=task_continuations.task_id AND version=?)",
     )
     .bind(&plan.abandonment_at)
     .bind(&task)
@@ -677,27 +706,36 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
     .bind(&generation)
     .bind(continuation_revision)
     .bind(admission_revision)
+    .bind(guard.admission_state)
+    .bind(task_version)
     .execute(&mut *connection)
     .await
     .map_err(|_| Failure::ManualRequired)?;
     if changed.rows_affected() != 1 {
         return Err(Failure::ManualRequired);
     }
+    guard.verify(connection, 2).await?;
     let changed = sqlx::query(
         "UPDATE delivery_dispositions
          SET state='terminal',reason_code='historical-unknown-abandoned'
-         WHERE task_id=? AND delivery_id=? AND attempt=? AND session_id=? AND state='outcome_unknown'",
+         WHERE task_id=? AND delivery_id=? AND attempt=? AND session_id=? AND state='outcome_unknown'
+           AND EXISTS (SELECT 1 FROM task_admissions WHERE task_id=delivery_dispositions.task_id AND revision=? AND state=?)
+           AND EXISTS (SELECT 1 FROM tasks WHERE task_id=delivery_dispositions.task_id AND version=?)",
     )
     .bind(&task)
     .bind(&delivery)
     .bind(attempt)
     .bind(&session_id)
+    .bind(admission_revision)
+    .bind(guard.admission_state)
+    .bind(task_version)
     .execute(&mut *connection)
     .await
     .map_err(|_| Failure::ManualRequired)?;
     if changed.rows_affected() != 1 {
         return Err(Failure::ManualRequired);
     }
+    guard.verify(connection, 3).await?;
     Ok(())
 }
 
@@ -810,9 +848,8 @@ impl D1ChainTuple {
 mod d1_tuple_tests {
     use super::{D1ChainTuple, apply_chain};
     use crate::offline_production_migration::reconciliation_records::{Binding, Decision, Plan};
-    use sqlx::Executor;
 
-    fn fixture_plan() -> Plan {
+    pub(super) fn fixture_plan() -> Plan {
         Plan {
             protocol: 2,
             plan_digest: "plan".into(),
@@ -903,18 +940,13 @@ mod d1_tuple_tests {
             .await
             .unwrap();
         crate::storage::migrate(&pool).await.unwrap();
-        for sql in [
-            "INSERT INTO agents VALUES('agent-a','a','acp',1,NULL,'[]'),('agent-b','b','acp',1,NULL,'[]')",
-            "INSERT INTO conversations VALUES('conversation',NULL,NULL,NULL,'[]')",
-            "INSERT INTO tasks VALUES('task-a','task-a',NULL,'agent-a','agent-b','conversation',NULL,'fixture',5,0,0,NULL,11),('task-b','task-b',NULL,'agent-a','agent-b','conversation',NULL,'fixture',5,0,0,NULL,12)",
-            "INSERT INTO deliveries VALUES('delivery-a','task-a',1,'agent-b','t','t'),('delivery-b','task-b',1,'agent-b','t','t')",
-            "INSERT INTO task_admissions(task_id,state,revision,created_at,updated_at) VALUES('task-a','recovery_needed',13,'t','t'),('task-b','recovery_needed',14,'t','t')",
-            "INSERT INTO execution_leases VALUES('resource-a','task-a','owner-a',7,'recovery_needed','t','t','later'),('resource-b','task-b','owner-b',8,'recovery_needed','t','t','later')",
-            "INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes,runtime_generation,runtime_generation_version) VALUES('task-a','resource-a','delivery-a',7,17,'recovery_needed',1,0,0,'','t','t','t',0,'generation-a',1),('task-b','resource-b','delivery-b',8,18,'recovery_needed',1,0,0,'','t','t','t',0,'generation-b',1)",
-            "INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state,session_id) VALUES('delivery-a','task-a',2,'outcome_unknown','session-a'),('delivery-b','task-b',1,'outcome_unknown','session-b')",
-        ] {
-            pool.execute(sql).await.unwrap();
-        }
+        let mut seed_connection = pool.acquire().await.unwrap();
+        super::super::reconciliation_d1_fixture::seed(
+            &mut seed_connection,
+            ["recovery_needed", "recovery_needed"],
+        )
+        .await;
+        drop(seed_connection);
         let snapshot_pool = pool.clone();
         let snapshot = move |task: &str| {
             let task = task.to_owned();
@@ -944,6 +976,7 @@ mod d1_tuple_tests {
         .map(String::from)
         .collect();
         let mut plan = fixture_plan();
+        super::super::reconciliation_d1_fixture::populate(&mut connection, &mut plan, "a").await;
         plan.d1_unknown_chain = Some(Decision {
             decision_id: "native".into(),
             evidence_digest: "evidence".into(),

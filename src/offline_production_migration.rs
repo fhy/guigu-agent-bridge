@@ -17,6 +17,8 @@ mod identity_records;
 mod launcher;
 mod reconciliation;
 #[cfg(test)]
+mod reconciliation_d1_fixture;
+#[cfg(test)]
 mod reconciliation_e2e_tests;
 mod reconciliation_files;
 mod reconciliation_graph;

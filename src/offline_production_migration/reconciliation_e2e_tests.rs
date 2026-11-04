@@ -24,6 +24,9 @@ const CHILD_PHASE: &str = "R094_RECON_PHASE";
 #[path = "reconciliation_owner_tests.rs"]
 mod owner_tests;
 
+#[path = "reconciliation_terminal_e2e_tests.rs"]
+mod terminal_tests;
+
 struct Protocol2Fixture {
     fixture: Fixture,
     request: TransitionRequest,
@@ -36,6 +39,14 @@ impl Protocol2Fixture {
     }
 
     async fn with_owners(owners: bool) -> Self {
+        Self::build(owners, false).await
+    }
+
+    async fn with_chain() -> Self {
+        Self::build(false, true).await
+    }
+
+    async fn build(owners: bool, chain: bool) -> Self {
         let mut fixture = Fixture::new().await;
         fixture.request.target_schema = 25;
         let mut provenance: serde_json::Value =
@@ -96,15 +107,22 @@ impl Protocol2Fixture {
         if owners {
             owner_tests::seed(&mut connection).await;
         }
-        sqlx::query(
+        if chain {
+            super::reconciliation_d1_fixture::seed(
+                &mut connection,
+                ["terminal", "recovery_needed"],
+            )
+            .await;
+        } else {
+            sqlx::query(
             "INSERT INTO agents(endpoint_id,agent_id,transport,enabled,address_json,capabilities_json)
              VALUES('fixture-agent','fixture-agent','acp',1,NULL,'[]')",
         )
         .execute(&mut connection)
         .await
         .unwrap();
-        for conversation in ["fixture-conversation-a", "fixture-conversation-b"] {
-            sqlx::query(
+            for conversation in ["fixture-conversation-a", "fixture-conversation-b"] {
+                sqlx::query(
                 "INSERT INTO conversations(conversation_id,transport,external_id,thread_ref,participants_json)
                  VALUES(?,NULL,NULL,NULL,'[]')",
             )
@@ -112,6 +130,7 @@ impl Protocol2Fixture {
             .execute(&mut connection)
             .await
             .unwrap();
+            }
         }
         sqlx::query(
             "UPDATE offline_recovery_binding
@@ -136,7 +155,16 @@ impl Protocol2Fixture {
             crate::storage::recovery_eligibility::inventory::identities(&mut connection)
                 .await
                 .unwrap();
-        assert_eq!(identities.len(), if owners { 255 } else { 3 });
+        assert_eq!(
+            identities.len(),
+            if chain {
+                21
+            } else if owners {
+                255
+            } else {
+                3
+            }
+        );
         let mut classifications = Vec::new();
         let mut anchors = Vec::new();
         let mut actions = Vec::new();
@@ -260,6 +288,11 @@ impl Protocol2Fixture {
             evidence_digest: native.evidence_digest.clone(),
         });
         let inserted_classifications = vec![native];
+        if chain {
+            for action in &mut actions {
+                super::reconciliation_d1_fixture::update(action, "a", "2026-11-03 00:00:00");
+            }
+        }
         let d2_owner = owner_tests::proofs(&mut connection).await;
         connection.close().await.unwrap();
 
@@ -337,7 +370,8 @@ impl Protocol2Fixture {
             inserted_classifications,
             action_digest: records::encoded_digest(&actions).unwrap(),
             actions,
-            d1_unknown_chain: None,
+            d1_unknown_chain: chain
+                .then(|| super::reconciliation_d1_fixture::decision("a", "native-operation")),
             d1_quarantined: None,
             d2_owner,
             anchors,
