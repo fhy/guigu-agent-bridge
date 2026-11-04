@@ -270,7 +270,10 @@ async fn run_locked(
             expected_graph.as_ref(),
         )
         .await?;
-        let graph_digest = reconciliation_graph::graph_digest(&mut tx, &authenticated.plan).await?;
+        let graph_digest = expected_graph
+            .as_ref()
+            .ok_or(Failure::ManualRequired)?
+            .digest()?;
         let commit_digest = records::encoded_digest(&(
             &authenticated.intent,
             &graph_digest,
@@ -309,7 +312,10 @@ async fn run_locked(
         expected_graph.as_ref(),
     )
     .await?;
-    let graph_digest = reconciliation_graph::graph_digest(&mut reader, &authenticated.plan).await?;
+    let graph_digest = match expected_graph.as_ref() {
+        Some(expected) => expected.digest()?,
+        None => reconciliation_graph::graph_digest(&mut reader, &authenticated.plan).await?,
+    };
     reader.close().await.map_err(|_| Failure::Migration)?;
     let completion = Completion {
         protocol: 2,

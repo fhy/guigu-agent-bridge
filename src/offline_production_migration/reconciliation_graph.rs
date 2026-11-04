@@ -164,6 +164,11 @@ impl ExpectedPostGraph {
     pub(super) fn matches(&self, actual: &BTreeSet<(String, String, String)>) -> bool {
         &self.rows == actual
     }
+
+    pub(super) fn digest(&self) -> Result<String, Failure> {
+        let bytes = serde_json::to_vec(&self.rows).map_err(|_| Failure::Preflight)?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
 }
 
 type ControlRow = (i64, String, String, Option<String>);
