@@ -103,6 +103,14 @@ impl PreTransitionGraph {
             "set".into(),
             serde_json::to_string(&parents).map_err(|_| Failure::Preflight)?,
         ));
+        let deletions: Vec<(String, String)> = sqlx::query_as(
+            "SELECT table_name,canonical_pk FROM offline_recovery_workspace_deletions ORDER BY table_name,canonical_pk",
+        ).fetch_all(&mut *connection).await.map_err(|_| Failure::ManualRequired)?;
+        rows.insert((
+            "deletions".into(),
+            "set".into(),
+            serde_json::to_string(&deletions).map_err(|_| Failure::Preflight)?,
+        ));
         Ok(Self { rows })
     }
 }
@@ -279,6 +287,21 @@ impl ExpectedPostGraph {
             "parents".into(),
             "set".into(),
             serde_json::to_string(&parents).map_err(|_| Failure::Preflight)?,
+        ));
+        let deletions = plan
+            .workspaces
+            .iter()
+            .map(|workspace| {
+                (
+                    "workspace_claims".to_owned(),
+                    workspace.canonical_pk.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.insert((
+            "deletions".into(),
+            "set".into(),
+            serde_json::to_string(&deletions).map_err(|_| Failure::Preflight)?,
         ));
         Ok(Self { rows })
     }
