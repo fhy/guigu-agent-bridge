@@ -883,6 +883,31 @@ pub(super) async fn verify_expected_graph(
     Ok(())
 }
 
+pub(super) async fn verify_committed_marker(
+    connection: &mut SqliteConnection,
+    plan: &Plan,
+) -> Result<(), Failure> {
+    let row: (i64, i64, String, String, String, String, String, String, String, String, String, String, String) = sqlx::query_as(
+        "SELECT singleton,protocol,operation_id,root_digest,state,intent_digest,grant_digest,plan_digest,action_digest,archive_digest,schema_digest,identity_digest,commit_digest FROM r093_reconciliation_marker WHERE singleton=1",
+    ).fetch_one(&mut *connection).await.map_err(|_| Failure::ManualRequired)?;
+    if row.0 != 1
+        || row.1 != 2
+        || row.2 != plan.operation_id
+        || row.3 != plan.root_digest
+        || row.4 != "committed"
+        || row.6 != plan.grant_digest
+        || row.7 != plan.plan_digest
+        || row.8 != plan.action_digest
+        || row.9 != plan.archive_digest
+        || row.10 != plan.schema_complete_digest
+        || row.11 != plan.identity_digest
+        || row.12.is_empty()
+    {
+        return Err(Failure::ManualRequired);
+    }
+    Ok(())
+}
+
 pub(super) fn hex_digest(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
 }

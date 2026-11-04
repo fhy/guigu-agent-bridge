@@ -312,6 +312,7 @@ async fn run_locked(
         expected_graph.as_ref(),
     )
     .await?;
+    reconciliation_graph::verify_committed_marker(&mut reader, &authenticated.plan).await?;
     let graph_digest = match expected_graph.as_ref() {
         Some(expected) => expected.digest()?,
         None => reconciliation_graph::graph_digest(&mut reader, &authenticated.plan).await?,
