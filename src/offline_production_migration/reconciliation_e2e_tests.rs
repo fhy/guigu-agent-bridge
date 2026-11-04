@@ -21,6 +21,9 @@ const CHILD_MANIFEST: &str = "R094_RECON_MANIFEST";
 const CHILD_GRANT: &str = "R094_RECON_GRANT";
 const CHILD_PHASE: &str = "R094_RECON_PHASE";
 
+#[path = "reconciliation_owner_tests.rs"]
+mod owner_tests;
+
 struct Protocol2Fixture {
     fixture: Fixture,
     request: TransitionRequest,
@@ -29,6 +32,10 @@ struct Protocol2Fixture {
 
 impl Protocol2Fixture {
     async fn new() -> Self {
+        Self::with_owners(false).await
+    }
+
+    async fn with_owners(owners: bool) -> Self {
         let mut fixture = Fixture::new().await;
         fixture.request.target_schema = 25;
         let mut provenance: serde_json::Value =
@@ -86,6 +93,9 @@ impl Protocol2Fixture {
         let mut connection = verification::open(&fixture.request.database, false)
             .await
             .unwrap();
+        if owners {
+            owner_tests::seed(&mut connection).await;
+        }
         sqlx::query(
             "INSERT INTO agents(endpoint_id,agent_id,transport,enabled,address_json,capabilities_json)
              VALUES('fixture-agent','fixture-agent','acp',1,NULL,'[]')",
@@ -126,7 +136,7 @@ impl Protocol2Fixture {
             crate::storage::recovery_eligibility::inventory::identities(&mut connection)
                 .await
                 .unwrap();
-        assert_eq!(identities.len(), 3);
+        assert_eq!(identities.len(), if owners { 255 } else { 3 });
         let mut classifications = Vec::new();
         let mut anchors = Vec::new();
         let mut actions = Vec::new();
@@ -153,7 +163,7 @@ impl Protocol2Fixture {
                 after: Some(image.clone()),
                 set_columns: Vec::new(),
                 unchanged_columns: image.names.clone(),
-                parents: Vec::new(),
+                parents: owner_tests::action_parents(&mut connection, &snapshot).await,
                 evidence_digest: "2".repeat(64),
             });
             classifications.push(Classification {
@@ -162,7 +172,7 @@ impl Protocol2Fixture {
                 origin_generation: "native-operation".into(),
                 original_revision: snapshot.revision.clone(),
                 original_digest: snapshot.digest.clone(),
-                parent_relations: serde_json::to_value(snapshot.parents).unwrap(),
+                parent_relations: owner_tests::parent_relations(&mut connection, &snapshot).await,
                 disposition: "terminal_evidenced".into(),
                 evidence_digest: "2".repeat(64),
                 context_kind: "admin".into(),
@@ -171,12 +181,14 @@ impl Protocol2Fixture {
                 plan_digest: None,
                 matrix_operation_id: Some("native-operation".into()),
             });
-            anchors.push(Anchor {
-                table_name: identity.table,
-                canonical_pk: identity.key,
-                original_revision: snapshot.revision,
-                original_digest: snapshot.digest,
-            });
+            if matches!(identity.table.as_str(), "agents" | "conversations") {
+                anchors.push(Anchor {
+                    table_name: identity.table,
+                    canonical_pk: identity.key,
+                    original_revision: snapshot.revision,
+                    original_digest: snapshot.digest,
+                });
+            }
         }
         let encoded_text = |value: &str| {
             format!(
@@ -248,6 +260,7 @@ impl Protocol2Fixture {
             evidence_digest: native.evidence_digest.clone(),
         });
         let inserted_classifications = vec![native];
+        let d2_owner = owner_tests::proofs(&mut connection).await;
         connection.close().await.unwrap();
 
         let successor_executable_digest = evidence::hash_file(&fixture.request.executable).unwrap();
@@ -269,10 +282,14 @@ impl Protocol2Fixture {
             allowed_modes: vec!["apply".into(), "resume".into(), "verify".into()],
         };
         let grant_digest = records::encoded_digest(&grant).unwrap();
+        let mut ordered_classifications = classifications
+            .iter()
+            .chain(&inserted_classifications)
+            .collect::<Vec<_>>();
+        ordered_classifications.sort_by_key(|item| (&item.table_name, &item.canonical_pk));
         let classification_digest = records::encoded_digest(
-            &classifications
+            &ordered_classifications
                 .iter()
-                .chain(&inserted_classifications)
                 .map(|classification| {
                     (
                         &classification.table_name,
@@ -322,7 +339,7 @@ impl Protocol2Fixture {
             actions,
             d1_unknown_chain: None,
             d1_quarantined: None,
-            d2_owner: Vec::new(),
+            d2_owner,
             anchors,
             workspaces: Vec::new(),
             native_at: "2026-11-03T00:00:00Z".into(),
@@ -565,13 +582,17 @@ async fn child_entry() {
     let grant = std::env::var_os(CHILD_GRANT).unwrap();
     unsafe {
         std::env::set_var("R094_GRANT_PATH", grant);
-        std::env::set_var("R071_TEST_CRASH", phase);
+        std::env::set_var("R071_TEST_CRASH", &phase);
     }
     let mut request = Fixture::request(Path::new(&root), Mode::Apply);
     request.target_schema = 25;
     request.manifest_dir = manifest.into();
     let request = TransitionRequest {
-        mode: Mode::Apply,
+        mode: if phase == "owner-resume" {
+            Mode::Resume
+        } else {
+            Mode::Apply
+        },
         config: request.config,
         database: request.database,
         operation_id: request.operation_id,

@@ -1301,16 +1301,6 @@ async fn validate_decisions(connection: &mut SqliteConnection, plan: &Plan) -> R
     {
         return Err(Failure::ManualRequired);
     }
-    let owner_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM offline_recovery_rows
-         WHERE table_name='runtime_owner_evidence'",
-    )
-    .fetch_one(&mut *connection)
-    .await
-    .map_err(|_| Failure::ManualRequired)?;
-    if owner_count == 126 && plan.d2_owner.len() != 126 {
-        return Err(Failure::ManualRequired);
-    }
     let quarantined = plan
         .classifications
         .iter()
@@ -1330,24 +1320,7 @@ async fn validate_decisions(connection: &mut SqliteConnection, plan: &Plan) -> R
     }) {
         return Err(Failure::ManualRequired);
     }
-    for proof in &plan.d2_owner {
-        let count: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM runtime_owner_evidence evidence
-             JOIN runtime_instances instance USING(instance_token)
-             WHERE evidence.instance_token=? AND evidence.runtime_generation=?
-               AND evidence.evidence_revision=? AND evidence.state='reaped'
-               AND instance.state='stopped'",
-        )
-        .bind(&proof.instance_token)
-        .bind(proof.runtime_generation)
-        .bind(proof.evidence_revision)
-        .fetch_one(&mut *connection)
-        .await
-        .map_err(|_| Failure::ManualRequired)?;
-        if count != 1 || !hex_digest(&proof.evidence_digest) || !hex_digest(&proof.parent_digest) {
-            return Err(Failure::ManualRequired);
-        }
-    }
+    super::reconciliation_owner::validate(connection, plan).await?;
     Ok(())
 }
 

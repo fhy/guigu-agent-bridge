@@ -66,7 +66,14 @@ async fn execute_with_launcher(
         drop(lock);
         return result;
     }
-    run_locked(request, authenticated, lock).await
+    run_locked(
+        request,
+        authenticated,
+        lock,
+        &evidence.listeners,
+        live_launcher,
+    )
+    .await
 }
 
 struct Authenticated {
@@ -175,6 +182,7 @@ async fn verify_readonly(
     authenticated: &Authenticated,
 ) -> Result<String, Failure> {
     let mut connection = super::verification::open(&request.database, true).await?;
+    super::reconciliation_owner::validate(&mut connection, &authenticated.plan).await?;
     let binding = load_binding(&mut connection).await?;
     if binding.root_digest != authenticated.plan.root_digest
         || binding.admin_operation_id != authenticated.plan.operation_id
@@ -235,6 +243,8 @@ async fn run_locked(
     request: TransitionRequest,
     mut authenticated: Authenticated,
     _lock: RuntimeLock,
+    listeners: &[std::net::SocketAddr],
+    live_launcher: bool,
 ) -> Result<String, Failure> {
     if authenticated.intent.pre_transition.is_none() {
         let mut source = super::verification::open(&request.database, true).await?;
@@ -334,6 +344,8 @@ async fn run_locked(
             &expected_graph,
         )
         .await?;
+        super::reconciliation_owner::validate(&mut tx, &authenticated.plan).await?;
+        launcher::check(listeners, live_launcher, "transition-v2-first-commit").await?;
         tx.commit().await.map_err(|_| Failure::Migration)?;
         connection.close().await.map_err(|_| Failure::Migration)?;
         super::flow::fault("reconciliation-after-first-commit");
@@ -345,6 +357,8 @@ async fn run_locked(
         }
     }
     let mut reader = super::verification::open(&request.database, true).await?;
+    super::reconciliation_owner::validate(&mut reader, &authenticated.plan).await?;
+    launcher::check(listeners, live_launcher, "transition-v2-readback").await?;
     let binding = load_binding(&mut reader).await?;
     reconciliation_graph::verify_classifications(
         &mut reader,
@@ -439,6 +453,8 @@ async fn run_locked(
         &expected_graph,
     )
     .await?;
+    super::reconciliation_owner::validate(&mut tx, &authenticated.plan).await?;
+    launcher::check(listeners, live_launcher, "transition-v2-final-commit").await?;
     tx.commit().await.map_err(|_| Failure::Migration)?;
     connection.close().await.map_err(|_| Failure::Migration)?;
     super::flow::fault("reconciliation-after-final-commit");

@@ -20,6 +20,7 @@ mod reconciliation;
 mod reconciliation_e2e_tests;
 mod reconciliation_files;
 mod reconciliation_graph;
+mod reconciliation_owner;
 mod reconciliation_records;
 mod reconciliation_schema;
 mod reconciliation_sql;
