@@ -13,6 +13,17 @@ pub(crate) async fn apply(
     original_record: &Option<String>,
     source_digest: &str,
 ) -> Result<(), Failure> {
+    let now = chrono::Utc::now().to_rfc3339();
+    apply_at(connection, operation, original_record, source_digest, &now).await
+}
+
+pub(super) async fn apply_at(
+    connection: &mut SqliteConnection,
+    operation: &str,
+    original_record: &Option<String>,
+    source_digest: &str,
+    now: &str,
+) -> Result<(), Failure> {
     if original(connection).await? != *original_record {
         return Err(Failure::ManualRequired);
     }
@@ -32,7 +43,6 @@ pub(crate) async fn apply(
     if legacy.digest != source_digest {
         return Err(Failure::ManualRequired);
     }
-    let now = chrono::Utc::now().to_rfc3339();
     if original_record.is_some() {
         let changed = sqlx::query("UPDATE matrix_recovery_compatibility SET decision='native',native_operation_id=?,reason_code='administrative-transition' WHERE singleton=1 AND decision='held' AND source_state_digest=? AND native_operation_id IS NULL")
             .bind(operation).bind(source_digest).execute(&mut *connection).await.map_err(|_| Failure::ManualRequired)?;
@@ -45,7 +55,7 @@ pub(crate) async fn apply(
             &legacy,
             Some(operation),
             None,
-            &now,
+            now,
         )
         .await
         .map_err(|_| Failure::ManualRequired)?;

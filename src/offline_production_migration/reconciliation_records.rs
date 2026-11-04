@@ -191,6 +191,7 @@ pub(super) struct Intent {
     pub source_state_digest: String,
     pub native_operation_id: String,
     pub original_binding: Binding,
+    pub pre_transition: Option<super::reconciliation_graph::PreTransitionGraph>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -259,5 +260,6 @@ pub(super) fn intent(plan: &Plan) -> Intent {
         source_state_digest: plan.source_state_digest.clone(),
         native_operation_id: plan.native_operation_id.clone(),
         original_binding: plan.original_binding.clone(),
+        pre_transition: None,
     }
 }

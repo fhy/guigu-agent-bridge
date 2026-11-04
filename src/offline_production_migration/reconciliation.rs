@@ -134,9 +134,13 @@ fn authenticate(
         return Err(Failure::ManualRequired);
     }
     let intent_path = request.manifest_dir.join("reconciliation-intent-v2.json");
-    let intent = rec::intent(&plan);
-    if intent_path.exists() && rec::load::<Intent>(&intent_path)? != intent {
-        return Err(Failure::ManualRequired);
+    let mut intent = rec::intent(&plan);
+    if intent_path.exists() {
+        let saved = rec::load::<Intent>(&intent_path)?;
+        intent.pre_transition = saved.pre_transition.clone();
+        if saved != intent || saved.pre_transition.is_none() {
+            return Err(Failure::ManualRequired);
+        }
     }
     Ok(Authenticated {
         plan,
@@ -197,6 +201,29 @@ async fn verify_readonly(
     )
     .await?;
     reconciliation_graph::verify_actions(&mut connection, &authenticated.plan).await?;
+    let intent_digest = records::encoded_digest(&authenticated.intent)?;
+    let expected = reconciliation_graph::ExpectedPostGraph::from_pre_state(
+        authenticated
+            .intent
+            .pre_transition
+            .as_ref()
+            .ok_or(Failure::ManualRequired)?,
+        &authenticated.plan,
+        &intent_digest,
+    )?;
+    reconciliation_graph::verify_expected_graph(
+        &mut connection,
+        &authenticated.plan,
+        Some(&expected),
+    )
+    .await?;
+    reconciliation_graph::verify_committed_marker(
+        &mut connection,
+        &authenticated.plan,
+        &authenticated.intent,
+        &expected,
+    )
+    .await?;
     connection.close().await.map_err(|_| Failure::Migration)?;
     Ok(format!(
         "offline-transition-matrix-compatibility result=phase-{}",
@@ -206,9 +233,19 @@ async fn verify_readonly(
 
 async fn run_locked(
     request: TransitionRequest,
-    authenticated: Authenticated,
+    mut authenticated: Authenticated,
     _lock: RuntimeLock,
 ) -> Result<String, Failure> {
+    if authenticated.intent.pre_transition.is_none() {
+        let mut source = super::verification::open(&request.database, true).await?;
+        if load_binding(&mut source).await? != authenticated.plan.original_binding {
+            return Err(Failure::ManualRequired);
+        }
+        reconciliation_graph::validate_plan(&mut source, &authenticated.plan).await?;
+        authenticated.intent.pre_transition =
+            Some(reconciliation_graph::PreTransitionGraph::capture(&mut source).await?);
+        source.close().await.map_err(|_| Failure::Migration)?;
+    }
     let intent_bytes = serde_json::to_vec(&authenticated.intent).map_err(|_| Failure::Preflight)?;
     if !authenticated.intent_path.exists() {
         rec::publish(&authenticated.intent_path, &authenticated.intent)?;
@@ -230,21 +267,34 @@ async fn run_locked(
             reconciliation_sql::marker(&mut tx, &authenticated.plan.operation_id).await?
         }
     };
-    let mut expected_graph: Option<reconciliation_graph::ExpectedPostGraph> = None;
+    let intent_digest = records::encoded_digest(&authenticated.intent)?;
+    let expected_graph = reconciliation_graph::ExpectedPostGraph::from_pre_state(
+        authenticated
+            .intent
+            .pre_transition
+            .as_ref()
+            .ok_or(Failure::ManualRequired)?,
+        &authenticated.plan,
+        &intent_digest,
+    )?;
     if binding.phase == "identity_ready" && state.is_none() {
         if marker == reconciliation_sql::SchemaState::None {
             reconciliation_sql::create_schema(&mut tx).await?;
         }
         let pre_graph = reconciliation_graph::PreTransitionGraph::capture(&mut tx).await?;
+        if Some(&pre_graph) != authenticated.intent.pre_transition.as_ref() {
+            return Err(Failure::ManualRequired);
+        }
         reconciliation_graph::validate_plan(&mut tx, &authenticated.plan).await?;
         reconciliation_sql::insert_audit(&mut tx, &authenticated.plan).await?;
         apply_chain(&mut tx, &authenticated.plan).await?;
         let original = super::transition_native::original(&mut tx).await?;
-        super::transition_native::apply(
+        super::transition_native::apply_at(
             &mut tx,
             &authenticated.plan.native_operation_id,
             &original,
             &authenticated.plan.source_state_digest,
+            &authenticated.plan.native_at,
         )
         .await?;
         reconciliation_sql::insert_classifications(&mut tx, &authenticated.plan).await?;
@@ -260,25 +310,8 @@ async fn run_locked(
         )
         .await?;
         reconciliation_graph::verify_actions(&mut tx, &authenticated.plan).await?;
-        expected_graph = Some(reconciliation_graph::ExpectedPostGraph::from_pre_state(
-            &pre_graph,
-            &authenticated.plan,
-        )?);
-        reconciliation_graph::verify_expected_graph(
-            &mut tx,
-            &authenticated.plan,
-            expected_graph.as_ref(),
-        )
-        .await?;
-        let graph_digest = expected_graph
-            .as_ref()
-            .ok_or(Failure::ManualRequired)?
-            .digest()?;
-        let commit_digest = records::encoded_digest(&(
-            &authenticated.intent,
-            &graph_digest,
-            authenticated.plan.original_binding.revision + 1,
-        ))?;
+        let graph_digest = expected_graph.digest()?;
+        let commit_digest = expected_graph.commit_digest(&authenticated.plan)?;
         reconciliation_sql::insert_marker(
             &mut tx,
             &authenticated.plan,
@@ -286,6 +319,19 @@ async fn run_locked(
             &graph_digest,
             &commit_digest,
             authenticated.plan.original_binding.revision + 1,
+        )
+        .await?;
+        reconciliation_graph::verify_expected_graph(
+            &mut tx,
+            &authenticated.plan,
+            Some(&expected_graph),
+        )
+        .await?;
+        reconciliation_graph::verify_committed_marker(
+            &mut tx,
+            &authenticated.plan,
+            &authenticated.intent,
+            &expected_graph,
         )
         .await?;
         tx.commit().await.map_err(|_| Failure::Migration)?;
@@ -309,14 +355,17 @@ async fn run_locked(
     reconciliation_graph::verify_expected_graph(
         &mut reader,
         &authenticated.plan,
-        expected_graph.as_ref(),
+        Some(&expected_graph),
     )
     .await?;
-    reconciliation_graph::verify_committed_marker(&mut reader, &authenticated.plan).await?;
-    let graph_digest = match expected_graph.as_ref() {
-        Some(expected) => expected.digest()?,
-        None => reconciliation_graph::graph_digest(&mut reader, &authenticated.plan).await?,
-    };
+    reconciliation_graph::verify_committed_marker(
+        &mut reader,
+        &authenticated.plan,
+        &authenticated.intent,
+        &expected_graph,
+    )
+    .await?;
+    let graph_digest = expected_graph.digest()?;
     reader.close().await.map_err(|_| Failure::Migration)?;
     let completion = Completion {
         protocol: 2,
@@ -341,12 +390,8 @@ async fn run_locked(
     }
     super::flow::fault("reconciliation-after-completion");
     let completion_digest = records::encoded_digest(&completion)?;
-    let final_graph = graph_digest;
-    let final_cas = records::encoded_digest(&(
-        &authenticated.plan.root_digest,
-        &completion_digest,
-        &final_graph,
-    ))?;
+    let final_graph = expected_graph.finalized(&authenticated.plan)?.digest()?;
+    let final_cas = expected_graph.final_cas_digest(&authenticated.plan)?;
     let mut connection = super::verification::open(&request.database, false).await?;
     let mut tx = connection
         .begin_with("BEGIN IMMEDIATE")
@@ -381,13 +426,26 @@ async fn run_locked(
     } else if marker.0 != "finalized" {
         return Err(Failure::ManualRequired);
     }
+    reconciliation_graph::verify_expected_graph(
+        &mut tx,
+        &authenticated.plan,
+        Some(&expected_graph),
+    )
+    .await?;
+    reconciliation_graph::verify_committed_marker(
+        &mut tx,
+        &authenticated.plan,
+        &authenticated.intent,
+        &expected_graph,
+    )
+    .await?;
     tx.commit().await.map_err(|_| Failure::Migration)?;
     connection.close().await.map_err(|_| Failure::Migration)?;
     super::flow::fault("reconciliation-after-final-commit");
     Ok("offline-transition-matrix-compatibility result=phase-baseline_ready".into())
 }
 
-async fn load_binding(connection: &mut SqliteConnection) -> Result<Binding, Failure> {
+pub(super) async fn load_binding(connection: &mut SqliteConnection) -> Result<Binding, Failure> {
     sqlx::query(
         "SELECT db_generation,canonical_db_digest,root_digest,admin_operation_id,
                 schema_intent_digest,schema_complete_digest,plan_digest,identity_digest,
@@ -549,24 +607,27 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
         &task,
         &delivery,
     ))?;
-    sqlx::query(
+    let audit = sqlx::query(
         "INSERT INTO historical_unknown_abandonments
          (decision_id,task_id,delivery_id,resource_key,owner_token,fence,
           before_task_version,before_admission_revision,before_continuation_revision,
           before_generation,post_continuation_revision,disposition,reason,policy_ref,
           authorization_ref,not_replayed,created_at,session_id_digest,before_state_digest,
           post_state_digest,abandonment_kind)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,'manual_abandonment',?,?,?,1,datetime('now'),?,?,?,'historical_unknown_abandoned')",
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,'manual_abandonment',?,?,?,1,?,?,?,?,'historical_unknown_abandoned')",
     )
     .bind(&plan.native_operation_id)
     .bind(&task).bind(&delivery).bind(&resource).bind(&owner).bind(fence)
     .bind(task_version).bind(admission_revision).bind(continuation_revision)
     .bind(&generation).bind(continuation_revision + 1)
     .bind("offline protocol-2 D1 reconciliation")
-    .bind("R093-D1").bind(&plan.operation_id).bind(&plan.native_operation_id)
+    .bind("R093-D1").bind(&plan.operation_id).bind(&plan.abandonment_at)
     .bind(&session_digest).bind(&before_digest)
     .bind(&records::encoded_digest(&(task_version, admission_revision, continuation_revision + 1, &generation, &resource, &task, &delivery, "terminal"))?)
     .execute(&mut *connection).await.map_err(|_| Failure::ManualRequired)?;
+    if audit.rows_affected() != 1 {
+        return Err(Failure::ManualRequired);
+    }
     let changed = sqlx::query(
         "UPDATE execution_leases SET state='released',heartbeat_at=?
          WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=?
@@ -622,6 +683,62 @@ async fn apply_chain(connection: &mut SqliteConnection, plan: &Plan) -> Result<(
         return Err(Failure::ManualRequired);
     }
     Ok(())
+}
+
+pub(super) fn expected_chain_audit(plan: &Plan) -> Result<Option<String>, Failure> {
+    let Some(decision) = &plan.d1_unknown_chain else {
+        return Ok(None);
+    };
+    let tuple = D1ChainTuple::parse(&decision.references)?;
+    if decision.decision_id != plan.native_operation_id {
+        return Err(Failure::ManualRequired);
+    }
+    let before = records::encoded_digest(&(
+        tuple.task_version,
+        tuple.admission_revision,
+        tuple.continuation_revision,
+        &tuple.generation,
+        &tuple.resource,
+        &tuple.task,
+        &tuple.delivery,
+    ))?;
+    let after = records::encoded_digest(&(
+        tuple.task_version,
+        tuple.admission_revision,
+        tuple.continuation_revision + 1,
+        &tuple.generation,
+        &tuple.resource,
+        &tuple.task,
+        &tuple.delivery,
+        "terminal",
+    ))?;
+    Ok(Some(
+        serde_json::json!([
+            plan.native_operation_id,
+            tuple.task,
+            tuple.delivery,
+            tuple.resource,
+            tuple.owner,
+            tuple.fence,
+            tuple.task_version,
+            tuple.admission_revision,
+            tuple.continuation_revision,
+            tuple.generation,
+            tuple.continuation_revision + 1,
+            "manual_abandonment",
+            "offline protocol-2 D1 reconciliation",
+            "R093-D1",
+            plan.operation_id,
+            1,
+            plan.abandonment_at,
+            records::encoded_digest(&tuple.session)?,
+            before,
+            after,
+            "historical_unknown_abandoned",
+            0
+        ])
+        .to_string(),
+    ))
 }
 
 struct D1ChainTuple {
@@ -826,6 +943,15 @@ mod d1_tuple_tests {
             after_selected.0
         );
         assert_ne!(before_selected.1, after_selected.1);
+        let mut continuation: serde_json::Value = serde_json::from_str(&before_selected.1).unwrap();
+        continuation[4] = serde_json::json!(18);
+        continuation[5] = serde_json::json!("terminal");
+        continuation[11] = serde_json::json!(plan.abandonment_at);
+        assert_eq!(continuation.to_string(), after_selected.1);
+        let mut disposition: serde_json::Value = serde_json::from_str(&before_selected.2).unwrap();
+        disposition[3] = serde_json::json!("terminal");
+        disposition[8] = serde_json::json!("historical-unknown-abandoned");
+        assert_eq!(disposition.to_string(), after_selected.2);
         assert_eq!(audit_before, Vec::<String>::new());
         assert_eq!(audit_after.len(), 1);
         let audit: i64 = sqlx::query_scalar("SELECT count(*) FROM historical_unknown_abandonments WHERE task_id='task-a' AND delivery_id='delivery-a'").fetch_one(&pool).await.unwrap();
@@ -837,5 +963,13 @@ mod d1_tuple_tests {
         .unwrap();
         assert_eq!(audit, 1);
         assert_eq!(other_audit, 0);
+        let actual: String = sqlx::query_scalar("SELECT json_array(decision_id,task_id,delivery_id,resource_key,owner_token,fence,before_task_version,before_admission_revision,before_continuation_revision,before_generation,post_continuation_revision,disposition,reason,policy_ref,authorization_ref,not_replayed,created_at,session_id_digest,before_state_digest,post_state_digest,abandonment_kind,termination_proven) FROM historical_unknown_abandonments WHERE decision_id='native'").fetch_one(&pool).await.unwrap();
+        assert_eq!(Some(actual), super::expected_chain_audit(&plan).unwrap());
+        assert!(matches!(
+            apply_chain(&mut connection, &plan).await,
+            Err(super::Failure::ManualRequired)
+        ));
+        assert_eq!(after_other, snapshot("task-b").await);
+        assert_eq!(after_selected, snapshot("task-a").await);
     }
 }

@@ -7,7 +7,9 @@ use std::{
 
 use super::{
     Mode, TransitionRequest, evidence, flow, reconciliation,
-    reconciliation_records::{self as rec, Anchor, Binding, Classification, Grant, Plan},
+    reconciliation_records::{
+        self as rec, Action, Anchor, Binding, Classification, Grant, Plan, RowImage,
+    },
     records,
     test_fixture::Fixture,
     verification, version2_records,
@@ -127,6 +129,7 @@ impl Protocol2Fixture {
         assert_eq!(identities.len(), 3);
         let mut classifications = Vec::new();
         let mut anchors = Vec::new();
+        let mut actions = Vec::new();
         for identity in identities {
             let snapshot = crate::storage::recovery_eligibility::inventory::snapshot(
                 &mut connection,
@@ -134,6 +137,25 @@ impl Protocol2Fixture {
             )
             .await
             .unwrap();
+            let (names, values) =
+                crate::storage::recovery_eligibility::inventory::values(&mut connection, &identity)
+                    .await
+                    .unwrap();
+            let image = RowImage { names, values };
+            actions.push(Action {
+                action_id: format!("preserve:{}:{}", identity.table, identity.key),
+                action_type: "preserve".into(),
+                table_name: identity.table.clone(),
+                canonical_pk: identity.key.clone(),
+                original_revision: snapshot.revision.clone(),
+                original_digest: snapshot.digest.clone(),
+                before: Some(image.clone()),
+                after: Some(image.clone()),
+                set_columns: Vec::new(),
+                unchanged_columns: image.names.clone(),
+                parents: Vec::new(),
+                evidence_digest: "2".repeat(64),
+            });
             classifications.push(Classification {
                 table_name: identity.table.clone(),
                 canonical_pk: identity.key.clone(),
@@ -156,6 +178,76 @@ impl Protocol2Fixture {
                 original_digest: snapshot.digest,
             });
         }
+        let encoded_text = |value: &str| {
+            format!(
+                "text:{}",
+                value
+                    .as_bytes()
+                    .iter()
+                    .map(|byte| format!("{byte:02X}"))
+                    .collect::<String>()
+            )
+        };
+        let native_image = RowImage {
+            names: [
+                "control_id",
+                "cutover_operation_id",
+                "phase",
+                "watermark",
+                "updated_at",
+                "restart_hold_state",
+                "restart_hold_event_id",
+                "restart_hold_reason",
+            ]
+            .into_iter()
+            .map(String::from)
+            .collect(),
+            values: vec![
+                "integer:31".into(),
+                encoded_text("native-operation"),
+                encoded_text("baseline"),
+                "null:".into(),
+                encoded_text("2026-11-03T00:00:00Z"),
+                "null:".into(),
+                "null:".into(),
+                "null:".into(),
+            ],
+        };
+        let native = Classification {
+            table_name: "matrix_recovery_control".into(),
+            canonical_pk: "[\"integer:31\"]".into(),
+            origin_generation: "native-operation".into(),
+            original_revision: records::encoded_digest(&(
+                &native_image.names,
+                &native_image.values,
+            ))
+            .unwrap(),
+            original_digest: records::encoded_digest(&(&native_image.names, &native_image.values))
+                .unwrap(),
+            parent_relations: serde_json::json!([]),
+            disposition: "eligible_new".into(),
+            evidence_digest: "2".repeat(64),
+            context_kind: "admin".into(),
+            context_generation: None,
+            admin_operation_id: Some(fixture.request.operation_id.clone()),
+            plan_digest: None,
+            matrix_operation_id: Some("native-operation".into()),
+        };
+        actions.push(Action {
+            action_id: "insert-native-control".into(),
+            action_type: "insert".into(),
+            table_name: native.table_name.clone(),
+            canonical_pk: native.canonical_pk.clone(),
+            original_revision: "absent".into(),
+            original_digest: records::encoded_digest(&Option::<RowImage>::None).unwrap(),
+            before: None,
+            after: Some(native_image.clone()),
+            set_columns: native_image.names,
+            unchanged_columns: Vec::new(),
+            parents: Vec::new(),
+            evidence_digest: native.evidence_digest.clone(),
+        });
+        let inserted_classifications = vec![native];
         connection.close().await.unwrap();
 
         let successor_executable_digest = evidence::hash_file(&fixture.request.executable).unwrap();
@@ -180,6 +272,7 @@ impl Protocol2Fixture {
         let classification_digest = records::encoded_digest(
             &classifications
                 .iter()
+                .chain(&inserted_classifications)
                 .map(|classification| {
                     (
                         &classification.table_name,
@@ -224,8 +317,9 @@ impl Protocol2Fixture {
                 ..binding
             },
             classifications,
-            inserted_classifications: Vec::new(),
-            actions: Vec::new(),
+            inserted_classifications,
+            action_digest: records::encoded_digest(&actions).unwrap(),
+            actions,
             d1_unknown_chain: None,
             d1_quarantined: None,
             d2_owner: Vec::new(),
@@ -233,11 +327,14 @@ impl Protocol2Fixture {
             workspaces: Vec::new(),
             native_at: "2026-11-03T00:00:00Z".into(),
             abandonment_at: "2026-11-03 00:00:00".into(),
-            action_digest: "4".repeat(64),
             classification_digest,
         };
         plan.plan_digest = rec::plan_digest(&plan).unwrap();
-        for classification in &mut plan.classifications {
+        for classification in plan
+            .classifications
+            .iter_mut()
+            .chain(&mut plan.inserted_classifications)
+        {
             classification.plan_digest = Some(plan.plan_digest.clone());
         }
         assert_eq!(rec::plan_digest(&plan).unwrap(), plan.plan_digest);
@@ -407,13 +504,46 @@ async fn protocol2_disposable_fixture_covers_resume_states_and_final_cas() {
             ("baseline_ready".into(), "finalized".into(), true, true),
             "{phase} final"
         );
+        let final_graph = final_graph_state(&request).await;
         let result = reconciliation::execute_fixture(request.clone()).await;
         assert!(result.is_ok(), "{phase} repeated resume: {result:?}");
         assert_eq!(state(&request).await, first_final, "{phase} idempotence");
+        assert_eq!(
+            final_graph_state(&request).await,
+            final_graph,
+            "{phase} graph/digest parity"
+        );
         unsafe {
             std::env::remove_var("R094_GRANT_PATH");
         }
     }
+}
+
+async fn final_graph_state(request: &TransitionRequest) -> (String, String) {
+    use super::reconciliation_graph::{ExpectedPostGraph, PreTransitionGraph};
+    let plan: Plan = rec::load(&request.transition_plan).unwrap();
+    let intent: rec::Intent =
+        rec::load(&request.manifest_dir.join("reconciliation-intent-v2.json")).unwrap();
+    let expected = ExpectedPostGraph::from_pre_state(
+        intent.pre_transition.as_ref().unwrap(),
+        &plan,
+        &records::encoded_digest(&intent).unwrap(),
+    )
+    .unwrap();
+    let mut connection = verification::open(&request.database, true).await.unwrap();
+    let digests: (String, String, String) = sqlx::query_as("SELECT committed_graph_digest,final_graph_digest,final_cas_digest FROM r093_reconciliation_marker").fetch_one(&mut connection).await.unwrap();
+    assert_eq!(
+        digests,
+        (
+            expected.digest().unwrap(),
+            expected.finalized(&plan).unwrap().digest().unwrap(),
+            expected.final_cas_digest(&plan).unwrap()
+        )
+    );
+    let graph = PreTransitionGraph::capture(&mut connection).await.unwrap();
+    let marker: String = sqlx::query_scalar("SELECT json_array(singleton,protocol,operation_id,root_digest,state,intent_digest,grant_digest,plan_digest,action_digest,archive_digest,schema_digest,identity_digest,committed_graph_digest,committed_binding_revision,commit_digest,completion_digest,final_graph_digest,final_cas_digest) FROM r093_reconciliation_marker").fetch_one(&mut connection).await.unwrap();
+    connection.close().await.unwrap();
+    (records::encoded_digest(&graph).unwrap(), marker)
 }
 
 #[tokio::test]
@@ -451,4 +581,243 @@ async fn child_entry() {
         executable: request.executable,
     };
     reconciliation::execute_fixture(request).await.unwrap();
+}
+
+#[tokio::test]
+async fn expected_graph_rejects_disposable_sql_corruption() {
+    use super::reconciliation_graph::ExpectedPostGraph;
+    use super::reconciliation_records::Intent;
+
+    let fixture = Protocol2Fixture::new().await;
+    let output = fixture.child("reconciliation-after-first-commit");
+    assert_eq!(output.status.code(), Some(86), "{output:?}");
+    let plan: Plan = rec::load(&fixture.request.transition_plan).unwrap();
+    let intent: Intent = rec::load(
+        &fixture
+            .request
+            .manifest_dir
+            .join("reconciliation-intent-v2.json"),
+    )
+    .unwrap();
+    let before = intent.pre_transition.as_ref().unwrap();
+    let expected = ExpectedPostGraph::from_pre_state(
+        before,
+        &plan,
+        &records::encoded_digest(&intent).unwrap(),
+    )
+    .unwrap();
+    reject_missing_actions(before, &plan, &intent);
+    let mut connection = verification::open(&fixture.request.database, false)
+        .await
+        .unwrap();
+    super::reconciliation_graph::verify_expected_graph(&mut connection, &plan, Some(&expected))
+        .await
+        .unwrap();
+    super::reconciliation_graph::verify_committed_marker(
+        &mut connection,
+        &plan,
+        &intent,
+        &expected,
+    )
+    .await
+    .unwrap();
+    verify_corruptions(&mut connection, &plan, &intent, &expected).await;
+    reject_stale_snapshot(before, &plan, &intent);
+    connection.close().await.unwrap();
+}
+
+const GRAPH_CORRUPTIONS: &[(&str, &str, bool)] = &[
+    (
+        "binding",
+        "UPDATE offline_recovery_binding SET canonical_db_digest='wrong'",
+        false,
+    ),
+    (
+        "marker",
+        "UPDATE r093_reconciliation_marker SET root_digest='wrong'",
+        true,
+    ),
+    (
+        "marker-cas",
+        "UPDATE r093_reconciliation_marker SET commit_digest='wrong'",
+        true,
+    ),
+    (
+        "native",
+        "UPDATE matrix_recovery_compatibility SET reason_code='wrong'",
+        false,
+    ),
+    (
+        "control",
+        "UPDATE matrix_recovery_control SET restart_hold_state='wrong'",
+        false,
+    ),
+    (
+        "extra-row",
+        "INSERT INTO agents(endpoint_id,agent_id,transport,enabled,address_json,capabilities_json) VALUES('unrelated','unrelated','acp',1,NULL,'[]')",
+        false,
+    ),
+    (
+        "missing-action-cell",
+        "UPDATE agents SET enabled=0 WHERE endpoint_id='fixture-agent'",
+        false,
+    ),
+    (
+        "missing-classification",
+        "DELETE FROM offline_recovery_rows WHERE table_name='agents'",
+        false,
+    ),
+    (
+        "parent-cell",
+        "UPDATE offline_recovery_rows SET parent_relations='[{}]' WHERE table_name='agents'",
+        false,
+    ),
+    (
+        "anchor",
+        "UPDATE offline_recovery_metadata_anchors SET original_digest='wrong' WHERE table_name='agents'",
+        false,
+    ),
+    (
+        "receipt-deletion",
+        "INSERT INTO offline_recovery_workspace_deletions(table_name,canonical_pk,classification_json,snapshot_json,context_json,authority_fence_json,receipt_digest,runtime_owner,task_id,owner_fence) VALUES('workspace_claims','[\"missing\"]','{}','{}','{}','{}','0000000000000000000000000000000000000000000000000000000000000000','owner','task',1)",
+        false,
+    ),
+    (
+        "extra-audit",
+        "INSERT INTO r093_reconciliation_audit(operation_id,action_id,action_type,table_name,canonical_pk,original_revision,original_digest,pre_digest,post_digest,evidence_digest) SELECT operation_id,'extra','preserve','agents','[]','1','wrong','wrong','wrong','wrong' FROM r093_reconciliation_marker",
+        false,
+    ),
+];
+
+async fn verify_corruptions(
+    connection: &mut sqlx::SqliteConnection,
+    plan: &Plan,
+    intent: &rec::Intent,
+    expected: &super::reconciliation_graph::ExpectedPostGraph,
+) {
+    for (label, mutation, marker) in GRAPH_CORRUPTIONS.iter().copied() {
+        let mut transaction = connection.begin().await.unwrap();
+        sqlx::query("PRAGMA defer_foreign_keys=ON")
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        let triggers: Vec<String> =
+            sqlx::query_scalar("SELECT name FROM sqlite_schema WHERE type='trigger'")
+                .fetch_all(&mut *transaction)
+                .await
+                .unwrap();
+        for trigger in triggers {
+            sqlx::raw_sql(sqlx::AssertSqlSafe(format!(
+                "DROP TRIGGER \"{}\"",
+                trigger.replace('"', "\"\"")
+            )))
+            .execute(&mut *transaction)
+            .await
+            .unwrap();
+        }
+        sqlx::raw_sql(mutation)
+            .execute(&mut *transaction)
+            .await
+            .unwrap_or_else(|failure| panic!("{label}: mutation failed: {failure}"));
+        let result = if marker {
+            super::reconciliation_graph::verify_committed_marker(
+                &mut transaction,
+                plan,
+                intent,
+                expected,
+            )
+            .await
+        } else {
+            super::reconciliation_graph::verify_expected_graph(
+                &mut transaction,
+                plan,
+                Some(expected),
+            )
+            .await
+        };
+        assert!(
+            matches!(result, Err(super::Failure::ManualRequired)),
+            "{label}: {result:?}"
+        );
+        transaction.rollback().await.unwrap();
+    }
+}
+
+fn reject_stale_snapshot(
+    before: &super::reconciliation_graph::PreTransitionGraph,
+    plan: &Plan,
+    intent: &rec::Intent,
+) {
+    use super::reconciliation_graph::{ExpectedPostGraph, PreTransitionGraph};
+    let mut stale = serde_json::to_value(before).unwrap();
+    let rows = stale["rows"].as_array_mut().unwrap();
+    let image = rows.iter_mut().find(|row| row[0] == "image").unwrap();
+    let mut cells: rec::RowImage = serde_json::from_str(image[2].as_str().unwrap()).unwrap();
+    cells.values[0].push_str("00");
+    image[2] = serde_json::json!(serde_json::to_string(&cells).unwrap());
+    let stale: PreTransitionGraph = serde_json::from_value(stale).unwrap();
+    assert!(matches!(
+        ExpectedPostGraph::from_pre_state(&stale, plan, &records::encoded_digest(intent).unwrap()),
+        Err(super::Failure::ManualRequired)
+    ));
+}
+
+fn reject_missing_actions(
+    before: &super::reconciliation_graph::PreTransitionGraph,
+    plan: &Plan,
+    intent: &rec::Intent,
+) {
+    use super::reconciliation_graph::ExpectedPostGraph;
+    for index in [0, plan.actions.len() - 1] {
+        let mut missing_action = plan.clone();
+        missing_action.actions.remove(index);
+        missing_action.action_digest = records::encoded_digest(&missing_action.actions).unwrap();
+        assert!(matches!(
+            ExpectedPostGraph::from_pre_state(
+                before,
+                &missing_action,
+                &records::encoded_digest(intent).unwrap()
+            ),
+            Err(super::Failure::ManualRequired)
+        ));
+    }
+    let mut missing_native = plan.clone();
+    missing_native.inserted_classifications.clear();
+    assert!(matches!(
+        ExpectedPostGraph::from_pre_state(
+            before,
+            &missing_native,
+            &records::encoded_digest(intent).unwrap()
+        ),
+        Err(super::Failure::ManualRequired)
+    ));
+    let mut wrong_parent = plan.clone();
+    wrong_parent.actions[0].parents.push(rec::Parent {
+        identity: crate::storage::recovery_eligibility::RowIdentity {
+            table: "agents".into(),
+            key: "[\"text:666978747572652D6167656E74\"]".into(),
+        },
+        revision: "wrong".into(),
+        digest: "0".repeat(64),
+        role: "effectful".into(),
+    });
+    wrong_parent.action_digest = records::encoded_digest(&wrong_parent.actions).unwrap();
+    assert!(matches!(
+        ExpectedPostGraph::from_pre_state(
+            before,
+            &wrong_parent,
+            &records::encoded_digest(intent).unwrap()
+        ),
+        Err(super::Failure::ManualRequired)
+    ));
+    let mut wrong_classification = plan.clone();
+    wrong_classification.classification_digest = "0".repeat(64);
+    assert!(matches!(
+        ExpectedPostGraph::from_pre_state(
+            before,
+            &wrong_classification,
+            &records::encoded_digest(intent).unwrap()
+        ),
+        Err(super::Failure::ManualRequired)
+    ));
 }

@@ -160,7 +160,7 @@ pub(super) async fn delete_workspaces(
     for item in workspaces {
         let changed = sqlx::query(
             "DELETE FROM workspace_claims
-             WHERE claim_id=json_extract(?, '$[0]')
+             WHERE json_array(typeof(claim_id)||':'||hex(CAST(claim_id AS BLOB)))=?
                AND runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'",
         )
         .bind(&item.canonical_pk)

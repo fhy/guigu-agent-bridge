@@ -3,6 +3,68 @@ use crate::offline_production_migration::reconciliation_records::{Binding, Compl
 use sqlx::{Connection, Row, SqliteConnection};
 
 #[tokio::test]
+async fn canonical_workspace_deletion_preserves_receipt_and_refuses_replay() {
+    let root = tempfile::tempdir().unwrap();
+    let pool = crate::storage::connect(root.path().join("workspace.db"))
+        .await
+        .unwrap();
+    crate::storage::migrate(&pool).await.unwrap();
+    let mut connection = pool.acquire().await.unwrap();
+    sqlx::query("INSERT INTO workspace_claims VALUES('claim','owner','task','/fixture','[]',1,0,'active','t','t')").execute(&mut *connection).await.unwrap();
+    let key = "[\"text:636C61696D\"]";
+    sqlx::query("INSERT INTO offline_recovery_rows VALUES('workspace_claims',?,'native','integer:30','digest','[]','terminal_evidenced','evidence','admin',NULL,'operation','plan','native')").bind(key).execute(&mut *connection).await.unwrap();
+    let workspace = Workspace {
+        canonical_pk: key.into(),
+        classification_json: "{}".into(),
+        snapshot_json: "{}".into(),
+        context_json: "{}".into(),
+        authority_fence_json: "{}".into(),
+        receipt_digest: "d".repeat(64),
+        runtime_owner: "owner".into(),
+        task_id: "task".into(),
+        owner_fence: 1,
+    };
+    insert_workspaces(&mut connection, std::slice::from_ref(&workspace))
+        .await
+        .unwrap();
+    delete_workspaces(&mut connection, std::slice::from_ref(&workspace))
+        .await
+        .unwrap();
+    let remaining: i64 = sqlx::query_scalar("SELECT count(*) FROM workspace_claims")
+        .fetch_one(&mut *connection)
+        .await
+        .unwrap();
+    assert_eq!(remaining, 0);
+    let receipt: (String, String, String, String, String, String, String, String, i64) = sqlx::query_as("SELECT canonical_pk,classification_json,snapshot_json,context_json,authority_fence_json,receipt_digest,runtime_owner,task_id,owner_fence FROM offline_recovery_workspace_deletions").fetch_one(&mut *connection).await.unwrap();
+    assert_eq!(
+        receipt,
+        (
+            workspace.canonical_pk.clone(),
+            workspace.classification_json.clone(),
+            workspace.snapshot_json.clone(),
+            workspace.context_json.clone(),
+            workspace.authority_fence_json.clone(),
+            workspace.receipt_digest.clone(),
+            workspace.runtime_owner.clone(),
+            workspace.task_id.clone(),
+            workspace.owner_fence
+        )
+    );
+    assert!(matches!(
+        delete_workspaces(&mut connection, std::slice::from_ref(&workspace)).await,
+        Err(Failure::ManualRequired)
+    ));
+    assert!(sqlx::query("INSERT INTO workspace_claims VALUES('claim','owner','task','/fixture','[]',1,0,'active','t','t')").execute(&mut *connection).await.is_err());
+    assert!(
+        sqlx::query("PRAGMA foreign_key_check")
+            .fetch_all(&mut *connection)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
 async fn schema_inspection_rejects_constraint_and_object_drift() {
     let variants = [
         MARKER_DDL.replace("protocol INTEGER NOT NULL", "protocol INTEGER"),
