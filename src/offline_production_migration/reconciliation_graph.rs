@@ -88,6 +88,21 @@ impl PreTransitionGraph {
             "set".into(),
             serde_json::to_string(&receipts).map_err(|_| Failure::Preflight)?,
         ));
+        let cells: Vec<(String, String, String, String, String, String, String, String, Option<String>, Option<String>, Option<String>, Option<String>, Option<String>)> = sqlx::query_as("SELECT table_name,canonical_pk,origin_generation,original_revision,original_digest,parent_relations,disposition,evidence_digest,context_kind,context_generation,admin_operation_id,plan_digest,matrix_operation_id FROM offline_recovery_rows ORDER BY table_name,canonical_pk").fetch_all(&mut *connection).await.map_err(|_| Failure::ManualRequired)?;
+        rows.insert((
+            "cells".into(),
+            "set".into(),
+            serde_json::to_string(&cells).map_err(|_| Failure::Preflight)?,
+        ));
+        let parents: Vec<(String, String, String)> = cells
+            .iter()
+            .map(|row| (row.0.clone(), row.1.clone(), row.5.clone()))
+            .collect();
+        rows.insert((
+            "parents".into(),
+            "set".into(),
+            serde_json::to_string(&parents).map_err(|_| Failure::Preflight)?,
+        ));
         Ok(Self { rows })
     }
 }
@@ -218,6 +233,52 @@ impl ExpectedPostGraph {
             "receipts".into(),
             "set".into(),
             serde_json::to_string(&receipts).map_err(|_| Failure::Preflight)?,
+        ));
+        let classifications = plan
+            .classifications
+            .iter()
+            .chain(&plan.inserted_classifications)
+            .collect::<Vec<_>>();
+        let cells = classifications
+            .iter()
+            .map(|item| -> Result<_, Failure> {
+                Ok((
+                    item.table_name.clone(),
+                    item.canonical_pk.clone(),
+                    item.origin_generation.clone(),
+                    item.original_revision.clone(),
+                    item.original_digest.clone(),
+                    serde_json::to_string(&item.parent_relations)
+                        .map_err(|_| Failure::Preflight)?,
+                    item.disposition.clone(),
+                    item.evidence_digest.clone(),
+                    item.context_kind.clone(),
+                    item.context_generation.clone(),
+                    item.admin_operation_id.clone(),
+                    Some(plan.plan_digest.clone()),
+                    item.matrix_operation_id.clone(),
+                ))
+            })
+            .collect::<Result<Vec<_>, Failure>>()?;
+        rows.insert((
+            "cells".into(),
+            "set".into(),
+            serde_json::to_string(&cells).map_err(|_| Failure::Preflight)?,
+        ));
+        let parents = classifications
+            .iter()
+            .map(|item| {
+                (
+                    item.table_name.clone(),
+                    item.canonical_pk.clone(),
+                    serde_json::to_string(&item.parent_relations).unwrap_or_default(),
+                )
+            })
+            .collect::<Vec<_>>();
+        rows.insert((
+            "parents".into(),
+            "set".into(),
+            serde_json::to_string(&parents).map_err(|_| Failure::Preflight)?,
         ));
         Ok(Self { rows })
     }
