@@ -74,6 +74,13 @@ fn main() {
 
         match method {
             "initialize" => {
+                if scenario == "gated-initialize" {
+                    let gate = marker.as_ref().expect("gated fixture needs a path");
+                    std::fs::write(format!("{gate}.ready"), b"setup").unwrap();
+                    while !std::path::Path::new(gate).exists() {
+                        std::thread::sleep(Duration::from_millis(10));
+                    }
+                }
                 if scenario == "delayed-initialize" {
                     std::thread::sleep(std::time::Duration::from_secs(2));
                 }

@@ -44,6 +44,15 @@ existing launcher; inspect that instance's journal with
 Return to the ordinary filter after capturing the incident. Do not enable global
 TRACE, print environment files or publish raw logs containing private identifiers.
 
+Execution-lease heartbeats also cover bounded ACP session initialization and
+resume, before the first task prompt. DEBUG stage `delivery-lease` reports the
+unchanged task/fence and renewal progress; INFO-level ERROR distinguishes an
+expired lease, lost owner fence and storage failure. If ownership is lost, the
+adapter retains the bounded setup through backend reap and preserves recovery
+state without prompting or replaying the task. It never revives an expired lease.
+An acknowledged setup with no continuation is not eligible for the no-execution-
+evidence admission hold; preserve that state instead of manually clearing it.
+
 | Stage | Safe diagnostic distinction |
 |---|---|
 | initial-baseline / baseline-publication | No checkpoint versus durable active checkpoint; limited-room count; history executed=0; response acceptance is not a committed baseline. |

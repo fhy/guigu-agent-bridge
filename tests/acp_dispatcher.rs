@@ -294,6 +294,9 @@ impl RuntimeClock for FixedClock {
         ts()
     }
 }
+
+#[path = "support/r107_delivery_lease.rs"]
+mod r107_delivery_lease;
 fn default_policy() -> ContinuationPolicy {
     ContinuationPolicy {
         max_turns: 2,

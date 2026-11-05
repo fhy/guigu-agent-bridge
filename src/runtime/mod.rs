@@ -1,5 +1,6 @@
 //! Durable runtime control for exclusive execution and bounded continuation.
 
+mod delivery_lease;
 mod recovery_audit;
 mod refused_projection;
 
@@ -2115,7 +2116,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                     self.policy.lease_ttl,
                 )
                 .await;
-            let lease = match acquired {
+            let mut lease = match acquired {
                 Err(error) => {
                     let category = match &error {
                         RuntimeError::Storage(StorageError::Query(sqlx::Error::Protocol(
@@ -2164,7 +2165,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                 }
                 return Err(Self::execution_error(error));
             }
-            if let Err(error) = self.dispatcher.deliver(request.clone()).await {
+            if let Err(error) = self.deliver_with_renewal(request.clone(), &mut lease).await {
                 self.pending
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -2187,6 +2188,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                 )
                 .await
             {
+                tracing::error!(task_id = %request.task.task_id, delivery_id = %request.delivery_id, stage = "continuation-setup", fence = lease.fence, lease_expired = self.clock.now() >= lease.expires_at, acknowledged = true, "continuation setup failed before any task prompt; preserving recovery state");
                 let _ = self.dispatcher.shutdown().await;
                 let _ = self
                     .store
