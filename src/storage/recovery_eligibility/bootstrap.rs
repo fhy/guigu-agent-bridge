@@ -47,6 +47,31 @@ pub async fn bootstrap_nonadmin(
     Ok(context)
 }
 
+pub(crate) async fn readback_nonadmin(
+    pool: &SqlitePool,
+    matrix_enabled: bool,
+) -> Result<EligibilityContext, sqlx::Error> {
+    let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    let admin: i64 = sqlx::query_scalar("SELECT count(*) FROM offline_recovery_binding")
+        .fetch_one(&mut *transaction)
+        .await?;
+    if admin != 0 {
+        return Err(refused());
+    }
+    let native = lineage::native(&mut transaction, matrix_enabled).await?;
+    let state: (String, String) = sqlx::query_as(
+        "SELECT state,bootstrap_nonce FROM runtime_eligibility_bootstrap WHERE singleton=1",
+    )
+    .fetch_one(&mut *transaction)
+    .await?;
+    if state.0 != "complete" {
+        return Err(refused());
+    }
+    let context = readback::context(&mut transaction, matrix_enabled, &native).await?;
+    transaction.commit().await?;
+    Ok(context)
+}
+
 async fn create(
     connection: &mut SqliteConnection,
     matrix_enabled: bool,

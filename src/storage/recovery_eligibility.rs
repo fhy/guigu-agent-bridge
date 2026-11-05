@@ -25,6 +25,7 @@ use sqlx::{Row, SqliteConnection};
 
 pub use authority::{EffectDomain, EligibilityContext, LiveFence};
 pub use bootstrap::bootstrap_nonadmin;
+pub(crate) use bootstrap::readback_nonadmin;
 pub use inventory::RowIdentity;
 pub use writer::RecoveryScope;
 

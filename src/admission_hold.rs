@@ -5,7 +5,7 @@ use sqlx::Row;
 
 use crate::storage::{
     MatrixRecoveryStore,
-    recovery_eligibility::{EffectDomain, LiveFence, RecoveryScope, bootstrap_nonadmin, writer},
+    recovery_eligibility::{EffectDomain, LiveFence, RecoveryScope, readback_nonadmin, writer},
 };
 
 pub(crate) struct Request {
@@ -81,7 +81,7 @@ pub(crate) async fn run(request: Request) -> Result<(), ()> {
         stage = "hold-classification",
         "checking non-administrative recovery context"
     );
-    let context = bootstrap_nonadmin(&pool, config.transports.matrix.enabled)
+    let context = readback_nonadmin(&pool, config.transports.matrix.enabled)
         .await
         .map_err(|_| ())?;
     let scope = RecoveryScope::new(context, EffectDomain::Local, None);

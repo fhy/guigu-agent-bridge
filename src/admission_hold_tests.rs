@@ -1,4 +1,5 @@
 use super::*;
+use crate::storage::recovery_eligibility::bootstrap_nonadmin;
 
 #[test]
 fn exact_command_refuses_duplicate_or_missing_scope() {
@@ -49,6 +50,10 @@ async fn exact_dispatching_admission_is_held_without_a_terminal_event() {
         .unwrap();
     }
     transaction.commit().await.unwrap();
+    let context = crate::storage::recovery_eligibility::readback_nonadmin(&pool, false)
+        .await
+        .unwrap();
+    let scope = RecoveryScope::new(context, EffectDomain::Local, None);
     let mut request = Request {
         database,
         config: root.path().join("config"),
