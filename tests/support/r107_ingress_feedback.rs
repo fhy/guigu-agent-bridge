@@ -50,6 +50,7 @@ async fn unrouted_notice_is_allowlisted_room_scoped_deduplicated_and_never_admit
         repository.as_ref().clone(),
         Clock::default(),
     );
+    let bus = bus.with_reliability(ReliabilityStore::new(pool.clone()), "r107-feedback".into());
     let reload = Arc::new(
         ReloadController::new(
             initial.clone(),
