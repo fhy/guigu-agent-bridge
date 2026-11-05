@@ -21,7 +21,7 @@ pub(crate) fn parse(arguments: &[OsString]) -> Result<Request, ()> {
         return Err(());
     }
     let mut fields = std::collections::BTreeMap::new();
-    for pair in arguments[1..].chunks_exact(2) {
+    for pair in arguments[1..].chunks(2) {
         let key = pair[0].to_str().ok_or(())?;
         let value = pair[1]
             .to_str()
@@ -158,7 +158,7 @@ async fn hold(pool: &sqlx::SqlitePool, scope: &RecoveryScope, request: &Request)
     {
         return Err(());
     }
-    let conflicts: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM runtime_instances WHERE state!='stopped')+(SELECT count(*) FROM deliveries WHERE task_id=?)+(SELECT count(*) FROM execution_leases WHERE task_id=?)+(SELECT count(*) FROM task_continuations WHERE task_id=?)+(SELECT count(*) FROM session_owner_bindings WHERE task_id=?)+(SELECT count(*) FROM agent_work_queue WHERE task_id=?)+(SELECT count(*) FROM workspace_claims WHERE task_id=?)")
+    let conflicts: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM deliveries WHERE task_id=?)+(SELECT count(*) FROM execution_leases WHERE task_id=?)+(SELECT count(*) FROM task_continuations WHERE task_id=?)+(SELECT count(*) FROM session_owner_bindings WHERE task_id=?)+(SELECT count(*) FROM agent_work_queue WHERE task_id=?)+(SELECT count(*) FROM workspace_claims WHERE task_id=?)")
         .bind(&request.task).bind(&request.task).bind(&request.task).bind(&request.task).bind(&request.task).bind(&request.task).fetch_one(&mut *transaction).await.map_err(|_| ())?;
     let statuses: Vec<String> =
         sqlx::query_scalar("SELECT status FROM task_events WHERE task_id=? ORDER BY seq")

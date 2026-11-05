@@ -50,6 +50,10 @@ async fn exact_dispatching_admission_is_held_without_a_terminal_event() {
         .unwrap();
     }
     transaction.commit().await.unwrap();
+    sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES('unrelated-live','t','t','active','pid:1')")
+        .execute(&pool)
+        .await
+        .unwrap();
     let context = crate::storage::recovery_eligibility::readback_nonadmin(&pool, false)
         .await
         .unwrap();
