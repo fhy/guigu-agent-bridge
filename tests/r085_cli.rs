@@ -8,7 +8,7 @@ fn binary() -> &'static str {
 fn version_contract_is_standalone_and_rejects_extra_arguments() {
     let version = Command::new(binary()).arg("--version").output().unwrap();
     assert_eq!(version.status.code(), Some(0));
-    assert_eq!(version.stdout, b"guigu-agent-bridge 0.2.24\n");
+    assert_eq!(version.stdout, b"guigu-agent-bridge 0.2.25\n");
     assert!(version.stderr.is_empty());
 
     for extra in ["--bad", "unexpected"] {
