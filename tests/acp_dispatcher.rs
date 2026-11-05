@@ -1528,9 +1528,51 @@ async fn lease_conflict_is_rejected_before_the_acp_process_starts() {
         queue_lease: None,
     };
     assert!(matches!(
-        leased.deliver(request).await,
+        leased.deliver(request.clone()).await,
         Err(guigu_agent_bridge::bus::DispatchError::NotAccepted { .. })
     ));
+    let failed = TaskEvent {
+        id: EventId::generate(),
+        task_id: task.task_id,
+        seq: 3,
+        status: TaskStatus::Failed,
+        timestamp: ts(),
+        payload: TaskEventPayload::Failed {
+            error: "refused".into(),
+        },
+    };
+    assert!(matches!(
+        leased.finalize_delivery_failure(request, failed).await,
+        Err(guigu_agent_bridge::bus::DispatchError::RecoveryNeeded)
+    ));
+    let second = harness.task("also must not start");
+    let request = guigu_agent_bridge::bus::DispatchRequest {
+        task: &second,
+        target,
+        delivery_id: DeliveryId::generate(),
+        attempt: 1,
+        queue_lease: None,
+    };
+    assert!(matches!(
+        leased.deliver(request.clone()).await,
+        Err(guigu_agent_bridge::bus::DispatchError::NotAccepted { .. })
+    ));
+    let refused = TaskEvent {
+        id: EventId::generate(),
+        task_id: second.task_id,
+        seq: 3,
+        status: TaskStatus::Failed,
+        timestamp: ts(),
+        payload: TaskEventPayload::Failed {
+            error: "not accepted".into(),
+        },
+    };
+    assert!(
+        leased
+            .finalize_delivery_failure(request, refused)
+            .await
+            .is_ok()
+    );
     assert_eq!(harness.dispatcher.backend_id(), None);
     harness.dispatcher.shutdown().await;
     harness.pool.close().await;

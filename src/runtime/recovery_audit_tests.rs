@@ -15,6 +15,9 @@ use std::time::Duration;
 #[path = "workspace_deletion_tests.rs"]
 mod workspace_deletion;
 
+#[path = "dispatch_reuse_tests.rs"]
+mod dispatch_reuse;
+
 struct Seed {
     root: tempfile::TempDir,
     pool: sqlx::SqlitePool,

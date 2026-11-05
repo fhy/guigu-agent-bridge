@@ -313,6 +313,23 @@ impl MatrixIngress {
                 let _ = send_permission_denied(self.sender.as_ref(), &context).await;
             }
             Err(RouteError::Bus) => return Err(crate::matrix::MatrixError::Storage),
+            Err(RouteError::NoRoute | RouteError::Target | RouteError::Ambiguous)
+                if snapshot.hot.permissions.permits_unrouted(&event.sender)
+                    && (snapshot.hot.route.knows_room(&event.room_id)
+                        || snapshot.hot.monitor_room.as_deref()
+                            == Some(event.room_id.as_str()))
+                    && self.dedup.mark(&event.room_id, &event.event_id) =>
+            {
+                tracing::warn!(event_id = %event.event_id, category = "route-unavailable", "authorized request has no usable Agent route");
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    self.sender.send_reply(
+                        &context,
+                        "No enabled Agent route is available for this request.",
+                    ),
+                )
+                .await;
+            }
             Err(_) => {}
         }
         Ok(())

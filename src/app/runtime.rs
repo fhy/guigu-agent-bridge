@@ -255,12 +255,13 @@ fn record_task_worker_result(
     result: &Result<(), crate::bus::WorkerError>,
     slot: &Arc<Mutex<Option<RequiredOwnerFailure>>>,
 ) {
-    if result.is_err() {
+    if let Err(error) = result {
+        tracing::error!(category = error.category(), error = %error, component = "task-worker", "required worker stopped");
         retain_failure(
             slot,
             RequiredOwnerFailure {
                 component: "task-worker",
-                class: "failed",
+                class: error.category(),
             },
         );
     }
@@ -1998,7 +1999,7 @@ enabled = true
             runtime.shutdown().await,
             Err(AppError::RequiredOwner {
                 component: "task-worker",
-                class: "failed"
+                class: "event-stream-closed",
             })
         ));
         std::fs::remove_dir_all(root).unwrap();

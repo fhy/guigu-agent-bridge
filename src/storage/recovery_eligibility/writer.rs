@@ -17,7 +17,8 @@ mod native_lease;
 mod transaction;
 mod workspace;
 pub(crate) use mutation::{
-    Mutation, complete_mutation, complete_refused_receipt, prepare_mutation,
+    Mutation, complete_mutation, complete_reassigned_lease, complete_refused_receipt,
+    prepare_mutation,
 };
 pub(crate) use native_control::{complete_control, prepare_control};
 pub(crate) use native_lease::{complete_expired_lease, complete_lease, prepare_lease};

@@ -1,6 +1,7 @@
 //! Durable runtime control for exclusive execution and bounded continuation.
 
 mod recovery_audit;
+mod refused_projection;
 
 use crate::{
     acp::{AcpDispatcher, TurnResult},
@@ -294,6 +295,7 @@ impl SqliteRuntimeStore {
             }
             Err(error) => return Err(error.into()),
         };
+        let mut reassigned = false;
         let outcome = if let Some(row) = row {
             let state: String = row.try_get("state").map_err(|_| RuntimeError::Malformed)?;
             match state.as_str() {
@@ -332,6 +334,7 @@ impl SqliteRuntimeStore {
                     if result.rows_affected() != 1 {
                         return Err(RuntimeError::Fenced);
                     }
+                    reassigned = true;
                     AcquireOutcome::Acquired(Lease {
                         resource,
                         task_id,
@@ -345,8 +348,12 @@ impl SqliteRuntimeStore {
         } else {
             return Err(RuntimeError::Malformed);
         };
-        self.complete_or_insert(&mut tx, "execution_leases", &resource.to_string(), mutation)
-            .await?;
+        if reassigned {
+            self.complete_reassigned_lease(&mut tx, mutation).await?;
+        } else {
+            self.complete_or_insert(&mut tx, "execution_leases", &resource.to_string(), mutation)
+                .await?;
+        }
         if let Err(error) = tx.commit().await {
             if error.to_string().contains("database is locked") {
                 return Ok(AcquireOutcome::Busy);
@@ -1220,6 +1227,9 @@ impl TaskLifecycle for SqliteTaskLifecycle {
             writer::inserted(&mut tx, self.recovery.as_ref(), &event_identity)
                 .await
                 .map_err(runtime_dispatch_error)?;
+            refused_projection::record(&mut tx, event, self.recovery.as_ref())
+                .await
+                .map_err(runtime_dispatch_error)?;
             tx.commit().await.map_err(runtime_dispatch_error)?;
             Ok(LifecycleResult::Committed)
         })
@@ -1461,6 +1471,7 @@ impl Drop for ExecutionGuard {
 
 #[derive(Clone)]
 pub struct LeasedAcpDispatcher {
+    refused_before_delivery: Arc<Mutex<std::collections::HashSet<TaskId>>>,
     dispatcher: AcpDispatcher,
     store: SqliteRuntimeStore,
     workspace: WorkspaceId,
@@ -1547,6 +1558,7 @@ impl LeasedAcpDispatcher {
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
         Self {
+            refused_before_delivery: Arc::new(Mutex::new(std::collections::HashSet::new())),
             dispatcher,
             store,
             workspace,
@@ -1649,6 +1661,21 @@ impl LeasedAcpDispatcher {
     fn execution_error(error: impl std::fmt::Display) -> DispatchError {
         DispatchError::ExecutionFailed {
             reason: crate::acp::bounded(&error.to_string()),
+        }
+    }
+
+    fn refuse_before_delivery(&self, task: TaskId, reason: &'static str) -> DispatchError {
+        let mut refused = self
+            .refused_before_delivery
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if refused.len() >= 4096 && !refused.contains(&task) {
+            return DispatchError::RecoveryNeeded;
+        }
+        refused.insert(task);
+        tracing::warn!(%task, stage = "lease-acquisition", category = reason, "delivery refused before ACP");
+        DispatchError::NotAccepted {
+            reason: reason.into(),
         }
     }
 
@@ -2072,7 +2099,11 @@ impl TaskDispatcher for LeasedAcpDispatcher {
     ) -> BusFuture<'a, Result<(), DispatchError>> {
         Box::pin(async move {
             let resource = ExecutionResourceKey::new(request.task.to_agent, self.workspace);
-            let lease = match self
+            self.refused_before_delivery
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&request.task.task_id);
+            let acquired = self
                 .store
                 .acquire(
                     resource,
@@ -2080,24 +2111,39 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                     self.clock.now(),
                     self.policy.lease_ttl,
                 )
-                .await
-                .map_err(Self::execution_error)?
-            {
-                AcquireOutcome::Acquired(value) => {
+                .await;
+            let lease = match acquired {
+                Err(error) => {
+                    let category = match &error {
+                        RuntimeError::Storage(StorageError::Query(sqlx::Error::Protocol(
+                            detail,
+                        ))) if detail == "offline-recovery-eligibility-refused" => {
+                            "eligibility-refused"
+                        }
+                        RuntimeError::Storage(_) => "storage",
+                        _ => "runtime",
+                    };
+                    tracing::error!(task_id = %request.task.task_id, stage = "lease-acquisition", category, "lease acquisition failed before ACP");
+                    return Err(self.refuse_before_delivery(
+                        request.task.task_id,
+                        "execution lease acquisition failed",
+                    ));
+                }
+                Ok(AcquireOutcome::Acquired(value)) => {
                     self.metrics.increment(Metric::LeaseAcquired);
                     value
                 }
-                AcquireOutcome::Busy => {
+                Ok(AcquireOutcome::Busy) => {
                     self.metrics.increment(Metric::LeaseBusy);
-                    return Err(DispatchError::NotAccepted {
-                        reason: "execution resource busy".into(),
-                    });
+                    return Err(self
+                        .refuse_before_delivery(request.task.task_id, "execution resource busy"));
                 }
-                AcquireOutcome::RecoveryNeeded => {
+                Ok(AcquireOutcome::RecoveryNeeded) => {
                     self.metrics.increment(Metric::LeaseRecoveryNeeded);
-                    return Err(DispatchError::NotAccepted {
-                        reason: "execution resource needs recovery".into(),
-                    });
+                    return Err(self.refuse_before_delivery(
+                        request.task.task_id,
+                        "execution resource needs recovery",
+                    ));
                 }
             };
             if let Err(error) = self
@@ -2105,10 +2151,14 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                 .claim_workspaces(&lease, &self.workspace_paths)
                 .await
             {
-                let _ = self
+                let released = self
                     .store
                     .release(&lease, ReleaseDisposition::Released, self.clock.now())
                     .await;
+                if released.is_ok() {
+                    return Err(self
+                        .refuse_before_delivery(request.task.task_id, "workspace claim refused"));
+                }
                 return Err(Self::execution_error(error));
             }
             if let Err(error) = self.dispatcher.deliver(request.clone()).await {
@@ -2265,6 +2315,17 @@ impl TaskDispatcher for LeasedAcpDispatcher {
         event: crate::models::TaskEvent,
     ) -> BusFuture<'a, Result<(), DispatchError>> {
         Box::pin(async move {
+            let refused = self
+                .refused_before_delivery
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&request.task.task_id);
+            if refused {
+                return match self.store.lease_for_task(request.task.task_id).await {
+                    Ok(None) => Ok(()),
+                    _ => Err(DispatchError::RecoveryNeeded),
+                };
+            }
             let pending = self
                 .pending
                 .lock()

@@ -2,6 +2,10 @@ use super::*;
 use matrix_sdk::sync::SyncResponse;
 use serde_json::Value;
 
+#[cfg(test)]
+#[path = "gap_tests.rs"]
+mod gap_tests;
+
 pub(super) fn canonical(raw: &str) -> Result<Value, MatrixError> {
     let mut value: Value = serde_json::from_str(raw).map_err(|_| MatrixError::Protocol {
         detail: "malformed timeline event",

@@ -5,6 +5,7 @@
 
 pub mod a2a;
 pub mod acp;
+mod admission_hold;
 pub mod agents;
 pub mod app;
 pub mod bus;
@@ -159,6 +160,15 @@ pub async fn run() -> Result<(), Error> {
                 status: 4,
             })
         })?;
+    if all_args.get(1).and_then(|value| value.to_str()) == Some("hold-unresolved-admission") {
+        let request = admission_hold::parse(&all_args[1..])
+            .map_err(|_| recovery_failure("hold-unresolved-admission"))?;
+        admission_hold::run(request)
+            .await
+            .map_err(|_| recovery_failure("hold-unresolved-admission"))?;
+        println!("hold-unresolved-admission result=held-no-replay");
+        return Ok(());
+    }
     if all_args.get(1).and_then(|v| v.to_str()) == Some("historical-terminal-cleanup") {
         let req = terminal_acknowledged_cleanup::parse_args(&all_args[1..]).map_err(|_| {
             Error::Cli(error::CliFailure {

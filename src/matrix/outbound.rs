@@ -80,8 +80,23 @@ impl MatrixSender for SdkMatrixSender {
                 "body": cap(body),
                 "m.relates_to": relation
             });
-            self.send(&context.room_id, content)
+            let room_id: OwnedRoomId = context.room_id.parse().map_err(|_| super::ReplyError)?;
+            let room = self
+                .client
+                .inner
+                .get_room(&room_id)
+                .ok_or(super::ReplyError)?;
+            let transaction = format!(
+                "bridge-reply-{}",
+                uuid::Uuid::new_v5(
+                    &uuid::Uuid::NAMESPACE_URL,
+                    format!("{}:{}", context.room_id, context.event_id).as_bytes()
+                )
+            );
+            room.send_raw("m.room.message", content)
+                .with_transaction_id(transaction.as_str().into())
                 .await
+                .map(|_| ())
                 .map_err(|_| super::ReplyError)
         })
     }

@@ -77,6 +77,14 @@ impl SqliteRuntimeStore {
         writer::complete_mutation(connection, self.recovery.as_ref(), mutation).await
     }
 
+    pub(super) async fn complete_reassigned_lease(
+        &self,
+        connection: &mut SqliteConnection,
+        mutation: Option<Mutation>,
+    ) -> Result<(), sqlx::Error> {
+        writer::complete_reassigned_lease(connection, self.recovery.as_ref(), mutation).await
+    }
+
     pub(super) async fn insert(
         &self,
         connection: &mut SqliteConnection,

@@ -16,6 +16,10 @@ use crate::config::MatrixTransportConfig;
 use super::MatrixError;
 use super::store_identity;
 
+#[cfg(test)]
+#[path = "baseline_tests.rs"]
+mod baseline_tests;
+
 /// Authenticated Matrix client. SDK types do not leave `src/matrix`.
 #[derive(Clone)]
 pub struct MatrixClient {
@@ -212,13 +216,7 @@ impl MatrixClient {
             )
             .await
             .map_err(|_| MatrixError::Transport)?;
-        if response.next_batch.is_empty()
-            || response
-                .rooms
-                .join
-                .values()
-                .any(|room| room.timeline.limited)
-        {
+        if response.next_batch.is_empty() {
             return Err(MatrixError::CutoverRefused);
         }
         Ok(response.next_batch)

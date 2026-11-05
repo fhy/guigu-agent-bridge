@@ -1372,7 +1372,7 @@ impl ReliabilityStore {
         &self,
         _limit: u32,
     ) -> Result<AdmissionRecovery, ReliabilityError> {
-        let rows=sqlx::query("SELECT a.task_id,a.revision,a.state,r.state AS owner_state FROM task_admissions a LEFT JOIN runtime_instances r ON r.instance_token=a.runtime_instance WHERE a.state NOT IN ('terminal','recovery_needed') ORDER BY a.created_at")
+        let rows=sqlx::query("SELECT a.task_id,a.revision,a.state,r.state AS owner_state,EXISTS(SELECT 1 FROM transport_receipts receipt WHERE receipt.transport='offline-admission-hold' AND receipt.external_event_id=a.task_id AND receipt.task_id=a.task_id AND receipt.receipt_kind='admin' AND receipt.route_kind='unknown-dispatch-hold-v1' AND receipt.state='rejected' AND receipt.result_code='unknown-preserved:'||a.runtime_instance||':'||a.revision) AS explicit_hold FROM task_admissions a LEFT JOIN runtime_instances r ON r.instance_token=a.runtime_instance WHERE a.state!='terminal' ORDER BY a.created_at")
             .fetch_all(&self.pool).await?;
         let mut result = AdmissionRecovery {
             eligible: Vec::new(),
@@ -1384,6 +1384,12 @@ impl ReliabilityStore {
             let revision: i64 = row.try_get("revision")?;
             let state: String = row.try_get("state")?;
             let owner: Option<String> = row.try_get("owner_state")?;
+            if state == "recovery_needed" {
+                if row.try_get::<bool, _>("explicit_hold")? && owner.as_deref() == Some("stopped") {
+                    result.covered.push(task);
+                }
+                continue;
+            }
             result.covered.push(task.clone());
             if state == "ready" || (state == "enqueued" && owner.as_deref() == Some("stopped")) {
                 result.eligible.push((task, revision));

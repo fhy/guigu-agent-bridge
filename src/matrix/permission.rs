@@ -24,4 +24,8 @@ impl PermissionPolicy {
             .get(user_id)
             .is_some_and(|allowed| allowed.is_none_or(|id| id == target))
     }
+
+    pub(crate) fn permits_unrouted(&self, user_id: &str) -> bool {
+        matches!(self.users.get(user_id), Some(None))
+    }
 }

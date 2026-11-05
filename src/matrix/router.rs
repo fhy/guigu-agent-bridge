@@ -39,6 +39,9 @@ impl RoutePolicy {
     pub fn new() -> Self {
         Self::default()
     }
+    pub(crate) fn knows_room(&self, room: &str) -> bool {
+        self.room_targets.contains_key(room) || self.direct_targets.contains_key(room)
+    }
     pub fn alias(mut self, alias: impl Into<String>, agent_id: impl Into<String>) -> Self {
         self.aliases.insert(alias.into(), agent_id.into());
         self

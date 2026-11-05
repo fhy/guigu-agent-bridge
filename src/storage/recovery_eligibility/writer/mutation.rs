@@ -10,6 +10,7 @@ pub(crate) struct Mutation {
     revision: String,
     digest: String,
     parents: String,
+    released_lease: Option<(String, i64)>,
 }
 
 pub(crate) async fn complete_refused_receipt(
@@ -69,12 +70,19 @@ pub(crate) async fn prepare_mutation(
     )
     .await?;
     let row = sqlx::query("SELECT original_revision,original_digest,parent_relations FROM offline_recovery_rows WHERE table_name=? AND canonical_pk=? AND disposition IN ('eligible_new','eligible_preserved')")
-        .bind(&identity.table).bind(&identity.key).fetch_optional(connection).await?.ok_or_else(refused)?;
+        .bind(&identity.table).bind(&identity.key).fetch_optional(&mut *connection).await?.ok_or_else(refused)?;
+    let released_lease = if identity.table == "execution_leases" {
+        sqlx::query_as("SELECT task_id,fence FROM execution_leases WHERE json_array('text:'||hex(CAST(resource_key AS BLOB)))=? AND state='released'")
+            .bind(&identity.key).fetch_optional(&mut *connection).await?
+    } else {
+        None
+    };
     Ok(Some(Mutation {
         identity: identity.clone(),
         revision: row.try_get(0)?,
         digest: row.try_get(1)?,
         parents: row.try_get(2)?,
+        released_lease,
     }))
 }
 
@@ -82,6 +90,23 @@ pub(crate) async fn complete_mutation(
     connection: &mut SqliteConnection,
     scope: Option<&RecoveryScope>,
     mutation: Option<Mutation>,
+) -> Result<(), sqlx::Error> {
+    complete(connection, scope, mutation, false).await
+}
+
+pub(crate) async fn complete_reassigned_lease(
+    connection: &mut SqliteConnection,
+    scope: Option<&RecoveryScope>,
+    mutation: Option<Mutation>,
+) -> Result<(), sqlx::Error> {
+    complete(connection, scope, mutation, true).await
+}
+
+async fn complete(
+    connection: &mut SqliteConnection,
+    scope: Option<&RecoveryScope>,
+    mutation: Option<Mutation>,
+    reassign: bool,
 ) -> Result<(), sqlx::Error> {
     let (Some(scope), Some(mutation)) = (scope, mutation) else {
         return Ok(());
@@ -96,8 +121,17 @@ pub(crate) async fn complete_mutation(
     )
     .await?;
     let snapshot = inventory::snapshot(connection, &mutation.identity).await?;
-    let declared: Vec<ParentIdentity> =
+    let mut declared: Vec<ParentIdentity> =
         serde_json::from_str(&mutation.parents).map_err(|_| refused())?;
+    let parents = if reassign {
+        validate_reassignment(connection, &mutation, &mut declared).await?;
+        serde_json::to_string(
+            &super::parents(connection, scope, &mutation.identity, &snapshot).await?,
+        )
+        .map_err(|_| refused())?
+    } else {
+        mutation.parents.clone()
+    };
     if declared.len() != snapshot.parents.len()
         || snapshot
             .parents
@@ -106,8 +140,8 @@ pub(crate) async fn complete_mutation(
     {
         return Err(refused());
     }
-    let affected = sqlx::query("UPDATE offline_recovery_rows SET original_revision=?,original_digest=? WHERE table_name=? AND canonical_pk=? AND original_revision=? AND original_digest=? AND parent_relations=? AND disposition IN ('eligible_new','eligible_preserved')")
-        .bind(&snapshot.revision).bind(&snapshot.digest).bind(&mutation.identity.table)
+    let affected = sqlx::query("UPDATE offline_recovery_rows SET original_revision=?,original_digest=?,parent_relations=? WHERE table_name=? AND canonical_pk=? AND original_revision=? AND original_digest=? AND parent_relations=? AND disposition IN ('eligible_new','eligible_preserved')")
+        .bind(&snapshot.revision).bind(&snapshot.digest).bind(parents).bind(&mutation.identity.table)
         .bind(&mutation.identity.key).bind(&mutation.revision).bind(&mutation.digest)
         .bind(&mutation.parents).execute(&mut *connection).await?;
     if affected.rows_affected() != 1 {
@@ -122,6 +156,29 @@ pub(crate) async fn complete_mutation(
         &mutation.identity,
     )
     .await
+}
+
+async fn validate_reassignment(
+    connection: &mut SqliteConnection,
+    mutation: &Mutation,
+    declared: &mut [ParentIdentity],
+) -> Result<(), sqlx::Error> {
+    let (previous_task, previous_fence) = mutation.released_lease.as_ref().ok_or_else(refused)?;
+    if mutation.identity.table != "execution_leases" {
+        return Err(refused());
+    }
+    let (task, fence): (String, i64) = sqlx::query_as("SELECT task_id,fence FROM execution_leases WHERE json_array('text:'||hex(CAST(resource_key AS BLOB)))=? AND state='active'")
+        .bind(&mutation.identity.key).fetch_one(&mut *connection).await?;
+    if previous_fence.checked_add(1) != Some(fence) {
+        return Err(refused());
+    }
+    let previous = super::text_identity("tasks", previous_task)?;
+    let parent = declared
+        .iter_mut()
+        .find(|parent| parent.identity == previous)
+        .ok_or_else(refused)?;
+    parent.identity = super::text_identity("tasks", &task)?;
+    Ok(())
 }
 
 async fn refresh_references(

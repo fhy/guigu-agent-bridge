@@ -386,6 +386,18 @@ pub enum DispatchError {
     RecoveryNeeded,
 }
 
+impl DispatchError {
+    pub(crate) fn category(&self) -> &'static str {
+        match self {
+            Self::NotAccepted { .. } => "not-accepted",
+            Self::ExecutionFailed { .. } => "execution-failed",
+            Self::UnsupportedPrepared => "unsupported-prepared",
+            Self::AcceptanceUnknown => "acceptance-unknown",
+            Self::RecoveryNeeded => "recovery-needed",
+        }
+    }
+}
+
 /// Result of the crate-owned reliable finalization protocol.
 ///
 /// This type is public so lifecycle integrations and diagnostics can name
@@ -718,6 +730,15 @@ fn admit_ready(
 /// [`TaskId`] and a sequence number — never an address, command or credential.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WorkerError {
+    #[error(
+        "delivery finalization failed for task {task_id} at seq {seq}: {delivery_class}/{finalization_class}"
+    )]
+    DeliveryFinalization {
+        task_id: TaskId,
+        seq: u64,
+        delivery_class: &'static str,
+        finalization_class: &'static str,
+    },
     /// The event stream is closed; no further transition can be recorded.
     ///
     /// The worker stops, drops the task receiver, and later submissions report
@@ -838,6 +859,15 @@ impl LoopLimits {
 }
 
 impl WorkerError {
+    pub(crate) fn category(&self) -> &'static str {
+        match self {
+            Self::DeliveryFinalization { .. } => "delivery-finalization",
+            Self::EventStreamClosed { .. } => "event-stream-closed",
+            Self::EventBackpressure { .. } => "event-backpressure",
+            Self::EventWrite { .. } if self.is_recovery_needed() => "recovery-needed",
+            Self::EventWrite { .. } => "event-write",
+        }
+    }
     const RECOVERY_SEQ: u64 = u64::MAX;
 
     fn recovery_needed(task_id: TaskId) -> Self {
@@ -1322,6 +1352,7 @@ impl Worker {
             match delivered {
                 Raced::Done(Ok(())) => {}
                 Raced::Done(Err(err)) => {
+                    tracing::warn!(%task_id, %delivery_id, attempt, seq, category = err.category(), stage = "delivery", "delivery failed");
                     if dispatcher.supports_prepared() {
                         let (status, payload) = if let Some(reason) = self.cancel_reason(task_id) {
                             (
@@ -1352,10 +1383,11 @@ impl Worker {
                         dispatcher
                             .finalize_delivery_failure(request.clone(), event.clone())
                             .await
-                            .map_err(|_| WorkerError::EventWrite {
+                            .map_err(|error| WorkerError::DeliveryFinalization {
                                 task_id,
                                 seq,
-                                error: BusError::TaskChannelClosed,
+                                delivery_class: err.category(),
+                                finalization_class: error.category(),
                             })?;
                         let result = self.emit(event, task_id, seq).await;
                         if let Some(cancellation) = &self.config.cancellation {

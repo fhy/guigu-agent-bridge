@@ -14,6 +14,25 @@ remain failures. The default is false (strict structured results). Do not combin
 it with `allow_nonterminal_end_turn`, which deliberately continues rather than
 completing such turns.
 
+For ordinary Codex ACP, set this option explicitly before the first task; a
+connected Matrix listener does not prove that the Agent can complete a turn.
+Verify an encrypted request and its successful Agent reply, then repeat after a
+same-device/store restart. Do not reset the store to work around admission errors.
+
+## Retaining an unresolved dispatch
+
+`hold-unresolved-admission --database DB --config CONFIG --task TASK --owner OWNER
+--revision REVISION` is an offline, exact-scope recovery operation for a stopped,
+non-administrative deployment. It changes only a matching `dispatching` admission
+to `recovery_needed`, preserving the task and its queued/dispatched events. It
+records an exact owner/revision-bound administrative hold receipt atomically;
+an unrelated `recovery_needed` row does not gain this no-replay exemption. It
+does not assert failure, nonacceptance or absence of effects and never replays it.
+It refuses delivery, execution lease, continuation, workspace, queue or session
+binding evidence for that task, a live durable runtime, stale revision or owner,
+and administrative bindings. Preserve a consistent backup before using it.
+Other unresolved execution/delivery evidence still blocks startup normally.
+
 Start from `config.example.toml`. Unknown or invalid values fail startup. Secret values
 use `{env:VARIABLE}` references; do not store access tokens in the file.
 

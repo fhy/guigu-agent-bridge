@@ -15,6 +15,7 @@ pub(crate) fn acquire(args: &[OsString]) -> Result<Option<RuntimeLock>, Failure>
     let explicit = matches!(
         command,
         "historical-terminal-cleanup"
+            | "hold-unresolved-admission"
             | "historical-unknown-abandon"
             | "recover-runtime"
             | "reconcile-delivery"
