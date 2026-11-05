@@ -37,6 +37,8 @@ pub mod selected_preacceptance;
 pub mod storage;
 pub(crate) mod terminal_acknowledged_cleanup;
 pub(crate) mod terminal_closure;
+#[cfg(test)]
+mod test_diagnostics;
 
 use std::future::Future;
 
@@ -151,6 +153,13 @@ pub async fn run() -> Result<(), Error> {
             })?;
         println!("{result}");
         return Ok(());
+    }
+    if all_args.get(1).and_then(|value| value.to_str()) == Some("hold-unresolved-admission") {
+        init_tracing();
+        tracing::debug!(
+            stage = "maintenance-exclusion",
+            "acquiring offline admission hold exclusion"
+        );
     }
     let _maintenance_guard = offline_production_migration::cli_exclusion::acquire(&all_args)
         .map_err(|_| {

@@ -298,6 +298,7 @@ impl SqliteRuntimeStore {
         let mut reassigned = false;
         let outcome = if let Some(row) = row {
             let state: String = row.try_get("state").map_err(|_| RuntimeError::Malformed)?;
+            tracing::debug!(%task_id, stage = "lease-acquisition", state, fence = row.try_get::<i64, _>("fence").ok(), "evaluating existing lease without assuming acceptance");
             match state.as_str() {
                 "active" => {
                     let stored: String = row
@@ -349,6 +350,7 @@ impl SqliteRuntimeStore {
             return Err(RuntimeError::Malformed);
         };
         if reassigned {
+            tracing::debug!(%task_id, stage = "lease-reassignment", committed = false, "validating released lease parent replacement");
             self.complete_reassigned_lease(&mut tx, mutation).await?;
         } else {
             self.complete_or_insert(&mut tx, "execution_leases", &resource.to_string(), mutation)
@@ -360,6 +362,7 @@ impl SqliteRuntimeStore {
             }
             return Err(error.into());
         }
+        tracing::debug!(%task_id, stage = "lease-acquisition", reassigned, committed = true, "lease transaction committed");
         Ok(outcome)
     }
 

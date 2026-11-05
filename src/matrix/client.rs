@@ -204,6 +204,12 @@ impl MatrixClient {
     }
 
     pub(crate) async fn baseline_sync_token(&self) -> Result<String, MatrixError> {
+        let started = std::time::Instant::now();
+        tracing::debug!(
+            stage = "initial-baseline",
+            checkpoint_present = false,
+            "requesting a historical cutover, not executing its timeline"
+        );
         let mut request = sync_events::v3::Request::new();
         request.timeout = Some(std::time::Duration::from_secs(10));
         let response = self
@@ -215,10 +221,37 @@ impl MatrixClient {
                     .timeout(std::time::Duration::from_secs(60)),
             )
             .await
-            .map_err(|_| MatrixError::Transport)?;
+            .map_err(|_| {
+                tracing::error!(
+                    stage = "initial-baseline",
+                    category = "transport",
+                    "baseline request failed before publication"
+                );
+                MatrixError::Transport
+            })?;
         if response.next_batch.is_empty() {
+            tracing::error!(
+                stage = "initial-baseline",
+                category = "empty-token",
+                committed = false,
+                "baseline refused"
+            );
             return Err(MatrixError::CutoverRefused);
         }
+        let limited_rooms = response
+            .rooms
+            .join
+            .values()
+            .filter(|room| room.timeline.limited)
+            .count();
+        tracing::debug!(
+            stage = "initial-baseline",
+            limited_rooms,
+            elapsed_ms = started.elapsed().as_millis(),
+            historical_events_executed = 0,
+            committed = false,
+            "baseline response accepted; durable publication still required"
+        );
         Ok(response.next_batch)
     }
 }

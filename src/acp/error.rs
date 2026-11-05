@@ -162,6 +162,32 @@ pub enum AcpError {
     },
 }
 
+impl AcpError {
+    pub(crate) fn category(&self) -> &'static str {
+        match self {
+            Self::UnsupportedAddress { .. } => "unsupported-address",
+            Self::Spawn { .. } => "spawn",
+            Self::Timeout { .. } => "timeout",
+            Self::StreamBackpressure => "stream-backpressure",
+            Self::RecoveryNeeded => "acceptance-needs-recovery",
+            Self::Exited { .. } => "child-exited",
+            Self::TransportClosed => "transport-closed",
+            Self::UnsupportedProtocol { .. } => "unsupported-protocol",
+            Self::Authentication { .. } => "authentication",
+            Self::Frame { .. } => "frame",
+            Self::Protocol { .. } => "protocol",
+            Self::Schema { detail, .. } if detail == "missing taskResult in strict mode" => {
+                "missing-task-result-strict-mode"
+            }
+            Self::Schema { .. } => "schema",
+            Self::MissingTaskResult => "missing-task-result-strict-mode",
+            Self::Agent { .. } => "agent-refused",
+            Self::SessionId { .. } => "session-identity",
+            Self::Storage { .. } => "session-storage",
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -219,6 +245,33 @@ mod tests {
     fn a_phase_renders_its_step() {
         assert_eq!(Phase::Spawn.to_string(), "process start");
         assert_eq!(Phase::Prompt.to_string(), "prompt");
+    }
+
+    #[test]
+    fn safe_categories_distinguish_mode_omission_without_logging_remote_details() {
+        let captured = crate::test_diagnostics::Capture::default();
+        tracing::subscriber::with_default(captured.subscriber(), || {
+            for error in [
+                AcpError::MissingTaskResult,
+                AcpError::Schema {
+                    method: "session/prompt".into(),
+                    detail: "missing taskResult in strict mode".into(),
+                },
+                AcpError::Agent {
+                    source: JsonRpcErrorObject::new(-1, "SECRET_REMOTE_CONTENT"),
+                },
+            ] {
+                tracing::error!(
+                    stage = "acp-execution",
+                    category = error.category(),
+                    "controlled diagnostic classification"
+                );
+            }
+        });
+        let output = captured.output();
+        assert_eq!(output.matches("missing-task-result-strict-mode").count(), 2);
+        assert!(output.contains("agent-refused"));
+        assert!(!output.contains("SECRET_REMOTE_CONTENT"));
     }
 
     #[test]

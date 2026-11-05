@@ -28,6 +28,10 @@ struct Seed {
 
 impl Seed {
     async fn new() -> Self {
+        Self::create(false).await
+    }
+
+    async fn create(matrix: bool) -> Self {
         let root = tempfile::Builder::new()
             .prefix("r092-runtime-audit-")
             .tempdir_in("/tmp")
@@ -36,8 +40,7 @@ impl Seed {
             .await
             .unwrap();
         crate::storage::migrate(&pool).await.unwrap();
-        let context = bootstrap_nonadmin(&pool, false).await.unwrap();
-        let scope = RecoveryScope::new(context, EffectDomain::Local, None);
+        let scope = audited_scope(&pool, matrix).await;
         let endpoint = crate::models::EndpointId::generate();
         let task = TaskId::generate();
         let mut tx = writer::begin(&pool, Some(&scope)).await.unwrap();
@@ -104,6 +107,49 @@ impl Seed {
             },
         }
     }
+}
+
+async fn audited_scope(pool: &sqlx::SqlitePool, matrix: bool) -> RecoveryScope {
+    use crate::storage::{CompatibilityGate, MatrixCompatibilityStore, MatrixRecoveryStore};
+    let operation = if matrix {
+        let CompatibilityGate::Native(operation) = MatrixCompatibilityStore::new(pool.clone())
+            .gate(true, None)
+            .await
+            .unwrap()
+        else {
+            panic!("native operation required")
+        };
+        Some(operation)
+    } else {
+        None
+    };
+    let context = bootstrap_nonadmin(pool, matrix).await.unwrap();
+    let scope = RecoveryScope::new(context, EffectDomain::Local, None);
+    if let Some(operation) = operation {
+        let store = MatrixRecoveryStore::new_scoped(pool.clone(), Some(scope.clone()));
+        store
+            .activate_cutover(&operation, "synthetic-baseline", "activation")
+            .await
+            .unwrap();
+        let now = Utc::now();
+        let epoch = store
+            .acquire_component_lease(
+                "MatrixSync",
+                "synthetic-owner",
+                &now.to_rfc3339(),
+                &(now + chrono::Duration::minutes(10)).to_rfc3339(),
+            )
+            .await
+            .unwrap();
+        scope
+            .install_matrix_fence(crate::storage::recovery_eligibility::LiveFence {
+                component: "MatrixSync".into(),
+                owner: "synthetic-owner".into(),
+                epoch,
+            })
+            .unwrap();
+    }
+    scope
 }
 
 #[tokio::test]

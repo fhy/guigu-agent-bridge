@@ -475,6 +475,7 @@ impl AcpDispatcher {
     async fn deliver_inner(&self, request: &DispatchRequest<'_>) -> Result<(), AcpError> {
         let endpoint = request.target.id();
         let conversation = request.task.conversation_id;
+        tracing::debug!(task_id = %request.task.task_id, delivery_id = %request.delivery_id, attempt = request.attempt, stage = "acp-delivery", legacy_acp_results = self.inner.legacy_results, allow_nonterminal_end_turn = self.inner.allow_nonterminal_end_turn, "effective ACP completion contract");
         let prepared_at = self.inner.clock.now();
         if let Some(reliability) = &self.inner.reliability {
             reliability
@@ -522,6 +523,7 @@ impl AcpDispatcher {
         };
         let session_id = match existing {
             Some(stored) => {
+                tracing::debug!(task_id = %request.task.task_id, stage = "acp-session", action = "resume", "reconfirming durable session before acceptance");
                 // A live session is re-confirmed with the agent rather than assumed:
                 // `resume` is this attempt's acknowledgement, and it is what makes a
                 // second task in one conversation still have an explicit round trip.
@@ -545,6 +547,7 @@ impl AcpDispatcher {
                 session_id
             }
             None => {
+                tracing::debug!(task_id = %request.task.task_id, stage = "acp-session", action = "new", "creating session before acceptance");
                 let session_id = client
                     .new_session_with_workspaces(
                         &self.inner.cwd,
@@ -869,7 +872,7 @@ impl TaskDispatcher for AcpDispatcher {
     ) -> BusFuture<'a, Result<(), DispatchError>> {
         Box::pin(async move {
             self.deliver_inner(&request).await.map_err(|error| {
-                tracing::warn!(%error, "acp delivery was not accepted");
+                tracing::error!(task_id = %request.task.task_id, delivery_id = %request.delivery_id, attempt = request.attempt, stage = "acp-delivery", category = error.category(), "ACP delivery failed before acknowledgement");
                 DispatchError::NotAccepted {
                     reason: reason_of(&error),
                 }
@@ -884,7 +887,7 @@ impl TaskDispatcher for AcpDispatcher {
     ) -> BusFuture<'a, Result<DispatchOutcome, DispatchError>> {
         Box::pin(async move {
             self.execute_inner(&request).await.map_err(|error| {
-                tracing::warn!(%error, "acp execution failed");
+                tracing::error!(task_id = %request.task.task_id, delivery_id = %request.delivery_id, attempt = request.attempt, stage = "acp-execution", category = error.category(), legacy_acp_results = self.inner.legacy_results, "ACP turn failed; task outcome requires durable finalization");
                 DispatchError::ExecutionFailed {
                     reason: reason_of(&error),
                 }

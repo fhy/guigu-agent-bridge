@@ -62,6 +62,12 @@ pub(super) async fn prepare_sync(
     let mut activation_epoch = None;
     match control.phase.as_str() {
         "baseline" if control.watermark.is_none() => {
+            tracing::debug!(
+                stage = "baseline-publication",
+                checkpoint_present = false,
+                phase = "baseline",
+                "establishing durable cutover before routing input"
+            );
             let now = Utc::now();
             let epoch = recovery
                 .acquire_component_lease(
@@ -117,13 +123,35 @@ pub(super) async fn prepare_sync(
                     .await
                     .map_err(|_| AppError::Runtime)?;
             }
+            tracing::info!(
+                stage = "baseline-publication",
+                committed = true,
+                historical_events_executed = 0,
+                "durable baseline published before active consumer"
+            );
         }
         "active"
             if control
                 .watermark
                 .as_ref()
-                .is_some_and(|token| !token.is_empty()) => {}
-        _ => return Err(AppError::Runtime),
+                .is_some_and(|token| !token.is_empty()) =>
+        {
+            tracing::debug!(
+                stage = "baseline-publication",
+                checkpoint_present = true,
+                phase = "active",
+                "resuming existing checkpoint without rebaseline"
+            );
+        }
+        _ => {
+            tracing::error!(
+                stage = "baseline-publication",
+                category = "phase-or-checkpoint",
+                checkpoint_present = control.watermark.is_some(),
+                "startup refused without discarding durable state"
+            );
+            return Err(AppError::Runtime);
+        }
     }
     let now = Utc::now();
     let epoch = match activation_epoch {

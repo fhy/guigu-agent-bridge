@@ -47,15 +47,26 @@ pub(crate) fn parse(arguments: &[OsString]) -> Result<Request, ()> {
 }
 
 pub(crate) async fn run(request: Request) -> Result<(), ()> {
+    tracing::debug!(stage = "hold-config", task_id = %request.task, revision = request.revision, "validating offline hold inputs");
     let config = crate::config::load(&request.config).map_err(|_| ())?;
     if config.bridge.database.canonicalize().map_err(|_| ())?
         != request.database.canonicalize().map_err(|_| ())?
     {
         return Err(());
     }
+    tracing::debug!(
+        stage = "hold-admission-guard",
+        "acquiring exact launcher identity guard"
+    );
     let guard =
         crate::runtime_admission::Guard::acquire(&request.database, &request.config, "startup")
-            .map_err(|_| ())?;
+            .map_err(|error| {
+                tracing::error!(stage = "hold-admission-guard", category = "identity-or-exclusion", kind = ?error.kind(), "offline hold refused before database mutation");
+            })?;
+    tracing::debug!(
+        stage = "hold-database",
+        "opening preserved database under exclusion"
+    );
     let pool = crate::storage::connect(&request.database)
         .await
         .map_err(|_| ())?;
@@ -66,35 +77,29 @@ pub(crate) async fn run(request: Request) -> Result<(), ()> {
     if administrative != 0 {
         return Err(());
     }
+    tracing::debug!(
+        stage = "hold-classification",
+        "checking non-administrative recovery context"
+    );
     let context = bootstrap_nonadmin(&pool, config.transports.matrix.enabled)
         .await
         .map_err(|_| ())?;
     let scope = RecoveryScope::new(context, EffectDomain::Local, None);
     let recovery = MatrixRecoveryStore::new_scoped(pool.clone(), Some(scope.clone()));
     let owner = uuid::Uuid::now_v7().to_string();
-    let now = Utc::now();
-    let epoch = if config.transports.matrix.enabled {
-        let epoch = recovery
-            .acquire_component_lease(
-                "MatrixSync",
-                &owner,
-                &now.to_rfc3339(),
-                &(now + chrono::Duration::seconds(60)).to_rfc3339(),
-            )
-            .await
-            .map_err(|_| ())?;
-        scope
-            .install_matrix_fence(LiveFence {
-                component: "MatrixSync".into(),
-                owner: owner.clone(),
-                epoch,
-            })
-            .map_err(|_| ())?;
-        Some(epoch)
-    } else {
-        None
-    };
+    let epoch = acquire_fence(&recovery, &scope, &owner, config.transports.matrix.enabled).await?;
+    tracing::debug!(
+        stage = "hold-transaction",
+        "validating exact unresolved task predicate"
+    );
     let result = hold(&pool, &scope, &request).await;
+    if result.is_err() {
+        tracing::error!(
+            stage = "hold-transaction",
+            category = "hold-refused",
+            "transaction did not confirm an unresolved task hold"
+        );
+    }
     let released = if let Some(epoch) = epoch {
         recovery
             .release_component_lease("MatrixSync", &owner, epoch, &Utc::now().to_rfc3339())
@@ -106,6 +111,35 @@ pub(crate) async fn run(request: Request) -> Result<(), ()> {
     pool.close().await;
     guard.revalidate().map_err(|_| ())?;
     result.and(released)
+}
+
+async fn acquire_fence(
+    recovery: &MatrixRecoveryStore,
+    scope: &RecoveryScope,
+    owner: &str,
+    enabled: bool,
+) -> Result<Option<i64>, ()> {
+    if !enabled {
+        return Ok(None);
+    }
+    let now = Utc::now();
+    let epoch = recovery
+        .acquire_component_lease(
+            "MatrixSync",
+            owner,
+            &now.to_rfc3339(),
+            &(now + chrono::Duration::seconds(60)).to_rfc3339(),
+        )
+        .await
+        .map_err(|_| ())?;
+    scope
+        .install_matrix_fence(LiveFence {
+            component: "MatrixSync".into(),
+            owner: owner.into(),
+            epoch,
+        })
+        .map_err(|_| ())?;
+    Ok(Some(epoch))
 }
 
 async fn hold(pool: &sqlx::SqlitePool, scope: &RecoveryScope, request: &Request) -> Result<(), ()> {

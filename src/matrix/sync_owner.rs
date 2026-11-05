@@ -128,10 +128,14 @@ impl MatrixSync {
             };
             match response {
                 Ok(_) => {
+                    if failures != 0 {
+                        report_recovered(failures);
+                    }
                     failures = 0;
                 }
                 Err(MatrixError::Transport) if failures < 2 => {
                     failures += 1;
+                    report_retry(failures);
                     tokio::select! {
                         biased;
                         changed = shutdown.changed() => {
@@ -142,9 +146,66 @@ impl MatrixSync {
                     }
                     continue;
                 }
-                Err(error) => return Err(error),
+                Err(error) => {
+                    tracing::error!(
+                        stage = "incremental-sync",
+                        category = "sync-owner-stopped",
+                        failures,
+                        "required sync owner stopped; inspect the correlated first failure"
+                    );
+                    return Err(error);
+                }
             }
         }
+    }
+}
+
+fn report_retry(failures: u8) {
+    if failures == 1 {
+        tracing::warn!(
+            stage = "incremental-sync",
+            category = "transport",
+            failures,
+            retry_limit = 2,
+            "sync failed; bounded retry pending"
+        );
+    } else {
+        tracing::debug!(
+            stage = "incremental-sync",
+            category = "transport",
+            failures,
+            "repeated sync failure within retry budget"
+        );
+    }
+}
+
+fn report_recovered(failures: u8) {
+    tracing::info!(
+        stage = "incremental-sync",
+        category = "transport-recovered",
+        failures,
+        "sync recovered within retry budget"
+    );
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn retries_preserve_first_warning_count_repeats_and_report_recovery() {
+        let captured = crate::test_diagnostics::Capture::default();
+        tracing::subscriber::with_default(captured.subscriber(), || {
+            report_retry(1);
+            report_retry(2);
+            report_recovered(2);
+        });
+        let output = captured.output();
+        assert_eq!(output.matches("WARN").count(), 1);
+        assert_eq!(output.matches("DEBUG").count(), 1);
+        assert_eq!(output.matches("INFO").count(), 1);
+        assert!(output.contains("failures=2"));
+        assert!(output.find("WARN").unwrap() < output.find("transport-recovered").unwrap());
     }
 }
 

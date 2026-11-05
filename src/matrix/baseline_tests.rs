@@ -1,5 +1,6 @@
 use super::*;
 use serde_json::json;
+use tracing::instrument::WithSubscriber;
 use wiremock::{
     Mock, MockServer, ResponseTemplate,
     matchers::{method, path_regex},
@@ -53,6 +54,22 @@ async fn first_baseline_accepts_limited_history_without_loading_its_timeline() {
         user_id: "@bridge:example.test".into(),
         device_id: "SYNTHETIC".into(),
     };
-    assert_eq!(client.baseline_sync_token().await.unwrap(), "fresh-cutover");
+    let captured = crate::test_diagnostics::Capture::default();
+    assert_eq!(
+        client
+            .baseline_sync_token()
+            .with_subscriber(captured.subscriber())
+            .await
+            .unwrap(),
+        "fresh-cutover"
+    );
     assert!(client.inner.rooms().is_empty());
+    let output = captured.output();
+    assert!(output.contains("initial-baseline"));
+    assert!(output.contains("limited_rooms=1"));
+    assert!(output.contains("historical_events_executed=0"));
+    assert!(output.contains("committed=false"));
+    for secret in ["fresh-cutover", "loopback-only", "historical command"] {
+        assert!(!output.contains(secret));
+    }
 }

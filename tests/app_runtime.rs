@@ -32,6 +32,9 @@ use guigu_agent_bridge::{
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
+#[path = "support/r107_ingress_feedback.rs"]
+mod r107_ingress_feedback;
+
 struct TempDir(std::path::PathBuf);
 impl TempDir {
     fn new() -> Self {

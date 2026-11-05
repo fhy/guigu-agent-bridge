@@ -31,6 +31,20 @@ impl MatrixSync {
                 .values()
                 .any(|room| room.timeline.limited)
         {
+            tracing::error!(
+                stage = "incremental-sync",
+                category = "checkpoint-gap",
+                checkpoint_present = token.is_some(),
+                empty_token = response.next_batch.is_empty(),
+                limited_rooms = response
+                    .rooms
+                    .joined
+                    .values()
+                    .filter(|room| room.timeline.limited)
+                    .count(),
+                committed = false,
+                "sync response refused without advancing checkpoint"
+            );
             return Err(MatrixError::CutoverRefused);
         }
         let batch_id = Uuid::now_v7().to_string();

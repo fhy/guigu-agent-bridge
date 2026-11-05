@@ -1394,6 +1394,7 @@ impl ReliabilityStore {
             if state == "ready" || (state == "enqueued" && owner.as_deref() == Some("stopped")) {
                 result.eligible.push((task, revision));
             } else {
+                tracing::error!(task_id = %task, stage = "admission-recovery", category = "unresolved-admission", state, revision, owner_state = owner.as_deref().unwrap_or("missing"), replay = false, "startup blocked; preserve unknown work and use exact-scope recovery");
                 result.blocked = true;
             }
         }
