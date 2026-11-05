@@ -84,7 +84,7 @@ pub(crate) async fn run(request: Request) -> Result<(), ()> {
     let context = readback_nonadmin(&pool, config.transports.matrix.enabled)
         .await
         .map_err(|_| ())?;
-    let scope = RecoveryScope::new(context, EffectDomain::Local, None);
+    let scope = RecoveryScope::new(context, EffectDomain::LocalHold, None);
     let recovery = MatrixRecoveryStore::new_scoped(pool.clone(), Some(scope.clone()));
     let owner = uuid::Uuid::now_v7().to_string();
     let epoch = acquire_fence(&recovery, &scope, &owner, config.transports.matrix.enabled).await?;

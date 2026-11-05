@@ -213,7 +213,7 @@ pub(crate) async fn inserted(
         .any(|parent| parent.role == ParentRole::MetadataAnchor);
     let matrix =
         snapshot.matrix || inherited_matrix || matrix_parents(connection, &parents).await?;
-    if matrix && scope.domain != EffectDomain::Matrix {
+    if matrix && !matches!(scope.domain, EffectDomain::Matrix) {
         return Err(refused());
     }
     let encoded = serde_json::to_string(&parents).map_err(|_| refused())?;

@@ -58,16 +58,21 @@ pub(crate) async fn readback_nonadmin(
     if admin != 0 {
         return Err(refused());
     }
-    let native = lineage::native(&mut transaction, matrix_enabled).await?;
-    let state: (String, String) = sqlx::query_as(
-        "SELECT state,bootstrap_nonce FROM runtime_eligibility_bootstrap WHERE singleton=1",
+    let context = sqlx::query_as::<_, (String, i64, i64, Option<String>)>(
+        "SELECT generation,revision,matrix_enabled,compatibility_operation_id FROM runtime_eligibility_context WHERE singleton=1 AND state='ready' AND matrix_enabled=? AND EXISTS (SELECT 1 FROM runtime_eligibility_bootstrap bootstrap WHERE bootstrap.singleton=1 AND bootstrap.state='complete' AND bootstrap.generation=runtime_eligibility_context.generation AND bootstrap.bootstrap_nonce=runtime_eligibility_context.bootstrap_nonce AND bootstrap.inventory_digest=runtime_eligibility_context.bootstrap_inventory_digest)",
     )
-    .fetch_one(&mut *transaction)
-    .await?;
-    if state.0 != "complete" {
-        return Err(refused());
-    }
-    let context = readback::context(&mut transaction, matrix_enabled, &native).await?;
+    .bind(matrix_enabled)
+    .fetch_optional(&mut *transaction)
+    .await?
+    .map(|(generation, revision, matrix_enabled, matrix_operation)| {
+        EligibilityContext::NonAdmin {
+            generation,
+            revision,
+            matrix_enabled: matrix_enabled != 0,
+            matrix_operation,
+        }
+    })
+    .ok_or_else(refused)?;
     transaction.commit().await?;
     Ok(context)
 }

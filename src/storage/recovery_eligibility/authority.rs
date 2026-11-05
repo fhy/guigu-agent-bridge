@@ -5,6 +5,7 @@ use super::refused;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EffectDomain {
     Local,
+    LocalHold,
     Matrix,
 }
 
@@ -116,7 +117,9 @@ pub(super) async fn validate(
     if !valid {
         return Err(refused());
     }
-    super::native_context::validate(connection, context).await?;
+    if domain != EffectDomain::LocalHold {
+        super::native_context::validate(connection, context).await?;
+    }
     let held: i64 = sqlx::query_scalar("SELECT count(*) FROM offline_recovery_rows WHERE disposition IN ('uncertain_hold','refused_hold')")
         .fetch_one(&mut *connection).await?;
     if held != 0 {

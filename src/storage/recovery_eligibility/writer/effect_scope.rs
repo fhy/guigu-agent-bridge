@@ -8,7 +8,9 @@ pub(super) async fn resolve(
     identity: &RowIdentity,
 ) -> Result<RecoveryScope, sqlx::Error> {
     let mut routed = scope.clone();
-    if scope.domain != EffectDomain::Local || scope.matrix_fence.get().is_none() {
+    if !matches!(scope.domain, EffectDomain::Local | EffectDomain::LocalHold)
+        || scope.matrix_fence.get().is_none()
+    {
         return Ok(routed);
     }
     let snapshot = inventory::snapshot(connection, identity).await?;

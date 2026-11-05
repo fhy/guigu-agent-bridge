@@ -136,7 +136,9 @@ async fn validate_node(
     if snapshot.matrix && matrix_operation.is_none() {
         return Err(refused());
     }
-    if domain == EffectDomain::Local && (matrix_operation.is_some() || snapshot.matrix) {
+    if matches!(domain, EffectDomain::Local | EffectDomain::LocalHold)
+        && (matrix_operation.is_some() || snapshot.matrix)
+    {
         return Err(refused());
     }
     if matrix_operation.is_some() && matrix_operation.as_deref() != context.matrix_operation() {
