@@ -392,96 +392,101 @@ impl AppRuntime {
         )
         .map_err(|_| AppError::Runtime)?;
         let runtime_instance = uuid::Uuid::now_v7().to_string();
-        let recovery_scope =
-            match recovery_startup::classify_startup(admin_bindings, sentinel.as_deref()) {
-                recovery_startup::StartupEligibility::NonAdmin => {
-                    if sentinel.as_deref() == Some("pending") {
-                        let gate = crate::storage::MatrixCompatibilityStore::new(pool.clone())
-                            .gate(
-                                config.transports.matrix.enabled,
-                                config.transports.matrix.crypto_store_path.as_deref(),
-                            )
-                            .await
-                            .map_err(|_| AppError::Runtime)?;
-                        if let crate::storage::CompatibilityGate::Held(reason) = gate {
-                            return Self::compatibility_held(
-                                path,
-                                config,
-                                pool,
-                                base_reliability,
-                                maintenance_lock,
-                                reason,
-                            )
-                            .await;
-                        }
-                    }
-                    let hold: Option<Option<String>> = sqlx::query_scalar::<_, Option<String>>(
-                        "SELECT restart_hold_state FROM matrix_recovery_control WHERE control_id=1",
-                    )
-                    .fetch_optional(&pool)
-                    .await
-                    .map_err(|_| AppError::Runtime)?;
-                    if hold.flatten().is_some() {
+        let startup_eligibility =
+            recovery_startup::classify_startup(admin_bindings, sentinel.as_deref());
+        recovery_startup::log_startup_eligibility(
+            admin_bindings,
+            sentinel.as_deref(),
+            startup_eligibility,
+        );
+        let recovery_scope = match startup_eligibility {
+            recovery_startup::StartupEligibility::NonAdmin => {
+                if sentinel.as_deref() == Some("pending") {
+                    let gate = crate::storage::MatrixCompatibilityStore::new(pool.clone())
+                        .gate(
+                            config.transports.matrix.enabled,
+                            config.transports.matrix.crypto_store_path.as_deref(),
+                        )
+                        .await
+                        .map_err(|_| AppError::Runtime)?;
+                    if let crate::storage::CompatibilityGate::Held(reason) = gate {
                         return Self::compatibility_held(
                             path,
                             config,
                             pool,
                             base_reliability,
                             maintenance_lock,
-                            "compatibility-held",
+                            reason,
                         )
                         .await;
                     }
-                    let control_rows: i64 =
-                        sqlx::query_scalar("SELECT count(*) FROM matrix_recovery_control")
-                            .fetch_one(&pool)
-                            .await
-                            .map_err(|_| AppError::Runtime)?;
-                    if !config.transports.matrix.enabled && control_rows == 0 {
-                        None
-                    } else {
-                        let context =
-                            match crate::storage::recovery_eligibility::bootstrap_nonadmin(
-                                &pool,
-                                config.transports.matrix.enabled,
-                            )
-                            .await
-                            {
-                                Ok(context) => context,
-                                Err(_) => {
-                                    return Self::compatibility_held(
-                                        path,
-                                        config,
-                                        pool,
-                                        base_reliability,
-                                        maintenance_lock,
-                                        "compatibility-held",
-                                    )
-                                    .await;
-                                }
-                            };
-                        Some(crate::storage::recovery_eligibility::RecoveryScope::new(
-                            context,
-                            crate::storage::recovery_eligibility::EffectDomain::Local,
-                            None,
-                        ))
-                    }
                 }
-                recovery_startup::StartupEligibility::Admin => Some(
-                    crate::offline_production_migration::administrative_startup::prepare(
-                        &path,
-                        &config,
+                let hold: Option<Option<String>> = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT restart_hold_state FROM matrix_recovery_control WHERE control_id=1",
+                )
+                .fetch_optional(&pool)
+                .await
+                .map_err(|_| AppError::Runtime)?;
+                if hold.flatten().is_some() {
+                    return Self::compatibility_held(
+                        path,
+                        config,
+                        pool,
+                        base_reliability,
+                        maintenance_lock,
+                        "compatibility-held",
+                    )
+                    .await;
+                }
+                let control_rows: i64 =
+                    sqlx::query_scalar("SELECT count(*) FROM matrix_recovery_control")
+                        .fetch_one(&pool)
+                        .await
+                        .map_err(|_| AppError::Runtime)?;
+                if !config.transports.matrix.enabled && control_rows == 0 {
+                    None
+                } else {
+                    let context = match crate::storage::recovery_eligibility::bootstrap_nonadmin(
                         &pool,
-                        &runtime_instance,
+                        config.transports.matrix.enabled,
                     )
                     .await
-                    .map_err(|_| AppError::Runtime)?,
-                ),
-                recovery_startup::StartupEligibility::Legacy => None,
-                recovery_startup::StartupEligibility::Refused => {
-                    return Err(AppError::Runtime);
+                    {
+                        Ok(context) => context,
+                        Err(_) => {
+                            return Self::compatibility_held(
+                                path,
+                                config,
+                                pool,
+                                base_reliability,
+                                maintenance_lock,
+                                "compatibility-held",
+                            )
+                            .await;
+                        }
+                    };
+                    Some(crate::storage::recovery_eligibility::RecoveryScope::new(
+                        context,
+                        crate::storage::recovery_eligibility::EffectDomain::Local,
+                        None,
+                    ))
                 }
-            };
+            }
+            recovery_startup::StartupEligibility::Admin => Some(
+                crate::offline_production_migration::administrative_startup::prepare(
+                    &path,
+                    &config,
+                    &pool,
+                    &runtime_instance,
+                )
+                .await
+                .map_err(|_| AppError::Runtime)?,
+            ),
+            recovery_startup::StartupEligibility::Legacy => None,
+            recovery_startup::StartupEligibility::Refused => {
+                return Err(AppError::Runtime);
+            }
+        };
         let reliability = if let Some(scope) = recovery_scope.clone() {
             crate::storage::ReliabilityStore::with_recovery(pool.clone(), scope)
         } else {
