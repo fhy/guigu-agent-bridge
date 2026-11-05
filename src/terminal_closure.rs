@@ -50,6 +50,7 @@ pub(crate) enum AdmissionMode<'a> {
 pub(crate) enum DeliveryBinding<'a> {
     LiveContinuation,
     OfflineExact { delivery_id: &'a str, attempt: i64 },
+    OfflinePrePrompt { delivery_id: &'a str, attempt: i64 },
 }
 
 #[derive(Clone, Copy)]
@@ -164,7 +165,8 @@ pub(crate) async fn apply_scoped(
                 .fetch_one(&mut *c)
                 .await?
         }
-        DeliveryBinding::OfflineExact { delivery_id, .. } => delivery_id.into(),
+        DeliveryBinding::OfflineExact { delivery_id, .. }
+        | DeliveryBinding::OfflinePrePrompt { delivery_id, .. } => delivery_id.into(),
     };
     let identity = writer::text_identity("deliveries", &delivery_id)?;
     let delivery_mutation = writer::prepare_mutation(c, recovery, &identity).await?;
@@ -174,6 +176,9 @@ pub(crate) async fn apply_scoped(
                 .bind(context.now).bind(context.task_id).bind(context.task_id).execute(&mut *c).await?
         }
         DeliveryBinding::OfflineExact {
+            delivery_id,
+            attempt,
+        } | DeliveryBinding::OfflinePrePrompt {
             delivery_id,
             attempt,
         } => {
@@ -187,11 +192,20 @@ pub(crate) async fn apply_scoped(
     let disposition = match context.delivery {
         DeliveryBinding::LiveContinuation => sqlx::query("UPDATE delivery_dispositions SET state='terminal',reason_code=NULL WHERE delivery_id=(SELECT delivery_id FROM task_continuations WHERE task_id=?) AND task_id=? AND state IN ('prepared','acknowledged','outcome_unknown')")
             .bind(context.task_id).bind(context.task_id).execute(&mut *c).await?,
-        DeliveryBinding::OfflineExact { delivery_id, attempt } => sqlx::query("UPDATE delivery_dispositions SET state='terminal',reason_code=? WHERE delivery_id=? AND task_id=? AND attempt=? AND state='prepared' AND session_id IS NULL AND child_fingerprint IS NULL")
+        DeliveryBinding::OfflineExact { delivery_id, attempt } => sqlx::query("UPDATE delivery_dispositions SET state='terminal',reason_code=? WHERE delivery_id=? AND task_id=? AND attempt=? AND state IN ('prepared','acknowledged','outcome_unknown') AND session_id IS NULL AND child_fingerprint IS NULL")
+            .bind(context.disposition_reason.unwrap_or("pre_acceptance_auth_failure")).bind(delivery_id).bind(context.task_id).bind(attempt).execute(&mut *c).await?,
+        DeliveryBinding::OfflinePrePrompt { delivery_id, attempt } => sqlx::query("UPDATE delivery_dispositions SET state='terminal',reason_code=? WHERE delivery_id=? AND task_id=? AND attempt=? AND state IN ('prepared','acknowledged','outcome_unknown') AND child_fingerprint IS NULL")
             .bind(context.disposition_reason.unwrap_or("pre_acceptance_auth_failure")).bind(delivery_id).bind(context.task_id).bind(attempt).execute(&mut *c).await?,
     };
-    if matches!(context.delivery, DeliveryBinding::OfflineExact { .. })
-        && (ack.rows_affected() != 1 || disposition.rows_affected() != 1)
+    if matches!(context.delivery, DeliveryBinding::OfflineExact { .. } | DeliveryBinding::OfflinePrePrompt { .. })
+        && (disposition.rows_affected() != 1
+            || (ack.rows_affected() != 1
+                && sqlx::query_scalar::<_, i64>("SELECT count(*) FROM deliveries WHERE delivery_id=? AND task_id=? AND attempt=? AND acknowledged_at IS NOT NULL")
+                    .bind(&delivery_id)
+                    .bind(context.task_id)
+                    .bind(match context.delivery { DeliveryBinding::OfflineExact { attempt, .. } | DeliveryBinding::OfflinePrePrompt { attempt, .. } => attempt, DeliveryBinding::LiveContinuation => 0 })
+                    .fetch_one(&mut *c)
+                    .await? != 1))
     {
         return Err(ClosureError::Fenced);
     }

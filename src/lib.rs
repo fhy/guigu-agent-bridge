@@ -11,6 +11,7 @@ pub mod app;
 pub mod bus;
 pub mod config;
 pub mod error;
+pub mod failed_before_prompt;
 pub mod gateway;
 pub(crate) mod historical_unknown_abandonment;
 pub mod isolated_fixture_migration;
@@ -106,6 +107,27 @@ pub fn init_tracing() {
 /// termination signal.
 pub async fn run() -> Result<(), Error> {
     let all_args = std::env::args_os().collect::<Vec<_>>();
+    if all_args.get(1).and_then(|value| value.to_str()) == Some("reconcile-failed-before-prompt") {
+        let database = failed_before_prompt::parse_args(&all_args[1..]).map_err(|e| {
+            Error::Cli(error::CliFailure {
+                command: "reconcile-failed-before-prompt",
+                category: e.slug(),
+                status: e.status(),
+            })
+        })?;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        failed_before_prompt::reconcile(database, &now)
+            .await
+            .map_err(|e| {
+                Error::Cli(error::CliFailure {
+                    command: "reconcile-failed-before-prompt",
+                    category: e.slug(),
+                    status: e.status(),
+                })
+            })?;
+        println!("reconcile-failed-before-prompt result=reconciled status=0");
+        return Ok(());
+    }
     if all_args.get(1).and_then(|value| value.to_str()) == Some("--version") {
         if all_args.len() == 2 {
             println!("guigu-agent-bridge {}", env!("CARGO_PKG_VERSION"));
