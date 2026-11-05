@@ -105,7 +105,7 @@ pub async fn run() -> Result<(), Error> {
     let all_args = std::env::args_os().collect::<Vec<_>>();
     if all_args.get(1).and_then(|value| value.to_str()) == Some("--version") {
         if all_args.len() == 2 {
-            println!("guigu-agent-bridge 0.2.24");
+            println!("guigu-agent-bridge {}", env!("CARGO_PKG_VERSION"));
             return Ok(());
         }
         return Err(Error::Cli(error::CliFailure {
