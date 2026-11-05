@@ -5,7 +5,7 @@ mod matrix_identity;
 mod recovery_startup;
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     future::Future,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
@@ -58,6 +58,19 @@ fn owner_fingerprint_pid(fingerprint: &str) -> Option<u32> {
         return None;
     }
     pid.parse::<u32>().ok().filter(|pid| *pid > 0)
+}
+
+fn remove_covered_admissions(recovery: &mut crate::storage::RecoveryPlan, covered: &[String]) {
+    let covered: HashSet<&str> = covered.iter().map(String::as_str).collect();
+    recovery
+        .unfinished
+        .retain(|id| !covered.contains(id.to_string().as_str()));
+    recovery
+        .unacknowledged
+        .retain(|delivery| !covered.contains(delivery.task_id().to_string().as_str()));
+    recovery
+        .awaiting_outcome
+        .retain(|delivery| !covered.contains(delivery.task_id().to_string().as_str()));
 }
 
 #[cfg(test)]
@@ -709,12 +722,7 @@ impl AppRuntime {
         if admission_recovery.eligible.len() > config.bridge.queue_capacity {
             admission_recovery.blocked = true;
         }
-        recovery.unfinished.retain(|id| {
-            !admission_recovery
-                .covered
-                .iter()
-                .any(|value| value == &id.to_string())
-        });
+        remove_covered_admissions(&mut recovery, &admission_recovery.covered);
         let runtime_recovery = runtime_store
             .recovery_snapshot(Utc::now(), 4096)
             .await
@@ -1561,15 +1569,35 @@ mod assembly_tests {
 
     use super::{
         AppError, AppRuntime, DeadlineOutcome, MATRIX_INITIALIZATION_BUDGET, MatrixPhase,
-        matrix_failure_observer, spawn_task_worker, within_matrix_deadline,
+        matrix_failure_observer, remove_covered_admissions, spawn_task_worker,
+        within_matrix_deadline,
     };
     use crate::{
-        bus::WorkerError,
+        bus::{WorkerError, derive_endpoint_id},
         config::load_from_str_with_env,
         matrix::{MatrixClient, MatrixError, MatrixSync, MemorySyncTokenStore},
         models::TaskId,
-        storage::{ReliabilityStore, connect, migrate},
+        storage::{Delivery, RecoveryPlan, ReliabilityStore, connect, migrate},
     };
+
+    #[test]
+    fn explicit_hold_removes_all_recovery_views_for_the_same_task() {
+        let task = TaskId::generate();
+        let delivery = Delivery::new(
+            crate::models::DeliveryId::generate(),
+            task,
+            1,
+            derive_endpoint_id("held-target"),
+            "2026-11-06T00:00:00Z".parse().unwrap(),
+        );
+        let mut plan = RecoveryPlan {
+            unfinished: vec![task],
+            unacknowledged: vec![delivery.clone()],
+            awaiting_outcome: vec![delivery],
+        };
+        remove_covered_admissions(&mut plan, &[task.to_string()]);
+        assert!(plan.is_empty());
+    }
 
     #[tokio::test]
     async fn matrix_initialization_and_proof_share_one_total_budget() {
