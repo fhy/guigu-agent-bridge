@@ -65,6 +65,44 @@ async fn ordinary_stop_without_qualification_never_authorizes_disposition() {
 }
 
 #[tokio::test]
+async fn startup_abort_preserves_scan_pending_boundary_before_stop() {
+    let fixture = Fixture::new().await;
+    fixture.start().await;
+    let now = Utc::now().to_rfc3339();
+    assert!(
+        fixture
+            .store
+            .stopping_runtime(&fixture.token, &now)
+            .await
+            .unwrap()
+    );
+    assert!(
+        fixture
+            .store
+            .stop_runtime(&fixture.token, &now)
+            .await
+            .unwrap()
+    );
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM runtime_instances WHERE instance_token=?")
+            .bind(&fixture.token)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    let evidence: String = sqlx::query_scalar(
+        "SELECT state FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1",
+    )
+    .bind(&fixture.token)
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "stopped");
+    assert_eq!(evidence, "scan_pending");
+    assert_eq!(fixture.qualified_count().await, 0);
+    fixture.pool.close().await;
+}
+
+#[tokio::test]
 async fn ordinary_stop_keeps_conditional_qualified_publication_and_consumer() {
     let fixture = Fixture::new().await;
     fixture.start().await;

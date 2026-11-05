@@ -614,11 +614,16 @@ impl AppRuntime {
             Err(error) => {
                 if owns_runtime {
                     let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-                    if !reliability
-                        .stop_runtime(&runtime_instance, &now)
+                    let stopping = reliability
+                        .stopping_runtime(&runtime_instance, &now)
                         .await
-                        .unwrap_or(false)
-                    {
+                        .unwrap_or(false);
+                    let stopped = stopping
+                        && reliability
+                            .stop_runtime(&runtime_instance, &now)
+                            .await
+                            .unwrap_or(false);
+                    if !stopped {
                         tracing::warn!("runtime epoch rollback failed during startup cleanup");
                     }
                 }
