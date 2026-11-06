@@ -13,10 +13,10 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 const USER: &str = "@bridge-restart-test-20261105:matrix.0x8.xyz";
-const DEVICE: &str = "CHJBUHHCSD";
+const DEVICE: &str = "GAZUUBLMHH";
 const ROOM: &str = "!oISwKcAHFRwvYvGLFf:matrix.0x8.xyz";
-const EVENT: &str = "$rE0I7FhHhUWL7sxcKXfZE096ZIb6pGLNFdt5iFt3t6s";
-const DIGEST: &str = "505b44d2e9d39f378dafb9b486deb4b87531e672d52ab1bce7f4db500235809e";
+const EVENT: &str = "$FDauUxHWW-NhS7besZtFc9w9fm3x5LojXLaYmr20b-k";
+const DIGEST: &str = "b83f8040ef9d374a212b6c3a3c8c0fa90197869a1d876e4c04a14e471a5d4009";
 
 fn field<'value>(value: &'value Value, name: &str) -> Result<&'value str, &'static str> {
     value[name].as_str().ok_or("input-field")
@@ -68,8 +68,16 @@ struct BoundEvent {
 }
 
 fn bind_wire(raw: &str) -> Result<BoundEvent, &'static str> {
-    let mut value: Value = serde_json::from_str(raw).map_err(|_| "event-json")?;
-    if value["event_id"] != EVENT
+    bind_wire_expected(raw, EVENT, DIGEST)
+}
+
+fn bind_wire_expected(
+    raw: &str,
+    expected_event: &str,
+    expected_digest: &str,
+) -> Result<BoundEvent, &'static str> {
+    let value: Value = serde_json::from_str(raw).map_err(|_| "event-json")?;
+    if value["event_id"] != expected_event
         || value["type"] != "m.room.encrypted"
         || value.get("room_id").is_some_and(|room| room != ROOM)
     {
@@ -96,11 +104,11 @@ fn bind_wire(raw: &str) -> Result<BoundEvent, &'static str> {
         "{:x}",
         Sha256::digest(no_server_fields.to_string().as_bytes())
     );
-    let (digest, value) = if full_digest == DIGEST {
+    let (digest, value) = if full_digest == expected_digest {
         (full_digest.clone(), canonical)
-    } else if sync_digest == DIGEST {
+    } else if sync_digest == expected_digest {
         (sync_digest.clone(), sync_shape)
-    } else if no_server_digest == DIGEST {
+    } else if no_server_digest == expected_digest {
         (no_server_digest.clone(), no_server_fields)
     } else {
         println!(
@@ -195,5 +203,51 @@ async fn main() {
             println!("{}", json!({"failure":"bounded-sdk-timeout"}));
             std::process::exit(4);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ciphertext() -> Value {
+        json!({"event_id":EVENT,"type":"m.room.encrypted","room_id":ROOM,
+            "content":{"session_id":"test-session","ciphertext":"test-ciphertext"}})
+    }
+
+    #[test]
+    fn exact_ciphertext_and_unsigned_metadata_bind() {
+        let mut event = ciphertext();
+        let digest = format!("{:x}", Sha256::digest(event.to_string().as_bytes()));
+        assert!(bind_wire_expected(&event.to_string(), EVENT, &digest).is_ok());
+        event["unsigned"] = json!({"age":123});
+        assert!(bind_wire_expected(&event.to_string(), EVENT, &digest).is_ok());
+    }
+
+    #[test]
+    fn changed_ciphertext_is_refused() {
+        let mut event = ciphertext();
+        let digest = format!("{:x}", Sha256::digest(event.to_string().as_bytes()));
+        event["content"]["ciphertext"] = json!("changed");
+        assert!(matches!(
+            bind_wire_expected(&event.to_string(), EVENT, &digest),
+            Err("ciphertext-digest-mismatch")
+        ));
+    }
+
+    #[test]
+    fn foreign_identity_is_refused() {
+        let mut event = ciphertext();
+        event["room_id"] = json!("!foreign:matrix.0x8.xyz");
+        assert!(matches!(
+            bind_wire_expected(&event.to_string(), EVENT, DIGEST),
+            Err("event-identity-mismatch")
+        ));
+        event = ciphertext();
+        event["event_id"] = json!("$foreign");
+        assert!(matches!(
+            bind_wire_expected(&event.to_string(), EVENT, DIGEST),
+            Err("event-identity-mismatch")
+        ));
     }
 }
