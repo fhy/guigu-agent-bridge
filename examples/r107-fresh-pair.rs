@@ -47,6 +47,24 @@ fn configured(template: &str, root: &Path) -> Result<String, &'static str> {
     toml::to_string(&config).map_err(|_| "config-serialize")
 }
 
+async fn initialize_native(root: &Path) -> Result<(), &'static str> {
+    let pool = storage::connect(root.join("state/state.db"))
+        .await
+        .map_err(|_| "database-create")?;
+    storage::migrate(&pool)
+        .await
+        .map_err(|_| "database-migrate")?;
+    let gate = storage::MatrixCompatibilityStore::new(pool.clone())
+        .gate(true, Some(&root.join("state/crypto")))
+        .await
+        .map_err(|_| "native-bootstrap")?;
+    pool.close().await;
+    if !matches!(gate, storage::CompatibilityGate::Native(_)) {
+        return Err("native-bootstrap-refused-no-login");
+    }
+    Ok(())
+}
+
 async fn run() -> Result<(), &'static str> {
     let root = std::env::var_os("R107_FRESH_ROOT").ok_or("root-missing")?;
     let root = Path::new(&root);
@@ -80,13 +98,7 @@ async fn run() -> Result<(), &'static str> {
         &root.join("config/agent.env"),
         &fs::read(agent_path).map_err(|_| "agent-read")?,
     )?;
-    let pool = storage::connect(root.join("state/state.db"))
-        .await
-        .map_err(|_| "database-create")?;
-    storage::migrate(&pool)
-        .await
-        .map_err(|_| "database-migrate")?;
-    pool.close().await;
+    initialize_native(root).await?;
     private_file(
         &root.join("login-attempted"),
         b"single SDK login; never retry this root\n",
@@ -212,5 +224,34 @@ mod tests {
             Err("private-file-create")
         );
         assert_eq!(fs::read(output).unwrap(), b"retained");
+    }
+
+    #[tokio::test]
+    async fn native_bootstrap_precedes_crypto_creation() {
+        let root = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        fs::create_dir(root.path().join("state")).unwrap();
+        initialize_native(root.path()).await.unwrap();
+        assert!(!root.path().join("state/crypto").exists());
+    }
+
+    #[tokio::test]
+    async fn nonempty_store_is_refused_without_login() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir_in(std::env::var_os("HOME").unwrap()).unwrap();
+        fs::create_dir_all(root.path().join("state/crypto")).unwrap();
+        fs::set_permissions(
+            root.path().join("state/crypto"),
+            fs::Permissions::from_mode(0o700),
+        )
+        .unwrap();
+        private_file(&root.path().join("state/crypto/retained"), b"retained").unwrap();
+        assert_eq!(
+            initialize_native(root.path()).await,
+            Err("native-bootstrap-refused-no-login")
+        );
+        assert_eq!(
+            fs::read(root.path().join("state/crypto/retained")).unwrap(),
+            b"retained"
+        );
     }
 }
