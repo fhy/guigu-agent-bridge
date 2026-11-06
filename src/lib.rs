@@ -36,7 +36,6 @@ pub mod runtime;
 pub mod runtime_admission;
 pub mod selected_preacceptance;
 pub mod storage;
-mod systemd_owner;
 pub(crate) mod terminal_acknowledged_cleanup;
 pub(crate) mod terminal_closure;
 #[cfg(test)]
@@ -435,16 +434,6 @@ pub async fn run() -> Result<(), Error> {
         return Ok(());
     }
     let mut args = std::env::args_os().skip(1);
-    if args.next().as_deref().and_then(|value| value.to_str()) == Some("recover-systemd-owner") {
-        let mut cli = vec![std::ffi::OsString::from("recover-systemd-owner")];
-        cli.extend(args);
-        systemd_owner::run(&cli).await.map_err(|category| {
-            tracing::error!(category, "systemd owner recovery refused");
-            app::AppError::Runtime
-        })?;
-        return Ok(());
-    }
-    let mut args = std::env::args_os().skip(1);
     if args.next().as_deref().and_then(|v| v.to_str()) == Some("recover-runtime") {
         let mut cli = vec![std::ffi::OsString::from("recover-runtime")];
         cli.extend(args);
@@ -453,7 +442,10 @@ pub async fn run() -> Result<(), Error> {
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         let result = offline_recovery::recover_stale_runtime(database, &token, &fingerprint, &now)
             .await
-            .map_err(|_| app::AppError::Runtime)?;
+            .map_err(|error| {
+                tracing::error!(phase = "recover-runtime", reason = %error, "runtime recovery refused");
+                app::AppError::Runtime
+            })?;
         println!(
             "recover-runtime result={}",
             match result {

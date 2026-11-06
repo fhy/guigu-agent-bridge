@@ -48,19 +48,6 @@ impl ReliabilityStore {
         if !valid_owner_clock(evidence, now) || fingerprint.trim().is_empty() {
             return Ok(false);
         }
-        let database: String =
-            sqlx::query_scalar("SELECT file FROM pragma_database_list WHERE name='main'")
-                .fetch_one(&self.pool)
-                .await?;
-        let snapshot = crate::systemd_owner::capture(
-            std::path::Path::new(&database),
-            token,
-            fingerprint,
-            evidence,
-        )
-        .await
-        .map_err(|_| ReliabilityError::Malformed)?
-        .unwrap_or_else(|| "{}".into());
         let mut transaction = writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let inserted = sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES(?,?,?,'active',?) ON CONFLICT DO NOTHING")
             .bind(token).bind(now).bind(now).bind(fingerprint).execute(&mut *transaction).await?;
@@ -72,7 +59,7 @@ impl ReliabilityStore {
         writer::inserted(&mut transaction, self.recovery.as_ref(), &owner_identity).await?;
         sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current,max_age_seconds) VALUES(?,1,1,'live',?,?,?,?,?,?,0,'open',0,'inaccessible',?,1,?)")
             .bind(token).bind(evidence.pid).bind(evidence.proc_starttime).bind(fingerprint)
-            .bind(&evidence.boot_id).bind(evidence.boottime_ns).bind(now).bind(snapshot).bind(self.owner_evidence_max_age)
+            .bind(&evidence.boot_id).bind(evidence.boottime_ns).bind(now).bind("{}").bind(self.owner_evidence_max_age)
             .execute(&mut *transaction).await?;
         let identity = evidence_identity(&mut transaction, token, 1).await?;
         writer::inserted(&mut transaction, self.recovery.as_ref(), &identity).await?;

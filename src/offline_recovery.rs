@@ -24,6 +24,8 @@ pub enum RecoveryError {
     Fenced,
     #[error("recovery rejected: owner is not proven stale")]
     NotStale,
+    #[error("recovery rejected: stopped runtime has unresolved owner evidence")]
+    OwnerEvidencePending,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -315,6 +317,16 @@ async fn recover_in_transaction_inner(
         return Err(RecoveryError::OwnerIdentity);
     }
     if state == "stopped" {
+        let unresolved: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1 AND (state!='reaped' OR barrier_state!='closed_joined' OR in_flight_spawns!=0 OR child_scan_state!='complete_zero_escaped')",
+        )
+        .bind(token)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|_| RecoveryError::Database)?;
+        if unresolved != 0 {
+            return Err(RecoveryError::OwnerEvidencePending);
+        }
         return Ok(RecoveryOutcome::AlreadyStopped);
     }
     if state != "active" && state != "stopping" {
@@ -422,6 +434,10 @@ fn is_busy(error: &sqlx::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("busy") || message.contains("locked")
 }
+
+#[cfg(test)]
+#[path = "offline_recovery_pending_tests.rs"]
+mod pending_tests;
 
 #[cfg(test)]
 mod tests {
