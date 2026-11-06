@@ -1,5 +1,7 @@
 use super::*;
 
+const METRICS_COUNTS_BUDGET: Duration = Duration::from_millis(500);
+
 impl HealthState {
     pub(super) async fn metrics_body(&self) -> String {
         let readiness = self.snapshot().await;
@@ -90,7 +92,14 @@ impl HealthState {
         }
     }
     async fn append_current_metrics(&self, body: &mut String) -> (bool, bool) {
-        let current_counts = self.runtime.counts().await;
+        let current_counts =
+            match tokio::time::timeout(METRICS_COUNTS_BUDGET, self.runtime.counts()).await {
+                Ok(result) => result,
+                Err(_) => {
+                    body.push_str("guigu_readiness_storage_available 0\n");
+                    return (false, false);
+                }
+            };
         let (storage_available, current_recovery) = match &current_counts {
             Ok(counts) => {
                 body.push_str(&format!(
