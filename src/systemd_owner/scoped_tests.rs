@@ -1,4 +1,43 @@
 use super::*;
+
+#[tokio::test]
+async fn abnormal_publication_keeps_scan_audit_and_rolls_back_as_one_cas() {
+    let (_root, pool, store, proof) = super::tests::fixture().await;
+    sqlx::query("DELETE FROM runtime_owner_evidence WHERE evidence_revision=2")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE runtime_owner_evidence SET is_current=1 WHERE evidence_revision=1")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE runtime_instances SET state='active' WHERE instance_token='owner'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query("CREATE TRIGGER refuse_abnormal BEFORE INSERT ON runtime_owner_evidence WHEN NEW.state='reaped' BEGIN SELECT RAISE(ABORT,'test'); END").execute(&pool).await.unwrap();
+    assert!(store.finalize_systemd_owner(&proof, 1).await.is_err());
+    let current: (i64, String) = sqlx::query_as(
+        "SELECT evidence_revision,state FROM runtime_owner_evidence WHERE is_current=1",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(current, (1, "live".into()));
+    sqlx::query("DROP TRIGGER refuse_abnormal")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(store.finalize_systemd_owner(&proof, 1).await.unwrap());
+    let states: Vec<String> =
+        sqlx::query_scalar("SELECT state FROM runtime_owner_evidence ORDER BY evidence_revision")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(states, ["live", "scan_pending", "reaped"]);
+    assert!(store.finalize_systemd_owner(&proof, 1).await.unwrap());
+}
+
 use crate::storage::recovery_eligibility::{
     EffectDomain, RecoveryScope, bootstrap_nonadmin, writer,
 };

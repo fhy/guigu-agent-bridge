@@ -9,6 +9,8 @@ use uuid::Uuid;
 
 #[path = "owner_lifecycle.rs"]
 mod owner_lifecycle;
+#[path = "owner_systemd.rs"]
+mod owner_systemd;
 #[path = "reliability_projection.rs"]
 mod projections;
 

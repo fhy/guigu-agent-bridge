@@ -122,7 +122,7 @@ fn private_capsules_reject_missing_links_modes_and_overwrite() {
     assert!(read_private(&path).is_err());
 }
 
-async fn fixture() -> (tempfile::TempDir, sqlx::SqlitePool, ReliabilityStore, Proof) {
+pub(super) async fn fixture() -> (tempfile::TempDir, sqlx::SqlitePool, ReliabilityStore, Proof) {
     let root = private_root();
     let pool = connect(root.path().join("state.db")).await.unwrap();
     migrate(&pool).await.unwrap();
