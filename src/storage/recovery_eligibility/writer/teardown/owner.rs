@@ -53,6 +53,15 @@ pub(crate) async fn stopping_runtime(
         return Err(refused());
     }
     require_current_process(&mut transaction, scope, token).await?;
+    let observation = RuntimeOwnerEvidence::capture().ok_or_else(refused)?;
+    if !crate::storage::owner_observation::current_timestamp(now) {
+        return Err(refused());
+    }
+    let monotonic: i64 = sqlx::query_scalar("SELECT count(*) FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1 AND boottime_ns<=? AND julianday(captured_at)<=julianday(?)")
+        .bind(token).bind(observation.boottime_ns).bind(now).fetch_one(&mut *transaction).await?;
+    if monotonic != 1 {
+        return Err(refused());
+    }
     let identity = super::super::text_identity("runtime_instances", token)?;
     let runtime = prepare(&mut transaction, scope, &identity).await?;
     let revision: i64 = sqlx::query_scalar("SELECT evidence_revision FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1 AND state='live'")
@@ -72,8 +81,8 @@ pub(crate) async fn stopping_runtime(
         return Err(refused());
     }
     complete(&mut transaction, scope, evidence).await?;
-    sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current,max_age_seconds) SELECT instance_token,runtime_generation,?,'scan_pending',pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,1,max_age_seconds FROM runtime_owner_evidence WHERE instance_token=? AND evidence_revision=?")
-        .bind(next).bind(token).bind(revision).execute(&mut *transaction).await?;
+    sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current,max_age_seconds) SELECT instance_token,runtime_generation,?,'scan_pending',pid,proc_starttime,process_fingerprint,boot_id,?,?,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,1,max_age_seconds FROM runtime_owner_evidence WHERE instance_token=? AND evidence_revision=?")
+        .bind(next).bind(observation.boottime_ns).bind(now).bind(token).bind(revision).execute(&mut *transaction).await?;
     let identity = evidence_identity(&mut transaction, token, next).await?;
     inserted(&mut transaction, scope, &identity).await?;
     transaction.commit().await?;

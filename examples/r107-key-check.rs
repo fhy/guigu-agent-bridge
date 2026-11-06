@@ -12,6 +12,9 @@ use matrix_sdk::{
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
+#[path = "support/r107_key_transfer.rs"]
+mod transfer;
+
 const USER: &str = "@bridge-restart-test-20261105:matrix.0x8.xyz";
 const DEVICE: &str = "GAZUUBLMHH";
 const ROOM: &str = "!oISwKcAHFRwvYvGLFf:matrix.0x8.xyz";
@@ -192,6 +195,23 @@ async fn run() -> Result<(), &'static str> {
 
 #[tokio::main]
 async fn main() {
+    if std::env::var("R107_DEVICE_DIAGNOSTIC").as_deref() == Ok("62aaab86") {
+        if let Err(category) = transfer::diagnose().await {
+            println!("{}", json!({"failure":category}));
+            std::process::exit(3);
+        }
+        return;
+    }
+    if std::env::var("R107_EXACT_TRANSFER").as_deref() == Ok("62aaab86") {
+        if let Err(category) = transfer::run().await {
+            println!(
+                "{}",
+                json!({"failure":category,"transfer_retry_allowed":false})
+            );
+            std::process::exit(3);
+        }
+        return;
+    }
     let result = tokio::time::timeout(Duration::from_secs(90), run()).await;
     match result {
         Ok(Ok(())) => (),

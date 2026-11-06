@@ -183,6 +183,7 @@ async fn execute(
             {
                 return Err("send-bound");
             }
+            refresh_recipient(client).await?;
             let room = client.get_room(&room_id).ok_or("room-not-synced")?;
             if !room
                 .latest_encryption_state()
@@ -212,6 +213,44 @@ async fn execute(
         }
         _ => Err("action-refused"),
     }
+}
+
+fn recipient_device(session: &Value) -> Result<&str, &'static str> {
+    if field(session, "user_id")? != BRIDGE {
+        return Err("recipient-account-refused");
+    }
+    let device = field(session, "device_id")?;
+    if device.is_empty() {
+        return Err("recipient-device-missing");
+    }
+    Ok(device)
+}
+
+fn require_visible_recipient(visible: bool) -> Result<(), &'static str> {
+    if visible {
+        Ok(())
+    } else {
+        Err("recipient-device-not-published")
+    }
+}
+
+async fn refresh_recipient(client: &Client) -> Result<(), &'static str> {
+    let path = std::env::var_os("R107_BRIDGE_SESSION").ok_or("bridge-session-file-missing")?;
+    let session = read_json(Path::new(&path))?;
+    let device = recipient_device(&session)?;
+    let user: matrix_sdk::ruma::OwnedUserId =
+        BRIDGE.parse().map_err(|_| "recipient-user-format")?;
+    client
+        .encryption()
+        .request_user_identity(&user)
+        .await
+        .map_err(|_| "recipient-fresh-key-query")?;
+    let devices = client
+        .encryption()
+        .get_user_devices(&user)
+        .await
+        .map_err(|_| "recipient-device-query")?;
+    require_visible_recipient(devices.get(device.into()).is_some())
 }
 
 async fn run() -> Result<(), &'static str> {
@@ -249,5 +288,27 @@ async fn main() {
     if let Err(category) = run().await {
         println!("{}", json!({"failure":category}));
         std::process::exit(3);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn receiving_device_is_bound_to_registered_account() {
+        assert_eq!(
+            recipient_device(&json!({"user_id":BRIDGE,"device_id":"NEW"})),
+            Ok("NEW")
+        );
+        assert!(recipient_device(&json!({"user_id":SENDER,"device_id":"NEW"})).is_err());
+        assert!(recipient_device(&json!({"user_id":BRIDGE,"device_id":""})).is_err());
+        assert!(recipient_device(&json!({"user_id":BRIDGE})).is_err());
+    }
+
+    #[test]
+    fn absent_queried_device_cannot_proceed_to_send() {
+        assert!(require_visible_recipient(false).is_err());
+        assert!(require_visible_recipient(true).is_ok());
     }
 }
