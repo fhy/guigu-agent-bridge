@@ -61,19 +61,18 @@ async fn client() -> Result<Client, &'static str> {
     Ok(client)
 }
 
-async fn run() -> Result<(), &'static str> {
-    let client = client().await?;
-    let room_id: OwnedRoomId = ROOM.parse().map_err(|_| "room-id")?;
-    let response = client
-        .send(get_room_event::v3::Request::new(
-            room_id.clone(),
-            EVENT.parse().map_err(|_| "event-id")?,
-        ))
-        .await
-        .map_err(|_| "event-fetch")?;
-    let mut value: Value =
-        serde_json::from_str(response.event.json().get()).map_err(|_| "event-json")?;
-    if value["event_id"] != EVENT || value["type"] != "m.room.encrypted" {
+struct BoundEvent {
+    event: Raw<OriginalSyncRoomEncryptedEvent>,
+    session_id: String,
+    digest: String,
+}
+
+fn bind_wire(raw: &str) -> Result<BoundEvent, &'static str> {
+    let mut value: Value = serde_json::from_str(raw).map_err(|_| "event-json")?;
+    if value["event_id"] != EVENT
+        || value["type"] != "m.room.encrypted"
+        || value.get("room_id").is_some_and(|room| room != ROOM)
+    {
         return Err("event-identity-mismatch");
     }
     let object = value.as_object_mut().ok_or("event-object")?;
@@ -103,6 +102,28 @@ async fn run() -> Result<(), &'static str> {
     let session_id = field(&value["content"], "session_id")?.to_owned();
     let event = Raw::<OriginalSyncRoomEncryptedEvent>::from_json_string(value.to_string())
         .map_err(|_| "raw-event")?;
+    Ok(BoundEvent {
+        event,
+        session_id,
+        digest,
+    })
+}
+
+async fn run() -> Result<(), &'static str> {
+    let client = client().await?;
+    let room_id: OwnedRoomId = ROOM.parse().map_err(|_| "room-id")?;
+    let response = client
+        .send(get_room_event::v3::Request::new(
+            room_id.clone(),
+            EVENT.parse().map_err(|_| "event-id")?,
+        ))
+        .await
+        .map_err(|_| "event-fetch")?;
+    let BoundEvent {
+        event,
+        session_id,
+        digest,
+    } = bind_wire(response.event.json().get())?;
     let room = client.get_room(&room_id).ok_or("retained-room-missing")?;
     let before = room
         .decrypt_event(&event, None)
