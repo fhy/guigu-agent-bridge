@@ -1,6 +1,9 @@
 #[path = "matrix_identity.rs"]
 mod matrix_identity;
 
+#[cfg(test)]
+#[path = "controlled_stop_tests.rs"]
+mod controlled_stop_tests;
 #[path = "recovery_startup.rs"]
 mod recovery_startup;
 
@@ -237,6 +240,7 @@ pub struct AppRuntime {
     outbox: Option<crate::app::OutboxDrainHandle>,
     output_drain: Option<crate::app::output_drain::OutputSetDrainHandle>,
     acp: Option<Arc<AcpDispatcherRouter>>,
+    spawn_gate: Option<crate::acp::AcpSpawnGate>,
     a2a: Option<A2aServerHandle>,
     a2a_cleanup: Option<CleanupHandle>,
     gateway: Option<Arc<MatrixGateway>>,
@@ -597,6 +601,8 @@ impl AppRuntime {
             .revalidate()
             .map_err(|_| AppError::Runtime)?;
         drop(admission_guard);
+        let spawn_gate = crate::acp::AcpSpawnGate::for_generation(&runtime_instance);
+        let assembly_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
         match Self::build(
             path,
             config,
@@ -607,23 +613,42 @@ impl AppRuntime {
             maintenance_lock.clone(),
             recovery_scope.clone(),
             a2a_faults,
+            spawn_gate.clone(),
+            Arc::clone(&assembly_started),
         )
         .await
         {
             Ok(runtime) => Ok(runtime),
             Err(error) => {
-                if owns_runtime {
+                if owns_runtime && !assembly_started.load(std::sync::atomic::Ordering::Acquire) {
                     let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
                     let stopping = reliability
                         .stopping_runtime(&runtime_instance, &now)
                         .await
                         .unwrap_or(false);
+                    spawn_gate.close_and_join().await;
+                    spawn_gate.reap_transports().await;
+                    let mut completed = false;
+                    if stopping
+                        && let Some(joined) = spawn_gate.joined_children()
+                        && let Some(evidence) = crate::storage::RuntimeOwnerEvidence::capture()
+                    {
+                        completed = reliability
+                            .finish_controlled_stop(
+                                &runtime_instance,
+                                &Utc::now().to_rfc3339(),
+                                &evidence,
+                                &joined,
+                            )
+                            .await
+                            .unwrap_or(false);
+                    }
                     tracing::warn!(
                         phase = "startup-abort-cleanup",
                         owner = %runtime_instance,
                         stopping,
-                        reason = "final-observation-unavailable",
-                        impact = "owner-remains-unresolved",
+                        completed,
+                        containment = false,
                         first_cause_preserved = true,
                         "startup failed; cleanup did not establish final owner evidence"
                     );
@@ -645,6 +670,8 @@ impl AppRuntime {
         maintenance_lock: Arc<crate::offline_production_migration::RuntimeLock>,
         recovery_scope: Option<crate::storage::recovery_eligibility::RecoveryScope>,
         a2a_faults: Arc<dyn crate::a2a::IngressFaultInjector>,
+        spawn_gate: crate::acp::AcpSpawnGate,
+        assembly_started: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, AppError> {
         let repository = Arc::new(match recovery_scope.clone() {
             Some(scope) => SqliteRepository::with_recovery(pool.clone(), scope),
@@ -800,6 +827,7 @@ impl AppRuntime {
             outbox: None,
             output_drain: None,
             acp: None,
+            spawn_gate: Some(spawn_gate.clone()),
             a2a: None,
             a2a_cleanup: None,
             gateway: None,
@@ -809,452 +837,476 @@ impl AppRuntime {
             runtime_instance: owns_runtime.then_some(runtime_instance.clone()),
             first_failure: Arc::clone(&first_failure),
         };
-        if owns_runtime {
-            let heartbeat_store = reliability.clone();
-            let heartbeat_token = runtime_instance.clone();
-            let heartbeat_interval =
-                Duration::from_millis(config.bridge.owner_evidence_max_age_seconds * 1_000 / 3);
-            runtime.heartbeat = Some(tokio::spawn(async move {
-                let mut tick = tokio::time::interval(heartbeat_interval);
-                loop {
-                    tick.tick().await;
-                    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-                    let evidence = crate::storage::RuntimeOwnerEvidence::capture().unwrap_or(
-                        crate::storage::RuntimeOwnerEvidence {
-                            pid: 0,
-                            proc_starttime: 0,
-                            boot_id: String::new(),
-                            boottime_ns: 0,
-                        },
+        assembly_started.store(true, std::sync::atomic::Ordering::Release);
+        let assembly_result: Result<(), AppError> = async {
+            if owns_runtime {
+                let heartbeat_store = reliability.clone();
+                let heartbeat_token = runtime_instance.clone();
+                let heartbeat_interval =
+                    Duration::from_millis(config.bridge.owner_evidence_max_age_seconds * 1_000 / 3);
+                runtime.heartbeat = Some(tokio::spawn(async move {
+                    let mut tick = tokio::time::interval(heartbeat_interval);
+                    loop {
+                        tick.tick().await;
+                        let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+                        let evidence = crate::storage::RuntimeOwnerEvidence::capture().unwrap_or(
+                            crate::storage::RuntimeOwnerEvidence {
+                                pid: 0,
+                                proc_starttime: 0,
+                                boot_id: String::new(),
+                                boottime_ns: 0,
+                            },
+                        );
+                        let heartbeat_fingerprint =
+                            crate::storage::RuntimeOwnerEvidence::fingerprint().unwrap_or_default();
+                        if !heartbeat_store
+                            .publish_owner_heartbeat(
+                                &heartbeat_token,
+                                &heartbeat_fingerprint,
+                                &now,
+                                &evidence,
+                            )
+                            .await
+                            .unwrap_or(false)
+                        {
+                            break;
+                        }
+                    }
+                }));
+            }
+            // Bind the loopback health listener before Matrix restore/proof.  Health
+            // remains false until the existing state predicates transition, but the
+            // endpoint is observable while startup is blocked on external/runtime
+            // prerequisites.
+            if !recovery_allows_service_assembly(recovery_blocked) {
+                if let Some(generation) = matrix_generation {
+                    runtime.health_state.matrix().mark_recovery_blocked();
+                    runtime.health_state.matrix().transition(
+                        generation,
+                        &[MatrixPhase::Preflight],
+                        MatrixPhase::RecoveryBlocked,
                     );
-                    let heartbeat_fingerprint =
-                        crate::storage::RuntimeOwnerEvidence::fingerprint().unwrap_or_default();
-                    if !heartbeat_store
-                        .publish_owner_heartbeat(
-                            &heartbeat_token,
-                            &heartbeat_fingerprint,
-                            &now,
-                            &evidence,
-                        )
-                        .await
-                        .unwrap_or(false)
-                    {
-                        break;
+                }
+                tracing::warn!(
+                    category = "recovery-blocked",
+                    action = "startup-terminated",
+                    emission = "recovery-blocked-startup-terminated"
+                );
+                return Err(AppError::Runtime);
+            }
+
+            // Only a recovery-safe runtime may expose the health listener.  The
+            // recovery-blocked path above terminates before any listener, Matrix
+            // ingress, ACP dispatcher, or worker can be assembled.
+            runtime.health = start_health(config.bridge.health_bind, &runtime.health_state).await?;
+            tracing::info!(
+                category = "health-listener",
+                phase = "bound",
+                emission = "health-listener-bound"
+            );
+
+            // Matrix authentication, store binding and fresh device-key proof are the
+            // assembly gate. No ACP, bus, gateway, outbox or task owner exists before it.
+            let matrix_client = if let Some(generation) = matrix_generation {
+                match matrix_identity::restore(&config, &runtime.health_state, generation).await {
+                    Ok(client) => Some(client),
+                    Err(()) => {
+                        runtime.health_state.set_owner(OwnerState::Running);
+                        return Ok(());
                     }
                 }
-            }));
-        }
-        // Bind the loopback health listener before Matrix restore/proof.  Health
-        // remains false until the existing state predicates transition, but the
-        // endpoint is observable while startup is blocked on external/runtime
-        // prerequisites.
-        if !recovery_allows_service_assembly(recovery_blocked) {
-            if let Some(generation) = matrix_generation {
-                runtime.health_state.matrix().mark_recovery_blocked();
-                runtime.health_state.matrix().transition(
-                    generation,
-                    &[MatrixPhase::Preflight],
-                    MatrixPhase::RecoveryBlocked,
-                );
-            }
-            tracing::warn!(
-                category = "recovery-blocked",
-                action = "startup-terminated",
-                emission = "recovery-blocked-startup-terminated"
-            );
-            return Err(AppError::Runtime);
-        }
-
-        // Only a recovery-safe runtime may expose the health listener.  The
-        // recovery-blocked path above terminates before any listener, Matrix
-        // ingress, ACP dispatcher, or worker can be assembled.
-        runtime.health = start_health(config.bridge.health_bind, &runtime.health_state).await?;
-        tracing::info!(
-            category = "health-listener",
-            phase = "bound",
-            emission = "health-listener-bound"
-        );
-
-        // Matrix authentication, store binding and fresh device-key proof are the
-        // assembly gate. No ACP, bus, gateway, outbox or task owner exists before it.
-        let matrix_client = if let Some(generation) = matrix_generation {
-            match matrix_identity::restore(&config, &runtime.health_state, generation).await {
-                Ok(client) => Some(client),
-                Err(()) => {
-                    runtime.health_state.set_owner(OwnerState::Running);
-                    return Ok(runtime);
-                }
-            }
-        } else {
-            None
-        };
-
-        let mut endpoint_dispatchers = HashMap::new();
-        let spawn_gate = crate::acp::AcpSpawnGate::for_generation(&runtime_instance);
-        for (agent_id, declared) in &config.agents {
-            if !declared.enabled || declared.transport != TransportType::Acp {
-                continue;
-            }
-            let workspace = declared
-                .workspace
-                .as_ref()
-                .ok_or(AppError::Assembly("enabled ACP workspace missing"))?;
-            let workspace_path = workspace.clone();
-            let endpoint = registry
-                .get_by_agent_id(agent_id)
-                .ok_or(AppError::Assembly("configured endpoint missing"))?;
-            let dispatcher = AcpDispatcher::builder()
-                .cwd(workspace)
-                .additional_directories(
-                    declared
-                        .additional_workspaces
-                        .iter()
-                        .map(|path| path.to_string_lossy().into_owned())
-                        .collect(),
-                )
-                .sessions(sessions.clone())
-                .repository(repository_trait.clone())
-                .reliability(reliability.clone())
-                .legacy_results(config.runtime.legacy_acp_results)
-                .durable_output(output_spool.clone(), runtime_instance.clone())
-                .allow_nonterminal_end_turn(config.runtime.allow_nonterminal_end_turn)
-                .spawn_gate(spawn_gate.clone())
-                .build()
-                .map_err(AppError::Assembly)?;
-            let workspace =
-                WorkspaceId::from_canonical_path(workspace).map_err(|_| AppError::Runtime)?;
-            endpoint_dispatchers.insert(
-                endpoint.id(),
-                Arc::new(LeasedAcpDispatcher::new_with_paths(
-                    dispatcher,
-                    runtime_store.clone(),
-                    workspace,
-                    std::iter::once(workspace_path.clone())
-                        .chain(declared.additional_workspaces.iter().cloned())
-                        .collect(),
-                    continuation_policy(&config),
-                    Arc::new(SystemRuntimeClock),
-                    Arc::new(TokioRuntimeTimer),
-                    Arc::clone(&metrics),
-                )),
-            );
-        }
-        let acp = Arc::new(AcpDispatcherRouter::with_gate(
-            endpoint_dispatchers,
-            spawn_gate,
-        ));
-        let mut dispatchers = DispatcherRegistry::new().with(TransportType::Acp, acp.clone());
-        if config.transports.a2a.enabled {
-            let a2a = crate::a2a::assembly::dispatchers(&config, pool.clone())
-                .await
-                .map_err(|_| AppError::Assembly("A2A peer startup failed"))?;
-            dispatchers = dispatchers.with(TransportType::A2a, Arc::new(a2a));
-        }
-
-        let (event_sink, events) = MpscEventSink::new(config.bridge.event_capacity);
-        let event_sink: Arc<dyn crate::bus::EventSink> = Arc::new(event_sink);
-        let default_timeout =
-            chrono::Duration::from_std(Duration::from_secs(config.bridge.default_timeout_seconds))
-                .map_err(|_| AppError::Assembly("default timeout is out of range"))?;
-        let (bus, tasks) = PersistingBus::new(
-            Arc::clone(&registry),
-            config.bridge.queue_capacity,
-            Arc::clone(&event_sink),
-            repository.as_ref().clone(),
-            Clock::system(),
-        );
-        let bus = bus
-            .with_default_timeout(default_timeout)
-            .with_reliability(reliability.clone(), runtime_instance.clone());
-        let durable_bus = Arc::new(bus);
-        let gateway_handoff = crate::app::gateway_handoff::GatewayHandoff::new(
-            crate::gateway::GatewayStore::new_scoped(pool.clone(), recovery_scope.clone()),
-            Arc::clone(&durable_bus),
-            runtime_instance.clone(),
-        );
-        if config.transports.gateway.enabled
-            && !crate::gateway::GatewayStore::new_scoped(pool.clone(), recovery_scope.clone())
-                .validate_retained_bytes()
-                .await
-                .map_err(|_| AppError::Assembly("gateway retained-byte validation failed"))?
-        {
-            return Err(AppError::Assembly(
-                "gateway retained-byte validation failed",
-            ));
-        }
-        for (task_id, revision) in admission_recovery.eligible {
-            let parsed = task_id.parse().map_err(|_| AppError::Runtime)?;
-            if let Some(task) = repository_trait.get_task(parsed).await? {
-                let gateway_task: bool = sqlx::query_scalar(
-                    "SELECT EXISTS(SELECT 1 FROM gateway_envelopes WHERE internal_task_id=?)",
-                )
-                .bind(&task_id)
-                .fetch_one(&pool)
-                .await
-                .map_err(|_| AppError::Runtime)?;
-                if gateway_task {
-                    gateway_handoff
-                        .handoff(task, revision)
-                        .await
-                        .map_err(|_| AppError::Runtime)?;
-                    continue;
-                }
-                let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-                let state: Option<String> =
-                    sqlx::query_scalar("SELECT state FROM task_admissions WHERE task_id=?")
-                        .bind(&task_id)
-                        .fetch_optional(&pool)
-                        .await
-                        .map_err(|_| AppError::Runtime)?;
-                let claimed = if state.as_deref() == Some("ready") {
-                    reliability
-                        .claim_admission(&task_id, revision, Some(&runtime_instance), &now)
-                        .await
-                        .map_err(|_| AppError::Runtime)?
-                } else {
-                    reliability
-                        .reclaim_stopped_admission(&task_id, revision, &runtime_instance, &now)
-                        .await
-                        .map_err(|_| AppError::Runtime)?
-                };
-                if claimed && durable_bus.enqueue_persisted(task).await.is_err() {
-                    let _ = reliability
-                        .release_admission(&task_id, revision + 1, &now)
-                        .await;
-                }
-            }
-        }
-        let bus: Arc<dyn crate::bus::Bus> = durable_bus.clone();
-        let cancellation = Cancellation::new();
-        let worker = Worker::builder(
-            Arc::clone(&registry),
-            tasks,
-            Arc::clone(&event_sink),
-            Clock::system(),
-            dispatchers,
-        )
-        .lifecycle(Arc::new(crate::runtime::SqliteTaskLifecycle::new_scoped(
-            pool.clone(),
-            recovery_scope.clone(),
-        )))
-        .config(WorkerConfig {
-            limits: crate::bus::LoopLimits::from_bridge(&config.bridge),
-            retry: Default::default(),
-            cancellation: Some(cancellation.clone()),
-            timer: Some(Arc::new(TokioTimer)),
-        })
-        .build();
-
-        let persistence: Arc<dyn EventConsumer> =
-            Arc::new(RepositoryEventConsumer::new(repository_trait.clone()));
-        let mut siblings: Vec<Arc<dyn EventConsumer>> = if config.transports.a2a.enabled {
-            vec![Arc::new(crate::a2a::A2aTerminalProjection::new(
-                A2aStore::new(pool.clone()),
-            ))]
-        } else {
-            Vec::new()
-        };
-        if config.transports.matrix.enabled {
-            siblings.push(Arc::new(
-                crate::app::output_projection::DurableOutputProjection::new(
-                    output_store.clone(),
-                    output_spool.clone(),
-                    runtime_instance.clone(),
-                ),
-            ));
-        }
-
-        let matrix = if let Some(client) = matrix_client {
-            let (active, sync) = super::matrix_recovery::prepare_sync(
-                client,
-                &config,
-                &pool,
-                &runtime_instance,
-                recovery_scope.clone(),
-            )
-            .await?;
-            output_spool
-                .recover_cleanup(&Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
-                .await
-                .map_err(|_| AppError::Assembly("durable Matrix output cleanup recovery failed"))?;
-            let sdk = Arc::new(SdkMatrixSender::new(active));
-            let mut sync = sync
-                .with_failure_observer(matrix_failure_observer(
-                    Arc::clone(&first_failure),
-                    Arc::clone(&runtime.health_state),
-                    matrix_generation.expect("Matrix generation"),
-                ))
-                .with_missing_key_observer(runtime.health_state.clone());
-            let gateway = if config.transports.gateway.enabled {
-                let gateway = Arc::new(MatrixGateway::new(
-                    sdk.clone(),
-                    MatrixRoute {
-                        room_id: config.transports.gateway.room_id.clone(),
-                        peer_id: config.transports.gateway.peer_id.clone(),
-                        local_endpoint_id: config.transports.gateway.local_endpoint_id.clone(),
-                        remote_endpoint_id: config.transports.gateway.remote_endpoint_id.clone(),
-                        generation: config.transports.gateway.generation,
-                        max_payload_bytes: config.transports.gateway.max_payload_bytes,
-                        deadline_seconds: config.transports.gateway.deadline_seconds,
-                        allowed_senders: config.transports.gateway.allowed_senders.clone(),
-                        own_user: config.transports.matrix.user_id.clone(),
-                        runtime_instance: runtime_instance.clone(),
-                    },
-                ));
-                sync = sync.with_raw_consumer(Arc::new(GatewayRawConsumer::new(
-                    Arc::clone(&gateway),
-                    GatewayStore::new_scoped(pool.clone(), recovery_scope.clone()),
-                    repository.as_ref().clone(),
-                    gateway_handoff.clone(),
-                )));
-                Some(gateway)
             } else {
                 None
             };
-            Some((sdk, sync, gateway))
-        } else {
-            None
-        };
 
-        if let Some((sdk, sync, gateway)) = matrix {
-            let generation = matrix_generation.expect("enabled Matrix has a generation");
-            let matrix_sender: Arc<dyn crate::matrix::MatrixSender> = sdk.clone();
-            runtime.gateway = gateway;
-            if runtime.gateway.is_some() {
-                runtime.gateway_cleanup = Some(crate::gateway::GatewayCleanupHandle::start(
-                    GatewayStore::new_scoped(pool.clone(), recovery_scope.clone()),
-                    runtime_instance.clone(),
+            let mut endpoint_dispatchers = HashMap::new();
+            for (agent_id, declared) in &config.agents {
+                if !declared.enabled || declared.transport != TransportType::Acp {
+                    continue;
+                }
+                let workspace = declared
+                    .workspace
+                    .as_ref()
+                    .ok_or(AppError::Assembly("enabled ACP workspace missing"))?;
+                let workspace_path = workspace.clone();
+                let endpoint = registry
+                    .get_by_agent_id(agent_id)
+                    .ok_or(AppError::Assembly("configured endpoint missing"))?;
+                let dispatcher = AcpDispatcher::builder()
+                    .cwd(workspace)
+                    .additional_directories(
+                        declared
+                            .additional_workspaces
+                            .iter()
+                            .map(|path| path.to_string_lossy().into_owned())
+                            .collect(),
+                    )
+                    .sessions(sessions.clone())
+                    .repository(repository_trait.clone())
+                    .reliability(reliability.clone())
+                    .legacy_results(config.runtime.legacy_acp_results)
+                    .durable_output(output_spool.clone(), runtime_instance.clone())
+                    .allow_nonterminal_end_turn(config.runtime.allow_nonterminal_end_turn)
+                    .spawn_gate(spawn_gate.clone())
+                    .build()
+                    .map_err(AppError::Assembly)?;
+                let workspace =
+                    WorkspaceId::from_canonical_path(workspace).map_err(|_| AppError::Runtime)?;
+                endpoint_dispatchers.insert(
+                    endpoint.id(),
+                    Arc::new(LeasedAcpDispatcher::new_with_paths(
+                        dispatcher,
+                        runtime_store.clone(),
+                        workspace,
+                        std::iter::once(workspace_path.clone())
+                            .chain(declared.additional_workspaces.iter().cloned())
+                            .collect(),
+                        continuation_policy(&config),
+                        Arc::new(SystemRuntimeClock),
+                        Arc::new(TokioRuntimeTimer),
+                        Arc::clone(&metrics),
+                    )),
+                );
+            }
+            let acp = Arc::new(AcpDispatcherRouter::with_gate(
+                endpoint_dispatchers,
+                spawn_gate,
+            ));
+            let mut dispatchers = DispatcherRegistry::new().with(TransportType::Acp, acp.clone());
+            if config.transports.a2a.enabled {
+                let a2a = crate::a2a::assembly::dispatchers(&config, pool.clone())
+                    .await
+                    .map_err(|_| AppError::Assembly("A2A peer startup failed"))?;
+                dispatchers = dispatchers.with(TransportType::A2a, Arc::new(a2a));
+            }
+
+            let (event_sink, events) = MpscEventSink::new(config.bridge.event_capacity);
+            let event_sink: Arc<dyn crate::bus::EventSink> = Arc::new(event_sink);
+            let default_timeout = chrono::Duration::from_std(Duration::from_secs(
+                config.bridge.default_timeout_seconds,
+            ))
+            .map_err(|_| AppError::Assembly("default timeout is out of range"))?;
+            let (bus, tasks) = PersistingBus::new(
+                Arc::clone(&registry),
+                config.bridge.queue_capacity,
+                Arc::clone(&event_sink),
+                repository.as_ref().clone(),
+                Clock::system(),
+            );
+            let bus = bus
+                .with_default_timeout(default_timeout)
+                .with_reliability(reliability.clone(), runtime_instance.clone());
+            let durable_bus = Arc::new(bus);
+            let gateway_handoff = crate::app::gateway_handoff::GatewayHandoff::new(
+                crate::gateway::GatewayStore::new_scoped(pool.clone(), recovery_scope.clone()),
+                Arc::clone(&durable_bus),
+                runtime_instance.clone(),
+            );
+            if config.transports.gateway.enabled
+                && !crate::gateway::GatewayStore::new_scoped(pool.clone(), recovery_scope.clone())
+                    .validate_retained_bytes()
+                    .await
+                    .map_err(|_| AppError::Assembly("gateway retained-byte validation failed"))?
+            {
+                return Err(AppError::Assembly(
+                    "gateway retained-byte validation failed",
                 ));
             }
-            let outbox_sender: Arc<dyn crate::matrix::MatrixOutboxSender> = sdk.clone();
-            let durable_sender: Arc<dyn crate::matrix::DurableMatrixSender> = sdk.clone();
-            let outbox_store = super::matrix_recovery::outbox_store(
-                &pool,
-                &runtime_instance,
-                recovery_scope.clone(),
-            )
-            .await?;
-            let outbox = crate::app::OutboxDrain::new(outbox_store, outbox_sender, 64);
-            let outbox_owner = outbox.clone().start(Duration::from_secs(1));
-            let output_owner = crate::app::output_drain::OutputSetDrain::new(
-                output_store.clone(),
-                output_spool.clone(),
-                durable_sender,
-            )
-            .start(Duration::from_secs(1));
-            let replies = Arc::new(ReplyRegistry::default());
-
-            runtime.health_state.matrix().transition(
-                generation,
-                &[MatrixPhase::KeyProved],
-                MatrixPhase::Registering,
-            );
-            let (sync_handle, receiver, dispositions) = sync.start_with_dispositions();
-            let retry: Arc<dyn crate::matrix::RetryAdmission> =
-                Arc::new(crate::app::DurableRetryAdmission::new(
-                    reliability.clone(),
-                    Clock::system(),
-                    default_timeout,
-                    durable_bus.as_ref().clone(),
-                    outbox,
-                    runtime_instance.clone(),
-                ));
-            let ingress = MatrixIngress::new(
-                receiver,
-                repository_trait.clone(),
+            for (task_id, revision) in admission_recovery.eligible {
+                let parsed = task_id.parse().map_err(|_| AppError::Runtime)?;
+                if let Some(task) = repository_trait.get_task(parsed).await? {
+                    let gateway_task: bool = sqlx::query_scalar(
+                        "SELECT EXISTS(SELECT 1 FROM gateway_envelopes WHERE internal_task_id=?)",
+                    )
+                    .bind(&task_id)
+                    .fetch_one(&pool)
+                    .await
+                    .map_err(|_| AppError::Runtime)?;
+                    if gateway_task {
+                        gateway_handoff
+                            .handoff(task, revision)
+                            .await
+                            .map_err(|_| AppError::Runtime)?;
+                        continue;
+                    }
+                    let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+                    let state: Option<String> =
+                        sqlx::query_scalar("SELECT state FROM task_admissions WHERE task_id=?")
+                            .bind(&task_id)
+                            .fetch_optional(&pool)
+                            .await
+                            .map_err(|_| AppError::Runtime)?;
+                    let claimed = if state.as_deref() == Some("ready") {
+                        reliability
+                            .claim_admission(&task_id, revision, Some(&runtime_instance), &now)
+                            .await
+                            .map_err(|_| AppError::Runtime)?
+                    } else {
+                        reliability
+                            .reclaim_stopped_admission(&task_id, revision, &runtime_instance, &now)
+                            .await
+                            .map_err(|_| AppError::Runtime)?
+                    };
+                    if claimed && durable_bus.enqueue_persisted(task).await.is_err() {
+                        let _ = reliability
+                            .release_admission(&task_id, revision + 1, &now)
+                            .await;
+                    }
+                }
+            }
+            let bus: Arc<dyn crate::bus::Bus> = durable_bus.clone();
+            let cancellation = Cancellation::new();
+            let worker = Worker::builder(
                 Arc::clone(&registry),
-                durable_bus.clone(),
-                matrix_sender,
-                Arc::clone(&runtime.reload),
-                cancellation.clone(),
-                Arc::new(crate::matrix::CommandLedger::new(4096)),
-                replies,
-                4096,
+                tasks,
+                Arc::clone(&event_sink),
+                Clock::system(),
+                dispatchers,
             )
-            .with_dispositions(dispositions)
-            .with_queue_control_store(Arc::new(reliability.clone()))
-            .with_reap_control(acp.clone())
-            .with_retry_admission(retry)
-            .start();
-            runtime
-                .health_state
-                .register_matrix_required(sync_handle.alive());
-            runtime
-                .health_state
-                .register_matrix_required(ingress.alive());
-            runtime.health_state.matrix().transition(
-                generation,
-                &[MatrixPhase::Registering],
-                MatrixPhase::Ready,
-            );
-            runtime.matrix_sync = Some(sync_handle);
-            runtime.ingress = Some(ingress);
-            runtime.outbox = Some(outbox_owner);
-            runtime.output_drain = Some(output_owner);
-        }
+            .lifecycle(Arc::new(crate::runtime::SqliteTaskLifecycle::new_scoped(
+                pool.clone(),
+                recovery_scope.clone(),
+            )))
+            .config(WorkerConfig {
+                limits: crate::bus::LoopLimits::from_bridge(&config.bridge),
+                retry: Default::default(),
+                cancellation: Some(cancellation.clone()),
+                timer: Some(Arc::new(TokioTimer)),
+            })
+            .build();
 
-        let projection: Arc<dyn EventConsumer> = Arc::new(PersistenceFirstProjection::new(
-            persistence,
-            siblings,
-            projection_metrics,
-        ));
-        let worker_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        runtime
-            .health_state
-            .register_required(Arc::clone(&worker_alive));
-        let worker_failure = Arc::clone(&first_failure);
-        runtime.worker = Some(spawn_task_worker(
-            async move { worker.run().await },
-            worker_alive,
-            worker_failure,
-        ));
-        let broadcaster_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
-        runtime
-            .health_state
-            .register_required(Arc::clone(&broadcaster_alive));
-        runtime.broadcaster = Some(tokio::spawn(async move {
-            EventBroadcaster::new(events, vec![projection]).run().await;
-            broadcaster_alive.store(false, std::sync::atomic::Ordering::Release);
-        }));
-        runtime.bus = Some(bus);
-        runtime.acp = Some(acp);
-        if config.transports.a2a.enabled {
-            runtime.a2a_cleanup = Some(
-                start_cleanup(
+            let persistence: Arc<dyn EventConsumer> =
+                Arc::new(RepositoryEventConsumer::new(repository_trait.clone()));
+            let mut siblings: Vec<Arc<dyn EventConsumer>> = if config.transports.a2a.enabled {
+                vec![Arc::new(crate::a2a::A2aTerminalProjection::new(
                     A2aStore::new(pool.clone()),
-                    runtime_instance.clone(),
-                    CleanupPolicy {
-                        terminal_ttl: Duration::from_secs(
-                            config.transports.a2a.terminal_content_ttl_seconds,
-                        ),
-                        byte_ceiling: config.transports.a2a.retained_bytes_ceiling as i64,
-                        low_watermark: config.transports.a2a.retained_bytes_low_watermark as i64,
-                        batch: config.transports.a2a.cleanup_batch,
-                        interval: Duration::from_secs(60),
-                    },
-                )
-                .await
-                .map_err(|_| AppError::Assembly("A2A cleanup startup failed"))?,
-            );
-            runtime.a2a = Some(
-                crate::a2a::assembly::server(
+                ))]
+            } else {
+                Vec::new()
+            };
+            if config.transports.matrix.enabled {
+                siblings.push(Arc::new(
+                    crate::app::output_projection::DurableOutputProjection::new(
+                        output_store.clone(),
+                        output_spool.clone(),
+                        runtime_instance.clone(),
+                    ),
+                ));
+            }
+
+            let matrix = if let Some(client) = matrix_client {
+                let (active, sync) = super::matrix_recovery::prepare_sync(
+                    client,
                     &config,
-                    crate::a2a::assembly::ServerDependencies {
-                        pool: pool.clone(),
-                        repository: repository_trait.clone(),
-                        concrete: repository.as_ref().clone(),
-                        bus: durable_bus,
-                        cancellation,
-                        registry: Arc::clone(&registry),
-                        faults: a2a_faults,
-                    },
+                    &pool,
+                    &runtime_instance,
+                    recovery_scope.clone(),
                 )
-                .await
-                .map_err(|_| AppError::Assembly("A2A listener startup failed"))?,
-            );
+                .await?;
+                output_spool
+                    .recover_cleanup(
+                        &Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
+                    )
+                    .await
+                    .map_err(|_| {
+                        AppError::Assembly("durable Matrix output cleanup recovery failed")
+                    })?;
+                let sdk = Arc::new(SdkMatrixSender::new(active));
+                let mut sync = sync
+                    .with_failure_observer(matrix_failure_observer(
+                        Arc::clone(&first_failure),
+                        Arc::clone(&runtime.health_state),
+                        matrix_generation.expect("Matrix generation"),
+                    ))
+                    .with_missing_key_observer(runtime.health_state.clone());
+                let gateway = if config.transports.gateway.enabled {
+                    let gateway = Arc::new(MatrixGateway::new(
+                        sdk.clone(),
+                        MatrixRoute {
+                            room_id: config.transports.gateway.room_id.clone(),
+                            peer_id: config.transports.gateway.peer_id.clone(),
+                            local_endpoint_id: config.transports.gateway.local_endpoint_id.clone(),
+                            remote_endpoint_id: config
+                                .transports
+                                .gateway
+                                .remote_endpoint_id
+                                .clone(),
+                            generation: config.transports.gateway.generation,
+                            max_payload_bytes: config.transports.gateway.max_payload_bytes,
+                            deadline_seconds: config.transports.gateway.deadline_seconds,
+                            allowed_senders: config.transports.gateway.allowed_senders.clone(),
+                            own_user: config.transports.matrix.user_id.clone(),
+                            runtime_instance: runtime_instance.clone(),
+                        },
+                    ));
+                    sync = sync.with_raw_consumer(Arc::new(GatewayRawConsumer::new(
+                        Arc::clone(&gateway),
+                        GatewayStore::new_scoped(pool.clone(), recovery_scope.clone()),
+                        repository.as_ref().clone(),
+                        gateway_handoff.clone(),
+                    )));
+                    Some(gateway)
+                } else {
+                    None
+                };
+                Some((sdk, sync, gateway))
+            } else {
+                None
+            };
+
+            if let Some((sdk, sync, gateway)) = matrix {
+                let generation = matrix_generation.expect("enabled Matrix has a generation");
+                let matrix_sender: Arc<dyn crate::matrix::MatrixSender> = sdk.clone();
+                runtime.gateway = gateway;
+                if runtime.gateway.is_some() {
+                    runtime.gateway_cleanup = Some(crate::gateway::GatewayCleanupHandle::start(
+                        GatewayStore::new_scoped(pool.clone(), recovery_scope.clone()),
+                        runtime_instance.clone(),
+                    ));
+                }
+                let outbox_sender: Arc<dyn crate::matrix::MatrixOutboxSender> = sdk.clone();
+                let durable_sender: Arc<dyn crate::matrix::DurableMatrixSender> = sdk.clone();
+                let outbox_store = super::matrix_recovery::outbox_store(
+                    &pool,
+                    &runtime_instance,
+                    recovery_scope.clone(),
+                )
+                .await?;
+                let outbox = crate::app::OutboxDrain::new(outbox_store, outbox_sender, 64);
+                let outbox_owner = outbox.clone().start(Duration::from_secs(1));
+                let output_owner = crate::app::output_drain::OutputSetDrain::new(
+                    output_store.clone(),
+                    output_spool.clone(),
+                    durable_sender,
+                )
+                .start(Duration::from_secs(1));
+                let replies = Arc::new(ReplyRegistry::default());
+
+                runtime.health_state.matrix().transition(
+                    generation,
+                    &[MatrixPhase::KeyProved],
+                    MatrixPhase::Registering,
+                );
+                let (sync_handle, receiver, dispositions) = sync.start_with_dispositions();
+                let retry: Arc<dyn crate::matrix::RetryAdmission> =
+                    Arc::new(crate::app::DurableRetryAdmission::new(
+                        reliability.clone(),
+                        Clock::system(),
+                        default_timeout,
+                        durable_bus.as_ref().clone(),
+                        outbox,
+                        runtime_instance.clone(),
+                    ));
+                let ingress = MatrixIngress::new(
+                    receiver,
+                    repository_trait.clone(),
+                    Arc::clone(&registry),
+                    durable_bus.clone(),
+                    matrix_sender,
+                    Arc::clone(&runtime.reload),
+                    cancellation.clone(),
+                    Arc::new(crate::matrix::CommandLedger::new(4096)),
+                    replies,
+                    4096,
+                )
+                .with_dispositions(dispositions)
+                .with_queue_control_store(Arc::new(reliability.clone()))
+                .with_reap_control(acp.clone())
+                .with_retry_admission(retry)
+                .start();
+                runtime
+                    .health_state
+                    .register_matrix_required(sync_handle.alive());
+                runtime
+                    .health_state
+                    .register_matrix_required(ingress.alive());
+                runtime.health_state.matrix().transition(
+                    generation,
+                    &[MatrixPhase::Registering],
+                    MatrixPhase::Ready,
+                );
+                runtime.matrix_sync = Some(sync_handle);
+                runtime.ingress = Some(ingress);
+                runtime.outbox = Some(outbox_owner);
+                runtime.output_drain = Some(output_owner);
+            }
+
+            let projection: Arc<dyn EventConsumer> = Arc::new(PersistenceFirstProjection::new(
+                persistence,
+                siblings,
+                projection_metrics,
+            ));
+            let worker_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            runtime
+                .health_state
+                .register_required(Arc::clone(&worker_alive));
+            let worker_failure = Arc::clone(&first_failure);
+            runtime.worker = Some(spawn_task_worker(
+                async move { worker.run().await },
+                worker_alive,
+                worker_failure,
+            ));
+            let broadcaster_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+            runtime
+                .health_state
+                .register_required(Arc::clone(&broadcaster_alive));
+            runtime.broadcaster = Some(tokio::spawn(async move {
+                EventBroadcaster::new(events, vec![projection]).run().await;
+                broadcaster_alive.store(false, std::sync::atomic::Ordering::Release);
+            }));
+            runtime.bus = Some(bus);
+            runtime.acp = Some(acp);
+            if config.transports.a2a.enabled {
+                runtime.a2a_cleanup = Some(
+                    start_cleanup(
+                        A2aStore::new(pool.clone()),
+                        runtime_instance.clone(),
+                        CleanupPolicy {
+                            terminal_ttl: Duration::from_secs(
+                                config.transports.a2a.terminal_content_ttl_seconds,
+                            ),
+                            byte_ceiling: config.transports.a2a.retained_bytes_ceiling as i64,
+                            low_watermark: config.transports.a2a.retained_bytes_low_watermark
+                                as i64,
+                            batch: config.transports.a2a.cleanup_batch,
+                            interval: Duration::from_secs(60),
+                        },
+                    )
+                    .await
+                    .map_err(|_| AppError::Assembly("A2A cleanup startup failed"))?,
+                );
+                runtime.a2a = Some(
+                    crate::a2a::assembly::server(
+                        &config,
+                        crate::a2a::assembly::ServerDependencies {
+                            pool: pool.clone(),
+                            repository: repository_trait.clone(),
+                            concrete: repository.as_ref().clone(),
+                            bus: durable_bus,
+                            cancellation,
+                            registry: Arc::clone(&registry),
+                            faults: a2a_faults,
+                        },
+                    )
+                    .await
+                    .map_err(|_| AppError::Assembly("A2A listener startup failed"))?,
+                );
+            }
+            runtime.health_state.set_adapter_ready(true);
+            runtime.health_state.set_owner(OwnerState::Running);
+            Ok(())
         }
-        runtime.health_state.set_adapter_ready(true);
-        runtime.health_state.set_owner(OwnerState::Running);
+        .await;
+        if let Err(error) = assembly_result {
+            let cleanup = runtime.shutdown().await;
+            tracing::warn!(
+                phase = "startup-abort-cleanup",
+                completed = cleanup.is_ok(),
+                first_cause_preserved = true,
+                "startup assembly failed; owned cleanup finished"
+            );
+            return Err(error);
+        }
         Ok(runtime)
     }
 
@@ -1283,6 +1335,10 @@ impl AppRuntime {
         let mut shutdown_error = None;
         let mut matrix_lease = None;
         self.health_state.set_owner(OwnerState::Stopping);
+        if let Some(heartbeat) = self.heartbeat.take() {
+            heartbeat.abort();
+            let _ = heartbeat.await;
+        }
         if let Some(token) = self.runtime_instance.as_deref() {
             let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
             if !self
@@ -1295,10 +1351,6 @@ impl AppRuntime {
             }
         }
         self.reload.stop().await;
-        if let Some(heartbeat) = self.heartbeat.take() {
-            heartbeat.abort();
-            let _ = heartbeat.await;
-        }
         if let Some(sync) = self.matrix_sync.take() {
             match sync.shutdown_bounded_deferred(self.shutdown_timeout).await {
                 Ok(lease) => matrix_lease = lease,
@@ -1357,8 +1409,17 @@ impl AppRuntime {
             }
         }
         let mut acp_shutdown = None;
+        let mut joined_children = None;
         if let Some(acp) = self.acp.take() {
             acp_shutdown = Some(acp.shutdown_observation().await);
+            joined_children = acp.joined_children();
+        }
+        if joined_children.is_none()
+            && let Some(gate) = self.spawn_gate.take()
+        {
+            gate.close_and_join().await;
+            gate.reap_transports().await;
+            joined_children = gate.joined_children();
         }
         if let Some(cleanup) = self.gateway_cleanup.take()
             && cleanup.shutdown().await.is_err()
@@ -1398,10 +1459,19 @@ impl AppRuntime {
             let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
             let evidence = crate::storage::RuntimeOwnerEvidence::capture();
             let final_owner = evidence.as_ref().zip(acp_shutdown.as_ref());
-            let result = self
-                .reliability
-                .finish_runtime_stop(&token, &now, final_owner)
-                .await;
+            let result = if shutdown_error.is_none()
+                && owners_healthy
+                && let Some(evidence) = evidence.as_ref()
+                && let Some(joined) = joined_children.as_ref()
+            {
+                self.reliability
+                    .finish_controlled_stop(&token, &now, evidence, joined)
+                    .await
+            } else {
+                self.reliability
+                    .finish_runtime_stop(&token, &now, final_owner)
+                    .await
+            };
             match result {
                 Ok(true) => {}
                 Ok(false) if shutdown_error.is_none() => shutdown_error = Some(AppError::Runtime),
@@ -1785,11 +1855,17 @@ enabled = true
         let instance = uuid::Uuid::now_v7().to_string();
         assert!(
             reliability
-                .begin_runtime(&instance, &instance, "2026-09-23T00:00:00Z")
+                .begin_runtime_with_evidence(
+                    &instance,
+                    &crate::storage::RuntimeOwnerEvidence::fingerprint().unwrap(),
+                    &chrono::Utc::now().to_rfc3339(),
+                    &crate::storage::RuntimeOwnerEvidence::capture().unwrap(),
+                )
                 .await
                 .unwrap()
         );
 
+        let gate = crate::acp::AcpSpawnGate::for_generation(&instance);
         let build = AppRuntime::build(
             config_path,
             config,
@@ -1800,6 +1876,8 @@ enabled = true
             Arc::new(crate::offline_production_migration::acquire_runtime_lock(&database).unwrap()),
             None,
             Arc::new(crate::a2a::NoFault),
+            gate,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         );
         tokio::pin!(build);
         let address = format!("127.0.0.1:{health_port}");
@@ -2086,6 +2164,7 @@ enabled = true
             .begin_runtime(&runtime_instance, "pid:fixture", "2026-10-18T00:00:00Z")
             .await
             .unwrap();
+        let gate = crate::acp::AcpSpawnGate::for_generation(&runtime_instance);
         let result = AppRuntime::build(
             root.join("bridge.toml"),
             config,
@@ -2096,6 +2175,8 @@ enabled = true
             Arc::new(crate::offline_production_migration::acquire_runtime_lock(&database).unwrap()),
             None,
             Arc::new(crate::a2a::NoFault),
+            gate,
+            Arc::new(std::sync::atomic::AtomicBool::new(false)),
         )
         .await;
         assert!(matches!(result, Err(AppError::Runtime)));

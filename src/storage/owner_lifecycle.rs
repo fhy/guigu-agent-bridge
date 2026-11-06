@@ -145,7 +145,7 @@ impl ReliabilityStore {
         Ok(valid)
     }
 
-    fn matches_clock(
+    pub(super) fn matches_clock(
         &self,
         row: &sqlx::sqlite::SqliteRow,
         fingerprint: &str,

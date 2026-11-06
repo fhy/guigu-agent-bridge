@@ -72,6 +72,7 @@ pub mod result;
 pub mod schema;
 pub mod session;
 mod spawn_gate;
+pub(crate) use spawn_gate::JoinedChildren;
 pub mod transport;
 
 mod dispatcher;

@@ -161,13 +161,16 @@ impl AcpTurnHandle {
 }
 
 /// A live ACP child process speaking JSONL over stdio.
+type ChildWait = (bool, Option<i32>);
+
 pub struct AcpTransport {
     outgoing: mpsc::Sender<Outgoing>,
     next_id: AtomicI64,
     alive: Arc<AtomicBool>,
     /// Taken by [`AcpTransport::shutdown`] so the handle is awaited exactly once.
     /// The lock is held only to take it out, never across an await.
-    loop_handle: Mutex<Option<JoinHandle<Option<i32>>>>,
+    loop_handle: Mutex<Option<JoinHandle<ChildWait>>>,
+    reaped: AtomicBool,
     child_pid: u32,
 }
 
@@ -287,6 +290,7 @@ impl AcpTransport {
             next_id: AtomicI64::new(0),
             alive,
             loop_handle: Mutex::new(Some(loop_handle)),
+            reaped: AtomicBool::new(false),
             child_pid,
         })
     }
@@ -426,10 +430,13 @@ impl AcpTransport {
         let _ = self.outgoing.send(Outgoing::Shutdown).await;
         match handle {
             Some(handle) => match handle.await {
-                Ok(code) => (true, code),
+                Ok((reaped, code)) => {
+                    self.reaped.store(reaped, Ordering::Release);
+                    (reaped, code)
+                }
                 Err(_) => (false, None),
             },
-            None => (false, None),
+            None => (self.reaped.load(Ordering::Acquire), None),
         }
     }
 
@@ -470,7 +477,7 @@ async fn run_loop(
     mut outgoing: mpsc::Receiver<Outgoing>,
     limits: TransportLimits,
     alive: Arc<AtomicBool>,
-) -> Option<i32> {
+) -> (bool, Option<i32>) {
     let mut reader = BufReader::new(stdout);
     let mut frames = FrameReader::new(limits.max_frame_bytes);
     let mut pending: HashMap<i64, Pending> = HashMap::new();
@@ -644,10 +651,10 @@ async fn run_loop(
         }
     }
 
-    let code = terminate(&mut child, stdin, limits.shutdown_deadline).await;
+    let (reaped, code) = terminate(&mut child, stdin, limits.shutdown_deadline).await;
     tracing::debug!(code, "acp transport stopped");
     alive.store(false, Ordering::Relaxed);
-    code
+    (reaped, code)
 }
 
 /// Remove requests whose caller no longer owns the reply receiver.
@@ -792,14 +799,21 @@ fn fail_all(pending: &mut HashMap<i64, Pending>, failure: impl Fn(Phase) -> AcpE
 }
 
 /// Close stdin, wait for the child, kill it if needed, and reap it.
-async fn terminate(child: &mut Child, stdin: ChildStdin, deadline: Duration) -> Option<i32> {
+async fn terminate(
+    child: &mut Child,
+    stdin: ChildStdin,
+    deadline: Duration,
+) -> (bool, Option<i32>) {
     drop(stdin);
     match tokio::time::timeout(deadline, child.wait()).await {
-        Ok(Ok(status)) => status.code(),
+        Ok(Ok(status)) => (true, status.code()),
         // It did not exit in time (or waiting failed): kill and reap.
         _ => {
             let _ = child.start_kill();
-            child.wait().await.ok().and_then(|status| status.code())
+            match child.wait().await {
+                Ok(status) => (true, status.code()),
+                Err(_) => (false, None),
+            }
         }
     }
 }

@@ -66,6 +66,10 @@ impl AcpDispatcherRouter {
         self.shutdown().await;
         self.spawn_gate.final_observation()
     }
+
+    pub(crate) fn joined_children(&self) -> Option<crate::acp::JoinedChildren> {
+        self.spawn_gate.joined_children()
+    }
 }
 
 impl ReapControl for AcpDispatcherRouter {

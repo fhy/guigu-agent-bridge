@@ -157,6 +157,7 @@ mod recovery;
 mod recovery_bridge;
 pub mod recovery_eligibility;
 mod reliability;
+pub(crate) use reliability::owner_restart;
 mod repository;
 pub use matrix_cutover::{CutoverState, CutoverStore, cutover_digest};
 pub use matrix_cutover_receipts::cutover_event_identity;

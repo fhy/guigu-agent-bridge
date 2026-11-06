@@ -98,6 +98,7 @@ impl AppRuntime {
             outbox: None,
             output_drain: None,
             acp: None,
+            spawn_gate: None,
             a2a: None,
             a2a_cleanup: None,
             gateway: None,

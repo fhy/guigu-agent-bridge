@@ -9,6 +9,8 @@ use uuid::Uuid;
 
 #[path = "owner_lifecycle.rs"]
 mod owner_lifecycle;
+#[path = "owner_restart.rs"]
+pub(crate) mod owner_restart;
 #[path = "reliability_projection.rs"]
 mod projections;
 

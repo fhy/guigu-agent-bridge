@@ -32,6 +32,7 @@ pub enum RecoveryError {
 pub enum RecoveryOutcome {
     Recovered,
     AlreadyStopped,
+    RestartEligible,
 }
 
 /// A narrowly scoped, fail-closed recovery transition for a durable ambiguous
@@ -317,6 +318,12 @@ async fn recover_in_transaction_inner(
         return Err(RecoveryError::OwnerIdentity);
     }
     if state == "stopped" {
+        if crate::storage::owner_restart::restart_eligible(conn, token)
+            .await
+            .map_err(|_| RecoveryError::Database)?
+        {
+            return Ok(RecoveryOutcome::RestartEligible);
+        }
         let (total, current, unresolved): (i64, i64, i64) = sqlx::query_as(
             "SELECT count(*),coalesce(sum(is_current),0),coalesce(sum(CASE WHEN is_current=1 AND (state!='reaped' OR barrier_state!='closed_joined' OR in_flight_spawns!=0 OR child_scan_state!='complete_zero_escaped') THEN 1 ELSE 0 END),0) FROM runtime_owner_evidence WHERE instance_token=?",
         )

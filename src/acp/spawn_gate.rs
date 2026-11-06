@@ -9,6 +9,7 @@ use crate::storage::owner_observation::{DomainBinding, FinalObservation};
 pub(crate) struct AcpSpawnGate {
     state: Arc<(Mutex<SpawnState>, Notify)>,
     domain: Arc<DomainBinding>,
+    generation: String,
 }
 
 struct SpawnState {
@@ -18,6 +19,18 @@ struct SpawnState {
     children: Vec<String>,
     registration_failed: bool,
     transports: Vec<Arc<AcpTransport>>,
+    joins_complete: bool,
+}
+
+pub(crate) struct JoinedChildren {
+    generation: String,
+    epoch: i64,
+}
+
+impl JoinedChildren {
+    pub(crate) fn identity(&self) -> (&str, i64) {
+        (&self.generation, self.epoch)
+    }
 }
 
 impl std::fmt::Debug for SpawnState {
@@ -57,10 +70,12 @@ impl AcpSpawnGate {
                     children: Vec::new(),
                     registration_failed: false,
                     transports: Vec::new(),
+                    joins_complete: false,
                 }),
                 Notify::new(),
             )),
             domain: Arc::new(DomainBinding::for_generation(generation)),
+            generation: generation.to_owned(),
         }
     }
 
@@ -126,9 +141,24 @@ impl AcpSpawnGate {
             .expect("spawn gate poisoned")
             .transports
             .clone();
-        for transport in transports {
-            let _ = transport.shutdown().await;
+        let mut complete = true;
+        for transport in &transports {
+            complete &= transport.shutdown_reaped().await;
         }
+        let mut state = self.state.0.lock().expect("spawn gate poisoned");
+        state.joins_complete = complete
+            && state.phase == SpawnPhase::ClosedJoined
+            && state.in_flight == 0
+            && !state.registration_failed
+            && state.children.len() == transports.len();
+    }
+
+    pub(crate) fn joined_children(&self) -> Option<JoinedChildren> {
+        let state = self.state.0.lock().ok()?;
+        (state.joins_complete && state.phase == SpawnPhase::ClosedJoined).then(|| JoinedChildren {
+            generation: self.generation.clone(),
+            epoch: state.epoch,
+        })
     }
 
     pub(crate) async fn close_and_join(&self) {

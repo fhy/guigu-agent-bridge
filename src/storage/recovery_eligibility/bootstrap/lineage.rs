@@ -176,6 +176,11 @@ pub(crate) async fn row_disposition(
     names: &[String],
     values: &[String],
 ) -> Result<&'static str, sqlx::Error> {
+    if identity.table == "runtime_owner_evidence"
+        && crate::storage::owner_restart::bootstrap_evidence(connection, &identity.key).await?
+    {
+        return Ok("eligible_preserved");
+    }
     if identity.table == "tasks" {
         let status: Option<String> = sqlx::query_scalar("SELECT status FROM task_events WHERE json_array(typeof(task_id)||':'||hex(CAST(task_id AS BLOB)))=? ORDER BY seq DESC LIMIT 1")
             .bind(&identity.key).fetch_optional(connection).await?;

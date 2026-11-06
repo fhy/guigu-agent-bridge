@@ -451,6 +451,7 @@ pub async fn run() -> Result<(), Error> {
             match result {
                 offline_recovery::RecoveryOutcome::Recovered => "recovered",
                 offline_recovery::RecoveryOutcome::AlreadyStopped => "already-stopped",
+                offline_recovery::RecoveryOutcome::RestartEligible => "restart-eligible",
             }
         );
         return Ok(());
