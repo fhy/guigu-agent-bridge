@@ -6,11 +6,11 @@ use super::{
 };
 
 pub(crate) struct Mutation {
-    identity: RowIdentity,
-    revision: String,
-    digest: String,
-    parents: String,
-    released_lease: Option<(String, i64)>,
+    pub(super) identity: RowIdentity,
+    pub(super) revision: String,
+    pub(super) digest: String,
+    pub(super) parents: String,
+    pub(super) released_lease: Option<(String, i64)>,
 }
 
 pub(crate) async fn complete_refused_receipt(
@@ -181,7 +181,7 @@ async fn validate_reassignment(
     Ok(())
 }
 
-async fn refresh_references(
+pub(super) async fn refresh_references(
     connection: &mut SqliteConnection,
     scope: &RecoveryScope,
     mutation: &Mutation,

@@ -10,13 +10,13 @@ mod tests;
 
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ControlledStop {
+pub(crate) struct ControlledStop {
     kind: String,
     owner: String,
     generation: i64,
-    source_revision: i64,
-    fingerprint: String,
-    epoch: i64,
+    pub(crate) source_revision: i64,
+    pub(crate) fingerprint: String,
+    pub(crate) epoch: i64,
 }
 
 pub(crate) async fn restart_eligible(
@@ -87,58 +87,37 @@ impl ReliabilityStore {
         evidence: &RuntimeOwnerEvidence,
         joined: &crate::acp::JoinedChildren,
     ) -> Result<bool, ReliabilityError> {
-        let (generation, epoch) = joined.identity();
-        let fingerprint = RuntimeOwnerEvidence::fingerprint().unwrap_or_default();
-        if generation != token || epoch <= 0 || evidence.pid != i64::from(std::process::id()) {
-            return Ok(false);
+        if writer::teardown::is_refused(&self.pool).await? {
+            return writer::teardown::finish_controlled_stop(
+                &self.pool,
+                self.recovery.as_ref(),
+                self,
+                token,
+                now,
+                evidence,
+                joined,
+            )
+            .await;
         }
         let mut transaction = writer::begin(&self.pool, self.recovery.as_ref()).await?;
         if restart_eligible(&mut transaction, token).await? {
             return Ok(true);
         }
-        let row = sqlx::query("SELECT e.* FROM runtime_owner_evidence e JOIN runtime_instances r USING(instance_token) WHERE e.instance_token=? AND e.is_current=1 AND e.state='scan_pending' AND r.state='stopping' AND e.process_fingerprint=r.process_fingerprint")
-            .bind(token).fetch_optional(&mut *transaction).await?;
-        let Some(row) = row else { return Ok(false) };
-        if sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1")
-            .bind(token).fetch_one(&mut *transaction).await? != 1
-            || !self.matches_clock(&row, &fingerprint, now, evidence)
-            || !guards::work_clear(&mut transaction).await?
-            || sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runtime_instances WHERE instance_token!=? AND state IN ('active','stopping')")
-                .bind(token).fetch_one(&mut *transaction).await? != 0
-        {
-            tracing::warn!(phase="owner-controlled-stop", reason="identity-clock-or-work-conflict", owner=token, "controlled stop remains unresolved");
+        let Some(record) = self
+            .prepare_controlled_stop(&mut transaction, token, now, evidence, joined)
+            .await?
+        else {
             return Ok(false);
-        }
-        let revision: i64 = row.get("evidence_revision");
-        let chain: (i64, i64, i64, i64) = sqlx::query_as("SELECT count(*),min(evidence_revision),max(evidence_revision),sum(CASE WHEN state NOT IN ('live','scan_pending') OR process_fingerprint!=? OR pid!=? OR proc_starttime!=? OR boot_id!=? THEN 1 ELSE 0 END) FROM runtime_owner_evidence WHERE instance_token=? AND runtime_generation=?")
-            .bind(&fingerprint).bind(evidence.pid).bind(evidence.proc_starttime).bind(&evidence.boot_id)
-            .bind(token).bind(row.get::<i64, _>("runtime_generation")).fetch_one(&mut *transaction).await?;
-        let total: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM runtime_owner_evidence WHERE instance_token=?",
-        )
-        .bind(token)
-        .fetch_one(&mut *transaction)
-        .await?;
-        if total != revision || chain != (revision, 1, revision, 0) {
-            return Ok(false);
-        }
-        let record = ControlledStop {
-            kind: "controlled-stop-v1".into(),
-            owner: token.into(),
-            generation: row.get("runtime_generation"),
-            source_revision: revision,
-            fingerprint,
-            epoch,
         };
         let snapshot = serde_json::to_string(&record).map_err(|_| ReliabilityError::Malformed)?;
         self.publish_controlled_stop(
             &mut transaction,
             token,
             now,
-            revision,
+            record.source_revision,
             &snapshot,
             evidence,
-            epoch,
+            record.epoch,
             &record.fingerprint,
         )
         .await?;
@@ -151,6 +130,55 @@ impl ReliabilityStore {
             "controlled owner joins completed"
         );
         Ok(true)
+    }
+
+    pub(crate) async fn prepare_controlled_stop(
+        &self,
+        connection: &mut sqlx::SqliteConnection,
+        token: &str,
+        now: &str,
+        evidence: &RuntimeOwnerEvidence,
+        joined: &crate::acp::JoinedChildren,
+    ) -> Result<Option<ControlledStop>, ReliabilityError> {
+        let (generation, epoch) = joined.identity();
+        let fingerprint = RuntimeOwnerEvidence::fingerprint().unwrap_or_default();
+        if generation != token || epoch <= 0 || evidence.pid != i64::from(std::process::id()) {
+            return Ok(None);
+        }
+        let row = sqlx::query("SELECT e.* FROM runtime_owner_evidence e JOIN runtime_instances r USING(instance_token) WHERE e.instance_token=? AND e.is_current=1 AND e.state='scan_pending' AND r.state='stopping' AND e.process_fingerprint=r.process_fingerprint")
+            .bind(token).fetch_optional(&mut *connection).await?;
+        let Some(row) = row else { return Ok(None) };
+        if sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1")
+            .bind(token).fetch_one(&mut *connection).await? != 1
+            || !self.matches_clock(&row, &fingerprint, now, evidence)
+            || !guards::work_clear(connection).await?
+            || sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runtime_instances WHERE instance_token!=? AND state IN ('active','stopping')")
+                .bind(token).fetch_one(&mut *connection).await? != 0
+        {
+            tracing::warn!(phase="owner-controlled-stop", reason="identity-clock-or-work-conflict", owner=token, "controlled stop remains unresolved");
+            return Ok(None);
+        }
+        let revision: i64 = row.get("evidence_revision");
+        let chain: (i64, i64, i64, i64) = sqlx::query_as("SELECT count(*),min(evidence_revision),max(evidence_revision),sum(CASE WHEN state NOT IN ('live','scan_pending') OR process_fingerprint!=? OR pid!=? OR proc_starttime!=? OR boot_id!=? THEN 1 ELSE 0 END) FROM runtime_owner_evidence WHERE instance_token=? AND runtime_generation=?")
+            .bind(&fingerprint).bind(evidence.pid).bind(evidence.proc_starttime).bind(&evidence.boot_id)
+            .bind(token).bind(row.get::<i64, _>("runtime_generation")).fetch_one(&mut *connection).await?;
+        let total: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM runtime_owner_evidence WHERE instance_token=?",
+        )
+        .bind(token)
+        .fetch_one(&mut *connection)
+        .await?;
+        if total != revision || chain != (revision, 1, revision, 0) {
+            return Ok(None);
+        }
+        Ok(Some(ControlledStop {
+            kind: "controlled-stop-v1".into(),
+            owner: token.into(),
+            generation: row.get("runtime_generation"),
+            source_revision: revision,
+            fingerprint,
+            epoch,
+        }))
     }
 
     #[allow(clippy::too_many_arguments)]

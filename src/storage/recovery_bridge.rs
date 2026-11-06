@@ -252,9 +252,22 @@ impl MatrixRecoveryStore {
         now: &str,
     ) -> Result<(), sqlx::Error> {
         use crate::storage::recovery_eligibility::writer;
+        if writer::teardown::is_refused(&self.pool).await? {
+            return writer::teardown::release_component_lease(
+                &self.pool,
+                self.recovery
+                    .as_ref()
+                    .ok_or_else(|| sqlx::Error::Protocol("teardown scope missing".into()))?,
+                component,
+                owner,
+                epoch,
+                now,
+            )
+            .await;
+        }
         let mut tx = writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let mutation = writer::prepare_lease(&mut tx, self.recovery.as_ref(), component).await?;
-        let changed = sqlx::query("UPDATE matrix_component_leases SET expires_at=?,updated_at=? WHERE component=? AND owner_token=? AND epoch=? AND state='active'")
+        let changed = sqlx::query("UPDATE matrix_component_leases SET state='expired',expires_at=?,updated_at=? WHERE component=? AND owner_token=? AND epoch=? AND state='active'")
             .bind(now).bind(now).bind(component).bind(owner).bind(epoch).execute(&mut *tx).await?;
         if changed.rows_affected() != 1 {
             return Err(sqlx::Error::Protocol(

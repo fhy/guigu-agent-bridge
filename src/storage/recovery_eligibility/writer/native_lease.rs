@@ -120,7 +120,7 @@ pub(crate) async fn complete_expired_lease(
     mutation: Option<LeaseMutation>,
 ) -> Result<(), sqlx::Error> {
     let Some(scope) = scope else { return Ok(()) };
-    let expired: i64 = sqlx::query_scalar("SELECT count(*) FROM matrix_component_leases WHERE component=? AND state='active' AND julianday(expires_at)<=julianday('now')")
+    let expired: i64 = sqlx::query_scalar("SELECT count(*) FROM matrix_component_leases WHERE component=? AND state='expired' AND julianday(expires_at)<=julianday('now')")
         .bind(component).fetch_one(&mut *connection).await?;
     let identity = super::text_identity("matrix_component_leases", component)?;
     if expired != 1

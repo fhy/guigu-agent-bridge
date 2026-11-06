@@ -68,6 +68,15 @@ pub async fn require_row(
         return Err(refused());
     }
     authority::validate(connection, context, domain, fence).await?;
+    require_lineage(connection, context, domain, identity).await
+}
+
+async fn require_lineage(
+    connection: &mut SqliteConnection,
+    context: &EligibilityContext,
+    domain: EffectDomain,
+    identity: &RowIdentity,
+) -> Result<(), sqlx::Error> {
     let mut pending = vec![(identity.clone(), None::<ParentIdentity>)];
     let mut checked = BTreeMap::<(String, String), (String, String)>::new();
     while let Some((identity, expected)) = pending.pop() {

@@ -1314,6 +1314,16 @@ impl ReliabilityStore {
     }
 
     pub async fn stopping_runtime(&self, token: &str, now: &str) -> Result<bool, ReliabilityError> {
+        if super::recovery_eligibility::writer::teardown::is_refused(&self.pool).await? {
+            return super::recovery_eligibility::writer::teardown::stopping_runtime(
+                &self.pool,
+                self.recovery.as_ref(),
+                token,
+                now,
+            )
+            .await
+            .map_err(Into::into);
+        }
         let mut transaction =
             super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let identity =

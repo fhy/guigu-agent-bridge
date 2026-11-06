@@ -89,6 +89,14 @@ pub(super) async fn validate(
     domain: EffectDomain,
     fence: Option<&LiveFence>,
 ) -> Result<(), sqlx::Error> {
+    let enabled = validate_identity(connection, context).await?;
+    validate_effect(connection, context, domain, fence, enabled).await
+}
+
+pub(super) async fn validate_identity(
+    connection: &mut SqliteConnection,
+    context: &EligibilityContext,
+) -> Result<bool, sqlx::Error> {
     let (valid, enabled) = match context {
         EligibilityContext::NonAdmin {
             generation,
@@ -117,6 +125,16 @@ pub(super) async fn validate(
     if !valid {
         return Err(refused());
     }
+    Ok(enabled)
+}
+
+async fn validate_effect(
+    connection: &mut SqliteConnection,
+    context: &EligibilityContext,
+    domain: EffectDomain,
+    fence: Option<&LiveFence>,
+    enabled: bool,
+) -> Result<(), sqlx::Error> {
     if domain != EffectDomain::LocalHold {
         super::native_context::validate(connection, context).await?;
     }
