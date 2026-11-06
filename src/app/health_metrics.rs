@@ -4,7 +4,16 @@ const METRICS_COUNTS_BUDGET: Duration = Duration::from_millis(500);
 
 impl HealthState {
     pub(super) async fn metrics_body(&self) -> String {
-        let readiness = self.snapshot().await;
+        let readiness = match tokio::time::timeout(METRICS_COUNTS_BUDGET, self.snapshot()).await {
+            Ok(snapshot) => snapshot,
+            Err(_) => HealthSnapshot {
+                live: true,
+                readiness: Readiness::StorageUnavailable,
+                degraded: std::collections::BTreeSet::new(),
+                observed_at: chrono::Utc::now(),
+                diagnostic: Some("storage-unavailable"),
+            },
+        };
         let snapshot = self.metrics.snapshot();
         let mut body = String::new();
         for (metric, value) in snapshot.values {

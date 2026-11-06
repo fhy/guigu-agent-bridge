@@ -147,6 +147,21 @@ async fn metrics_storage_failure_is_not_reported_as_none() {
 }
 
 #[tokio::test]
+async fn metrics_counts_timeout_releases_pool_wait() {
+    let (state, pool, root) = fixture().await;
+    let mut held = Vec::new();
+    for _ in 0..crate::storage::MAX_CONNECTIONS {
+        held.push(pool.acquire().await.unwrap());
+    }
+    let timed_out = state.metrics_body().await;
+    assert!(timed_out.contains("readiness_storage_available 0"));
+    drop(held);
+    let recovered = state.metrics_body().await;
+    assert!(recovered.contains("readiness_storage_available 1"));
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn metrics_missing_room_key_counter_is_not_causal() {
     let (state, _pool, root) = fixture().await;
     state.set_owner(OwnerState::Running);
