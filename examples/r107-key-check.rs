@@ -75,30 +75,40 @@ fn bind_wire(raw: &str) -> Result<BoundEvent, &'static str> {
     {
         return Err("event-identity-mismatch");
     }
-    let object = value.as_object_mut().ok_or("event-object")?;
-    object.remove("unsigned");
-    let full_digest = format!("{:x}", Sha256::digest(value.to_string().as_bytes()));
-    let embedded_room = value
+    let mut canonical = value.clone();
+    canonical
         .as_object_mut()
         .ok_or("event-object")?
-        .remove("room_id");
-    let sync_digest = format!("{:x}", Sha256::digest(value.to_string().as_bytes()));
-    if full_digest == DIGEST
-        && let Some(room_id) = embedded_room
-    {
-        value
-            .as_object_mut()
-            .ok_or("event-object")?
-            .insert("room_id".into(), room_id);
+        .remove("unsigned");
+    let full_digest = format!("{:x}", Sha256::digest(canonical.to_string().as_bytes()));
+    let mut sync_shape = canonical.clone();
+    if let Some(object) = sync_shape.as_object_mut() {
+        object.remove("age");
+        object.remove("user_id");
+        object.remove("room_id");
     }
-    let digest = format!("{:x}", Sha256::digest(value.to_string().as_bytes()));
-    if digest != DIGEST {
+    let sync_digest = format!("{:x}", Sha256::digest(sync_shape.to_string().as_bytes()));
+    let mut no_server_fields = sync_shape.clone();
+    if let Some(object) = no_server_fields.as_object_mut() {
+        object.remove("origin_server_ts");
+    }
+    let no_server_digest = format!(
+        "{:x}",
+        Sha256::digest(no_server_fields.to_string().as_bytes())
+    );
+    let (digest, value) = if full_digest == DIGEST {
+        (full_digest.clone(), canonical)
+    } else if sync_digest == DIGEST {
+        (sync_digest.clone(), sync_shape)
+    } else if no_server_digest == DIGEST {
+        (no_server_digest.clone(), no_server_fields)
+    } else {
         println!(
             "{}",
-            json!({"stage":"ciphertext-binding","full_digest":full_digest,"sync_digest":sync_digest,"matched":false,"fields":value.as_object().map(|object| object.keys().collect::<Vec<_>>())})
+            json!({"stage":"ciphertext-binding","full_digest":full_digest,"sync_digest":sync_digest,"no_server_digest":no_server_digest,"matched":false,"fields":value.as_object().map(|object| object.keys().collect::<Vec<_>>())})
         );
         return Err("ciphertext-digest-mismatch");
-    }
+    };
     let session_id = field(&value["content"], "session_id")?.to_owned();
     let event = Raw::<OriginalSyncRoomEncryptedEvent>::from_json_string(value.to_string())
         .map_err(|_| "raw-event")?;
