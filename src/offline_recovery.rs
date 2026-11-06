@@ -349,9 +349,42 @@ async fn recover_in_transaction_inner(
     bad(sqlx::query_scalar::<_, i64>(
         "SELECT count(*) FROM deliveries d LEFT JOIN delivery_dispositions p ON p.delivery_id=d.delivery_id WHERE d.acknowledged_at IS NULL OR p.state IS NULL OR p.state IN ('prepared','acknowledged','outcome_unknown')",
     ).fetch_one(&mut *conn).await.map_err(|_| RecoveryError::Database)?)?;
-    bad(sqlx::query_scalar::<_, i64>(
-        "SELECT count(*) FROM tasks t LEFT JOIN task_events e ON e.task_id=t.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=t.task_id) WHERE e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled')",
-    ).fetch_one(&mut *conn).await.map_err(|_| RecoveryError::Database)?)?;
+    let held_task: Option<String> = sqlx::query_scalar(
+        "SELECT admission.task_id FROM task_admissions admission
+         JOIN transport_receipts receipt ON receipt.task_id=admission.task_id
+           AND receipt.transport='offline-admission-hold'
+           AND receipt.receipt_kind='admin' AND receipt.state='rejected'
+           AND receipt.result_code='unknown-preserved:'||admission.runtime_instance||':'||admission.revision
+         JOIN runtime_owner_evidence evidence ON evidence.instance_token=admission.runtime_instance
+           AND evidence.is_current=1 AND evidence.state='live'
+           AND evidence.process_fingerprint=(SELECT process_fingerprint FROM runtime_instances WHERE instance_token=admission.runtime_instance)
+           AND evidence.barrier_state='closed_joined' AND evidence.in_flight_spawns=0
+           AND evidence.child_scan_state='complete_zero_escaped'
+         WHERE admission.state='recovery_needed'
+         GROUP BY admission.task_id HAVING count(*)=1
+           AND (SELECT count(*) FROM task_events event WHERE event.task_id=admission.task_id)=2
+           AND (SELECT group_concat(event.status, ',') FROM task_events event WHERE event.task_id=admission.task_id ORDER BY event.seq)='queued,dispatched'",
+    )
+    .fetch_optional(&mut *conn)
+    .await
+    .map_err(|_| RecoveryError::Database)?;
+    let unfinished_tasks = if let Some(task_id) = held_task.as_deref() {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM tasks t LEFT JOIN task_events e ON e.task_id=t.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=t.task_id) WHERE (e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled')) AND t.task_id != ?",
+        )
+        .bind(task_id)
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|_| RecoveryError::Database)?
+    } else {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM tasks t LEFT JOIN task_events e ON e.task_id=t.task_id AND e.seq=(SELECT MAX(seq) FROM task_events WHERE task_id=t.task_id) WHERE e.status IS NULL OR e.status NOT IN ('completed','failed','timed_out','cancelled')",
+        )
+        .fetch_one(&mut *conn)
+        .await
+        .map_err(|_| RecoveryError::Database)?
+    };
+    bad(unfinished_tasks)?;
     bad(sqlx::query_scalar::<_, i64>(
         "SELECT count(*) FROM deliveries WHERE acknowledged_at IS NULL",
     )
@@ -551,6 +584,125 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(state, "stopped");
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn held_pre_effect_owner_is_recovered_without_rewriting_events() {
+        let (path, pool) = stale_fixture().await;
+        sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES('ep','agent','acp',1,'[]')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations(conversation_id,participants_json) VALUES('conv','[]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES('task','task','ep','ep','conv','x',1,0,0,0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("UPDATE runtime_instances SET heartbeat_at='2026-10-18T00:00:00Z' WHERE instance_token='owner'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current,max_age_seconds) VALUES('owner',1,1,'live',123,456,'fp','boot',789,'2026-10-18T00:00:00Z',1,'closed_joined',0,'complete_zero_escaped','{}',1,30)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,created_at,updated_at) VALUES('task','recovery_needed',2,'owner','2026-10-18T00:00:00Z','2026-10-18T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (seq, status) in [(1, "queued"), (2, "dispatched")] {
+            sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,?,?,?,'{}')")
+                .bind(Uuid::now_v7().to_string())
+                .bind("task")
+                .bind(seq)
+                .bind(status)
+                .bind("2026-10-18T00:00:00Z")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        sqlx::query("INSERT INTO transport_receipts(transport,external_event_id,room_id,task_id,receipt_kind,route_kind,state,result_code,admin_actor,created_at,updated_at) VALUES('offline-admission-hold','task','','task','admin','unknown-dispatch-hold-v1','rejected','unknown-preserved:owner:2','offline-operator','2026-10-18T00:00:00Z','2026-10-18T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            recover_stale_runtime(&path, "owner", "fp", "2026-10-18T00:01:00Z")
+                .await
+                .unwrap(),
+            RecoveryOutcome::Recovered
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (String, String)>("SELECT state,process_fingerprint FROM runtime_instances WHERE instance_token='owner'")
+                .fetch_one(&pool)
+                .await
+                .unwrap(),
+            ("stopped".into(), "fp".into())
+        );
+        assert_eq!(
+            sqlx::query_as::<_, (i64, String)>(
+                "SELECT seq,status FROM task_events WHERE task_id='task' ORDER BY seq"
+            )
+            .fetch_all(&pool)
+            .await
+            .unwrap(),
+            vec![(1, "queued".into()), (2, "dispatched".into())]
+        );
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn held_pre_effect_owner_rejects_incomplete_child_scan() {
+        let (path, pool) = stale_fixture().await;
+        sqlx::query("INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES('ep','agent','acp',1,'[]')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query(
+            "INSERT INTO conversations(conversation_id,participants_json) VALUES('conv','[]')",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES('task','task','ep','ep','conv','x',1,0,0,0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current,max_age_seconds) VALUES('owner',1,1,'live',123,456,'fp','boot',789,'2026-10-18T00:00:00Z',1,'open',0,'inaccessible','{}',1,30)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,created_at,updated_at) VALUES('task','recovery_needed',2,'owner','2026-10-18T00:00:00Z','2026-10-18T00:00:00Z')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        for (seq, status) in [(1, "queued"), (2, "dispatched")] {
+            sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,?,?,?,'{}')")
+                .bind(Uuid::now_v7().to_string()).bind("task").bind(seq).bind(status)
+                .bind("2026-10-18T00:00:00Z").execute(&pool).await.unwrap();
+        }
+        sqlx::query("INSERT INTO transport_receipts(transport,external_event_id,room_id,task_id,receipt_kind,route_kind,state,result_code,admin_actor,created_at,updated_at) VALUES('offline-admission-hold','task','','task','admin','unknown-dispatch-hold-v1','rejected','unknown-preserved:owner:2','offline-operator','2026-10-18T00:00:00Z','2026-10-18T00:00:00Z')")
+            .execute(&pool).await.unwrap();
+        assert_eq!(
+            recover_stale_runtime(&path, "owner", "fp", "2026-10-18T00:01:00Z").await,
+            Err(RecoveryError::WorkPresent)
+        );
+        assert_eq!(
+            sqlx::query_scalar::<_, String>(
+                "SELECT state FROM runtime_instances WHERE instance_token='owner'"
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+            "active"
+        );
         pool.close().await;
         let _ = std::fs::remove_file(path);
     }
