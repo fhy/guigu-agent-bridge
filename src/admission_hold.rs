@@ -113,7 +113,7 @@ pub(crate) async fn run(request: Request) -> Result<(), ()> {
     result.and(released)
 }
 
-async fn acquire_fence(
+pub(crate) async fn acquire_fence(
     recovery: &MatrixRecoveryStore,
     scope: &RecoveryScope,
     owner: &str,
