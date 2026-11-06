@@ -28,6 +28,13 @@ impl ReliabilityStore {
     ) -> Result<bool, ReliabilityError> {
         if let Some((evidence, observation)) = final_owner
             && self
+                .verify_final_owner(token, now, evidence, observation)
+                .await?
+        {
+            return Ok(true);
+        }
+        if let Some((evidence, observation)) = final_owner
+            && self
                 .finalize_owner(token, now, evidence, observation)
                 .await?
         {
@@ -35,7 +42,14 @@ impl ReliabilityStore {
                 .verify_final_owner(token, now, evidence, observation)
                 .await;
         }
-        self.stop_runtime(token, now).await
+        tracing::warn!(
+            phase = "owner-finalize",
+            owner = token,
+            reason = "final-observation-unqualified",
+            impact = "owner-remains-unresolved",
+            "runtime cleanup did not establish final owner evidence"
+        );
+        Ok(false)
     }
 
     pub async fn begin_runtime_with_evidence(

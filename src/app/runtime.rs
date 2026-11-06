@@ -618,14 +618,15 @@ impl AppRuntime {
                         .stopping_runtime(&runtime_instance, &now)
                         .await
                         .unwrap_or(false);
-                    let stopped = stopping
-                        && reliability
-                            .stop_runtime(&runtime_instance, &now)
-                            .await
-                            .unwrap_or(false);
-                    if !stopped {
-                        tracing::warn!("runtime epoch rollback failed during startup cleanup");
-                    }
+                    tracing::warn!(
+                        phase = "startup-abort-cleanup",
+                        owner = %runtime_instance,
+                        stopping,
+                        reason = "final-observation-unavailable",
+                        impact = "owner-remains-unresolved",
+                        first_cause_preserved = true,
+                        "startup failed; cleanup did not establish final owner evidence"
+                    );
                 }
                 pool.close().await;
                 Err(error)

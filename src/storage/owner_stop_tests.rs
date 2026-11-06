@@ -7,7 +7,7 @@ async fn assert_unqualified_stop(fixture: &Fixture) {
             .fetch_one(&fixture.pool)
             .await
             .unwrap();
-    assert_eq!(state, "stopped");
+    assert_eq!(state, "stopping");
     let evidence: String = sqlx::query_scalar(
         "SELECT state FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1",
     )
@@ -53,7 +53,7 @@ async fn ordinary_stop_without_qualification_never_authorizes_disposition() {
         };
         let final_owner = (case != 3).then_some((&fixture.evidence, &observation));
         assert!(
-            fixture
+            !fixture
                 .store
                 .finish_runtime_stop(&fixture.token, &Utc::now().to_rfc3339(), final_owner,)
                 .await
@@ -65,7 +65,7 @@ async fn ordinary_stop_without_qualification_never_authorizes_disposition() {
 }
 
 #[tokio::test]
-async fn startup_abort_preserves_scan_pending_boundary_before_stop() {
+async fn startup_abort_without_observation_preserves_recoverable_pending_boundary() {
     let fixture = Fixture::new().await;
     fixture.start().await;
     let now = Utc::now().to_rfc3339();
@@ -77,9 +77,9 @@ async fn startup_abort_preserves_scan_pending_boundary_before_stop() {
             .unwrap()
     );
     assert!(
-        fixture
+        !fixture
             .store
-            .stop_runtime(&fixture.token, &now)
+            .finish_runtime_stop(&fixture.token, &now, None)
             .await
             .unwrap()
     );
@@ -96,7 +96,7 @@ async fn startup_abort_preserves_scan_pending_boundary_before_stop() {
     .fetch_one(&fixture.pool)
     .await
     .unwrap();
-    assert_eq!(state, "stopped");
+    assert_eq!(state, "stopping");
     assert_eq!(evidence, "scan_pending");
     assert_eq!(fixture.qualified_count().await, 0);
     fixture.pool.close().await;
@@ -124,6 +124,24 @@ async fn ordinary_stop_keeps_conditional_qualified_publication_and_consumer() {
     assert!(
         fixture
             .store
+            .finish_runtime_stop(
+                &fixture.token,
+                &now,
+                Some((&fixture.evidence, &observation)),
+            )
+            .await
+            .unwrap()
+    );
+    let revisions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM runtime_owner_evidence WHERE instance_token=?")
+            .bind(&fixture.token)
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(revisions, 3);
+    assert!(
+        fixture
+            .store
             .verify_final_owner(&fixture.token, &now, &fixture.evidence, &observation,)
             .await
             .unwrap()
@@ -148,17 +166,19 @@ async fn ordinary_stop_does_not_fall_back_on_database_failure() {
         } else {
             ScanOutcome::Unavailable
         });
-        assert!(
-            fixture
-                .store
-                .finish_runtime_stop(
-                    &fixture.token,
-                    &Utc::now().to_rfc3339(),
-                    Some((&fixture.evidence, &observation)),
-                )
-                .await
-                .is_err()
-        );
+        let result = fixture
+            .store
+            .finish_runtime_stop(
+                &fixture.token,
+                &Utc::now().to_rfc3339(),
+                Some((&fixture.evidence, &observation)),
+            )
+            .await;
+        if qualified {
+            assert!(result.is_err());
+        } else {
+            assert!(!result.unwrap());
+        }
         let state: String =
             sqlx::query_scalar("SELECT state FROM runtime_instances WHERE instance_token=?")
                 .bind(&fixture.token)

@@ -44,6 +44,14 @@ async fn stopped_runtime_with_pending_evidence_is_not_successful_recovery() {
             actual,
             (state.into(), 1, "inaccessible".into(), "{}".into())
         );
+        sqlx::query("UPDATE runtime_owner_evidence SET is_current=0 WHERE instance_token='owner'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert_eq!(
+            recover_stale_runtime(&database, "owner", "fingerprint", &now).await,
+            Err(RecoveryError::OwnerEvidencePending)
+        );
         pool.close().await;
     }
 }
