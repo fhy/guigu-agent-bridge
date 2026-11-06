@@ -93,10 +93,17 @@ impl OutboxDrain {
                     biased;
                     changed = receiver.changed() => {
                         let _ = changed;
-                        if self.store.release_outbox_component().await.is_err() {
-                            tracing::warn!("outbox component lease retained after release refusal");
+                        let result = self.store.release_outbox_component().await;
+                        if result.is_err() {
+                            tracing::error!(
+                                stage = "outbox-cleanup",
+                                reason = "component-lease-release-refused",
+                                joined = true,
+                                committed = false,
+                                "outbox joined but its exact lease could not be released"
+                            );
                         }
-                        break;
+                        return result;
                     }
                     _ = tokio::time::sleep(interval) => {}
                 }
@@ -108,12 +115,32 @@ impl OutboxDrain {
 
 pub struct OutboxDrainHandle {
     shutdown: watch::Sender<bool>,
-    join: tokio::task::JoinHandle<()>,
+    join: tokio::task::JoinHandle<Result<(), crate::storage::ReliabilityError>>,
 }
 
 impl OutboxDrainHandle {
-    pub async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
+    pub async fn shutdown(
+        self,
+    ) -> Result<Result<(), crate::storage::ReliabilityError>, tokio::task::JoinError> {
         let _ = self.shutdown.send(true);
         self.join.await
+    }
+}
+
+#[cfg(test)]
+mod shutdown_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn release_refusal_is_not_a_successful_cleanup() {
+        let (shutdown, _) = watch::channel(false);
+        let handle = OutboxDrainHandle {
+            shutdown,
+            join: tokio::spawn(async { Err(crate::storage::ReliabilityError::Malformed) }),
+        };
+        assert!(matches!(
+            handle.shutdown().await,
+            Ok(Err(crate::storage::ReliabilityError::Malformed))
+        ));
     }
 }

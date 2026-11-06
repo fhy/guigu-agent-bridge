@@ -211,6 +211,25 @@ impl MatrixSync {
         batch_id: &str,
     ) -> Result<(), MatrixError> {
         if value.get("type").and_then(Value::as_str) == Some("m.room.encrypted") {
+            tracing::debug!(
+                stage = "incremental-sync",
+                category = "decryption-refusal",
+                event_id = identity.unwrap_or("unknown"),
+                room_id = room,
+                batch_id,
+                durable_recovery = self.recovery.is_some(),
+                decision = "refuse-and-hold-checkpoint",
+                "encrypted event has no locally available room key"
+            );
+            tracing::error!(
+                stage = "incremental-sync",
+                category = "missing-room-key",
+                event_id = identity.unwrap_or("unknown"),
+                batch_id,
+                committed = false,
+                impact = "checkpoint-held",
+                "eligible timeline cannot be processed without decryption"
+            );
             if let Some(observer) = &self.missing_key_observer {
                 observer.record_missing_room_key();
             }

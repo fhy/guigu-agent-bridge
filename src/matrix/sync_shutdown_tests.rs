@@ -95,6 +95,36 @@ async fn joined_sync_defers_shared_fence_until_dependents_finish() {
 }
 
 #[tokio::test]
+async fn joined_processing_failure_preserves_cause_and_exact_deferred_lease() {
+    let (_root, pool, binding) = binding().await;
+    let mut owner = handle(binding, false);
+    owner.join.abort();
+    let _ = (&mut owner.join).await;
+    owner.join = tokio::spawn(async { Err(MatrixError::CryptoInitialization) });
+    let (result, lease) = owner.shutdown_joined(Duration::from_secs(1)).await.unwrap();
+    assert!(matches!(result, Err(MatrixError::CryptoInitialization)));
+    assert!(is_live(&pool).await);
+    lease.unwrap().release().await.unwrap();
+    assert!(!is_live(&pool).await);
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn panicked_sync_join_cannot_return_a_cleanup_lease() {
+    let (_root, pool, binding) = binding().await;
+    let mut owner = handle(binding, false);
+    owner.join.abort();
+    let _ = (&mut owner.join).await;
+    owner.join = tokio::spawn(async { panic!("controlled join failure") });
+    assert!(matches!(
+        owner.shutdown_joined(Duration::from_secs(1)).await,
+        Err(MatrixError::Join)
+    ));
+    assert!(is_live(&pool).await);
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn timeout_retains_fence_and_standalone_shutdown_releases_after_join() {
     let (_root, pool, binding) = binding().await;
     assert!(

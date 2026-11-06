@@ -423,14 +423,30 @@ impl MatrixSyncHandle {
     }
 
     pub(crate) async fn shutdown_bounded_deferred(
-        mut self,
+        self,
         timeout: Duration,
     ) -> Result<Option<MatrixSyncLease>, MatrixError> {
+        let (result, lease) = self.shutdown_joined(timeout).await?;
+        result?;
+        Ok(lease)
+    }
+
+    pub(crate) async fn shutdown_joined(
+        mut self,
+        timeout: Duration,
+    ) -> Result<(Result<(), MatrixError>, Option<MatrixSyncLease>), MatrixError> {
         let _ = self.shutdown_tx.send(true);
         match tokio::time::timeout(timeout, &mut self.join).await {
             Ok(result) => {
-                result.map_err(|_| MatrixError::Join)??;
-                Ok(self.recovery_lease)
+                let result = result.map_err(|_| MatrixError::Join)?;
+                tracing::debug!(
+                    stage = "matrix-sync-cleanup",
+                    joined = true,
+                    processing_failed = result.is_err(),
+                    lease_deferred = self.recovery_lease.is_some(),
+                    "sync task joined; processing result is separate from cleanup"
+                );
+                Ok((result, self.recovery_lease))
             }
             Err(_) => {
                 self.join.abort();

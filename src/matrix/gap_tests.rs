@@ -3,6 +3,32 @@ use crate::matrix::{MemorySyncTokenStore, SyncTokenStore};
 use tracing::instrument::WithSubscriber;
 
 #[tokio::test]
+async fn missing_key_refusal_binds_event_batch_and_keeps_checkpoint() {
+    let tokens = Arc::new(MemorySyncTokenStore::default());
+    tokens.save("private-checkpoint").await.unwrap();
+    let sync = MatrixSync::new(MatrixClient::for_test().await, tokens.clone(), 2).unwrap();
+    let capture = crate::test_diagnostics::Capture::default();
+    let value =
+        serde_json::json!({"type":"m.room.encrypted","content":{"ciphertext":"never-log-payload"}});
+    assert!(matches!(
+        sync.check_decryption(&value, "!room:example.test", Some("$event"), "batch")
+            .with_subscriber(capture.subscriber())
+            .await,
+        Err(MatrixError::CryptoInitialization)
+    ));
+    assert_eq!(
+        tokens.load().await.unwrap().as_deref(),
+        Some("private-checkpoint")
+    );
+    let output = capture.output();
+    assert!(output.contains("missing-room-key"));
+    assert!(output.contains("$event"));
+    assert!(output.contains("checkpoint-held"));
+    assert!(!output.contains("private-checkpoint"));
+    assert!(!output.contains("never-log-payload"));
+}
+
+#[tokio::test]
 async fn persisted_checkpoint_gap_does_not_advance_watermark_or_deliver_events() {
     let tokens = Arc::new(MemorySyncTokenStore::default());
     tokens.save("durable-before").await.unwrap();

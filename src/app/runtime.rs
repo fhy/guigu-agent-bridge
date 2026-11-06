@@ -1347,20 +1347,41 @@ impl AppRuntime {
                 .await
                 .unwrap_or(false)
             {
+                tracing::error!(
+                    stage = "owner-cleanup",
+                    reason = "stopping-transition-refused",
+                    owner = token,
+                    committed = false,
+                    "owner cleanup failed independently of the first processing error"
+                );
                 shutdown_error = Some(AppError::Runtime);
             }
         }
         self.reload.stop().await;
         if let Some(sync) = self.matrix_sync.take() {
-            match sync.shutdown_bounded_deferred(self.shutdown_timeout).await {
-                Ok(lease) => matrix_lease = lease,
-                Err(error) => retain_failure(
-                    &self.first_failure,
-                    RequiredOwnerFailure {
-                        component: "matrix-sync",
-                        class: matrix_error_class(&error),
-                    },
-                ),
+            match sync.shutdown_joined(self.shutdown_timeout).await {
+                Ok((result, lease)) => {
+                    matrix_lease = lease;
+                    if let Err(error) = result {
+                        retain_failure(
+                            &self.first_failure,
+                            RequiredOwnerFailure {
+                                component: "matrix-sync",
+                                class: matrix_error_class(&error),
+                            },
+                        );
+                    }
+                }
+                Err(error) => {
+                    shutdown_error.get_or_insert(AppError::Assembly("Matrix sync join failed"));
+                    retain_failure(
+                        &self.first_failure,
+                        RequiredOwnerFailure {
+                            component: "matrix-sync",
+                            class: matrix_error_class(&error),
+                        },
+                    );
+                }
             }
         }
         if let Some(ingress) = self.ingress.take() {
@@ -1426,23 +1447,23 @@ impl AppRuntime {
         {
             shutdown_error.get_or_insert(AppError::Assembly("gateway cleanup join failed"));
         }
-        if let Some(outbox) = self.outbox.take()
-            && outbox.shutdown().await.is_err()
-        {
-            shutdown_error.get_or_insert(AppError::Assembly("outbox owner join failed"));
+        if let Some(outbox) = self.outbox.take() {
+            match outbox.shutdown().await {
+                Ok(Ok(())) => {}
+                Ok(Err(_)) => {
+                    shutdown_error.get_or_insert(AppError::Assembly("outbox lease release failed"));
+                }
+                Err(_) => {
+                    shutdown_error.get_or_insert(AppError::Assembly("outbox owner join failed"));
+                }
+            }
         }
         if let Some(output) = self.output_drain.take()
             && output.shutdown().await.is_err()
         {
             shutdown_error.get_or_insert(AppError::Assembly("durable output owner join failed"));
         }
-        let owners_healthy = self
-            .first_failure
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .is_none();
         if shutdown_error.is_none()
-            && owners_healthy
             && let Some(lease) = matrix_lease
             && lease.release().await.is_err()
         {
@@ -1460,7 +1481,6 @@ impl AppRuntime {
             let evidence = crate::storage::RuntimeOwnerEvidence::capture();
             let final_owner = evidence.as_ref().zip(acp_shutdown.as_ref());
             let result = if shutdown_error.is_none()
-                && owners_healthy
                 && let Some(evidence) = evidence.as_ref()
                 && let Some(joined) = joined_children.as_ref()
             {
@@ -1474,9 +1494,16 @@ impl AppRuntime {
             };
             match result {
                 Ok(true) => {}
-                Ok(false) if shutdown_error.is_none() => shutdown_error = Some(AppError::Runtime),
-                Err(_) if shutdown_error.is_none() => shutdown_error = Some(AppError::Runtime),
-                Ok(false) | Err(_) => {}
+                Ok(false) | Err(_) => {
+                    tracing::error!(
+                        stage = "owner-cleanup",
+                        reason = "finalization-predicate-refused",
+                        owner = token,
+                        committed = false,
+                        "owner remains unresolved; first processing error is preserved"
+                    );
+                    shutdown_error.get_or_insert(AppError::Runtime);
+                }
             }
         }
         if let Some(pool) = self.pool.take() {
