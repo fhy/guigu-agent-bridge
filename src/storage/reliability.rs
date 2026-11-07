@@ -1297,7 +1297,7 @@ impl ReliabilityStore {
     ) -> Result<bool, ReliabilityError> {
         let mut transaction =
             super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
-        let result=sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES (?,?,?,'active',?) ON CONFLICT DO NOTHING")
+        let result=sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) SELECT ?,?,?,'active',? WHERE NOT EXISTS (SELECT 1 FROM runtime_instances WHERE state IN ('active','stopping')) ON CONFLICT DO NOTHING")
             .bind(token).bind(now).bind(now).bind(fingerprint).execute(&mut *transaction).await?;
         if result.rows_affected() == 1 {
             let identity =

@@ -74,6 +74,71 @@ impl Fixture {
 }
 
 #[tokio::test]
+async fn owner_start_refuses_active_and_stopping_until_qualified_finalization() {
+    let fixture = Fixture::new().await;
+    fixture.start().await;
+    for stopping in [false, true] {
+        if stopping {
+            fixture.stop().await;
+        }
+        let before: i64 = sqlx::query_scalar("SELECT count(*) FROM runtime_owner_evidence")
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+        let now = Utc::now().to_rfc3339();
+        assert!(
+            !fixture
+                .store
+                .begin_runtime("legacy-next", "next", &now)
+                .await
+                .unwrap()
+        );
+        assert!(
+            !fixture
+                .store
+                .begin_runtime_with_evidence("next", "next", &now, &fixture.evidence,)
+                .await
+                .unwrap()
+        );
+        let owners: i64 = sqlx::query_scalar("SELECT count(*) FROM runtime_instances")
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+        let after: i64 = sqlx::query_scalar("SELECT count(*) FROM runtime_owner_evidence")
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+        assert_eq!(owners, 1);
+        assert_eq!(before, after);
+    }
+    assert!(
+        fixture
+            .store
+            .finalize_owner(
+                &fixture.token,
+                &Utc::now().to_rfc3339(),
+                &fixture.evidence,
+                &fixture.observation(ScanOutcome::Complete),
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        fixture
+            .store
+            .begin_runtime_with_evidence(
+                "next",
+                "next",
+                &Utc::now().to_rfc3339(),
+                &fixture.evidence,
+            )
+            .await
+            .unwrap()
+    );
+    fixture.pool.close().await;
+}
+
+#[tokio::test]
 async fn owner_conditional_start_heartbeat_finalizer_and_consumer() {
     let fixture = Fixture::new().await;
     fixture.start().await;
