@@ -148,14 +148,26 @@ impl ReliabilityStore {
         let row = sqlx::query("SELECT e.* FROM runtime_owner_evidence e JOIN runtime_instances r USING(instance_token) WHERE e.instance_token=? AND e.is_current=1 AND e.state='scan_pending' AND r.state='stopping' AND e.process_fingerprint=r.process_fingerprint")
             .bind(token).fetch_optional(&mut *connection).await?;
         let Some(row) = row else { return Ok(None) };
-        if sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1")
-            .bind(token).fetch_one(&mut *connection).await? != 1
-            || !self.matches_clock(&row, &fingerprint, now, evidence)
-            || !guards::work_clear(connection).await?
-            || sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runtime_instances WHERE instance_token!=? AND state IN ('active','stopping')")
-                .bind(token).fetch_one(&mut *connection).await? != 0
-        {
-            tracing::warn!(phase="owner-controlled-stop", reason="identity-clock-or-work-conflict", owner=token, "controlled stop remains unresolved");
+        let refusal = if sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1")
+            .bind(token).fetch_one(&mut *connection).await? != 1 {
+            Some("current-evidence-count")
+        } else if !self.matches_clock(&row, &fingerprint, now, evidence) {
+            Some("owner-identity-or-clock")
+        } else if !guards::work_clear(connection).await? {
+            Some("unresolved-work")
+        } else if sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runtime_instances WHERE instance_token!=? AND state IN ('active','stopping')")
+            .bind(token).fetch_one(&mut *connection).await? != 0 {
+            Some("competing-owner")
+        } else {
+            None
+        };
+        if let Some(reason) = refusal {
+            tracing::warn!(
+                phase = "owner-controlled-stop",
+                reason,
+                owner = token,
+                "controlled stop remains unresolved"
+            );
             return Ok(None);
         }
         let revision: i64 = row.get("evidence_revision");

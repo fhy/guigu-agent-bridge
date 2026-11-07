@@ -218,3 +218,61 @@ async fn controlled_stop_concurrent_identity_change_rolls_back_publication() {
     );
     pool.close().await;
 }
+
+#[tokio::test]
+async fn controlled_stop_allows_only_fully_acknowledged_output_cleanup() {
+    for mutation in [
+        None,
+        Some("UPDATE acp_output_sets SET state='delivering'"),
+        Some("UPDATE acp_output_sets SET acknowledged_cursor=-1"),
+        Some("DELETE FROM acp_output_delivery_segments"),
+        Some("UPDATE acp_output_delivery_segments SET delivery_index=1"),
+        Some("UPDATE acp_output_segments SET state='reserved'"),
+        Some("UPDATE acp_output_segments SET state='quarantined'"),
+    ] {
+        let (pool, store, gate) = fixture().await;
+        sqlx::raw_sql(
+            "INSERT INTO conversations(conversation_id,participants_json) VALUES('conversation','[]');
+             INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES('agent','agent','acp',1,'[]');
+             INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES('task','task','sender','agent','conversation','fixture',1,0,0,0);
+             INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES('terminal','task',1,'completed','t','{}');
+             INSERT INTO acp_output_sets(set_id,task_id,attempt,turn,runtime_fence,room_id,render_version,total_bytes,total_hash,segment_count,acknowledged_cursor,state,created_at,updated_at) VALUES('output','task',1,1,'owner','room','v1',5,'hash',1,0,'cleaning','t','t');
+             INSERT INTO acp_output_segments(set_id,segment_index,byte_start,byte_end,byte_length,content_hash,relative_name,state,reservation_owner,created_at,updated_at) VALUES('output',0,0,5,5,'hash','part','landed','owner','t','t');
+             INSERT INTO acp_output_delivery_segments(set_id,delivery_index,spool_index,byte_start,byte_end,content_hash,stable_txn_id) VALUES('output',0,0,0,5,'hash','txn');",
+        ).execute(&pool).await.unwrap();
+        if let Some(query) = mutation {
+            sqlx::query(query).execute(&pool).await.unwrap();
+        }
+        assert_eq!(
+            finish(&store, &gate).await.unwrap(),
+            mutation.is_none(),
+            "{mutation:?}"
+        );
+        let mut connection = pool.acquire().await.unwrap();
+        assert_eq!(
+            restart_eligible(&mut connection, "owner").await.unwrap(),
+            mutation.is_none()
+        );
+        drop(connection);
+        if mutation.is_none() {
+            assert!(
+                store
+                    .begin_runtime_with_evidence(
+                        "next-owner",
+                        &RuntimeOwnerEvidence::fingerprint().unwrap(),
+                        &Utc::now().to_rfc3339(),
+                        &RuntimeOwnerEvidence::capture().unwrap(),
+                    )
+                    .await
+                    .unwrap()
+            );
+            let state: String =
+                sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='output'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(state, "cleaning");
+        }
+        pool.close().await;
+    }
+}
