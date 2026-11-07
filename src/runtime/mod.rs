@@ -2337,7 +2337,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&request.task.task_id)
                 .ok_or(DispatchError::RecoveryNeeded)?;
-            let reaped = self.dispatcher.shutdown_reaped_or_absent().await;
+            let reaped = self.dispatcher.shutdown_reaped().await;
             tracing::warn!(
                 task_id = %request.task.task_id,
                 delivery_id = %request.delivery_id,

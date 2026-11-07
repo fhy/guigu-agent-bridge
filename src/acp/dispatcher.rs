@@ -197,6 +197,7 @@ impl AcpDispatcherBuilder {
                 durable_output,
                 session_gate: tokio::sync::Mutex::new(()),
                 client: Mutex::new(None),
+                transport: Mutex::new(None),
                 connecting: tokio::sync::Mutex::new(()),
                 legacy_results,
                 allow_nonterminal_end_turn,
@@ -224,6 +225,7 @@ pub struct AcpDispatcher {
 }
 
 struct DispatcherInner {
+    transport: Mutex<Option<Arc<super::transport::AcpTransport>>>,
     cwd: String,
     additional_directories: Vec<String>,
     limits: AcpLimits,
@@ -346,21 +348,17 @@ impl AcpDispatcher {
 
     /// Shut the current backend down and report whether its owner loop joined.
     pub async fn shutdown_reaped(&self) -> bool {
-        match self.take_client() {
-            Some(client) => client.shutdown_reaped().await,
+        let _connecting = self.inner.connecting.lock().await;
+        self.take_client();
+        let transport = self
+            .inner
+            .transport
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        match transport {
+            Some(transport) => transport.shutdown_reaped().await,
             None => false,
-        }
-    }
-
-    /// Shut down the current backend, treating an absent client as a safe
-    /// pre-acceptance outcome. `connect_with_gate` reaps its transport before
-    /// returning an initialization failure, so an empty slot means there is no
-    /// runtime-owned ACP child left for this dispatcher to reap. A present
-    /// client still requires positive reaping evidence.
-    pub async fn shutdown_reaped_or_absent(&self) -> bool {
-        match self.take_client() {
-            Some(client) => client.shutdown_reaped().await,
-            None => true,
         }
     }
 
@@ -830,13 +828,32 @@ impl AcpDispatcher {
         let address = target.address().ok_or(AcpError::UnsupportedAddress {
             phase: Phase::Spawn,
         })?;
+        let previous = self
+            .inner
+            .transport
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(previous) = previous
+            && !previous.shutdown_reaped().await
+        {
+            return Err(AcpError::RecoveryNeeded);
+        }
+        self.inner.transport.lock().unwrap_or_else(|p| p.into_inner()).take();
         let client = Arc::new(
-            AcpClient::connect_with_gate(
+            AcpClient::connect_retaining_transport(
                 address,
                 target.agent_id(),
                 Some(std::path::Path::new(&self.inner.cwd)),
                 self.inner.limits,
                 self.inner.spawn_gate.as_ref(),
+                |transport| {
+                    *self
+                        .inner
+                        .transport
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = Some(transport);
+                },
             )
             .await?,
         );

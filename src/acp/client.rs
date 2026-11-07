@@ -112,11 +112,26 @@ impl AcpClient {
         limits: AcpLimits,
         gate: Option<&AcpSpawnGate>,
     ) -> Result<Self, AcpError> {
+        Self::connect_retaining_transport(address, agent_id, cwd, limits, gate, |_| {}).await
+    }
+
+    pub(crate) async fn connect_retaining_transport(
+        address: &EndpointAddress,
+        agent_id: &str,
+        cwd: Option<&Path>,
+        limits: AcpLimits,
+        gate: Option<&AcpSpawnGate>,
+        retain: impl FnOnce(Arc<AcpTransport>) + Send,
+    ) -> Result<Self, AcpError> {
         let mut reservation = gate.and_then(AcpSpawnGate::reserve);
         if gate.is_some() && reservation.is_none() {
             return Err(AcpError::TransportClosed);
         }
         let transport = Arc::new(AcpTransport::spawn(address, cwd, limits.transport)?);
+        // Publish ownership before any await or fallible registration. The
+        // caller can still join this exact transport if initialization fails
+        // or its future is cancelled before a client is returned.
+        retain(Arc::clone(&transport));
         if let Some(ref mut reservation) = reservation {
             if !AcpSpawnGate::retain_transport(reservation, Arc::clone(&transport)) {
                 let _ = transport.shutdown().await;
