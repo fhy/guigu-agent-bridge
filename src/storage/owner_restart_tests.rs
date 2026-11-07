@@ -276,3 +276,43 @@ async fn controlled_stop_allows_only_fully_acknowledged_output_cleanup() {
         pool.close().await;
     }
 }
+
+#[tokio::test]
+async fn controlled_stop_allows_empty_abandonment_but_no_residual_output_or_work() {
+    for mutation in [
+        None,
+        Some("UPDATE acp_output_sets SET total_bytes=1"),
+        Some("UPDATE acp_output_sets SET total_hash='unknown'"),
+        Some("UPDATE acp_output_sets SET acknowledged_cursor=0"),
+        Some("UPDATE acp_output_sets SET segment_count=1"),
+        Some("UPDATE acp_output_sets SET state='prepared'"),
+        Some("UPDATE task_events SET status='running'"),
+        Some(
+            "INSERT INTO acp_output_segments(set_id,segment_index,byte_start,byte_end,byte_length,content_hash,relative_name,state,reservation_owner,created_at,updated_at) VALUES('output',0,0,0,0,'','part','reserved','owner','t','t')",
+        ),
+    ] {
+        let (pool, store, gate) = fixture().await;
+        sqlx::raw_sql(
+            "INSERT INTO conversations(conversation_id,participants_json) VALUES('conversation','[]');
+             INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES('agent','agent','acp',1,'[]');
+             INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES('task','task','sender','agent','conversation','fixture',1,0,0,0);
+             INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES('terminal','task',1,'timed_out','t','{}');
+             INSERT INTO acp_output_sets(set_id,task_id,attempt,turn,runtime_fence,room_id,render_version,total_bytes,total_hash,segment_count,state,created_at,updated_at) VALUES('output','task',1,1,'owner','room','v1',0,'',0,'abandoned','t','t');",
+        ).execute(&pool).await.unwrap();
+        if let Some(query) = mutation {
+            sqlx::query(query).execute(&pool).await.unwrap();
+        }
+        assert_eq!(
+            finish(&store, &gate).await.unwrap(),
+            mutation.is_none(),
+            "{mutation:?}"
+        );
+        let mut connection = pool.acquire().await.unwrap();
+        assert_eq!(
+            restart_eligible(&mut connection, "owner").await.unwrap(),
+            mutation.is_none()
+        );
+        drop(connection);
+        pool.close().await;
+    }
+}

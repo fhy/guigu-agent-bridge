@@ -25,7 +25,7 @@ pub(super) async fn work_clear(connection: &mut SqliteConnection) -> Result<bool
         ),
         (
             "output-sets",
-            "SELECT count(*) FROM acp_output_sets o WHERE state NOT IN ('delivered','cleaned') AND NOT (state='cleaning' AND segment_count>0 AND acknowledged_cursor=segment_count-1 AND segment_count=(SELECT count(*) FROM acp_output_delivery_segments d WHERE d.set_id=o.set_id) AND NOT EXISTS(SELECT 1 FROM acp_output_delivery_segments d WHERE d.set_id=o.set_id AND d.delivery_index>=o.segment_count) AND NOT EXISTS(SELECT 1 FROM acp_output_segments s WHERE s.set_id=o.set_id AND s.state NOT IN ('landed','cleaned')))",
+            "SELECT count(*) FROM acp_output_sets o WHERE state NOT IN ('delivered','cleaned') AND NOT (state='cleaning' AND segment_count>0 AND acknowledged_cursor=segment_count-1 AND segment_count=(SELECT count(*) FROM acp_output_delivery_segments d WHERE d.set_id=o.set_id) AND NOT EXISTS(SELECT 1 FROM acp_output_delivery_segments d WHERE d.set_id=o.set_id AND d.delivery_index>=o.segment_count) AND NOT EXISTS(SELECT 1 FROM acp_output_segments s WHERE s.set_id=o.set_id AND s.state NOT IN ('landed','cleaned'))) AND NOT (state='abandoned' AND total_bytes=0 AND total_hash='' AND segment_count=0 AND acknowledged_cursor=-1 AND NOT EXISTS(SELECT 1 FROM acp_output_segments s WHERE s.set_id=o.set_id) AND NOT EXISTS(SELECT 1 FROM acp_output_delivery_segments d WHERE d.set_id=o.set_id))",
         ),
         (
             "admissions",
