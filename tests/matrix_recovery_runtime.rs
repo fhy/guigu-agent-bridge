@@ -185,3 +185,108 @@ async fn real_app_runtime_activates_bound_native_operation_and_processes_full_st
                 || request.url.path().ends_with("/messages"))
     );
 }
+
+// Exhaust the SAME pool used by metrics, the owner heartbeat and MatrixSync.
+// This exercises cancellation of pool acquisition, not executing SQLite SQL.
+#[tokio::test]
+async fn slow_metrics_pool_wait_preserves_runtime_heartbeat_and_matrix_lease() {
+    use std::time::{Duration, Instant};
+
+    let fixture = support::Fixture::new().await;
+    let server = MockServer::start().await;
+    mount_server(&server).await;
+    assert!(matches!(
+        MatrixCompatibilityStore::new(fixture.pool.clone())
+            .gate(true, Some(&fixture.store()))
+            .await
+            .unwrap(),
+        CompatibilityGate::Native(_)
+    ));
+    seed_device(&fixture, &server).await;
+    let mut config = fixture.config(true, &server.uri());
+    config.agents.get_mut("worker").unwrap().enabled = false;
+    let runtime = fixture.start(config).await;
+    let pool = runtime.test_storage_pool();
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .unwrap();
+    let url = format!("http://{}/metrics", runtime.health_addr().unwrap());
+    let before: (String, i64) = sqlx::query_as(
+        "SELECT instance_token,evidence_revision FROM runtime_owner_evidence WHERE is_current=1",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    let initial: (String, i64, String) = sqlx::query_as(
+        "SELECT owner_token,epoch,updated_at FROM matrix_component_leases WHERE component='MatrixSync'",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+
+    let mut timings = Vec::new();
+    for _ in 0..3 {
+        let mut held = Vec::new();
+        for _ in 0..guigu_agent_bridge::storage::MAX_CONNECTIONS {
+            held.push(pool.acquire().await.unwrap());
+        }
+        let started = Instant::now();
+        let response = client.get(&url).send().await.unwrap();
+        assert!(response.status().is_success());
+        let metrics = response.text().await.unwrap();
+        timings.push(started.elapsed());
+        assert!(metrics.contains("readiness_storage_available 0"));
+        assert!(metrics.contains("predicate=\"storage-unavailable\""));
+        drop(held);
+        // Leave renewal work a normal scheduling opportunity between bursts.
+        tokio::time::sleep(Duration::from_secs(1)).await;
+    }
+    let (after_revision, after_update) = tokio::time::timeout(Duration::from_secs(20), async {
+        loop {
+            let owner: (String, i64, String) = sqlx::query_as(
+                "SELECT instance_token,evidence_revision,state FROM runtime_owner_evidence WHERE is_current=1",
+            )
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+            let lease: (String, i64, String, String, bool) = sqlx::query_as(
+                "SELECT owner_token,epoch,updated_at,state,julianday(expires_at)>julianday('now') FROM matrix_component_leases WHERE component='MatrixSync'",
+            )
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+            assert_eq!(owner.0, before.0);
+            assert_eq!((&lease.0, lease.1), (&initial.0, initial.1));
+            assert_eq!(lease.3, "active");
+            assert!(lease.4, "the real component lease must not expire");
+            assert_ne!(owner.2, "unknown");
+            if owner.1 > before.1 && lease.2 > initial.2 {
+                break (owner.1, lease.2);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await
+    .expect("real heartbeat and MatrixSync renewal must both advance");
+    let recovered = client.get(&url).send().await.unwrap().text().await.unwrap();
+    assert!(recovered.contains("readiness_storage_available 1"));
+    assert_eq!(
+        runtime.health_state().snapshot().await.readiness,
+        guigu_agent_bridge::runtime::Readiness::Ready
+    );
+    runtime.shutdown().await.unwrap();
+    for elapsed in &timings {
+        assert!(*elapsed >= Duration::from_millis(900), "{elapsed:?}");
+        assert!(*elapsed < Duration::from_secs(3), "{elapsed:?}");
+    }
+    eprintln!(
+        "pool_wait_ms={:?}; owner_revision={}->{}; sync_epoch={}; sync_updated={}->{}",
+        timings.iter().map(Duration::as_millis).collect::<Vec<_>>(),
+        before.1,
+        after_revision,
+        initial.1,
+        initial.2,
+        after_update
+    );
+}

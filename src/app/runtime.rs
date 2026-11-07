@@ -1318,6 +1318,12 @@ impl AppRuntime {
         Arc::clone(&self.health_state)
     }
 
+    /// Share the actual runtime pool with isolated contention fixtures.
+    #[cfg(feature = "test-support")]
+    pub fn test_storage_pool(&self) -> SqlitePool {
+        self.pool.as_ref().expect("running test runtime").clone()
+    }
+
     pub fn health_addr(&self) -> Option<std::net::SocketAddr> {
         self.health.as_ref().map(HealthServer::local_addr)
     }

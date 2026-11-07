@@ -839,7 +839,11 @@ impl AcpDispatcher {
         {
             return Err(AcpError::RecoveryNeeded);
         }
-        self.inner.transport.lock().unwrap_or_else(|p| p.into_inner()).take();
+        self.inner
+            .transport
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
         let client = Arc::new(
             AcpClient::connect_retaining_transport(
                 address,

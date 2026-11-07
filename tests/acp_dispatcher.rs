@@ -1706,6 +1706,42 @@ async fn reliable_pre_acceptance_without_a_client_closes_once() {
 }
 
 #[tokio::test]
+async fn reliable_pre_acceptance_after_child_exit_closes_once() {
+    let harness =
+        Harness::new_reliable("reliable-child-exit", "exit-early", default_limits(), true).await;
+    let task = harness.task("fail after the ACP child exits");
+    let (outcome, continuations, backend_reaped) = harness
+        .run_leased(vec![task.clone()], default_policy(), Cp2Action::None)
+        .await;
+
+    let events = outcome.task_events(task.task_id);
+    assert_eq!(
+        statuses(&events),
+        [
+            TaskStatus::Queued,
+            TaskStatus::Dispatched,
+            TaskStatus::Failed
+        ]
+    );
+    assert!(failed_payload(&events[2]).contains("delivery was not accepted"));
+    assert!(backend_reaped, "the exited child must be positively reaped");
+    assert_eq!(continuations.len(), 1);
+    assert_eq!(
+        continuations[0].state,
+        guigu_agent_bridge::runtime::ContinuationState::Terminal
+    );
+    let delivery_id = dispatched_delivery(&events[1]);
+    let disposition: String =
+        sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=?")
+            .bind(delivery_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .unwrap();
+    assert_eq!(disposition, "terminal");
+    outcome.cleanup().await;
+}
+
+#[tokio::test]
 async fn pre_acceptance_child_exit_atomically_closes_delivery_and_restart_recovery() {
     let harness = Harness::new_reliable(
         "pre-acceptance-exit",
