@@ -36,10 +36,19 @@ async fn clean_shutdown_and_restart_stop_runtime_without_reaped_evidence() {
                 .await
                 .unwrap();
         assert_eq!(evidence.len(), generation);
+        assert!(evidence.iter().all(|state| state == "observing"));
+        let joined: Vec<(String, i64, String)> = sqlx::query_as(
+            "SELECT barrier_state,in_flight_spawns,child_scan_state FROM runtime_owner_evidence WHERE is_current=1",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
         assert!(
-            evidence
+            joined
                 .iter()
-                .all(|state| matches!(state.as_str(), "scan_pending" | "unknown"))
+                .all(|(barrier, in_flight, scan)| barrier == "closed_joined"
+                    && *in_flight == 0
+                    && scan == "inaccessible")
         );
         for query in [
             "SELECT count(*) FROM runtime_owner_evidence WHERE state='reaped'",
