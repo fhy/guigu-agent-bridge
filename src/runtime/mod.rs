@@ -2337,7 +2337,17 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&request.task.task_id)
                 .ok_or(DispatchError::RecoveryNeeded)?;
-            if !self.dispatcher.shutdown_reaped().await {
+            let reaped = self.dispatcher.shutdown_reaped_or_absent().await;
+            tracing::warn!(
+                task_id = %request.task.task_id,
+                delivery_id = %request.delivery_id,
+                attempt = request.attempt,
+                stage = "delivery-finalization",
+                reason = "failed_before_prompt",
+                reaped,
+                "closing ACP delivery failure before any prompt"
+            );
+            if !reaped {
                 let _ = self
                     .store
                     .release(

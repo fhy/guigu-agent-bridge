@@ -162,6 +162,29 @@ async fn metrics_counts_timeout_releases_pool_wait() {
 }
 
 #[tokio::test]
+async fn metrics_counts_measure_two_sequential_storage_budgets() {
+    let (state, pool, root) = fixture().await;
+    let mut held = Vec::new();
+    for _ in 0..crate::storage::MAX_CONNECTIONS {
+        held.push(pool.acquire().await.unwrap());
+    }
+    let started = std::time::Instant::now();
+    let metrics = state.metrics_body().await;
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(800),
+        "metrics should spend two bounded storage waits when the pool is exhausted: {elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the two waits must remain bounded: {elapsed:?}"
+    );
+    assert!(metrics.contains("readiness_storage_available 0"));
+    drop(held);
+    std::fs::remove_dir_all(root).unwrap();
+}
+
+#[tokio::test]
 async fn metrics_missing_room_key_counter_is_not_causal() {
     let (state, _pool, root) = fixture().await;
     state.set_owner(OwnerState::Running);

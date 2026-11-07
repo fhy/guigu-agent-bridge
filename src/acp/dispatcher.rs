@@ -352,6 +352,18 @@ impl AcpDispatcher {
         }
     }
 
+    /// Shut down the current backend, treating an absent client as a safe
+    /// pre-acceptance outcome. `connect_with_gate` reaps its transport before
+    /// returning an initialization failure, so an empty slot means there is no
+    /// runtime-owned ACP child left for this dispatcher to reap. A present
+    /// client still requires positive reaping evidence.
+    pub async fn shutdown_reaped_or_absent(&self) -> bool {
+        match self.take_client() {
+            Some(client) => client.shutdown_reaped().await,
+            None => true,
+        }
+    }
+
     /// The negotiated backend identity, when a backend is running.
     pub fn backend_id(&self) -> Option<String> {
         self.client_slot()

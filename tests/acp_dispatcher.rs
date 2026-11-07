@@ -1656,6 +1656,56 @@ async fn a_bad_protocol_version_fails_before_the_task_runs() {
 }
 
 #[tokio::test]
+async fn reliable_pre_acceptance_without_a_client_closes_once() {
+    let harness = Harness::new_reliable(
+        "reliable-bad-version",
+        "bad-protocol-version",
+        default_limits(),
+        true,
+    )
+    .await;
+    let task = harness.task("fail before ACP acceptance");
+    let (outcome, continuations, backend_reaped) = harness
+        .run_leased(vec![task.clone()], default_policy(), Cp2Action::None)
+        .await;
+
+    let events = outcome.task_events(task.task_id);
+    assert_eq!(
+        statuses(&events),
+        [
+            TaskStatus::Queued,
+            TaskStatus::Dispatched,
+            TaskStatus::Failed
+        ]
+    );
+    assert!(failed_payload(&events[2]).contains("protocol version"));
+    assert!(backend_reaped, "failed initialization must leave no child");
+    assert_eq!(continuations.len(), 1);
+    assert_eq!(
+        continuations[0].state,
+        guigu_agent_bridge::runtime::ContinuationState::Terminal
+    );
+    let delivery_id = dispatched_delivery(&events[1]);
+    let acknowledged: Option<String> =
+        sqlx::query_scalar("SELECT acknowledged_at FROM deliveries WHERE delivery_id=?")
+            .bind(delivery_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .unwrap();
+    assert!(acknowledged.is_some());
+    let disposition: String =
+        sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=?")
+            .bind(delivery_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .unwrap();
+    assert_eq!(disposition, "terminal");
+    let plan = plan_recovery(outcome.repository.as_ref()).await.unwrap();
+    assert!(!plan.unfinished.contains(&task.task_id));
+    outcome.cleanup().await;
+}
+
+#[tokio::test]
 async fn pre_acceptance_child_exit_atomically_closes_delivery_and_restart_recovery() {
     let harness = Harness::new_reliable(
         "pre-acceptance-exit",
