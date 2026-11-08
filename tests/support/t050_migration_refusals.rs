@@ -266,3 +266,50 @@ async fn deferred_discovery_still_refuses_unresolved_state_without_publication()
 }
 
 use sqlx::Connection;
+
+#[tokio::test]
+async fn unresolved_maintenance_preserves_stale_admission_evidence() {
+    use std::{
+        process::Stdio,
+        time::{Duration, Instant},
+    };
+
+    let f = Fixture::new().await;
+    let rows = durable_rows(&f.db).await;
+    let pause = f.root.join("precommit");
+    let mut child = f
+        .run()
+        .env("T050_FIXTURE_MIGRATION_TEST_PRECOMMIT", &pause)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let deadline = Instant::now() + Duration::from_secs(30);
+    while !pause.exists() && Instant::now() < deadline {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let parked = pause.exists();
+    if child.try_wait().unwrap().is_none() {
+        child.kill().unwrap();
+    }
+    let status = child.wait().unwrap();
+    assert!(parked, "child did not reach the precommit boundary");
+    assert!(!status.success());
+    assert_eq!(durable_rows(&f.db).await, rows);
+    assert!(f.root.join(".runtime-admission.lock").exists());
+    std::fs::write(
+        f.root.join(".state.db.offline-operation.pending"),
+        b"pending-sentinel",
+    )
+    .unwrap();
+    prepare_refused(
+        &f,
+        "preflight",
+        "maintenance-discovery",
+        "pending-with-stale-admission",
+    );
+    assert_eq!(durable_rows(&f.db).await, rows);
+}
