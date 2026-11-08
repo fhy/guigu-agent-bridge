@@ -39,6 +39,32 @@ pub struct RecoveryScope {
 }
 
 impl RecoveryScope {
+    // Lease renewal maintains an existing authority; it authorizes no Matrix
+    // effect. Keep the exact live fence and shared serialization while another
+    // component processes a response. Holds and expired fences still refuse.
+    pub(crate) fn for_lease_renewal(
+        &self,
+        component: &str,
+        owner: &str,
+        epoch: i64,
+    ) -> Result<Self, sqlx::Error> {
+        if self.domain == EffectDomain::LocalHold
+            || (self.domain == EffectDomain::Matrix && self.fence.is_none())
+        {
+            return Err(refused());
+        }
+        if self
+            .fence
+            .as_ref()
+            .is_some_and(|f| f.component != component || f.owner != owner || f.epoch != epoch)
+        {
+            return Err(refused());
+        }
+        let mut scope = self.clone();
+        scope.domain = EffectDomain::Local;
+        Ok(scope)
+    }
+
     pub(crate) fn component_fence(&self) -> Option<&LiveFence> {
         self.fence.as_ref()
     }

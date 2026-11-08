@@ -213,7 +213,7 @@ pub(crate) async fn fetch(
     ))
 }
 
-fn unrouted_no_effect(config: &Config, raw: &Value, room: &str) -> bool {
+pub(crate) fn unrouted_no_effect(config: &Config, raw: &Value, room: &str) -> bool {
     let matrix = &config.transports.matrix;
     let Some(body) = raw.pointer("/content/body").and_then(Value::as_str) else {
         return false;

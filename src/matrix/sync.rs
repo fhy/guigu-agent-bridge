@@ -384,9 +384,33 @@ impl MatrixSync {
         };
         self.processing.store(true, Ordering::Release);
         let _processing = RequestOwner(&self.processing);
-        let result = self
-            .process_batch(response, token.as_deref(), events, dispositions)
-            .await;
+        let maintain = async {
+            let mut tick = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                tick.tick().await;
+                if let Some(recovery) = &self.recovery
+                    && recovery
+                        .store
+                        .renew_component_lease(
+                            "MatrixSync",
+                            &recovery.owner_token,
+                            recovery.owner_epoch,
+                            &timestamp(),
+                        )
+                        .await
+                        .is_err()
+                {
+                    break MatrixError::Storage;
+                }
+            }
+        };
+        // Both futures remain polled while either waits for the shared writer
+        // lock. Awaiting renewal inside a timer branch would deadlock a paused
+        // batch that already owns that lock. No detached task survives shutdown.
+        let result = tokio::select! {
+            result = self.process_batch(response, token.as_deref(), events, dispositions) => result,
+            error = maintain, if self.recovery.is_some() => Err(error),
+        };
         if let Err(error) = &result {
             self.fence_fatal_response(error).await?;
         }

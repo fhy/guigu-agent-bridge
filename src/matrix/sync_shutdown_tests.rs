@@ -267,3 +267,32 @@ async fn durable_shutdown_preserves_failed_disposition_without_checkpoint() {
     assert!(store.reconcile_restart().await.is_err());
     pool.close().await;
 }
+
+#[tokio::test]
+async fn lease_maintenance_continues_while_durable_disposition_is_pending() {
+    let (_root, pool, binding) = binding().await;
+    let (owner, dispositions) = processing_owner(binding, &pool).await;
+    let before: String = sqlx::query_scalar(
+        "SELECT expires_at FROM matrix_component_leases WHERE component='MatrixSync'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    tokio::time::sleep(Duration::from_secs(18)).await;
+    let after: String = sqlx::query_scalar(
+        "SELECT expires_at FROM matrix_component_leases WHERE component='MatrixSync'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(
+        after > before,
+        "held response did not renew its component lease"
+    );
+    dispositions.send(Ok(())).await.unwrap();
+    owner
+        .shutdown_bounded(Duration::from_secs(5))
+        .await
+        .unwrap();
+    pool.close().await;
+}

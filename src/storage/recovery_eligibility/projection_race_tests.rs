@@ -80,3 +80,57 @@ async fn projection_cancelled_send_stays_unknown_and_is_never_repeated_by_clone(
     assert_eq!(sender.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     assert_eq!(state(&fixture).await, ("sending".into(), 0, 1));
 }
+
+#[tokio::test]
+async fn lease_maintenance_during_foreign_batch_does_not_authorize_projection_effects() {
+    let (fixture, store) = seeded().await;
+    let sender = OverlapSender {
+        pool: fixture.pool.clone(),
+        calls: Default::default(),
+    };
+    crate::matrix::MatrixOutboxSender::send_stable(&sender, "", None, None, "", "")
+        .await
+        .unwrap();
+    let now = chrono::Utc::now().to_rfc3339();
+    store.renew_outbox_component(&now).await.unwrap();
+    assert!(
+        store
+            .claim_projections("claim", &now, "unused", 1)
+            .await
+            .is_err()
+    );
+    assert_eq!(state(&fixture).await, ("pending".into(), 0, 0));
+    let future = (chrono::Utc::now() + chrono::Duration::minutes(2)).to_rfc3339();
+    assert!(store.renew_outbox_component(&future).await.is_err());
+    // An invalid scope cannot be converted into maintenance authority.
+    for fence in [
+        None,
+        Some(crate::storage::recovery_eligibility::LiveFence {
+            component: "OutboxDrain".into(),
+            owner: "different".into(),
+            epoch: 1,
+        }),
+    ] {
+        let scoped = crate::storage::MatrixRecoveryStore::new_scoped(
+            fixture.pool.clone(),
+            Some(RecoveryScope::new(
+                fixture.context.clone(),
+                EffectDomain::Matrix,
+                fence,
+            )),
+        );
+        assert!(
+            scoped
+                .renew_component_lease("OutboxDrain", "outbox-owner", 1, &now)
+                .await
+                .is_err()
+        );
+    }
+    // A genuine checkpoint hold still forbids even maintenance.
+    sqlx::query("UPDATE matrix_recovery_control SET restart_hold_state='processing'")
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    assert!(store.renew_outbox_component(&now).await.is_err());
+    fixture.pool.close().await;
+}

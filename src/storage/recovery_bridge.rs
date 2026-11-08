@@ -222,12 +222,17 @@ impl MatrixRecoveryStore {
         let expires = chrono::DateTime::parse_from_rfc3339(now)
             .map_err(|_| sqlx::Error::Protocol("invalid lease clock".into()))?
             + chrono::Duration::seconds(60);
+        let renewal = self
+            .recovery
+            .as_ref()
+            .map(|scope| scope.for_lease_renewal(component, owner, epoch))
+            .transpose()?;
         let mut tx =
-            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, renewal.as_ref())
                 .await?;
         let mutation = crate::storage::recovery_eligibility::writer::prepare_lease(
             &mut tx,
-            self.recovery.as_ref(),
+            renewal.as_ref(),
             component,
         )
         .await?;
@@ -238,7 +243,7 @@ impl MatrixRecoveryStore {
         }
         crate::storage::recovery_eligibility::writer::complete_lease(
             &mut tx,
-            self.recovery.as_ref(),
+            renewal.as_ref(),
             component,
             mutation,
         )

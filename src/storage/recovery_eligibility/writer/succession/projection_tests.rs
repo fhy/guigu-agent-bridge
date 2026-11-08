@@ -118,31 +118,61 @@ async fn succession_refuses_pending_projection_missing_claim_or_nonterminal_pare
 }
 
 #[tokio::test]
-async fn succession_never_combines_unresolved_notification_with_interrupted_input() {
+async fn succession_isolates_notifications_only_after_exact_no_effect_input_coverage() {
     let f = fixture(false).await;
     seed(&f).await;
+    let digest =
+        crate::matrix::response_identity::digest(Some("B"), "C", f.payloads.clone()).unwrap();
     f.store
         .begin_batch(
             "interrupted",
             Some("B"),
             "C",
-            "digest",
+            &digest,
             "B",
             "owner",
             f.epoch,
-            &[],
+            &["$notice:example.test".into()],
             &chrono::Utc::now().to_rfc3339(),
         )
         .await
         .unwrap();
     let mut c = f.pool.acquire().await.unwrap();
-    assert!(
-        state::read(&mut c)
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("input-and-output-uncertainty")
-    );
+    let state = state::read(&mut c).await.unwrap().unwrap();
     drop(c);
+    let proof = Exclusion::modeled(state.owner.clone());
+    // Isolation is not permission to skip or replace the interrupted response.
+    assert!(
+        publish(&f.pool, &state, &proof, &[], || Ok(()))
+            .await
+            .is_err()
+    );
+    assert!(
+        !confirmed(&f.root.path().join("state.db"), &state, &proof)
+            .await
+            .unwrap()
+    );
+    publish(&f.pool, &state, &proof, &f.payloads, || Ok(()))
+        .await
+        .unwrap();
+    assert!(
+        confirmed(&f.root.path().join("state.db"), &state, &proof)
+            .await
+            .unwrap()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM projection_outbox")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap(),
+        "sending"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM transport_receipts")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap(),
+        0
+    );
     f.pool.close().await;
 }

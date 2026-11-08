@@ -100,9 +100,9 @@ pub(crate) async fn read(connection: &mut SqliteConnection) -> Result<Option<Sta
     if pre_accept.is_some() && (batch.is_some() || hold.is_some()) {
         return Err(refuse("pre-acceptance-input-hold"));
     }
-    if !isolated_projections.is_empty() && (batch.is_some() || hold.is_some()) {
-        return Err(refuse("input-and-output-uncertainty"));
-    }
+    // Terminal notification claims are independently isolated. Publication
+    // still verifies every input payload and permits only dispositioned or
+    // proven no-effect events; uncertain input can never borrow this isolation.
     let state = State {
         owner,
         native_generation: control.get("generation"),

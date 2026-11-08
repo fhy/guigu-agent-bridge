@@ -96,6 +96,7 @@ pub(crate) struct Exclusion {
     physical: Vec<Physical>,
     pub inventory_digest: String,
     pub rebuild: Option<crate::matrix::rebuild_gap::Rebuild>,
+    pub unrouted: Vec<String>,
 }
 
 pub(crate) fn capture(owner: &Owner, config: &Config, path: &Path) -> Result<Exclusion> {
@@ -151,6 +152,7 @@ pub(crate) fn capture(owner: &Owner, config: &Config, path: &Path) -> Result<Exc
         physical,
         inventory_digest: digest,
         rebuild: None,
+        unrouted: Vec::new(),
     })
 }
 impl Exclusion {
@@ -166,6 +168,7 @@ impl Exclusion {
             physical: Vec::new(),
             inventory_digest: "modeled-resource-proof".into(),
             rebuild: None,
+            unrouted: Vec::new(),
         }
     }
     pub(crate) fn revalidate(&self, config: &Config, path: &Path) -> Result<()> {

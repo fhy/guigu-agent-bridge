@@ -53,6 +53,19 @@ pub(crate) async fn attempt(
     } else {
         Vec::new()
     };
+    proof.unrouted = payloads
+        .iter()
+        .filter_map(|(room, value)| {
+            crate::matrix::rebuild_gap::unrouted_no_effect(config, value, room)
+                .then(|| {
+                    value
+                        .get("event_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .flatten()
+        })
+        .collect();
     proof.revalidate(config, path)?;
     let outcome = crate::storage::recovery_eligibility::writer::succession::publish(
         pool,
