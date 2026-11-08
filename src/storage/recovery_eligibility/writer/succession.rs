@@ -13,6 +13,9 @@ use std::path::Path;
 #[cfg(test)]
 mod boundary_tests;
 mod lineage;
+mod pre_accept;
+#[cfg(test)]
+mod pre_accept_tests;
 #[cfg(test)]
 mod projection_tests;
 mod rebuild;
@@ -55,6 +58,7 @@ pub(crate) async fn publish(
     super::super::bootstrap::readback::inventory(&mut tx, &scope.context()).await?;
     let now = chrono::Utc::now().to_rfc3339();
     rows::retire_leases(&mut tx, &scope, state, &now).await?;
+    pre_accept::close(&mut tx, &scope, state, &now).await?;
     if !crate::storage::owner_restart::guards::work_clear(&mut tx).await? {
         return Err(state::refuse("business-effects"));
     }
@@ -147,6 +151,9 @@ pub(crate) async fn confirmed(
     super::super::authority::validate_identity(&mut c, &context).await?;
     super::super::native_context::validate(&mut c, &context).await?;
     super::super::bootstrap::readback::inventory(&mut c, &context).await?;
+    if !pre_accept::confirmed(&mut c, state).await? {
+        return Ok(false);
+    }
     c.close().await?;
     Ok(true)
 }

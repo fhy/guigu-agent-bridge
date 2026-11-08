@@ -9,6 +9,11 @@ pub(super) async fn prepare(
     if !matches!(
         id.table.as_str(),
         "runtime_instances"
+            | "tasks"
+            | "task_admissions"
+            | "deliveries"
+            | "delivery_dispositions"
+            | "execution_leases"
             | "runtime_owner_evidence"
             | "matrix_component_leases"
             | "matrix_recovery_control"
@@ -49,7 +54,11 @@ pub(super) async fn inserted(
 ) -> Result<(), sqlx::Error> {
     if !matches!(
         id.table.as_str(),
-        "runtime_owner_evidence" | "matrix_recovery_receipts" | "matrix_recovery_batches"
+        "runtime_owner_evidence"
+            | "matrix_recovery_receipts"
+            | "matrix_recovery_batches"
+            | "task_events"
+            | "projection_outbox"
     ) {
         return Err(refused());
     }

@@ -29,8 +29,10 @@ use uuid::Uuid;
 
 const RESOURCE_NAMESPACE: Uuid = Uuid::from_u128(0x8ce9c0d7_8257_5068_a369_b075e9d30e21);
 const WORKSPACE_NAMESPACE: Uuid = Uuid::from_u128(0xf6af15e8_6e64_56df_851f_24589ba97713);
-const TERMINAL_OUTBOX_NAMESPACE: Uuid = Uuid::from_u128(0x6c1ab2ee_4834_5f40_901b_0fbdbf95dbd0);
-const OUTBOX_BODY_NAMESPACE: Uuid = Uuid::from_u128(0x7297ec04_1338_57b4_9bc4_f0ff9f84fa5a);
+pub(crate) const TERMINAL_OUTBOX_NAMESPACE: Uuid =
+    Uuid::from_u128(0x6c1ab2ee_4834_5f40_901b_0fbdbf95dbd0);
+pub(crate) const OUTBOX_BODY_NAMESPACE: Uuid =
+    Uuid::from_u128(0x7297ec04_1338_57b4_9bc4_f0ff9f84fa5a);
 const CONTINUATION_RUNTIME_GENERATION: &str = "generation.v1:strict";
 pub const MAX_CONTINUATION_PROMPT_BYTES: usize = 4096;
 const MAX_OUTBOX_BODY_BYTES: usize = 2048;

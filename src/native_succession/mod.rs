@@ -1,5 +1,6 @@
 //! Restricted native succession before ordinary runtime admission.
 //! An ignored response may be completed atomically; uncertain work remains held.
+pub(crate) mod pre_accept;
 pub(crate) mod process;
 pub(crate) mod projections;
 pub(crate) mod state;
@@ -25,6 +26,9 @@ pub(crate) async fn attempt(
         return Ok(false);
     };
     drop(connection);
+    if let Some(delivery) = &expected.pre_accept {
+        pre_accept::config_covers(delivery, config)?;
+    }
     let guard = Guard::acquire(&config.bridge.database, path, "reconcile")
         .map_err(|_| state::refuse("admission-lock"))?;
     let mut proof = process::capture(&expected.owner, config, path)?;
