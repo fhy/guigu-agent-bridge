@@ -3,6 +3,17 @@ use std::{ffi::OsString, path::Path};
 use sha2::{Digest, Sha256};
 use sqlx::{Connection, Row, SqliteConnection, sqlite::SqliteConnectOptions};
 
+#[path = "owner_binding_diagnostics.rs"]
+mod diagnostics;
+
+#[cfg(test)]
+#[path = "owner_binding_close_fixture.rs"]
+mod close_fixture;
+
+#[cfg(test)]
+#[path = "owner_binding_close_tests.rs"]
+mod close_tests;
+
 const COMMAND: &str = "remediate-isolated-owner-bindings";
 const CONTRACT_VERSION: i64 = 2;
 const MIGRATION_VERSION: i64 = 14;
@@ -201,7 +212,7 @@ fn valid_owner(owner: &Owner) -> bool {
 
 async fn load_facts(c: &mut SqliteConnection) -> Result<Facts, Failure> {
     let owners = sqlx::query("SELECT instance_token,started_at,heartbeat_at,state,process_fingerprint FROM runtime_instances WHERE state IN ('active','stopping') ORDER BY state,instance_token")
-        .fetch_all(&mut *c).await.map_err(|_| Failure::new("database", "read"))?;
+        .fetch_all(&mut *c).await.map_err(|error| { diagnostics::sql("database-read", &error); Failure::new("database", "read") })?;
     if owners.len() != 2 {
         return Err(Failure::new("eligibility", "owner-topology"));
     }
@@ -244,7 +255,7 @@ async fn load_facts(c: &mut SqliteConnection) -> Result<Facts, Failure> {
     }
 
     let rows = sqlx::query("SELECT task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes,runtime_generation,runtime_generation_version FROM task_continuations")
-        .fetch_all(&mut *c).await.map_err(|_| Failure::new("database", "read"))?;
+        .fetch_all(&mut *c).await.map_err(|error| { diagnostics::sql("database-read", &error); Failure::new("database", "read") })?;
     if rows.len() != 1 {
         return Err(Failure::new("eligibility", "continuation"));
     }
@@ -272,7 +283,7 @@ async fn load_facts(c: &mut SqliteConnection) -> Result<Facts, Failure> {
     }
 
     let leases = sqlx::query("SELECT resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at FROM execution_leases")
-        .fetch_all(&mut *c).await.map_err(|_| Failure::new("database", "read"))?;
+        .fetch_all(&mut *c).await.map_err(|error| { diagnostics::sql("database-read", &error); Failure::new("database", "read") })?;
     if leases.len() != 1 {
         return Err(Failure::new("eligibility", "lease-shape"));
     }
@@ -297,7 +308,7 @@ async fn load_facts(c: &mut SqliteConnection) -> Result<Facts, Failure> {
     }
 
     let admissions = sqlx::query("SELECT task_id,state,revision,runtime_instance,reply_room,reply_thread_root,reply_event_id,monitor_room,monitor_generation,render_version,created_at,updated_at FROM task_admissions")
-        .fetch_all(&mut *c).await.map_err(|_| Failure::new("database", "read"))?;
+        .fetch_all(&mut *c).await.map_err(|error| { diagnostics::sql("database-read", &error); Failure::new("database", "read") })?;
     if admissions.len() != 1 {
         return Err(Failure::new("eligibility", "admission-shape"));
     }
@@ -326,7 +337,7 @@ async fn load_facts(c: &mut SqliteConnection) -> Result<Facts, Failure> {
 
     let stopping_refs: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM execution_leases WHERE owner_token=?)+(SELECT count(*) FROM task_admissions WHERE runtime_instance=?)+(SELECT count(*) FROM agent_work_queue WHERE runtime_owner=?)+(SELECT count(*) FROM workspace_claims WHERE runtime_owner=?)")
         .bind(&stopping.token).bind(&stopping.token).bind(&stopping.token).bind(&stopping.token)
-        .fetch_one(&mut *c).await.map_err(|_| Failure::new("database", "read"))?;
+        .fetch_one(&mut *c).await.map_err(|error| { diagnostics::sql("database-read", &error); Failure::new("database", "read") })?;
     if stopping_refs != 2 {
         return Err(Failure::new("eligibility", "downstream"));
     }
@@ -437,12 +448,15 @@ fn witness_digest(operation: &str, args: &Args, business: &str) -> String {
 async fn business_digest(c: &mut SqliteConnection) -> Result<String, Failure> {
     crate::isolated_fixture_migration::owner_binding_business_snapshot(c)
         .await
-        .map_err(|_| Failure::new("database", "read"))
+        .map_err(|_| {
+            diagnostics::predicate("business-snapshot-read");
+            Failure::new("database", "read")
+        })
 }
 
 async fn sibling_digest(c: &mut SqliteConnection, operation: &str) -> Result<String, Failure> {
     let rows = sqlx::query("SELECT operation_id,receipt_digest FROM isolated_owner_binding_remediation_receipts WHERE operation_id<>? ORDER BY operation_id")
-        .bind(operation).fetch_all(&mut *c).await.map_err(|_| Failure::new("database", "read"))?;
+        .bind(operation).fetch_all(&mut *c).await.map_err(|error| { diagnostics::sql("database-read", &error); Failure::new("database", "read") })?;
     let mut values = Vec::with_capacity(rows.len() * 2);
     for row in rows {
         values.push(get::<String>(&row, 0)?);
@@ -519,7 +533,7 @@ async fn authenticate_migration_ledger(
     )
     .fetch_all(&mut *c)
     .await
-    .map_err(|_| Failure::new("migration", "ledger"))?;
+    .map_err(|error| { diagnostics::sql("migration-ledger", &error); Failure::new("migration", "ledger") })?;
     let contract = crate::storage::migration_contract();
     if expected_versions > contract.len()
         || rows.len() != expected_versions
@@ -565,7 +579,10 @@ async fn authenticate_0014_tables(c: &mut SqliteConnection) -> Result<(), Failur
                 .bind(name)
                 .fetch_optional(&mut *c)
                 .await
-                .map_err(|_| Failure::new("migration", "compatibility"))?;
+                .map_err(|error| {
+                    diagnostics::sql("migration-compatibility", &error);
+                    Failure::new("migration", "compatibility")
+                })?;
         if actual.as_deref().map(normalized_sql) != migration_table_sql(name) {
             return Err(Failure::new("migration", "compatibility"));
         }
@@ -575,7 +592,10 @@ async fn authenticate_0014_tables(c: &mut SqliteConnection) -> Result<(), Failur
     )
     .fetch_one(&mut *c)
     .await
-    .map_err(|_| Failure::new("migration", "compatibility"))?;
+    .map_err(|error| {
+        diagnostics::sql("migration-compatibility", &error);
+        Failure::new("migration", "compatibility")
+    })?;
     if object_count != 2 {
         return Err(Failure::new("migration", "compatibility"));
     }
@@ -594,7 +614,10 @@ async fn exact_legacy_absence(c: &mut SqliteConnection, business: &str) -> Resul
     )
     .fetch_one(&mut *c)
     .await
-    .map_err(|_| Failure::new("migration", "compatibility"))?;
+    .map_err(|error| {
+        diagnostics::sql("migration-compatibility", &error);
+        Failure::new("migration", "compatibility")
+    })?;
     Ok(objects == 0 && business_digest(c).await? == business)
 }
 
@@ -659,10 +682,12 @@ async fn commit_publication(c: &mut SqliteConnection, _mode: PublicationMode) ->
         }
         _ => {}
     }
-    if sqlx::query("COMMIT").execute(&mut *c).await.is_ok() {
-        CommitObservation::Success
-    } else {
-        CommitObservation::Error
+    match sqlx::query("COMMIT").execute(&mut *c).await {
+        Ok(_) => CommitObservation::Success,
+        Err(error) => {
+            diagnostics::sql("publication-commit", &error);
+            CommitObservation::Error
+        }
     }
 }
 
@@ -673,31 +698,51 @@ async fn fresh_publication_reread(
     retained_business: &str,
     boundary: &mut BoundaryCheck<'_>,
 ) -> Result<(SqliteConnection, PublicationState), Failure> {
-    let mut reread = open_live(database)
-        .await
-        .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
-    boundary(Boundary::AfterPublicationReread)
-        .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
+    let mut reread = open_live(database).await.map_err(|error| {
+        diagnostics::failure("publication-open", error);
+        Failure::new("unknown-commit", "ambiguous")
+    })?;
+    boundary(Boundary::AfterPublicationReread).map_err(|error| {
+        diagnostics::failure("publication-boundary", error);
+        Failure::new("unknown-commit", "ambiguous")
+    })?;
     let receipt_count = sqlx::query_scalar::<_, i64>(
         "SELECT count(*) FROM isolated_owner_binding_remediation_receipts",
     )
     .fetch_one(&mut reread)
-    .await;
+    .await
+    .inspect_err(|error| diagnostics::sql("publication-receipt-count", error));
     let state = if exact_legacy_absence(&mut reread, retained_business)
         .await
         .unwrap_or(false)
     {
         PublicationState::LegacyAbsence
-    } else if authenticate_0014_schema(&mut reread).await.is_ok()
-        && exact_witness(&mut reread, operation, args, retained_business)
-            .await
-            .unwrap_or(false)
-        && business_digest(&mut reread).await.as_deref() == Ok(retained_business)
-        && matches!(receipt_count, Ok(0))
+    } else if authenticate_0014_schema(&mut reread)
+        .await
+        .inspect_err(|error| diagnostics::failure("publication-schema", *error))
+        .is_err()
     {
-        PublicationState::Complete
-    } else {
         PublicationState::Other
+    } else if !exact_witness(&mut reread, operation, args, retained_business)
+        .await
+        .inspect_err(|error| diagnostics::failure("publication-witness", *error))
+        .unwrap_or(false)
+    {
+        diagnostics::predicate("publication-witness");
+        PublicationState::Other
+    } else if business_digest(&mut reread)
+        .await
+        .inspect_err(|error| diagnostics::failure("publication-business", *error))
+        .as_deref()
+        != Ok(retained_business)
+    {
+        diagnostics::predicate("publication-business");
+        PublicationState::Other
+    } else if !matches!(receipt_count, Ok(0)) {
+        diagnostics::predicate("publication-receipts");
+        PublicationState::Other
+    } else {
+        PublicationState::Complete
     };
     Ok((reread, state))
 }
@@ -711,15 +756,32 @@ async fn finish_publication_commit(
     retained_business: &str,
     boundary: &mut BoundaryCheck<'_>,
 ) -> Result<SqliteConnection, Failure> {
-    drop(old);
+    close_before_reread(old, "publication-close").await?;
     let (reread, state) =
         fresh_publication_reread(database, operation, args, retained_business, boundary).await?;
+    tracing::debug!(
+        ?observation,
+        ?state,
+        "owner-binding publication classification"
+    );
     classify_publication(observation, state)?;
     Ok(reread)
 }
 
+// Dropping a SQLx connection only schedules worker cleanup. Its last WAL
+// checkpoint may still hold a lock when the fresh reader starts. Join that
+// cleanup before classifying durable state; never retry or infer commit success.
+async fn close_before_reread(c: SqliteConnection, stage: &'static str) -> Result<(), Failure> {
+    c.close().await.map_err(|error| {
+        diagnostics::sql(stage, &error);
+        Failure::new("unknown-commit", "ambiguous")
+    })
+}
+
 async fn open_live(database: &Path) -> Result<SqliteConnection, Failure> {
-    SqliteConnection::connect_with(
+    #[cfg(test)]
+    close_fixture::before_open(database).await;
+    let result = SqliteConnection::connect_with(
         &SqliteConnectOptions::new()
             .filename(database)
             .create_if_missing(false)
@@ -727,7 +789,19 @@ async fn open_live(database: &Path) -> Result<SqliteConnection, Failure> {
             .busy_timeout(std::time::Duration::from_secs(1)),
     )
     .await
-    .map_err(|_| Failure::new("database", "connect"))
+    .map_err(|error| {
+        diagnostics::sql("live-open", &error);
+        Failure::new("database", "connect")
+    });
+    #[cfg(test)]
+    let result = match result {
+        Ok(mut c) => {
+            close_fixture::install(&mut c, database).await;
+            Ok(c)
+        }
+        Err(error) => Err(error),
+    };
+    result
 }
 
 async fn exact_witness(
@@ -788,7 +862,10 @@ async fn receipt_repeat(
         sqlx::query_scalar("SELECT count(*) FROM isolated_owner_binding_remediation_receipts")
             .fetch_one(&mut *c)
             .await
-            .map_err(|_| Failure::new("database", "read"))?;
+            .map_err(|error| {
+                diagnostics::sql("database-read", &error);
+                Failure::new("database", "read")
+            })?;
     let row=sqlx::query("SELECT pre_state_digest,post_state_digest,active_owner_digest,stopping_owner_digest,continuation_digest,lease_before_digest,lease_after_digest,admission_before_digest,admission_after_digest,sibling_receipt_digest,receipt_digest,commit_timestamp,result,contract_version,backup_snapshot_sha256,backup_source_set_sha256 FROM isolated_owner_binding_remediation_receipts WHERE operation_id=?")
         .bind(operation).fetch_optional(&mut *c).await.map_err(|_|Failure::new("database","read"))?;
     let Some(row) = row else {
@@ -829,7 +906,7 @@ async fn receipt_repeat(
         .ok_or_else(|| Failure::new("receipt", "mismatch"))?;
     admission_after.updated_at = receipt.timestamp.clone();
     let lease_row = sqlx::query("SELECT resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at FROM execution_leases")
-        .fetch_one(&mut *c).await.map_err(|_| Failure::new("receipt", "mismatch"))?;
+        .fetch_one(&mut *c).await.map_err(|error| { diagnostics::sql("receipt-mismatch", &error); Failure::new("receipt", "mismatch") })?;
     let current_lease = Lease {
         resource_key: get(&lease_row, 0)?,
         task_id: get(&lease_row, 1)?,
@@ -841,7 +918,7 @@ async fn receipt_repeat(
         expires_at: get(&lease_row, 7)?,
     };
     let admission_row = sqlx::query("SELECT task_id,state,revision,runtime_instance,reply_room,reply_thread_root,reply_event_id,monitor_room,monitor_generation,render_version,created_at,updated_at FROM task_admissions")
-        .fetch_one(&mut *c).await.map_err(|_| Failure::new("receipt", "mismatch"))?;
+        .fetch_one(&mut *c).await.map_err(|error| { diagnostics::sql("receipt-mismatch", &error); Failure::new("receipt", "mismatch") })?;
     let current_admission = Admission {
         task_id: get(&admission_row, 0)?,
         state: get(&admission_row, 1)?,
@@ -887,17 +964,24 @@ async fn fresh_business_reread(
     retained_facts: &Facts,
     boundary: &mut BoundaryCheck<'_>,
 ) -> Result<(String, Option<Outcome>), Failure> {
-    let mut reread = open_live(database)
-        .await
-        .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
+    let mut reread = open_live(database).await.map_err(|error| {
+        diagnostics::failure("business-open", error);
+        Failure::new("unknown-commit", "ambiguous")
+    })?;
     authenticate_0014_schema(&mut reread)
         .await
-        .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
-    boundary(Boundary::AfterBusinessReread)
-        .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
-    let business = business_digest(&mut reread)
-        .await
-        .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
+        .map_err(|error| {
+            diagnostics::failure("business-schema", error);
+            Failure::new("unknown-commit", "ambiguous")
+        })?;
+    boundary(Boundary::AfterBusinessReread).map_err(|error| {
+        diagnostics::failure("business-boundary", error);
+        Failure::new("unknown-commit", "ambiguous")
+    })?;
+    let business = business_digest(&mut reread).await.map_err(|error| {
+        diagnostics::failure("business-digest", error);
+        Failure::new("unknown-commit", "ambiguous")
+    })?;
     let receipt = receipt_repeat(
         &mut reread,
         operation,
@@ -907,7 +991,10 @@ async fn fresh_business_reread(
         retained_facts,
     )
     .await
-    .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
+    .map_err(|error| {
+        diagnostics::failure("business-receipt", error);
+        Failure::new("unknown-commit", "ambiguous")
+    })?;
     Ok((business, receipt))
 }
 
@@ -1003,7 +1090,10 @@ async fn remediate_paths_opening(
     let latest: i64 = sqlx::query_scalar("SELECT coalesce(max(version),0) FROM _sqlx_migrations")
         .fetch_one(&mut c)
         .await
-        .map_err(|_| Failure::new("migration", "ledger"))?;
+        .map_err(|error| {
+            diagnostics::sql("migration-ledger", &error);
+            Failure::new("migration", "ledger")
+        })?;
     if latest == MIGRATION_VERSION - 1 {
         authenticate_migration_ledger(&mut c, (MIGRATION_VERSION - 1) as usize).await?;
         let live_business = business_digest(&mut c).await?;
@@ -1070,7 +1160,7 @@ async fn remediate_paths_opening(
             )
             .fetch_one(&mut c)
             .await
-            .map_err(|_| Failure::new("migration", "compatibility"))?;
+            .map_err(|error| { diagnostics::sql("migration-compatibility", &error); Failure::new("migration", "compatibility") })?;
             if receipts != 0 {
                 return Err(Failure::new("migration", "compatibility"));
             }
@@ -1115,7 +1205,7 @@ async fn remediate_paths_opening(
         .await;
         if let Err(error) = publication {
             let rollback = sqlx::query("ROLLBACK").execute(&mut c).await;
-            drop(c);
+            close_before_reread(c, "publication-rollback-close").await?;
             let mut reread = open_live(database_open_path)
                 .await
                 .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
@@ -1130,7 +1220,7 @@ async fn remediate_paths_opening(
         }
         if let Err(error) = boundary(Boundary::BeforePublicationCommit) {
             let rollback = sqlx::query("ROLLBACK").execute(&mut c).await;
-            drop(c);
+            close_before_reread(c, "publication-rollback-close").await?;
             let mut reread = open_live(database_open_path)
                 .await
                 .map_err(|_| Failure::new("unknown-commit", "ambiguous"))?;
@@ -1173,9 +1263,10 @@ async fn remediate_paths_opening(
     )
     .await?
     {
-        c.close()
-            .await
-            .map_err(|_| Failure::new("database", "read"))?;
+        c.close().await.map_err(|error| {
+            diagnostics::sql("database-read", &error);
+            Failure::new("database", "read")
+        })?;
         return Ok(outcome);
     }
     if current != retained_business {
@@ -1195,7 +1286,7 @@ async fn remediate_paths_opening(
     .await;
     if let Err(error) = result {
         let rollback = sqlx::query("ROLLBACK").execute(&mut c).await;
-        drop(c);
+        close_before_reread(c, "business-rollback-close").await?;
         let (durable, receipt) = fresh_business_reread(
             database_open_path,
             &operation,
@@ -1212,7 +1303,7 @@ async fn remediate_paths_opening(
     }
     boundary(Boundary::BeforeBusinessCommit)?;
     let commit = sqlx::query("COMMIT").execute(&mut c).await;
-    drop(c);
+    close_before_reread(c, "business-close").await?;
     let (post, receipt) = fresh_business_reread(
         database_open_path,
         &operation,
@@ -1398,7 +1489,7 @@ mod tests {
         .unwrap()
     }
 
-    async fn fixture() -> (
+    pub(super) async fn fixture() -> (
         tempfile::TempDir,
         std::path::PathBuf,
         std::path::PathBuf,
@@ -1539,10 +1630,11 @@ mod tests {
 
     #[tokio::test]
     async fn witness_and_receipt_drift_fail_closed() {
-        let (_root, database, retained, args) = fixture().await;
-        remediate_paths(&database, &retained, &args, false)
-            .await
-            .unwrap();
+        let (root, database, retained, args) = fixture().await;
+        if let Err(error) = remediate_paths(&database, &retained, &args, false).await {
+            let path = root.keep();
+            panic!("initial remediation {error:?}; retained fixture {path:?}");
+        }
         let mut c = open(&database).await;
         sqlx::query("UPDATE isolated_owner_binding_remediation_receipts SET receipt_digest=?")
             .bind("ff".repeat(32))
