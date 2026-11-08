@@ -8,12 +8,12 @@
 
 ## 快速开始
 
-当前源码版本为本地、尚未发布的 `0.2.12` 候选；以下 registry 安装示例仍保留
-历史 `0.2.10` 引用，不代表 `0.2.12` 已可从 registry 安装。候选范围与验证限制见
-[0.2.12 候选说明](docs/RELEASE-0.2.12.md)。
+当前源码版本为 `0.2.26`，变更与兼容边界见
+[0.2.26 发布说明](docs/RELEASE-0.2.26.md)。以下安装命令需在该版本已发布至
+crates.io 后执行；本地候选、公开制品与已运行的服务分别验证。
 
 ```bash
-cargo install guigu-agent-bridge --version 0.2.10
+cargo install guigu-agent-bridge --version 0.2.26 --locked
 install -m 600 config.example.toml "$HOME/.config/guigu-agent-bridge.toml"
 export MATRIX_USER_ID='@bridge:example.org'
 export MATRIX_ACCESS_TOKEN='replace-with-secret-manager-value'
@@ -26,6 +26,8 @@ guigu-agent-bridge "$HOME/.config/guigu-agent-bridge.toml"
 [发布清单](docs/RELEASE.md) 备份。
 
 ## 文档
+
+- [0.2.26 发布说明](docs/RELEASE-0.2.26.md)
 
 - [0.2.5 发布说明](docs/RELEASE-0.2.5.md)
 - [0.2.6 发布说明](docs/RELEASE-0.2.6.md)
