@@ -122,6 +122,18 @@ impl MatrixSync {
                 biased;
                 changed = shutdown.changed() => {
                     let _ = changed;
+                    if self.recovery.is_some() && self.processing.load(Ordering::Acquire) {
+                        // Ingress stays alive until this owner joins. Finish the
+                        // response already being persisted; dropping it would
+                        // strand a batch even during an ordinary graceful stop.
+                        // shutdown_joined still enforces the caller's deadline.
+                        tracing::debug!(
+                            stage = "matrix-sync-cleanup",
+                            decision = "drain-current-response",
+                            "shutdown waits for the durable response disposition"
+                        );
+                        return request.await.map(|_| ());
+                    }
                     return Ok(());
                 }
                 response = &mut request => response,

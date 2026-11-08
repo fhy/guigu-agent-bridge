@@ -138,3 +138,132 @@ async fn timeout_retains_fence_and_standalone_shutdown_releases_after_join() {
     assert!(!is_live(&pool).await);
     pool.close().await;
 }
+
+async fn processing_owner(
+    binding: RecoveryBinding,
+    pool: &sqlx::SqlitePool,
+) -> (
+    MatrixSyncHandle,
+    tokio::sync::mpsc::Sender<super::super::Disposition>,
+) {
+    use crate::matrix::{MatrixClient, MatrixSync, SqliteSyncTokenStore};
+    use matrix_sdk::{deserialized_responses::TimelineEvent, sync::SyncResponse};
+    let mut response = SyncResponse {
+        next_batch: "C".into(),
+        ..Default::default()
+    };
+    let mut room = matrix_sdk::sync::JoinedRoomUpdate::default();
+    room.timeline.events.push(TimelineEvent::from_plaintext(
+        serde_json::from_value(serde_json::json!({
+            "type": "m.room.message", "event_id": "$drain:example.test",
+            "sender": "@alice:example.test", "origin_server_ts": 1,
+            "content": {"msgtype": "m.text", "body": "harmless fixture"}
+        }))
+        .unwrap(),
+    ));
+    response
+        .rooms
+        .joined
+        .insert("!room:example.test".parse().unwrap(), room);
+    let mut sync = MatrixSync::new(
+        MatrixClient::for_test().await,
+        Arc::new(SqliteSyncTokenStore::new(pool.clone())),
+        2,
+    )
+    .unwrap()
+    .with_initial_response(response);
+    sync.recovery = Some(binding);
+    *sync.initial_token.lock().unwrap() = Some("B".into());
+    let (handle, mut events, dispositions) = sync.start_with_dispositions();
+    let event = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(event.event_id, "$drain:example.test");
+    (handle, dispositions)
+}
+
+async fn batch_state(pool: &sqlx::SqlitePool) -> (String, String, String) {
+    sqlx::query_as("SELECT watermark,b.state,r.state FROM matrix_recovery_control CROSS JOIN matrix_recovery_batches b CROSS JOIN matrix_recovery_receipts r")
+        .fetch_one(pool).await.unwrap()
+}
+
+#[tokio::test]
+async fn durable_shutdown_drains_disposition_before_checkpoint_and_join() {
+    let (_root, pool, binding) = binding().await;
+    let store = binding.store.clone();
+    let (mut owner, dispositions) = processing_owner(binding, &pool).await;
+    owner.shutdown_tx.send(true).unwrap();
+    let prematurely_joined = tokio::time::timeout(Duration::from_millis(30), &mut owner.join).await;
+    assert!(
+        prematurely_joined.is_err(),
+        "durable batch was canceled at shutdown"
+    );
+    assert_eq!(
+        batch_state(&pool).await,
+        ("B".into(), "processing".into(), "processing".into())
+    );
+    dispositions.send(Ok(())).await.unwrap();
+    let (result, lease) = owner.shutdown_joined(Duration::from_secs(5)).await.unwrap();
+    result.unwrap();
+    assert_eq!(
+        batch_state(&pool).await,
+        ("C".into(), "terminal".into(), "dispositioned".into())
+    );
+    assert!(is_live(&pool).await);
+    lease.unwrap().release().await.unwrap();
+    assert!(!is_live(&pool).await);
+    store.reconcile_restart().await.unwrap();
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn durable_shutdown_timeout_keeps_unfinished_batch_and_restart_hold() {
+    let (_root, pool, binding) = binding().await;
+    let store = binding.store.clone();
+    let (owner, _dispositions) = processing_owner(binding, &pool).await;
+    assert!(matches!(
+        owner.shutdown_joined(Duration::from_millis(30)).await,
+        Err(MatrixError::Join)
+    ));
+    assert!(is_live(&pool).await);
+    assert_eq!(
+        batch_state(&pool).await,
+        ("B".into(), "processing".into(), "processing".into())
+    );
+    assert!(store.reconcile_restart().await.is_err());
+    assert_eq!(
+        store
+            .control()
+            .await
+            .unwrap()
+            .unwrap()
+            .restart_hold_state
+            .as_deref(),
+        Some("processing")
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn durable_shutdown_preserves_failed_disposition_without_checkpoint() {
+    let (_root, pool, binding) = binding().await;
+    let store = binding.store.clone();
+    let (mut owner, dispositions) = processing_owner(binding, &pool).await;
+    owner.shutdown_tx.send(true).unwrap();
+    assert!(
+        tokio::time::timeout(Duration::from_millis(30), &mut owner.join)
+            .await
+            .is_err()
+    );
+    dispositions.send(Err(MatrixError::Storage)).await.unwrap();
+    let (result, _lease) = owner.shutdown_joined(Duration::from_secs(5)).await.unwrap();
+    assert!(matches!(result, Err(MatrixError::Storage)));
+    assert!(is_live(&pool).await);
+    assert_eq!(
+        batch_state(&pool).await,
+        ("B".into(), "processing".into(), "processing".into())
+    );
+    assert!(store.reconcile_restart().await.is_err());
+    pool.close().await;
+}
