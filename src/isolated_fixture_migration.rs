@@ -828,13 +828,12 @@ pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
     // The CLI holds the maintenance lock. Authenticate before discovery's SQLite
     // reads, and reject unresolved maintenance before admission can reclaim a
     // stale record.
-    let preflight_sidecars = Sidecars::capture(&database)
+    Sidecars::capture(&database)
         .map_err(|error| prepare_rejected("sqlite-open", "sidecar-auth", error))?;
     crate::offline_production_migration::check_runtime_discovery(&database)
         .map_err(|_| prepare_rejected("preflight", "maintenance-discovery", Error::Rejected))?;
-    preflight_sidecars
-        .revalidate(&database)
-        .map_err(|error| prepare_rejected("sqlite-open", "sidecar-revalidation", error))?;
+    // Discovery may normalize WAL permissions. The capture below binds the
+    // resulting identities before migration opens SQLite, as before.
     let admission = crate::runtime_admission::Guard::acquire(&database, &config, "fixture-prepare")
         .map_err(|_| prepare_rejected("preflight", "admission-lock", Error::Rejected))?;
     preflight_unit(&args.unit)
