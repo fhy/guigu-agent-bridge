@@ -115,14 +115,13 @@ fn validate_leases(state: &State) -> Result<()> {
     {
         return Err(refuse("component-fence"));
     }
-    if let Some(batch) = &state.batch {
-        if !state
+    if let Some(batch) = &state.batch
+        && !state
             .leases
             .iter()
             .any(|(c, o, e, _, _)| c == "MatrixSync" && o == &batch.owner && *e == batch.epoch)
-        {
-            return Err(refuse("batch-fence"));
-        }
+    {
+        return Err(refuse("batch-fence"));
     }
     Ok(())
 }
