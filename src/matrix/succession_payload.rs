@@ -52,6 +52,7 @@ pub(crate) async fn fetch(
         return Err(MatrixError::CutoverRefused);
     }
     let mut payloads = Vec::new();
+    let mut bytes = 0usize;
     for id in &batch.expected {
         let id: matrix_sdk::ruma::OwnedEventId =
             id.parse().map_err(|_| MatrixError::CutoverRefused)?;
@@ -70,7 +71,14 @@ pub(crate) async fn fetch(
                 found = Some((room.room_id().to_string(), value));
             }
         }
-        payloads.push(found.ok_or(MatrixError::CutoverRefused)?);
+        let found = found.ok_or(MatrixError::CutoverRefused)?;
+        bytes = bytes
+            .checked_add(found.1.to_string().len())
+            .ok_or(MatrixError::CutoverRefused)?;
+        if bytes > 16 * 1024 * 1024 {
+            return Err(MatrixError::CutoverRefused);
+        }
+        payloads.push(found);
     }
     verify(batch, &payloads)?;
     Ok(payloads)

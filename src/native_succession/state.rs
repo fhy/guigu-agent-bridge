@@ -178,7 +178,9 @@ async fn read_batch(connection: &mut SqliteConnection) -> Result<Option<Batch>> 
     let covered: Vec<String> =
         serde_json::from_str(row.get("covered_events_json")).map_err(|_| refuse("coverage"))?;
     let unique = expected.iter().collect::<std::collections::BTreeSet<_>>();
-    if expected.len() > 64
+    // Match the existing bounded timeline reconstruction window. Never truncate
+    // a legitimate response merely because it exceeds a small fixture batch.
+    if expected.len() > 1600
         || unique.len() != expected.len()
         || covered.iter().any(|e| !unique.contains(e))
     {

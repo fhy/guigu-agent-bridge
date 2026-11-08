@@ -121,8 +121,19 @@ async fn succession_refuses_pending_projection_missing_claim_or_nonterminal_pare
 async fn succession_isolates_notifications_only_after_exact_no_effect_input_coverage() {
     let f = fixture(false).await;
     seed(&f).await;
+    let payloads: Vec<_> = (0..90)
+        .map(|i| {
+            let (room, mut value) = f.payloads[0].clone();
+            value["event_id"] = serde_json::json!(format!("$notice-{i}:example.test"));
+            (room, value)
+        })
+        .collect();
+    let expected: Vec<_> = payloads
+        .iter()
+        .map(|(_, v)| v["event_id"].as_str().unwrap().to_owned())
+        .collect();
     let digest =
-        crate::matrix::response_identity::digest(Some("B"), "C", f.payloads.clone()).unwrap();
+        crate::matrix::response_identity::digest(Some("B"), "C", payloads.clone()).unwrap();
     f.store
         .begin_batch(
             "interrupted",
@@ -132,7 +143,7 @@ async fn succession_isolates_notifications_only_after_exact_no_effect_input_cove
             "B",
             "owner",
             f.epoch,
-            &["$notice:example.test".into()],
+            &expected,
             &chrono::Utc::now().to_rfc3339(),
         )
         .await
@@ -152,7 +163,7 @@ async fn succession_isolates_notifications_only_after_exact_no_effect_input_cove
             .await
             .unwrap()
     );
-    publish(&f.pool, &state, &proof, &f.payloads, || Ok(()))
+    publish(&f.pool, &state, &proof, &payloads, || Ok(()))
         .await
         .unwrap();
     assert!(
