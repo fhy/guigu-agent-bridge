@@ -95,6 +95,7 @@ pub(crate) struct Exclusion {
     pub device: String,
     physical: Vec<Physical>,
     pub inventory_digest: String,
+    pub rebuild: Option<crate::matrix::rebuild_gap::Rebuild>,
 }
 
 pub(crate) fn capture(owner: &Owner, config: &Config, path: &Path) -> Result<Exclusion> {
@@ -149,6 +150,7 @@ pub(crate) fn capture(owner: &Owner, config: &Config, path: &Path) -> Result<Exc
         device: config.transports.matrix.device_id.clone(),
         physical,
         inventory_digest: digest,
+        rebuild: None,
     })
 }
 impl Exclusion {
@@ -163,6 +165,7 @@ impl Exclusion {
             device: "BRIDGE".into(),
             physical: Vec::new(),
             inventory_digest: "modeled-resource-proof".into(),
+            rebuild: None,
         }
     }
     pub(crate) fn revalidate(&self, config: &Config, path: &Path) -> Result<()> {

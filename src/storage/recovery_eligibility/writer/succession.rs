@@ -13,6 +13,9 @@ use std::path::Path;
 #[cfg(test)]
 mod boundary_tests;
 mod lineage;
+mod rebuild;
+#[cfg(test)]
+mod rebuild_tests;
 mod rows;
 #[cfg(test)]
 pub(crate) mod tests;
@@ -55,10 +58,11 @@ pub(crate) async fn publish(
     }
     rows::invocations_clear(&mut tx).await?;
     let control = lineage::prepare(&mut tx, &scope, &lineage::control()).await?;
-    rows::complete_batch(&mut tx, &scope, state, proof, payloads, &now).await?;
+    let effective = rebuild::prepare(&mut tx, &scope, state, proof, &now).await?;
+    rows::complete_batch(&mut tx, &scope, &effective, proof, payloads, &now).await?;
     let record = record(state, proof)?;
     rows::retire_owner(&mut tx, &scope, state, &record, &now).await?;
-    let watermark = state
+    let watermark = effective
         .batch
         .as_ref()
         .map_or(state.watermark.as_str(), |b| b.response.as_str());
@@ -111,14 +115,15 @@ pub(crate) async fn confirmed(
         return Ok(false);
     }
     let checkpoint:Option<(String,Option<String>)>=sqlx::query_as("SELECT watermark,restart_hold_state FROM matrix_recovery_control WHERE control_id=1 AND cutover_operation_id=?").bind(&state.operation).fetch_optional(&mut c).await?;
-    let watermark = state
+    let effective = rebuild::effective(state, proof)?;
+    let watermark = effective
         .batch
         .as_ref()
         .map_or(state.watermark.as_str(), |b| b.response.as_str());
     if checkpoint.as_ref() != Some(&(watermark.into(), None)) {
         return Ok(false);
     }
-    if let Some(batch) = &state.batch {
+    if let Some(batch) = &effective.batch {
         let valid:i64=sqlx::query_scalar("SELECT count(*) FROM matrix_recovery_batches WHERE batch_id=? AND state='terminal' AND response_digest=? AND expected_events_json=covered_events_json AND NOT EXISTS(SELECT 1 FROM matrix_recovery_receipts WHERE batch_id=? AND state!='dispositioned')")
             .bind(&batch.id).bind(&batch.digest).bind(&batch.id).fetch_one(&mut c).await?;
         if valid != 1 {

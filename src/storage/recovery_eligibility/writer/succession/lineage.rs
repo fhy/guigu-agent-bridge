@@ -49,7 +49,7 @@ pub(super) async fn inserted(
 ) -> Result<(), sqlx::Error> {
     if !matches!(
         id.table.as_str(),
-        "runtime_owner_evidence" | "matrix_recovery_receipts"
+        "runtime_owner_evidence" | "matrix_recovery_receipts" | "matrix_recovery_batches"
     ) {
         return Err(refused());
     }
@@ -84,8 +84,13 @@ pub(super) async fn reconstruct_control(
     if times.len() != 1 {
         return Err(refused());
     }
-    let changed=sqlx::query("UPDATE matrix_recovery_control SET restart_hold_state=NULL,restart_hold_event_id=NULL,restart_hold_reason=NULL,updated_at=? WHERE control_id=1 AND cutover_operation_id=? AND watermark=? AND restart_hold_state='processing' AND restart_hold_event_id=? AND restart_hold_reason='incomplete response coverage requires reconciliation'")
-        .bind(&times[0]).bind(&state.operation).bind(&state.watermark).bind(format!("batch:{}",state.batch.as_ref().ok_or_else(refused)?.id)).execute(&mut *c).await?;
+    let changed = if state.hold.as_deref() == Some("refused") {
+        sqlx::query("UPDATE matrix_recovery_control SET phase='active',restart_hold_state=NULL,restart_hold_reason=NULL,updated_at=? WHERE control_id=1 AND cutover_operation_id=? AND watermark=? AND phase='refused' AND restart_hold_state='refused' AND restart_hold_event_id IS NULL AND restart_hold_reason='rebuild-history-gap'")
+            .bind(&times[0]).bind(&state.operation).bind(&state.watermark).execute(&mut *c).await?
+    } else {
+        sqlx::query("UPDATE matrix_recovery_control SET restart_hold_state=NULL,restart_hold_event_id=NULL,restart_hold_reason=NULL,updated_at=? WHERE control_id=1 AND cutover_operation_id=? AND watermark=? AND restart_hold_state='processing' AND restart_hold_event_id=? AND restart_hold_reason='incomplete response coverage requires reconciliation'")
+        .bind(&times[0]).bind(&state.operation).bind(&state.watermark).bind(format!("batch:{}",state.batch.as_ref().ok_or_else(refused)?.id)).execute(&mut *c).await?
+    };
     if changed.rows_affected() != 1 {
         return Err(refused());
     }

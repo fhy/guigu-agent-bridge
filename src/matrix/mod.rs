@@ -13,6 +13,7 @@ mod event;
 mod identity;
 pub(crate) mod outbound;
 mod permission;
+pub(crate) mod rebuild_gap;
 mod reply;
 pub(crate) mod response_identity;
 mod router;

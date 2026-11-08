@@ -128,6 +128,10 @@ async fn disposition(
         .bind(&proof.account).bind(room).bind(event).bind(&state.operation).execute(&mut *c).await?;
     if !crate::matrix::succession_payload::ignored(value, room, &proof.account)
         .map_err(|_| refused())?
+        && !proof
+            .rebuild
+            .as_ref()
+            .is_some_and(|r| r.unrouted.iter().any(|e| e == event))
     {
         return Err(refused());
     }

@@ -18,7 +18,7 @@ impl MatrixSync {
             )
             .await
             .map_err(|_| MatrixError::Storage)?;
-        let response = self
+        let mut response = self
             .client
             .inner
             .sync_once(
@@ -29,7 +29,28 @@ impl MatrixSync {
             )
             .await
             .map_err(classify_sdk_error)?;
-        if response.next_batch.is_empty()
+        // Complete the exact limited interval to a committed receipt before
+        // admitting the response. No receipt/checkpoint changes on failure.
+        let coverage = tokio::time::timeout(
+            Duration::from_secs(90),
+            crate::matrix::rebuild_gap::fill(
+                &self.client,
+                recovery.store.pool(),
+                &recovery.operation_id,
+                &mut response,
+            ),
+        )
+        .await;
+        if !matches!(coverage, Ok(Ok(_))) {
+            tracing::error!(
+                stage = "rebuild-state",
+                category = "history-gap",
+                committed = false,
+                "bounded timeline coverage could not reach a committed receipt"
+            );
+        }
+        if !matches!(coverage, Ok(Ok(_)))
+            || response.next_batch.is_empty()
             || response
                 .rooms
                 .joined

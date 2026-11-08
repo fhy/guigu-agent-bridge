@@ -26,8 +26,18 @@ pub(crate) async fn attempt(
     drop(connection);
     let guard = Guard::acquire(&config.bridge.database, path, "reconcile")
         .map_err(|_| state::refuse("admission-lock"))?;
-    let proof = process::capture(&expected.owner, config, path)?;
-    let payloads = if let Some(batch) = &expected.batch {
+    let mut proof = process::capture(&expected.owner, config, path)?;
+    let payloads = if expected.hold.as_deref() == Some("refused") {
+        let (rebuild, payloads) = tokio::time::timeout(Duration::from_secs(90), async {
+            let client = MatrixClient::restore(&config.transports.matrix).await?;
+            crate::matrix::rebuild_gap::fetch(&client, pool, config, &expected).await
+        })
+        .await
+        .map_err(|_| state::refuse("rebuild-deadline"))?
+        .map_err(|_| state::refuse("rebuild-coverage-or-effect"))?;
+        proof.rebuild = Some(rebuild);
+        payloads
+    } else if let Some(batch) = &expected.batch {
         tokio::time::timeout(Duration::from_secs(90), async {
             let client = MatrixClient::restore(&config.transports.matrix).await?;
             succession_payload::fetch(&client, batch).await

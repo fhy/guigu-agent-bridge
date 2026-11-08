@@ -66,12 +66,17 @@ pub(crate) async fn read(connection: &mut SqliteConnection) -> Result<Option<Sta
         boot: row.get("boot_id"),
         fingerprint: row.get("process_fingerprint"),
     };
-    let control=sqlx::query("SELECT x.generation,x.revision,c.* FROM runtime_eligibility_context x JOIN runtime_eligibility_bootstrap b ON b.generation=x.generation AND b.bootstrap_nonce=x.bootstrap_nonce AND b.inventory_digest=x.bootstrap_inventory_digest JOIN matrix_recovery_control c ON c.cutover_operation_id=x.compatibility_operation_id JOIN matrix_recovery_compatibility k ON k.native_operation_id=c.cutover_operation_id AND k.source_state_digest=x.compatibility_source_digest WHERE x.state='ready' AND x.matrix_enabled=1 AND x.provenance_kind='validated_native' AND b.state='complete' AND c.phase='active' AND k.decision='native' AND NOT EXISTS(SELECT 1 FROM offline_recovery_binding)")
+    let control=sqlx::query("SELECT x.generation,x.revision,c.* FROM runtime_eligibility_context x JOIN runtime_eligibility_bootstrap b ON b.generation=x.generation AND b.bootstrap_nonce=x.bootstrap_nonce AND b.inventory_digest=x.bootstrap_inventory_digest JOIN matrix_recovery_control c ON c.cutover_operation_id=x.compatibility_operation_id JOIN matrix_recovery_compatibility k ON k.native_operation_id=c.cutover_operation_id AND k.source_state_digest=x.compatibility_source_digest WHERE x.state='ready' AND x.matrix_enabled=1 AND x.provenance_kind='validated_native' AND b.state='complete' AND (c.phase='active' OR (c.phase='refused' AND c.restart_hold_state='refused' AND c.restart_hold_reason='rebuild-history-gap' AND c.restart_hold_event_id IS NULL)) AND k.decision='native' AND NOT EXISTS(SELECT 1 FROM offline_recovery_binding)")
         .fetch_optional(&mut *connection).await?.ok_or_else(||refuse("not-native"))?;
     let batch = read_batch(connection).await?;
     let hold: Option<String> = control.get("restart_hold_state");
     let held_id: Option<String> = control.get("restart_hold_event_id");
+    let rebuild = hold.as_deref() == Some("refused")
+        && control.get::<Option<&str>, _>("restart_hold_reason") == Some("rebuild-history-gap")
+        && held_id.is_none()
+        && batch.is_none();
     if hold.is_some()
+        && !rebuild
         && (hold.as_deref() != Some("processing")
             || batch.as_ref().map(|b| format!("batch:{}", b.id)) != held_id
             || control.get::<Option<&str>, _>("restart_hold_reason")
@@ -98,6 +103,19 @@ pub(crate) async fn read(connection: &mut SqliteConnection) -> Result<Option<Sta
         batch,
         leases,
     };
+    for (_, lease_owner, _, status, _) in &state.leases {
+        if lease_owner != &state.owner.token {
+            let stopped: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM runtime_instances WHERE instance_token=? AND state='stopped'",
+            )
+            .bind(lease_owner)
+            .fetch_one(&mut *connection)
+            .await?;
+            if status != "expired" || stopped != 1 {
+                return Err(refuse("foreign-component-owner"));
+            }
+        }
+    }
     validate_leases(&state)?;
     Ok(Some(state))
 }
@@ -108,7 +126,7 @@ fn validate_leases(state: &State) -> Result<()> {
         .iter()
         .any(|(component, owner, epoch, status, _)| {
             !matches!(component.as_str(), "MatrixSync" | "OutboxDrain")
-                || owner != &state.owner.token
+                || (owner != &state.owner.token && status != "expired")
                 || *epoch < 1
                 || !matches!(status.as_str(), "active" | "expired")
         })
