@@ -3,7 +3,7 @@ use crate::storage::recovery_eligibility::writer;
 use serde::{Deserialize, Serialize};
 
 #[path = "owner_restart_guards.rs"]
-mod guards;
+pub(crate) mod guards;
 #[cfg(test)]
 #[path = "owner_restart_tests.rs"]
 mod tests;

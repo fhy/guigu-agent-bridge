@@ -21,6 +21,7 @@ pub mod legacy_owner_reconciliation;
 pub(crate) mod maintenance_lock;
 pub mod matrix;
 pub mod models;
+pub(crate) mod native_succession;
 pub mod observer;
 pub mod offline_delivery;
 pub mod offline_identity;

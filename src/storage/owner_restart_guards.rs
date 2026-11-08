@@ -1,6 +1,6 @@
 use sqlx::SqliteConnection;
 
-pub(super) async fn work_clear(connection: &mut SqliteConnection) -> Result<bool, sqlx::Error> {
+pub(crate) async fn work_clear(connection: &mut SqliteConnection) -> Result<bool, sqlx::Error> {
     for (predicate, query) in [
         (
             "execution-leases",

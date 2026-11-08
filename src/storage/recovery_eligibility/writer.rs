@@ -14,6 +14,7 @@ mod effect_scope;
 mod mutation;
 mod native_control;
 mod native_lease;
+pub(crate) mod succession;
 pub(crate) mod teardown;
 mod transaction;
 mod workspace;

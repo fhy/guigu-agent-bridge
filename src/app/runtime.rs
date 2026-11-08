@@ -380,6 +380,12 @@ impl AppRuntime {
             pool.close().await;
             return Err(error.into());
         }
+        if let Err(error) =
+            crate::native_succession::attempt(&pool, &config, &path, &maintenance_lock).await
+        {
+            tracing::warn!(phase = "native-succession", reason = %error,
+                outcome = "hold-preserved", "restricted native recovery refused");
+        }
         let admin_bindings: i64 =
             sqlx::query_scalar("SELECT count(*) FROM offline_recovery_binding")
                 .fetch_one(&pool)
@@ -532,7 +538,7 @@ impl AppRuntime {
             )
             .await
             .map_err(|_| AppError::Runtime)?;
-        if !owns_runtime {
+        if !owns_runtime && recovery_scope.is_none() {
             // A prior isolated generation may have stopped before publishing its
             // terminal runtime row. Reuse the reviewed CAS recovery boundary for
             // each durable owner identity, then retry the fresh generation.

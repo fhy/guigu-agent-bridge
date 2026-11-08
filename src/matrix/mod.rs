@@ -14,8 +14,10 @@ mod identity;
 pub(crate) mod outbound;
 mod permission;
 mod reply;
+pub(crate) mod response_identity;
 mod router;
 mod store_identity;
+pub(crate) mod succession_payload;
 mod sync;
 
 pub use admin::{

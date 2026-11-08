@@ -9,6 +9,9 @@ pub(crate) use shutdown::MatrixSyncLease;
 
 #[path = "sync_batch.rs"]
 mod batch;
+#[cfg(test)]
+#[path = "succession_runloop_tests.rs"]
+mod succession_tests;
 
 use std::{
     future::Future,
@@ -144,6 +147,8 @@ pub struct MatrixSync {
     failure_observer: Option<FailureObserver>,
     #[cfg(test)]
     test_failure: Mutex<Option<MatrixError>>,
+    #[cfg(test)]
+    before_receipt: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 #[derive(Clone)]
@@ -190,6 +195,8 @@ impl MatrixSync {
             failure_observer: None,
             #[cfg(test)]
             test_failure: Mutex::new(None),
+            #[cfg(test)]
+            before_receipt: None,
         })
     }
 

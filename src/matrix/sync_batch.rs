@@ -6,15 +6,7 @@ use serde_json::Value;
 #[path = "gap_tests.rs"]
 mod gap_tests;
 
-pub(super) fn canonical(raw: &str) -> Result<Value, MatrixError> {
-    let mut value: Value = serde_json::from_str(raw).map_err(|_| MatrixError::Protocol {
-        detail: "malformed timeline event",
-    })?;
-    if let Some(object) = value.as_object_mut() {
-        object.remove("unsigned");
-    }
-    Ok(value)
-}
+use crate::matrix::response_identity::{canonical, digest};
 
 impl MatrixSync {
     pub(super) async fn process_batch(
@@ -51,6 +43,11 @@ impl MatrixSync {
         if let Some(recovery) = &self.recovery {
             self.begin_response(recovery, &batch_id, token, &response)
                 .await?;
+        }
+        #[cfg(test)]
+        if let Some((entered, resume)) = &self.before_receipt {
+            entered.notify_one();
+            resume.notified().await;
         }
         let mut delivered = 0;
         for (room_id, update) in response.rooms.joined {
@@ -109,14 +106,7 @@ impl MatrixSync {
             }
         }
         expected.sort();
-        payloads.sort_by(|left, right| {
-            left.0
-                .cmp(&right.0)
-                .then_with(|| left.1.to_string().cmp(&right.1.to_string()))
-        });
-        let bytes = serde_json::to_vec(&(token, &response.next_batch, payloads))
-            .map_err(|_| MatrixError::Storage)?;
-        let digest = format!("{:x}", Sha256::digest(bytes));
+        let digest = digest(token, &response.next_batch, payloads)?;
         recovery
             .store
             .begin_batch(
