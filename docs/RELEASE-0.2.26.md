@@ -24,6 +24,10 @@ and package, not a claim that a deployment has already been upgraded.
 - Align package repository/homepage metadata with the existing public repository,
   https://github.com/fhy/guigu-agent-bridge.
 
+The package includes the public ACP mock and SDK examples. The local acceptance
+account pairing helper remains outside the published package. Existing fixed-path
+legacy fixture tools retain their previously published safety boundaries.
+
 ## Compatibility and operations
 
 Embedded migrations remain 0001–0025, byte-identical to v0.2.25. The original
