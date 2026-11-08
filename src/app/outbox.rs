@@ -1,13 +1,27 @@
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 use crate::{matrix::MatrixOutboxSender, storage::ReliabilityStore};
-use tokio::sync::watch;
+use tokio::sync::{Mutex, watch};
 
 #[derive(Clone)]
 pub struct OutboxDrain {
     store: ReliabilityStore,
     sender: Arc<dyn MatrixOutboxSender>,
     batch: u32,
+    pending: Arc<Mutex<VecDeque<PendingSend>>>,
+}
+
+struct PendingSend {
+    row: crate::storage::PendingProjection,
+    // Some records the completed network call. A refused persistence write
+    // must never cause that call to be repeated, including through a clone.
+    sent: SendState,
+}
+
+enum SendState {
+    Prepared,
+    Started,
+    Complete(bool),
 }
 
 impl OutboxDrain {
@@ -17,66 +31,79 @@ impl OutboxDrain {
             store,
             sender,
             batch,
+            pending: Default::default(),
         }
     }
 
     #[allow(clippy::result_unit_err)]
     pub async fn drain_once(&self) -> Result<usize, ()> {
+        let mut pending = self.pending.lock().await;
         let now = chrono::Utc::now();
-        let stale = now - chrono::Duration::minutes(5);
-        let owner = uuid::Uuid::now_v7().to_string();
+        let stale = (now - chrono::Duration::minutes(5))
+            .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         let now = now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         self.store
             .renew_outbox_component(&now)
             .await
             .map_err(|_| ())?;
-        let stale = stale.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-        let rows = self
-            .store
-            .claim_projections(&owner, &now, &stale, self.batch)
-            .await
-            .map_err(|_| ())?;
-        let mut sent = 0;
-        for row in rows {
-            if !self
+        if pending.is_empty() {
+            let owner = uuid::Uuid::now_v7().to_string();
+            let rows = self
                 .store
-                .authorize_projection_send(&row)
+                .claim_projections(&owner, &now, &stale, self.batch)
                 .await
-                .map_err(|_| ())?
-            {
+                .map_err(|_| ())?;
+            pending.extend(rows.into_iter().map(|row| PendingSend {
+                row,
+                sent: SendState::Prepared,
+            }));
+        }
+        let mut sent = 0;
+        while let Some(next) = pending.front_mut() {
+            let row = &next.row;
+            if matches!(next.sent, SendState::Started) {
+                // A cancelled network future has no known outcome. Retain the
+                // sending claim; neither this instance nor a clone may retry it.
                 return Err(());
             }
-            let send_result = self
-                .sender
-                .send_stable(
-                    &row.room_id,
-                    row.thread_root.as_deref(),
-                    row.reply_event_id.as_deref(),
-                    &row.body,
-                    &row.stable_txn_id,
-                )
-                .await;
-            if send_result.is_ok() {
-                match self.store.mark_projection_sent(&row).await {
-                    Ok(true) => sent += 1,
-                    Ok(false) | Err(_) => {
-                        if !self
-                            .store
-                            .mark_projection_abandoned(&row)
-                            .await
-                            .map_err(|_| ())?
-                        {
-                            return Err(());
-                        }
-                    }
-                }
-            } else {
+            if matches!(next.sent, SendState::Prepared) {
                 if !self
                     .store
-                    .mark_projection_abandoned(&row)
+                    .authorize_projection_send(row)
                     .await
                     .map_err(|_| ())?
                 {
+                    return Err(());
+                }
+                next.sent = SendState::Started;
+                let outcome = self
+                    .sender
+                    .send_stable(
+                        &row.room_id,
+                        row.thread_root.as_deref(),
+                        row.reply_event_id.as_deref(),
+                        &row.body,
+                        &row.stable_txn_id,
+                    )
+                    .await;
+                next.sent = SendState::Complete(outcome.is_ok());
+            }
+            let success = matches!(next.sent, SendState::Complete(true));
+            let completed = if success {
+                self.store.mark_projection_sent(row).await
+            } else {
+                self.store.mark_projection_abandoned(row).await
+            };
+            match completed {
+                Ok(true) => {
+                    sent += usize::from(success);
+                    pending.pop_front();
+                }
+                Ok(false) | Err(_) => {
+                    tracing::debug!(stage="outbox-completion", source_id=%row.source_id,
+                        projection=%row.projection, send_succeeded=success,
+                        outcome="retained-without-resend",
+                        "projection completion deferred by durable authority");
                     return Err(());
                 }
             }

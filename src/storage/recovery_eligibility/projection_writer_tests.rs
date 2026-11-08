@@ -294,3 +294,6 @@ async fn projection_wrong_component_and_local_domain_cannot_claim_matrix_send() 
     }
     assert_eq!(state(&fixture).await, ("pending".into(), 0, 0));
 }
+
+#[path = "projection_race_tests.rs"]
+mod race_tests;

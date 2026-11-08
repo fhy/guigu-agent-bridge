@@ -13,6 +13,8 @@ use std::path::Path;
 #[cfg(test)]
 mod boundary_tests;
 mod lineage;
+#[cfg(test)]
+mod projection_tests;
 mod rebuild;
 #[cfg(test)]
 mod rebuild_tests;

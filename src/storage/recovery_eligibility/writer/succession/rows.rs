@@ -21,7 +21,6 @@ pub(super) async fn retire_leases(
 
 pub(super) async fn invocations_clear(c: &mut SqliteConnection) -> Result<(), sqlx::Error> {
     for query in [
-        "SELECT count(*) FROM projection_outbox WHERE state NOT IN ('sent','abandoned')",
         "SELECT count(*) FROM matrix_recovery_receipts WHERE state!='dispositioned'",
         "SELECT count(*) FROM sessions s WHERE s.state!='closed' AND NOT EXISTS(SELECT 1 FROM delivery_dispositions d WHERE d.session_id=s.session_id AND d.state='terminal')",
     ] {

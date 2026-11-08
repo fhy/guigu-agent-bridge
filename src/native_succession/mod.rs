@@ -1,6 +1,7 @@
 //! Restricted native succession before ordinary runtime admission.
 //! An ignored response may be completed atomically; uncertain work remains held.
 pub(crate) mod process;
+pub(crate) mod projections;
 pub(crate) mod state;
 use crate::{
     config::Config,

@@ -40,6 +40,7 @@ pub(crate) struct State {
     pub hold: Option<String>,
     pub batch: Option<Batch>,
     pub leases: Vec<(String, String, i64, String, String)>,
+    pub isolated_projections: Vec<super::projections::Projection>,
 }
 
 pub(crate) async fn read(connection: &mut SqliteConnection) -> Result<Option<State>> {
@@ -93,6 +94,10 @@ pub(crate) async fn read(connection: &mut SqliteConnection) -> Result<Option<Sta
         return Err(refuse("batch-binding"));
     }
     let leases=sqlx::query_as("SELECT component,owner_token,epoch,state,expires_at FROM matrix_component_leases ORDER BY component").fetch_all(&mut *connection).await?;
+    let isolated_projections = super::projections::read(connection).await?;
+    if !isolated_projections.is_empty() && (batch.is_some() || hold.is_some()) {
+        return Err(refuse("input-and-output-uncertainty"));
+    }
     let state = State {
         owner,
         native_generation: control.get("generation"),
@@ -102,6 +107,7 @@ pub(crate) async fn read(connection: &mut SqliteConnection) -> Result<Option<Sta
         hold,
         batch,
         leases,
+        isolated_projections,
     };
     for (_, lease_owner, _, status, _) in &state.leases {
         if lease_owner != &state.owner.token {
