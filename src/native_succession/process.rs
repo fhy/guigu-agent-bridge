@@ -7,11 +7,14 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{
     fs,
+    io::Read,
     os::unix::fs::MetadataExt,
+    os::unix::fs::OpenOptionsExt,
     path::{Path, PathBuf},
+    sync::Arc,
 };
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Physical {
     path: PathBuf,
     device: u64,
@@ -19,7 +22,22 @@ pub(crate) struct Physical {
     mode: u32,
     digest: Option<String>,
     config_change_time: Option<(i64, i64)>,
+    // Keeping the immutable config inode open prevents unlink/recreate from
+    // reusing it even on filesystems whose change-time resolution is coarse.
+    #[serde(skip)]
+    _config_handle: Option<Arc<fs::File>>,
 }
+impl PartialEq for Physical {
+    fn eq(&self, other: &Self) -> bool {
+        self.path == other.path
+            && self.device == other.device
+            && self.inode == other.inode
+            && self.mode == other.mode
+            && self.digest == other.digest
+            && self.config_change_time == other.config_change_time
+    }
+}
+impl Eq for Physical {}
 impl Physical {
     fn capture(path: &Path, hash: bool) -> Result<Self> {
         let meta = fs::symlink_metadata(path).map_err(|_| refuse("physical-identity"))?;
@@ -29,13 +47,25 @@ impl Physical {
         {
             return Err(refuse("physical-alias"));
         }
-        let digest = if hash {
-            Some(format!(
-                "{:x}",
-                Sha256::digest(fs::read(path).map_err(|_| refuse("config-read"))?)
-            ))
+        let (digest, handle) = if hash {
+            let mut file = fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_NOFOLLOW)
+                .open(path)
+                .map_err(|_| refuse("config-open"))?;
+            let opened = file.metadata().map_err(|_| refuse("config-metadata"))?;
+            if opened.dev() != meta.dev() || opened.ino() != meta.ino() || !opened.is_file() {
+                return Err(refuse("config-open-drift"));
+            }
+            let mut bytes = Vec::new();
+            file.read_to_end(&mut bytes)
+                .map_err(|_| refuse("config-read"))?;
+            (
+                Some(format!("{:x}", Sha256::digest(bytes))),
+                Some(Arc::new(file)),
+            )
         } else {
-            None
+            (None, None)
         };
         Ok(Self {
             path: path.into(),
@@ -44,6 +74,7 @@ impl Physical {
             mode: meta.mode(),
             digest,
             config_change_time: hash.then_some((meta.ctime(), meta.ctime_nsec())),
+            _config_handle: handle,
         })
     }
     fn verify(&self) -> Result<()> {
