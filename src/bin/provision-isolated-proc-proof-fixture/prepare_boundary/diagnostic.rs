@@ -37,6 +37,7 @@ fn canonical_cause(value: &str) -> Option<&'static str> {
             "binary-path",
             "path-identity",
             "admission-lock",
+            "maintenance-discovery",
             "unit-state",
             "runtime-process",
             "runtime-listener",
@@ -138,6 +139,7 @@ fn generic(stage: &str, cause: &str) -> bool {
                     | "binary-path"
                     | "path-identity"
                     | "admission-lock"
+                    | "maintenance-discovery"
                     | "unit-state"
                     | "runtime-process"
                     | "runtime-listener"

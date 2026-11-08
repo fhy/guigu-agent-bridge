@@ -860,6 +860,13 @@ pub async fn prepare_manifest(args: PrepareArgs) -> Result<(), Error> {
     }
     let sidecars = Sidecars::capture(&database)
         .map_err(|error| prepare_rejected("sqlite-open", "sidecar-auth", error))?;
+    // The CLI already holds the maintenance lock. Discovery must not preempt the
+    // command's publication/sidecar refusal contract by opening SQLite earlier.
+    crate::offline_production_migration::check_runtime_discovery(&database)
+        .map_err(|_| prepare_rejected("preflight", "maintenance-discovery", Error::Rejected))?;
+    sidecars
+        .revalidate(&database)
+        .map_err(|error| prepare_rejected("sqlite-open", "sidecar-revalidation", error))?;
     let mut c = SqliteConnection::connect_with(
         &SqliteConnectOptions::new()
             .filename(&database)

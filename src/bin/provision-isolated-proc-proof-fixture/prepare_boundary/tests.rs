@@ -179,6 +179,7 @@ fn fixed_generic_and_eligibility_aggregate_diagnostics_are_valid() {
     for diagnostic in [
         "stage=preflight cause=arguments counts=failures=1",
         "stage=preflight cause=binary-path counts=failures=1",
+        "stage=preflight cause=maintenance-discovery counts=failures=1",
         "stage=sqlite-open cause=sidecar-auth counts=failures=1",
         "stage=sqlite-close cause=sidecar-replacement-write counts=failures=1",
         "stage=sqlite-close cause=sidecar-replacement-mode counts=failures=1",
@@ -277,6 +278,8 @@ fn hostile_diagnostic_grammar_is_malformed_and_fail_closed() {
         "stage=preflight cause=root-path counts=failures=1 extra=planted",
         "stage=preflight cause=root-path counts=failures=2",
         "stage=preflight cause=root-path counts=failures=01",
+        "stage=publication cause=maintenance-discovery counts=failures=1",
+        "stage=preflight cause=maintenance-discovery counts=failures=2",
         "stage=eligibility cause=open-sessions counts=sessions=1,owners=2,continuations=1,children=0,leases=1,admissions=1,work=0",
         "stage=eligibility cause=open-sessions counts=owners=2,continuations=1,sessions=01,children=0,leases=1,admissions=1,work=0",
         "stage=eligibility cause=open-sessions counts=owners=2,continuations=1,sessions=1,children=0,leases=1,admissions=1,work=0,planted=1",

@@ -946,40 +946,7 @@ async fn preflight_diagnostic_process_exits_within_bound() {
 
 #[tokio::test]
 async fn publication_and_sqlite_open_diagnostics_are_fixed_and_invariant() {
-    use std::os::unix::fs::PermissionsExt;
-
-    let publication = Fixture::new().await;
-    std::fs::set_permissions(
-        &publication.manifest,
-        std::fs::Permissions::from_mode(0o644),
-    )
-    .unwrap();
-    let publication_tree = fixture_tree(&publication.root);
-    let output = publication
-        .prepare()
-        .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(3));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("stage=publication cause=manifest-target counts=failures=1"));
-    assert!(!stdout.contains(publication.root.to_str().unwrap()));
-    assert_eq!(fixture_tree(&publication.root), publication_tree);
-
-    let sqlite = Fixture::new().await;
-    let wal = PathBuf::from(format!("{}-wal", sqlite.db.to_string_lossy()));
-    std::fs::create_dir(&wal).unwrap();
-    let sqlite_tree = fixture_tree(&sqlite.root);
-    let output = sqlite
-        .prepare()
-        .env("T050_FIXTURE_MIGRATION_PREFLIGHT_DIAGNOSTIC", "1")
-        .output()
-        .unwrap();
-    assert_eq!(output.status.code(), Some(3));
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("stage=sqlite-open cause=sidecar-auth counts=failures=1"));
-    assert!(!stdout.contains(sqlite.root.to_str().unwrap()));
-    assert_eq!(fixture_tree(&sqlite.root), sqlite_tree);
+    refusals::publication_and_sqlite_open().await;
 }
 
 #[tokio::test]
@@ -1647,38 +1614,8 @@ async fn crash_before_commit_rolls_back_and_retry_succeeds() {
 
 #[tokio::test]
 async fn hostile_targets_and_live_interlock_fail_closed() {
-    use std::os::unix::fs::PermissionsExt;
-    let f = Fixture::new().await;
-    let before = durable_rows(&f.db).await;
-    let guard =
-        guigu_agent_bridge::runtime_admission::Guard::acquire(&f.db, &f.config, "startup").unwrap();
-    assert_eq!(f.run().output().unwrap().status.code(), Some(3));
-    assert_eq!(durable_rows(&f.db).await, before);
-    drop(guard);
-    std::fs::write(&f.evidence, b"hostile").unwrap();
-    std::fs::set_permissions(&f.evidence, std::fs::Permissions::from_mode(0o644)).unwrap();
-    assert_eq!(f.run().output().unwrap().status.code(), Some(3));
-    assert_eq!(durable_rows(&f.db).await, before);
-    let f = Fixture::new().await;
-    std::fs::remove_file(&f.manifest).unwrap();
-    let outside = f.root.join("outside");
-    std::fs::write(&outside, b"unchanged").unwrap();
-    std::os::unix::fs::symlink(&outside, &f.manifest).unwrap();
-    let before = durable_rows(&f.db).await;
-    assert_eq!(f.prepare().output().unwrap().status.code(), Some(3));
-    assert_eq!(std::fs::read(&outside).unwrap(), b"unchanged");
-    assert_eq!(durable_rows(&f.db).await, before);
-    let f = Fixture::new().await;
-    std::fs::remove_file(&f.manifest).unwrap();
-    for suffix in ["-wal", "-shm"] {
-        let _ = std::fs::remove_file(format!("{}{suffix}", f.db.to_string_lossy()));
-    }
-    let outside = f.root.join("outside");
-    std::fs::write(&outside, b"unchanged").unwrap();
-    let before = durable_rows(&f.db).await;
-    std::os::unix::fs::symlink(&outside, format!("{}-wal", f.db.to_string_lossy())).unwrap();
-    assert_eq!(f.prepare().output().unwrap().status.code(), Some(3));
-    assert_eq!(std::fs::read(&outside).unwrap(), b"unchanged");
-    std::fs::remove_file(format!("{}-wal", f.db.to_string_lossy())).unwrap();
-    assert_eq!(durable_rows(&f.db).await, before);
+    refusals::hostile_targets_and_live_interlock().await;
 }
+
+#[path = "support/t050_migration_refusals.rs"]
+mod refusals;

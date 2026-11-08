@@ -41,7 +41,12 @@ pub(crate) fn acquire(args: &[OsString]) -> Result<Option<RuntimeLock>, Failure>
         return Ok(None);
     }
     let canonical = std::fs::canonicalize(database).map_err(|_| Failure::Preflight)?;
-    acquire_runtime_lock(&canonical)
-        .map(Some)
-        .map_err(|_| Failure::Busy)
+    let lock = if command == "prepare-isolated-legacy-fixture-migration-manifest" {
+        // Keep exclusion before admission, but let prepare authenticate publication
+        // targets and sidecars before discovery performs its first SQLite read.
+        RuntimeLock::acquire(&canonical)
+    } else {
+        acquire_runtime_lock(&canonical)
+    };
+    lock.map(Some).map_err(|_| Failure::Busy)
 }
