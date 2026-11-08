@@ -152,7 +152,7 @@ pub(super) async fn retire_owner(
     let mutation = lineage::prepare(c, s, &id).await?;
     let id = evidence_id(c, &owner.token, owner.revision).await?;
     let previous = lineage::prepare(c, s, &id).await?;
-    let changed=sqlx::query("UPDATE runtime_owner_evidence SET is_current=0 WHERE instance_token=? AND runtime_generation=? AND evidence_revision=? AND is_current=1 AND state IN ('live','scan_pending') AND process_fingerprint=? AND barrier_state!='closed_joined'")
+    let changed=sqlx::query("UPDATE runtime_owner_evidence SET is_current=0 WHERE instance_token=? AND runtime_generation=? AND evidence_revision=? AND is_current=1 AND state IN ('live','scan_pending','unknown') AND process_fingerprint=? AND barrier_state!='closed_joined'")
         .bind(&owner.token).bind(owner.generation).bind(owner.revision).bind(&owner.fingerprint).execute(&mut *c).await?;
     if changed.rows_affected() != 1 {
         return Err(refused());
@@ -165,7 +165,7 @@ pub(super) async fn retire_owner(
         .bind(next).bind(record).bind(&owner.token).bind(owner.revision).execute(&mut *c).await?;
     let id = evidence_id(c, &owner.token, next).await?;
     lineage::inserted(c, s, &id).await?;
-    let changed=sqlx::query("UPDATE runtime_instances SET state='stopped',heartbeat_at=? WHERE instance_token=? AND state IN ('active','stopping') AND process_fingerprint=?")
+    let changed=sqlx::query("UPDATE runtime_instances SET state='stopped',heartbeat_at=? WHERE instance_token=? AND state IN ('active','stopping','stopped') AND process_fingerprint=?")
         .bind(now).bind(&owner.token).bind(&owner.fingerprint).execute(&mut *c).await?;
     if changed.rows_affected() != 1 {
         return Err(refused());

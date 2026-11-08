@@ -14,6 +14,10 @@ pub(crate) struct Fixture {
     pub payloads: Vec<(String, Value)>,
 }
 pub(crate) async fn fixture(batch: bool) -> Fixture {
+    fixture_with_options(batch, true).await
+}
+
+async fn fixture_with_options(batch: bool, stop: bool) -> Fixture {
     let root = tempfile::Builder::new()
         .prefix("r105-succession-")
         .tempdir_in("/tmp")
@@ -60,7 +64,9 @@ pub(crate) async fn fixture(batch: bool) -> Fixture {
         .await
         .unwrap();
     prior_batch(&store, epoch, &at).await;
-    assert!(reliability.stopping_runtime("owner", &at).await.unwrap());
+    if stop {
+        assert!(reliability.stopping_runtime("owner", &at).await.unwrap());
+    }
     let payloads = vec![(
         "!room:example.test".into(),
         json!({"type":"m.room.message","event_id":"$notice:example.test","sender":"@alice:example.test","origin_server_ts":1,"content":{"msgtype":"m.notice","body":"fixture notice"}}),
@@ -135,6 +141,35 @@ async fn unchanged(f: &Fixture, state: &State) {
         .await
         .unwrap();
     assert_eq!(count, 0);
+}
+
+async fn unknown_owner_fixture(stopped: bool) -> Fixture {
+    let f = fixture_with_options(false, false).await;
+    let context = bootstrap_nonadmin(&f.pool, true).await.unwrap();
+    let scope = RecoveryScope::new(context, EffectDomain::Local, None);
+    let reliability = ReliabilityStore::with_recovery(f.pool.clone(), scope);
+    let mut invalid = RuntimeOwnerEvidence::capture().unwrap();
+    invalid.boot_id.push_str("-unknown-fixture");
+    assert!(
+        !reliability
+            .publish_owner_heartbeat(
+                "owner",
+                &RuntimeOwnerEvidence::fingerprint().unwrap(),
+                &chrono::Utc::now().to_rfc3339(),
+                &invalid,
+            )
+            .await
+            .unwrap()
+    );
+    if stopped {
+        assert!(
+            reliability
+                .stop_runtime("owner", &chrono::Utc::now().to_rfc3339())
+                .await
+                .unwrap()
+        );
+    }
+    f
 }
 
 #[tokio::test]
@@ -336,5 +371,54 @@ async fn idle_native_owner_can_succeed_without_changing_checkpoint() {
             .await
             .unwrap()
     );
+    f.pool.close().await;
+}
+
+#[tokio::test]
+async fn unknown_owner_evidence_uses_native_exclusion_for_active_and_recovered_rows() {
+    for stopped in [false, true] {
+        let f = unknown_owner_fixture(stopped).await;
+        let (state, proof) = input(&f).await;
+        assert_eq!(state.owner.revision, 2);
+        publish(&f.pool, &state, &proof, &[], || Ok(()))
+            .await
+            .unwrap();
+        assert!(
+            confirmed(&f.root.path().join("state.db"), &state, &proof)
+                .await
+                .unwrap(),
+            "stopped={stopped}"
+        );
+        let evidence: (String, String, i64) = sqlx::query_as(
+            "SELECT state,barrier_state,evidence_revision FROM runtime_owner_evidence WHERE instance_token='owner' AND is_current=1",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(evidence, ("observing".into(), "open".into(), 3));
+        let history: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM runtime_owner_evidence WHERE instance_token='owner' AND state IN ('joined','reaped')",
+        )
+        .fetch_one(&f.pool)
+        .await
+        .unwrap();
+        assert_eq!(history, 0);
+        f.pool.close().await;
+    }
+}
+
+#[tokio::test]
+async fn unknown_owner_with_closed_join_barrier_is_refused_before_publication() {
+    let f = unknown_owner_fixture(true).await;
+    sqlx::query(
+        "UPDATE runtime_owner_evidence SET barrier_state='closed_joined' WHERE instance_token='owner' AND is_current=1",
+    )
+    .execute(&f.pool)
+    .await
+    .unwrap();
+    let mut c = f.pool.acquire().await.unwrap();
+    let error = state::read(&mut c).await.unwrap_err().to_string();
+    assert!(error.contains("native-succession/owner-identity"));
+    drop(c);
     f.pool.close().await;
 }

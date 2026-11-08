@@ -45,7 +45,11 @@ pub(crate) struct State {
 }
 
 pub(crate) async fn read(connection: &mut SqliteConnection) -> Result<Option<State>> {
-    let rows = sqlx::query("SELECT e.*,r.process_fingerprint AS runtime_fingerprint FROM runtime_instances r JOIN runtime_owner_evidence e USING(instance_token) WHERE r.state IN ('active','stopping') AND e.is_current=1")
+    // A runtime row may have been durably stopped by the supported
+    // recover-runtime command before native succession gets a chance to run.
+    // Keep that row on the same native path; process::capture still has to
+    // establish exact identity and current resource exclusion before publish.
+    let rows = sqlx::query("SELECT e.*,r.process_fingerprint AS runtime_fingerprint FROM runtime_instances r JOIN runtime_owner_evidence e USING(instance_token) WHERE r.state IN ('active','stopping','stopped') AND e.is_current=1")
         .fetch_all(&mut *connection).await?;
     if rows.is_empty() {
         return Ok(None);
@@ -55,7 +59,14 @@ pub(crate) async fn read(connection: &mut SqliteConnection) -> Result<Option<Sta
     }
     let row = &rows[0];
     if row.get::<String, _>("process_fingerprint") != row.get::<String, _>("runtime_fingerprint")
-        || !matches!(row.get::<&str, _>("state"), "live" | "scan_pending")
+        || row.get::<&str, _>("barrier_state") == "closed_joined"
+        || !matches!(
+            (
+                row.get::<&str, _>("state"),
+                row.get::<&str, _>("barrier_state")
+            ),
+            ("live" | "scan_pending", _) | ("unknown", "open")
+        )
     {
         return Err(refuse("owner-identity"));
     }
