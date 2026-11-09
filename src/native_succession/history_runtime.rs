@@ -1,4 +1,6 @@
 //! Disposable loopback runtime and separately scoped producer process.
+#[path = "history_effects_tests.rs"]
+mod effects;
 use super::history_fixture;
 use crate::{
     app::AppRuntime,
@@ -223,6 +225,9 @@ async fn mixed_history_real_startup_and_three_clean_cycles() {
         .await
         .unwrap();
         runtime.shutdown().await.unwrap();
+        if cycle == 0 {
+            effects::refuse_completed_history_effects(&server, &pool).await;
+        }
         assert_eq!(history_fixture::notices(&pool).await, before);
         assert_eq!(
             sqlx::query_scalar::<_, i64>("SELECT count(*) FROM tasks")

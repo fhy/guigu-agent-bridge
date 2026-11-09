@@ -77,6 +77,11 @@ pub(crate) async fn read(connection: &mut SqliteConnection) -> Result<Option<Sta
         }
     }
     if candidates.is_empty() {
+        // No publisher will check effects on this path. A single owner's
+        // succession must instead fence leases and close pre-accept work first.
+        if !crate::storage::owner_restart::guards::work_clear(connection).await? {
+            return Err(refuse("history-unresolved-effect"));
+        }
         return Ok(None);
     }
     if candidates.len() != 1 {
