@@ -2,6 +2,8 @@
 
 #[path = "sync_owner.rs"]
 mod owner;
+#[path = "sync_rebuild.rs"]
+mod rebuild;
 #[path = "sync_shutdown.rs"]
 mod shutdown;
 use owner::classify_sdk_error;
@@ -140,6 +142,7 @@ pub struct MatrixSync {
     missing_key_observer: Option<Arc<dyn MissingRoomKeyObserver>>,
     recovery: Option<RecoveryBinding>,
     initial_response: Mutex<Option<matrix_sdk::sync::SyncResponse>>,
+    rebuild_started: AtomicBool,
     initial_token: Mutex<Option<String>>,
     in_flight: AtomicBool,
     processing: AtomicBool,
@@ -188,6 +191,7 @@ impl MatrixSync {
             missing_key_observer: None,
             recovery: None,
             initial_response: Mutex::new(None),
+            rebuild_started: AtomicBool::new(false),
             initial_token: Mutex::new(None),
             in_flight: AtomicBool::new(false),
             processing: AtomicBool::new(false),

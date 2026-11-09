@@ -156,3 +156,115 @@ async fn succession_gap_sdk_pagination_proves_overlap_and_refuses_missing_or_cha
         f.pool.close().await;
     }
 }
+
+#[tokio::test]
+async fn gap_predicates_and_exact_readonly_retry_do_not_disclose_inputs() {
+    for (mode, expected) in [
+        ("anchor", "anchor-absent"),
+        ("cursor", "cursor-absent"),
+        ("shape", "page-start-mismatch"),
+        ("end", "page-end-absent"),
+        ("repeat", "cursor-repeat"),
+        ("transport", "page-transport"),
+        ("digest", "anchor-digest-mismatch"),
+        ("duplicate", "event-duplicate"),
+    ] {
+        let server = MockServer::start().await;
+        let client = client(&server).await;
+        let mut response = client
+            .inner
+            .sync_once(SyncSettings::default())
+            .await
+            .unwrap();
+        let f =
+            crate::storage::recovery_eligibility::writer::succession::tests::fixture(false).await;
+        if mode != "anchor" {
+            sqlx::query("INSERT INTO matrix_recovery_receipts(account_id,room_id,event_id,cutover_operation_id,payload_digest,state,batch_id,created_at,updated_at) VALUES('@bridge:example.test','!room:example.test','$anchor',?,?,'dispositioned','prior','t','t')")
+                .bind(&f.operation).bind(&anchor().digest).execute(&f.pool).await.unwrap();
+        }
+        if mode == "cursor" {
+            response
+                .rooms
+                .joined
+                .values_mut()
+                .next()
+                .unwrap()
+                .timeline
+                .prev_batch = None;
+        }
+        predicate_page(&server, mode).await;
+        for _ in 0..2 {
+            let failure = fill(&client, &f.pool, &f.operation, &mut response)
+                .await
+                .unwrap_err();
+            assert_eq!(failure.reason, expected, "{mode}");
+            let capture = crate::test_diagnostics::Capture::default();
+            tracing::subscriber::with_default(capture.subscriber(), || failure.report());
+            let output = capture.output();
+            assert!(output.contains(expected));
+            for private in [
+                "$anchor", "$last", "page-1", "secret-", "@bridge", "!room", "SELECT",
+            ] {
+                assert!(!output.contains(private), "{private}");
+            }
+        }
+        let watermark: String = sqlx::query_scalar("SELECT watermark FROM matrix_recovery_control")
+            .fetch_one(&f.pool)
+            .await
+            .unwrap();
+        assert_eq!(watermark, "B");
+        f.pool.close().await;
+    }
+}
+
+#[test]
+fn gap_event_size_identity_and_limit_fail_closed_with_distinct_predicates() {
+    let missing = TimelineEvent::from_plaintext(
+        serde_json::from_value(json!({"type":"m.room.message","content":{}})).unwrap(),
+    );
+    assert_eq!(
+        validate_events(&[missing]).unwrap_err().reason,
+        "event-id-absent"
+    );
+    let mut huge = value("$large");
+    huge["content"]["body"] = "x".repeat(16 * 1024 * 1024).into();
+    let huge = TimelineEvent::from_plaintext(serde_json::from_value(huge).unwrap());
+    assert_eq!(validate_events(&[huge]).unwrap_err().reason, "byte-limit");
+    let mut events = vec![event("$existing"); 1600];
+    assert_eq!(
+        append_page(&anchor(), &mut events, vec![event("$extra")])
+            .unwrap_err()
+            .reason,
+        "event-limit"
+    );
+}
+
+async fn predicate_page(server: &MockServer, mode: &str) {
+    let mut raw = value("$anchor");
+    if mode == "digest" {
+        raw["content"]["body"] = "secret-changed".into();
+    }
+    let chunk = match mode {
+        "end" | "repeat" => vec![],
+        "duplicate" => vec![value("$last"), raw],
+        _ => vec![raw],
+    };
+    let mut body = json!({"start":"page-1","chunk":chunk});
+    if mode == "shape" {
+        body["start"] = "secret-other-cursor".into();
+    }
+    if mode == "repeat" {
+        body["end"] = "page-1".into();
+    }
+    let reply = if mode == "transport" {
+        ResponseTemplate::new(403)
+            .set_body_json(json!({"errcode":"M_FORBIDDEN","error":"secret-server-error"}))
+    } else {
+        ResponseTemplate::new(200).set_body_json(body)
+    };
+    Mock::given(method("GET"))
+        .and(path_regex("/_matrix/client/.*/rooms/.*/messages"))
+        .respond_with(reply)
+        .mount(server)
+        .await;
+}

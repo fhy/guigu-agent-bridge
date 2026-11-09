@@ -26,13 +26,24 @@ async fn begin<'pool>(
         return Err(refused());
     }
     let operation = context.matrix_operation().ok_or_else(refused)?;
-    let valid: i64 = sqlx::query_scalar("SELECT count(*) FROM matrix_recovery_control c JOIN matrix_recovery_compatibility k ON k.native_operation_id=c.cutover_operation_id WHERE c.control_id=1 AND c.cutover_operation_id=? AND c.phase='refused' AND c.restart_hold_state='refused' AND c.restart_hold_reason='invalid-or-unrecoverable-response' AND c.watermark IS NOT NULL AND length(c.watermark)>0 AND k.decision='native' AND EXISTS(SELECT 1 FROM matrix_recovery_receipts r WHERE r.cutover_operation_id=c.cutover_operation_id AND r.state='refused')")
-        .bind(operation).fetch_one(&mut *transaction).await?;
-    if valid != 1 {
-        return Err(refused());
-    }
+    let reason: Option<String> = sqlx::query_scalar("SELECT c.restart_hold_reason FROM matrix_recovery_control c JOIN matrix_recovery_compatibility k ON k.native_operation_id=c.cutover_operation_id WHERE c.control_id=1 AND c.cutover_operation_id=? AND c.phase='refused' AND c.restart_hold_state='refused' AND c.watermark IS NOT NULL AND length(c.watermark)>0 AND k.decision='native'")
+        .bind(operation).fetch_optional(&mut *transaction).await?;
     validate_native_refusal(&mut transaction, &context).await?;
-    validate_refused_receipt(&mut transaction, scope).await?;
+    match reason.as_deref() {
+        Some("invalid-or-unrecoverable-response") => {
+            validate_refused_receipt(&mut transaction, scope).await?;
+        }
+        Some("rebuild-history-gap") => {
+            // Rebuild never admits a response. Only a fully dispositioned old
+            // stream qualifies for teardown; this does not grant effect authority.
+            let unfinished: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM matrix_recovery_receipts WHERE state!='dispositioned') + (SELECT count(*) FROM matrix_recovery_batches WHERE state!='terminal')")
+                .fetch_one(&mut *transaction).await?;
+            if unfinished != 0 || scope.matrix_fence.get().is_none() {
+                return Err(refused());
+            }
+        }
+        _ => return Err(refused()),
+    }
     validate_component_fences(&mut transaction, scope).await?;
     Ok(ScopedTransaction::new(
         transaction,
