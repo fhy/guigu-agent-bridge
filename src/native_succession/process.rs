@@ -1,4 +1,12 @@
 use super::state::{Owner, Result, refuse};
+#[path = "process_boot.rs"]
+pub(super) mod boot;
+#[path = "process_cross_boot.rs"]
+mod cross_boot;
+use boot::BootObservation;
+#[cfg(test)]
+#[path = "process_cross_tests.rs"]
+mod cross_tests;
 #[cfg(test)]
 #[path = "process_tests.rs"]
 mod tests;
@@ -95,11 +103,17 @@ pub(crate) struct Exclusion {
     pub device: String,
     physical: Vec<Physical>,
     pub inventory_digest: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot: Option<BootObservation>,
     pub rebuild: Option<crate::matrix::rebuild_gap::Rebuild>,
     pub unrouted: Vec<String>,
 }
 
 pub(crate) fn capture(owner: &Owner, config: &Config, path: &Path) -> Result<Exclusion> {
+    capture_at(Path::new("/proc"), owner, config, path)
+}
+
+fn capture_at(proc_root: &Path, owner: &Owner, config: &Config, path: &Path) -> Result<Exclusion> {
     let store = config
         .transports
         .matrix
@@ -134,8 +148,8 @@ pub(crate) fn capture(owner: &Owner, config: &Config, path: &Path) -> Result<Exc
             }
         }
     }
-    let digest = inspect(
-        Path::new("/proc"),
+    let (boot, digest) = inspect(
+        proc_root,
         owner,
         &roots,
         &private_roots,
@@ -143,7 +157,7 @@ pub(crate) fn capture(owner: &Owner, config: &Config, path: &Path) -> Result<Exc
         std::process::id(),
     )?;
     Ok(Exclusion {
-        kind: "current-scoped-exclusion-v1".into(),
+        kind: "current-scoped-exclusion-v2".into(),
         owner: owner.clone(),
         observed_at: chrono::Utc::now().to_rfc3339(),
         observer_pid: std::process::id(),
@@ -151,6 +165,7 @@ pub(crate) fn capture(owner: &Owner, config: &Config, path: &Path) -> Result<Exc
         device: config.transports.matrix.device_id.clone(),
         physical,
         inventory_digest: digest,
+        boot: Some(boot),
         rebuild: None,
         unrouted: Vec::new(),
     })
@@ -167,15 +182,23 @@ impl Exclusion {
             device: "BRIDGE".into(),
             physical: Vec::new(),
             inventory_digest: "modeled-resource-proof".into(),
+            boot: None,
             rebuild: None,
             unrouted: Vec::new(),
         }
     }
     pub(crate) fn revalidate(&self, config: &Config, path: &Path) -> Result<()> {
+        self.revalidate_at(Path::new("/proc"), config, path)
+    }
+
+    fn revalidate_at(&self, proc_root: &Path, config: &Config, path: &Path) -> Result<()> {
         for binding in &self.physical {
             binding.verify()?;
         }
-        let current = capture(&self.owner, config, path)?;
+        let current = capture_at(proc_root, &self.owner, config, path)?;
+        if current.boot != self.boot || current.kind != self.kind {
+            return Err(refuse("boot-proof-drift"));
+        }
         if current.account != self.account
             || current.device != self.device
             || current.physical != self.physical
@@ -186,25 +209,8 @@ impl Exclusion {
     }
 }
 
-fn owner_absent(proc_root: &Path, owner: &Owner) -> Result<()> {
-    if owner.pid <= 0
-        || owner.starttime <= 0
-        || owner.boot.is_empty()
-        || owner.fingerprint.is_empty()
-    {
-        return Err(refuse("owner-identity"));
-    }
-    let boot = fs::read_to_string(proc_root.join("sys/kernel/random/boot_id"))
-        .map_err(|_| refuse("boot-unavailable"))?;
-    if boot.trim() != owner.boot {
-        return Err(refuse("boot-changed"));
-    }
-    match fs::symlink_metadata(proc_root.join(owner.pid.to_string())) {
-        Ok(_) => return Err(refuse("live-or-reused-owner-pid")),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (),
-        Err(_) => return Err(refuse("owner-unreadable")),
-    }
-    Ok(())
+fn owner_absent(proc_root: &Path, owner: &Owner) -> Result<BootObservation> {
+    BootObservation::capture(proc_root, owner)
 }
 
 fn inspect(
@@ -214,8 +220,8 @@ fn inspect(
     private_roots: &[PathBuf],
     device: &str,
     self_pid: u32,
-) -> Result<String> {
-    owner_absent(proc_root, owner)?;
+) -> Result<(BootObservation, String)> {
+    let observation = owner_absent(proc_root, owner)?;
     let domain = owner
         .fingerprint
         .split_once(";cgroup:")
@@ -242,7 +248,15 @@ fn inspect(
         if meta.uid() != unsafe { libc::geteuid() } {
             continue;
         }
-        match inspect_one(&path, owner, roots, private_roots, device, domain) {
+        match inspect_one(
+            &path,
+            owner,
+            roots,
+            private_roots,
+            device,
+            domain,
+            observation.different_boot(),
+        ) {
             Ok(Some(start)) => scanned.push((pid, start)),
             Ok(None) => (),
             Err(e) if !path.exists() => {
@@ -255,9 +269,13 @@ fn inspect(
         }
     }
     scanned.sort();
-    Ok(format!(
-        "{:x}",
-        Sha256::digest(serde_json::to_vec(&scanned).map_err(|_| refuse("process-encoding"))?)
+    observation.revalidate(proc_root, owner)?;
+    Ok((
+        observation,
+        format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(&scanned).map_err(|_| refuse("process-encoding"))?)
+        ),
     ))
 }
 
@@ -268,6 +286,7 @@ fn inspect_one(
     private_roots: &[PathBuf],
     device: &str,
     domain: &str,
+    different_boot: bool,
 ) -> Result<Option<i64>> {
     let stat = fs::read_to_string(path.join("stat")).map_err(|_| refuse("process-stat"))?;
     let fields = stat
@@ -281,6 +300,11 @@ fn inspect_one(
         .ok_or_else(|| refuse("process-start"))?
         .parse()
         .map_err(|_| refuse("process-start"))?;
+    if different_boot {
+        cross_boot::inspect(path, private_roots, device, domain)?;
+        stable_start(path, start)?;
+        return Ok(Some(start));
+    }
     // It cannot be a spawned descendant, but accessible selectors can still
     // reveal a competitor. Unrelated older processes need no universal census.
     if start < owner.starttime {
@@ -323,14 +347,19 @@ fn inspect_one(
             return Err(refuse("related-open-resource"));
         }
     }
+    stable_start(path, start)?;
+    Ok(Some(start))
+}
+
+fn stable_start(path: &Path, start: i64) -> Result<()> {
     let after = fs::read_to_string(path.join("stat")).map_err(|_| refuse("process-raced"))?;
     let next = after
         .rsplit_once(") ")
         .and_then(|(_, s)| s.split_whitespace().nth(19));
-    if next != Some(start.to_string().as_str()) {
+    if start <= 0 || next != Some(start.to_string().as_str()) {
         return Err(refuse("process-raced"));
     }
-    Ok(Some(start))
+    Ok(())
 }
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty() && haystack.windows(needle.len()).any(|x| x == needle)

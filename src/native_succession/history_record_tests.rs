@@ -2,6 +2,39 @@ use super::*;
 use serde_json::json;
 use sqlx::Connection;
 
+#[test]
+fn new_boot_proof_records_require_consistent_observation_without_rewriting_owner() {
+    let owner = Owner {
+        token: "old".into(),
+        generation: 1,
+        revision: 38,
+        pid: 10,
+        starttime: 9000000000,
+        boot: "11111111-1111-4111-8111-111111111111".into(),
+        fingerprint: "old-identity".into(),
+    };
+    let mut record = json!({"kind":"current-scoped-exclusion-v2", "owner":owner,
+        "boot":{"current":"22222222-2222-4222-8222-222222222222", "absence":"different-boot"}});
+    assert!(
+        serde_json::from_value::<Exclusion>(record.clone())
+            .unwrap()
+            .valid()
+    );
+    for boot in [
+        json!(null),
+        json!({"current":"bad","absence":"different-boot"}),
+        json!({"current":"22222222-2222-4222-8222-222222222222","absence":"same-boot-pid-absent"}),
+    ] {
+        record["boot"] = boot;
+        assert!(
+            !serde_json::from_value::<Exclusion>(record.clone())
+                .unwrap()
+                .valid()
+        );
+    }
+    assert_eq!(record["owner"], json!(owner));
+}
+
 #[tokio::test]
 async fn historical_optional_fields_are_not_new_recovery_requirements() {
     let mut c = SqliteConnection::connect("sqlite::memory:").await.unwrap();

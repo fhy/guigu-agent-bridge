@@ -1,31 +1,35 @@
 use super::*;
 use std::os::unix::fs::symlink;
 
-fn owner() -> Owner {
+pub(super) fn owner() -> Owner {
     Owner {
         token: "old".into(),
         generation: 1,
         revision: 2,
         pid: 10,
         starttime: 100,
-        boot: "boot".into(),
+        boot: "11111111-1111-4111-8111-111111111111".into(),
         fingerprint: "pid:10;exe:1:2:3:4:5;cgroup:0::/observer".into(),
     }
 }
-fn stat(start: i64) -> String {
+pub(super) fn stat(start: i64) -> String {
     let mut fields = vec!["0".to_owned(); 20];
     fields[0] = "S".into();
     fields[1] = "1".into();
     fields[19] = start.to_string();
     format!("20 (fixture) {}", fields.join(" "))
 }
-fn fixture() -> tempfile::TempDir {
+pub(super) fn fixture() -> tempfile::TempDir {
     let root = tempfile::Builder::new()
         .prefix("r105-proc-")
         .tempdir_in("/tmp")
         .unwrap();
     fs::create_dir_all(root.path().join("sys/kernel/random")).unwrap();
-    fs::write(root.path().join("sys/kernel/random/boot_id"), "boot").unwrap();
+    fs::write(
+        root.path().join("sys/kernel/random/boot_id"),
+        "11111111-1111-4111-8111-111111111111",
+    )
+    .unwrap();
     let p = root.path().join("20");
     fs::create_dir(&p).unwrap();
     fs::write(p.join("stat"), stat(110)).unwrap();
@@ -54,7 +58,7 @@ fn native_succession_refuses_live_reused_pid_and_unknown_boot() {
     fs::create_dir(root.path().join("10")).unwrap();
     assert!(inspect(root.path(), &old, &[], &[], "DEVICE", 99).is_err());
     fs::remove_dir(root.path().join("10")).unwrap();
-    old.boot = "other".into();
+    old.boot = "malformed".into();
     assert!(inspect(root.path(), &old, &[], &[], "DEVICE", 99).is_err());
     old = owner();
     old.starttime = 0;

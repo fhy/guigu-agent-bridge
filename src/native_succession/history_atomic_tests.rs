@@ -16,6 +16,7 @@ fn mixed_history_crash_before_and_after_commit() {
         let template = tempfile::tempdir().unwrap();
         let database = template.path().join("state.db");
         let pool = fixture::seed(&database).await;
+        super::history_boot_tests::previous_boot(&pool).await;
         let before = fixture::snapshot(&pool).await;
         let notices = fixture::notices(&pool).await;
         let mut c = pool.acquire().await.unwrap();
@@ -60,7 +61,7 @@ async fn crash_child(root: &Path) {
     let mut c = pool.acquire().await.unwrap();
     let state = state::read(&mut c).await.unwrap().unwrap();
     drop(c);
-    let proof = Exclusion::modeled(state.owner.clone());
+    let proof = super::history_boot_tests::modeled_proof(state.owner.clone());
     std::fs::write(root.join("proof.json"), serde_json::to_vec(&proof).unwrap()).unwrap();
     let calls = std::cell::Cell::new(0);
     publish(&pool, &state, &proof, &[], || {

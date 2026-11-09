@@ -38,6 +38,19 @@ struct Source {
 struct Exclusion {
     kind: String,
     owner: Owner,
+    #[serde(default)]
+    boot: Option<super::process::boot::BootObservation>,
+}
+impl Exclusion {
+    fn valid(&self) -> bool {
+        match self.kind.as_str() {
+            "current-scoped-exclusion-v1" => self.boot.is_none(),
+            "current-scoped-exclusion-v2" => {
+                self.boot.as_ref().is_some_and(|b| b.valid_for(&self.owner))
+            }
+            _ => false,
+        }
+    }
 }
 
 pub(super) async fn completed(
@@ -116,7 +129,7 @@ fn succeeded(
         || record.historical_joined
         || record.source.owner != previous
         || record.exclusion.owner != previous
-        || record.exclusion.kind != "current-scoped-exclusion-v1"
+        || !record.exclusion.valid()
         || record.source.native_generation != generation
         || record.source.operation != operation
         || record.source.revision < 0

@@ -4,6 +4,8 @@ mod history;
 #[cfg(test)]
 mod history_atomic_tests;
 #[cfg(test)]
+mod history_boot_tests;
+#[cfg(test)]
 mod history_fixture;
 #[cfg(all(test, feature = "test-support"))]
 mod history_runtime;

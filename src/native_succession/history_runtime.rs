@@ -187,6 +187,16 @@ async fn seed_device(fixture: &Fixture, server: &MockServer) {
 #[tokio::test]
 #[ignore = "requires private user systemd scope; run explicitly for R114 runtime acceptance"]
 async fn mixed_history_real_startup_and_three_clean_cycles() {
+    run_mixed_history(false).await;
+}
+
+#[tokio::test]
+#[ignore = "requires private user systemd scope; run explicitly for R115"]
+async fn previous_boot_mixed_history_real_startup_and_restart() {
+    run_mixed_history(true).await;
+}
+
+async fn run_mixed_history(previous_boot: bool) {
     let f = Fixture::new();
     let server = MockServer::start().await;
     mount_server(&server).await;
@@ -194,6 +204,9 @@ async fn mixed_history_real_startup_and_three_clean_cycles() {
     let pool = crate::storage::connect(f.root.path().join("state.db"))
         .await
         .unwrap();
+    if previous_boot {
+        super::history_boot_tests::previous_boot(&pool).await;
+    }
     let before = history_fixture::notices(&pool).await;
     assert_eq!(before.len(), 5);
     refuses_history_drift(&f, &server, &pool).await;
@@ -225,6 +238,9 @@ async fn mixed_history_real_startup_and_three_clean_cycles() {
         .await
         .unwrap();
         runtime.shutdown().await.unwrap();
+        if previous_boot {
+            super::history_boot_tests::check_record(&pool).await;
+        }
         if cycle == 0 {
             effects::refuse_completed_history_effects(&server, &pool).await;
         }

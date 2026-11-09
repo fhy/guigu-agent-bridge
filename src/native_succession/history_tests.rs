@@ -87,10 +87,11 @@ async fn history_corruption_and_competitors_refuse_without_writes() {
 async fn mixed_history_cas_and_late_failure_roll_back_all_publication() {
     let root = tempfile::tempdir().unwrap();
     let pool = fixture::seed(&root.path().join("state.db")).await;
+    super::history_boot_tests::previous_boot(&pool).await;
     let mut c = pool.acquire().await.unwrap();
     let s = state::read(&mut c).await.unwrap().unwrap();
     drop(c);
-    let proof = Exclusion::modeled(s.owner.clone());
+    let proof = super::history_boot_tests::modeled_proof(s.owner.clone());
     let before = fixture::snapshot(&pool).await;
     let cancel = tokio::sync::Notify::new();
     let cancelled = tokio::select! {
