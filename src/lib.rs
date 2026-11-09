@@ -438,6 +438,21 @@ pub async fn run() -> Result<(), Error> {
     if args.next().as_deref().and_then(|v| v.to_str()) == Some("recover-runtime") {
         let mut cli = vec![std::ffi::OsString::from("recover-runtime")];
         cli.extend(args);
+        if cli
+            .iter()
+            .any(|arg| arg == "--stop-metadata-archive" || arg == "--config")
+        {
+            let (path, archive) = native_succession::stop_recovery::parse(&cli)
+                .map_err(|_| app::AppError::Assembly("invalid native stop recovery arguments"))?;
+            let config = config::load(&path)?;
+            native_succession::stop_recovery::recover(&config, &path, &archive).await
+                .map_err(|error| {
+                    tracing::error!(phase="recover-runtime", reason=%error, "native stop metadata recovery refused");
+                    app::AppError::Runtime
+                })?;
+            println!("recover-runtime result=native-stop-confirmed");
+            return Ok(());
+        }
         let (database, token, fingerprint) = offline_recovery::parse_cli_args(&cli)
             .map_err(|_| app::AppError::Assembly("invalid recover-runtime arguments"))?;
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);

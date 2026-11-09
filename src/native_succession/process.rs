@@ -107,6 +107,9 @@ pub(crate) struct Exclusion {
     pub boot: Option<BootObservation>,
     pub rebuild: Option<crate::matrix::rebuild_gap::Rebuild>,
     pub unrouted: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_metadata:
+        Option<crate::storage::recovery_eligibility::writer::succession::stop_metadata::Witness>,
 }
 
 pub(crate) fn capture(owner: &Owner, config: &Config, path: &Path) -> Result<Exclusion> {
@@ -168,6 +171,7 @@ fn capture_at(proc_root: &Path, owner: &Owner, config: &Config, path: &Path) -> 
         boot: Some(boot),
         rebuild: None,
         unrouted: Vec::new(),
+        stop_metadata: None,
     })
 }
 impl Exclusion {
@@ -185,6 +189,7 @@ impl Exclusion {
             boot: None,
             rebuild: None,
             unrouted: Vec::new(),
+            stop_metadata: None,
         }
     }
     pub(crate) fn revalidate(&self, config: &Config, path: &Path) -> Result<()> {

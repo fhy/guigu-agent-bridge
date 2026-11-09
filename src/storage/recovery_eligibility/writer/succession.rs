@@ -22,6 +22,7 @@ mod rebuild;
 #[cfg(test)]
 mod rebuild_tests;
 mod rows;
+pub(crate) mod stop_metadata;
 #[cfg(test)]
 pub(crate) mod tests;
 
@@ -55,6 +56,9 @@ pub(crate) async fn publish(
     );
     super::super::authority::validate_identity(&mut tx, &scope.context()).await?;
     super::super::native_context::validate(&mut tx, &scope.context()).await?;
+    if let Some(witness) = &proof.stop_metadata {
+        stop_metadata::apply(&mut tx, &scope, state, witness).await?;
+    }
     super::super::bootstrap::readback::inventory(&mut tx, &scope.context()).await?;
     let now = chrono::Utc::now().to_rfc3339();
     rows::retire_leases(&mut tx, &scope, state, &now).await?;

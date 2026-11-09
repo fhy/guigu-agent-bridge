@@ -17,6 +17,7 @@ pub(crate) mod projections;
 #[cfg(all(test, feature = "test-support"))]
 mod restoration_copy_tests;
 pub(crate) mod state;
+pub(crate) mod stop_recovery;
 use crate::{
     config::Config,
     matrix::{MatrixClient, succession_payload},
@@ -30,6 +31,16 @@ pub(crate) async fn attempt(
     config: &Config,
     path: &Path,
     _maintenance: &crate::maintenance_lock::MaintenanceLock,
+) -> Result<bool, sqlx::Error> {
+    attempt_with_archive(pool, config, path, _maintenance, None).await
+}
+
+pub(crate) async fn attempt_with_archive(
+    pool: &SqlitePool,
+    config: &Config,
+    path: &Path,
+    _maintenance: &crate::maintenance_lock::MaintenanceLock,
+    archive: Option<&Path>,
 ) -> Result<bool, sqlx::Error> {
     if !config.transports.matrix.enabled {
         return Ok(false);
@@ -45,27 +56,11 @@ pub(crate) async fn attempt(
     let guard = Guard::acquire(&config.bridge.database, path, "reconcile")
         .map_err(|_| state::refuse("admission-lock"))?;
     let mut proof = process::capture(&expected.owner, config, path)?;
-    let payloads = if expected.hold.as_deref() == Some("refused") {
-        let (rebuild, payloads) = tokio::time::timeout(Duration::from_secs(90), async {
-            let client = MatrixClient::restore(&config.transports.matrix).await?;
-            crate::matrix::rebuild_gap::fetch(&client, pool, config, &expected).await
-        })
-        .await
-        .map_err(|_| state::refuse("rebuild-deadline"))?
-        .map_err(|_| state::refuse("rebuild-coverage-or-effect"))?;
-        proof.rebuild = Some(rebuild);
-        payloads
-    } else if let Some(batch) = &expected.batch {
-        tokio::time::timeout(Duration::from_secs(90), async {
-            let client = MatrixClient::restore(&config.transports.matrix).await?;
-            succession_payload::fetch(&client, batch).await
-        })
-        .await
-        .map_err(|_| state::refuse("payload-deadline"))?
-        .map_err(|_| state::refuse("payload-unavailable-or-drift"))?
-    } else {
-        Vec::new()
-    };
+    if let Some(archive) = archive {
+        let mut c = pool.acquire().await?;
+        proof.stop_metadata = Some(stop_recovery::witness(&mut c, archive, &expected).await?);
+    }
+    let payloads = payloads(pool, config, &expected, &mut proof).await?;
     proof.unrouted = payloads
         .iter()
         .filter_map(|(room, value)| {
@@ -107,4 +102,33 @@ pub(crate) async fn attempt(
         outcome?;
         Err(state::refuse("publication-not-confirmed"))
     }
+}
+
+async fn payloads(
+    pool: &SqlitePool,
+    config: &Config,
+    expected: &state::State,
+    proof: &mut process::Exclusion,
+) -> Result<Vec<(String, serde_json::Value)>, sqlx::Error> {
+    Ok(if expected.hold.as_deref() == Some("refused") {
+        let (rebuild, payloads) = tokio::time::timeout(Duration::from_secs(90), async {
+            let client = MatrixClient::restore(&config.transports.matrix).await?;
+            crate::matrix::rebuild_gap::fetch(&client, pool, config, expected).await
+        })
+        .await
+        .map_err(|_| state::refuse("rebuild-deadline"))?
+        .map_err(|_| state::refuse("rebuild-coverage-or-effect"))?;
+        proof.rebuild = Some(rebuild);
+        payloads
+    } else if let Some(batch) = &expected.batch {
+        tokio::time::timeout(Duration::from_secs(90), async {
+            let client = MatrixClient::restore(&config.transports.matrix).await?;
+            succession_payload::fetch(&client, batch).await
+        })
+        .await
+        .map_err(|_| state::refuse("payload-deadline"))?
+        .map_err(|_| state::refuse("payload-unavailable-or-drift"))?
+    } else {
+        Vec::new()
+    })
 }

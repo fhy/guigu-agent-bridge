@@ -44,6 +44,16 @@ async fn frozen_pair_ready_and_normal_restart() {
         5,
         "Observer uncertain notices; full outbox snapshot also remains unchanged"
     );
+    if let Some(archive) = std::env::var_os("R115_STOP_METADATA_ARCHIVE") {
+        let archive = std::path::PathBuf::from(archive);
+        super::stop_recovery::recover(&config, &path, &archive)
+            .await
+            .unwrap();
+        super::stop_recovery::recover(&config, &path, &archive)
+            .await
+            .unwrap();
+        println!("archived_stop_recovery=true committed_retry=true");
+    }
     for cycle in 0..2 {
         ready(&path, &config, cycle).await;
         assert_eq!(super::history_fixture::notices(&pool).await, notices);

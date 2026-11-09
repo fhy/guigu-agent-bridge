@@ -26,6 +26,10 @@ pub enum RecoveryError {
     NotStale,
     #[error("recovery rejected: stopped runtime has unresolved owner evidence")]
     OwnerEvidencePending,
+    #[error(
+        "recovery rejected: classified database requires native succession; use normal startup or explicit recover-runtime --config with --stop-metadata-archive for authenticated stop drift"
+    )]
+    NativeScopeRequired,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -94,6 +98,9 @@ async fn recover_proven_stale_in_transaction(
     now: DateTime<Utc>,
     interrupt_after_cas: bool,
 ) -> Result<RecoveryOutcome, RecoveryError> {
+    crate::storage::recovery_eligibility::writer::validate_scope(conn, None)
+        .await
+        .map_err(|_| RecoveryError::NativeScopeRequired)?;
     let owners = sqlx::query(
         "SELECT started_at,heartbeat_at,state,process_fingerprint FROM runtime_instances WHERE instance_token=?",
     )
@@ -289,6 +296,9 @@ async fn recover_in_transaction_inner(
 ) -> Result<RecoveryOutcome, RecoveryError> {
     #[cfg(not(test))]
     let _ = pre_cas_fence;
+    crate::storage::recovery_eligibility::writer::validate_scope(conn, None)
+        .await
+        .map_err(|_| RecoveryError::NativeScopeRequired)?;
     let owners = sqlx::query(
         "SELECT state, process_fingerprint FROM runtime_instances WHERE instance_token=?",
     )
