@@ -78,3 +78,36 @@ async fn retained_copy_reports_actual_bootstrap_first_failure() {
     );
     pool.close().await;
 }
+
+#[cfg(feature = "test-support")]
+#[tokio::test]
+#[ignore = "explicit private paired-copy AppRuntime probe in a network/mount sandbox"]
+async fn retained_copy_app_runtime_reports_first_hold() {
+    let path = std::env::var_os("R115_COPY_CONFIG").expect("explicit disposable config required");
+    let captured = Capture::default();
+    let runtime = crate::app::AppRuntime::start(std::path::PathBuf::from(path))
+        .with_subscriber(captured.subscriber())
+        .await
+        .unwrap();
+    for line in captured.output().lines() {
+        if [
+            "native-succession",
+            "bootstrap_nonadmin",
+            "compatibility-held",
+            "startup-eligibility",
+        ]
+        .iter()
+        .any(|category| line.contains(category))
+        {
+            println!("{line}");
+        }
+    }
+    let addr = runtime.health_addr().unwrap();
+    let status = reqwest::get(format!("http://{addr}/ready"))
+        .await
+        .unwrap()
+        .status();
+    runtime.shutdown().await.unwrap();
+    assert_eq!(status.as_u16(), 503);
+    println!("copy_app_runtime_ready=503 normal_shutdown=true no_live_acceptance=true");
+}
