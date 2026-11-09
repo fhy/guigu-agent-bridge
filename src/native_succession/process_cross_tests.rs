@@ -122,6 +122,7 @@ impl Drop for Child {
 
 #[test]
 fn previous_boot_still_refuses_a_real_owned_resource_holder() {
+    use std::io::Write;
     let root = tempfile::tempdir().unwrap();
     let file = root.path().join("resource");
     fs::write(&file, "fixture").unwrap();
@@ -129,14 +130,15 @@ fn previous_boot_still_refuses_a_real_owned_resource_holder() {
         std::process::Command::new("bash")
             .args([
                 "-c",
-                "exec 3<\"$1\"; printf ready; exec sleep 60",
-                "fixture",
+                "IFS= read -r file; exec 3<\"$file\"; printf ready; IFS= read -r done",
             ])
-            .arg(&file)
+            .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .spawn()
             .unwrap(),
     );
+    writeln!(child.0.stdin.as_mut().unwrap(), "{}", file.display()).unwrap();
+    child.0.stdin.as_mut().unwrap().flush().unwrap();
     let mut ready = [0; 5];
     child
         .0
@@ -147,16 +149,20 @@ fn previous_boot_still_refuses_a_real_owned_resource_holder() {
         .unwrap();
     assert_eq!(&ready, b"ready");
     let proc = PathBuf::from(format!("/proc/{}", child.0.id()));
-    for _ in 0..100 {
-        if fs::read_to_string(proc.join("comm")).unwrap().trim() == "sleep" {
-            break;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(5));
-    }
     assert_eq!(fs::read_link(proc.join("fd/3")).unwrap(), file);
+    // Inspect real kernel evidence for the owned helper, without unrelated host
+    // processes racing this test's specific fd-selector assertion.
+    let view = tempfile::tempdir().unwrap();
+    fs::create_dir_all(view.path().join("sys/kernel/random")).unwrap();
+    symlink(
+        "/proc/sys/kernel/random/boot_id",
+        view.path().join("sys/kernel/random/boot_id"),
+    )
+    .unwrap();
+    symlink(&proc, view.path().join(child.0.id().to_string())).unwrap();
     let old = owner();
     let error = inspect(
-        Path::new("/proc"),
+        view.path(),
         &old,
         &[root.path().into()],
         &[root.path().into()],
