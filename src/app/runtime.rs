@@ -485,7 +485,16 @@ impl AppRuntime {
                     .await
                     {
                         Ok(context) => context,
-                        Err(_) => {
+                        Err(error) => {
+                            tracing::warn!(
+                                phase = "bootstrap_nonadmin",
+                                error_class =
+                                    crate::storage::recovery_eligibility::diagnostics::class(
+                                        &error
+                                    ),
+                                outcome = "hold-preserved",
+                                "native bootstrap refused"
+                            );
                             return Self::compatibility_held(
                                 path,
                                 config,

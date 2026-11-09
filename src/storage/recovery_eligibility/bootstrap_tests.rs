@@ -5,7 +5,7 @@ use super::{EffectDomain, EligibilityContext, RowIdentity, bootstrap_nonadmin, r
 #[path = "bootstrap_history_tests.rs"]
 mod history;
 
-async fn database() -> (SqlitePool, tempfile::TempDir) {
+pub(super) async fn database() -> (SqlitePool, tempfile::TempDir) {
     let root = tempfile::Builder::new()
         .prefix("r092-bootstrap-")
         .tempdir_in("/tmp")

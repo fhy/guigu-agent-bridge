@@ -4,6 +4,7 @@ pub(crate) mod readback;
 use sha2::{Digest, Sha256};
 use sqlx::{SqliteConnection, SqlitePool};
 
+use super::diagnostics;
 use super::{EligibilityContext, ParentIdentity, ParentRole, RowIdentity, inventory, refused};
 
 struct Entry {
@@ -31,7 +32,9 @@ pub async fn bootstrap_nonadmin(
     if admin != 0 {
         return Err(refused());
     }
-    let native = lineage::native(&mut transaction, matrix_enabled).await?;
+    let native = lineage::native(&mut transaction, matrix_enabled)
+        .await
+        .map_err(|error| diagnostics::stage("lineage", error))?;
     let state: (String, String) = sqlx::query_as(
         "SELECT state,bootstrap_nonce FROM runtime_eligibility_bootstrap WHERE singleton=1",
     )
@@ -39,10 +42,14 @@ pub async fn bootstrap_nonadmin(
     .await?;
     let context = match state.0.as_str() {
         "pending" => create(&mut transaction, matrix_enabled, &native, &state.1).await?,
-        "complete" => readback::context(&mut transaction, matrix_enabled, &native).await?,
+        "complete" => readback::context(&mut transaction, matrix_enabled, &native)
+            .await
+            .map_err(|error| diagnostics::stage("context", error))?,
         _ => return Err(refused()),
     };
-    readback::inventory(&mut transaction, &context).await?;
+    readback::inventory(&mut transaction, &context)
+        .await
+        .map_err(|error| diagnostics::stage("inventory", error))?;
     transaction.commit().await?;
     Ok(context)
 }

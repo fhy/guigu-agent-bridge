@@ -2,10 +2,13 @@ pub(crate) mod administrative;
 mod authority;
 pub(crate) mod bootstrap;
 #[cfg(test)]
+mod bootstrap_diagnostic_tests;
+#[cfg(test)]
 mod bootstrap_tests;
 #[cfg(test)]
 mod contract_tests;
 mod deletion;
+pub(crate) mod diagnostics;
 pub(crate) mod inventory;
 mod metadata;
 #[cfg(test)]
