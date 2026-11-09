@@ -3,10 +3,15 @@ use super::state::{Owner, Result, refuse};
 pub(super) mod boot;
 #[path = "process_cross_boot.rs"]
 mod cross_boot;
+#[path = "process_environment.rs"]
+mod environment;
 use boot::BootObservation;
 #[cfg(test)]
 #[path = "process_cross_tests.rs"]
 mod cross_tests;
+#[cfg(test)]
+#[path = "process_environment_tests.rs"]
+mod environment_tests;
 #[cfg(test)]
 #[path = "process_tests.rs"]
 mod tests;
@@ -329,9 +334,10 @@ fn inspect_one(
     if environment
         .split(|b| *b == 0)
         .any(|v| v == marker.as_bytes())
+        || environment::related(&environment, roots, private_roots)
         || roots.iter().any(|root| {
             let bytes = root.as_os_str().as_encoded_bytes();
-            contains(&environment, bytes) || contains(&command, bytes)
+            contains(&command, bytes)
         })
     {
         return Err(refuse("related-escaped-process"));
