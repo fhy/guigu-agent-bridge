@@ -144,9 +144,23 @@ pub(crate) async fn begin<'pool>(
         None => None,
     };
     let mut transaction = pool.begin_with("BEGIN IMMEDIATE").await?;
+    validate_scope(&mut transaction, scope).await?;
+    Ok(ScopedTransaction::new(
+        transaction,
+        scope.map(|scope| scope.revision.clone()),
+        guard,
+    ))
+}
+
+// Borrowed-connection writers must enforce the same authority boundary as begin.
+// In particular, a direct BEGIN IMMEDIATE does not grant an offline caller scope.
+pub(crate) async fn validate_scope(
+    connection: &mut SqliteConnection,
+    scope: Option<&RecoveryScope>,
+) -> Result<(), sqlx::Error> {
     if let Some(scope) = scope {
         authority::validate(
-            &mut transaction,
+            connection,
             &scope.context(),
             scope.domain,
             scope.fence.as_ref(),
@@ -154,16 +168,12 @@ pub(crate) async fn begin<'pool>(
         .await?;
     } else {
         let audit: i64 = sqlx::query_scalar("SELECT (SELECT count(*) FROM offline_recovery_binding)+(SELECT count(*) FROM runtime_eligibility_context)")
-            .fetch_one(&mut *transaction).await?;
+            .fetch_one(connection).await?;
         if audit != 0 {
             return Err(refused());
         }
     }
-    Ok(ScopedTransaction::new(
-        transaction,
-        scope.map(|scope| scope.revision.clone()),
-        guard,
-    ))
+    Ok(())
 }
 
 pub(crate) fn text_identity(table: &str, key: &str) -> Result<RowIdentity, sqlx::Error> {

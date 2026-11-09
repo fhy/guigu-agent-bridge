@@ -87,6 +87,7 @@ pub(crate) async fn apply_scoped(
     lease_mode: LeaseMode<'_>,
     recovery: Option<&RecoveryScope>,
 ) -> Result<(), ClosureError> {
+    writer::validate_scope(c, recovery).await?;
     if context.event.task_id.to_string() != context.task_id
         || !matches!(
             context.event.status,

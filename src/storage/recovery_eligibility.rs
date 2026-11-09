@@ -6,6 +6,8 @@ mod bootstrap_diagnostic_tests;
 #[cfg(test)]
 mod bootstrap_tests;
 #[cfg(test)]
+mod closure_scope_tests;
+#[cfg(test)]
 mod contract_tests;
 mod deletion;
 pub(crate) mod diagnostics;
