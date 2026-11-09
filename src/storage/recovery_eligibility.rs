@@ -71,7 +71,7 @@ pub async fn require_row(
     require_lineage(connection, context, domain, identity).await
 }
 
-async fn require_lineage(
+pub(crate) async fn require_lineage(
     connection: &mut SqliteConnection,
     context: &EligibilityContext,
     domain: EffectDomain,

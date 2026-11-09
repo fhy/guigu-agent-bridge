@@ -380,12 +380,23 @@ impl AppRuntime {
             pool.close().await;
             return Err(error.into());
         }
-        if let Err(error) =
-            crate::native_succession::attempt(&pool, &config, &path, &maintenance_lock).await
+        let native_refusal = match crate::native_succession::attempt(
+            &pool,
+            &config,
+            &path,
+            &maintenance_lock,
+        )
+        .await
         {
-            tracing::warn!(phase = "native-succession", reason = %error,
-                outcome = "hold-preserved", "restricted native recovery refused");
-        }
+            Ok(_) => false,
+            Err(error) => {
+                tracing::warn!(phase = "native-succession", reason = %error,
+                    outcome = "hold-preserved", "restricted native recovery refused");
+                // A non-native database still follows its own admission protocol.
+                // Native refusal must not fall through to a stopped-owner startup.
+                !matches!(&error, sqlx::Error::Protocol(reason) if reason == "native-succession/not-native")
+            }
+        };
         let admin_bindings: i64 =
             sqlx::query_scalar("SELECT count(*) FROM offline_recovery_binding")
                 .fetch_one(&pool)
@@ -401,6 +412,17 @@ impl AppRuntime {
             config.bridge.owner_evidence_max_age_seconds as i64,
         )
         .map_err(|_| AppError::Runtime)?;
+        if native_refusal {
+            return Self::compatibility_held(
+                path,
+                config,
+                pool,
+                base_reliability,
+                maintenance_lock,
+                "native-succession-refused",
+            )
+            .await;
+        }
         let runtime_instance = uuid::Uuid::now_v7().to_string();
         let startup_eligibility =
             recovery_startup::classify_startup(admin_bindings, sentinel.as_deref());

@@ -1,5 +1,14 @@
 //! Restricted native succession before ordinary runtime admission.
 //! An ignored response may be completed atomically; uncertain work remains held.
+mod history;
+#[cfg(test)]
+mod history_atomic_tests;
+#[cfg(test)]
+mod history_fixture;
+#[cfg(all(test, feature = "test-support"))]
+mod history_runtime;
+#[cfg(test)]
+mod history_tests;
 pub(crate) mod pre_accept;
 pub(crate) mod process;
 pub(crate) mod projections;
