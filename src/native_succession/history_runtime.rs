@@ -1,6 +1,8 @@
 //! Disposable loopback runtime and separately scoped producer process.
 #[path = "history_effects_tests.rs"]
 mod effects;
+#[path = "history_lifecycle_tests.rs"]
+mod lifecycle;
 use super::history_fixture;
 use crate::{
     app::AppRuntime,
@@ -50,8 +52,11 @@ impl Fixture {
         self.root.path().join("crypto")
     }
     fn config(&self, enabled: bool, server: &str) -> Config {
+        Self::config_at(self.root.path(), enabled, server)
+    }
+    fn config_at(root: &std::path::Path, enabled: bool, server: &str) -> Config {
         let env = BTreeMap::from([
-            ("HOME".into(), self.root.path().display().to_string()),
+            ("HOME".into(), root.display().to_string()),
             ("R114_TOKEN".into(), "synthetic-no-network-token".into()),
         ]);
         load_from_str_with_env(
@@ -76,10 +81,10 @@ device_trusted = true
 access_token = "{{env:R114_TOKEN}}"
 crypto_store_path = {:?}
 "#,
-                self.root.path().join("state.db"),
-                self.root.path().join("sessions"),
-                self.root.path().join("workspace"),
-                self.store()
+                root.join("state.db"),
+                root.join("sessions"),
+                root.join("workspace"),
+                root.join("crypto")
             ),
             &env,
         )

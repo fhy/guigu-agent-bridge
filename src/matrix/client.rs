@@ -20,6 +20,19 @@ use super::store_identity;
 #[path = "baseline_tests.rs"]
 mod baseline_tests;
 
+// Explicit paired-copy tests replace only network transport. Identity binding and
+// SDK session/store restoration still use the unchanged configured identity.
+#[cfg(test)]
+pub(crate) static COPY_LOOPBACK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn transport_origin(config: &MatrixTransportConfig) -> &str {
+    #[cfg(test)]
+    if let Some(origin) = COPY_LOOPBACK.get() {
+        return origin;
+    }
+    &config.homeserver
+}
+
 /// Authenticated Matrix client. SDK types do not leave `src/matrix`.
 #[derive(Clone)]
 pub struct MatrixClient {
@@ -81,7 +94,7 @@ impl MatrixClient {
             .map_err(|_| MatrixError::Configuration)?;
         let device_id: OwnedDeviceId = config.device_id.as_str().into();
         let transient = Client::builder()
-            .homeserver_url(&config.homeserver)
+            .homeserver_url(transport_origin(config))
             .build()
             .await
             .map_err(|_| MatrixError::Configuration)?;
@@ -125,7 +138,7 @@ impl MatrixClient {
         validate_store_databases(store)?;
         store_bound();
         let inner = Client::builder()
-            .homeserver_url(&config.homeserver)
+            .homeserver_url(transport_origin(config))
             .sqlite_store(store, None)
             .build()
             .await

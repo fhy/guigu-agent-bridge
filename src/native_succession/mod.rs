@@ -14,6 +14,8 @@ mod history_tests;
 pub(crate) mod pre_accept;
 pub(crate) mod process;
 pub(crate) mod projections;
+#[cfg(all(test, feature = "test-support"))]
+mod restoration_copy_tests;
 pub(crate) mod state;
 use crate::{
     config::Config,

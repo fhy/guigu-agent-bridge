@@ -6,6 +6,8 @@
 mod admin;
 pub(crate) use admin::sealed;
 mod client;
+#[cfg(test)]
+pub(crate) use client::COPY_LOOPBACK;
 mod conversation;
 mod dedup;
 mod error;

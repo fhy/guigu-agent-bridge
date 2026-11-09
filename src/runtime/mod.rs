@@ -1,6 +1,8 @@
 //! Durable runtime control for exclusive execution and bounded continuation.
 
 mod delivery_lease;
+#[cfg(all(test, feature = "test-support"))]
+pub(crate) mod lifecycle_tests;
 mod recovery_audit;
 mod refused_projection;
 
