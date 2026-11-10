@@ -214,27 +214,6 @@ async fn workflow_classification_failure_rolls_back_and_exact_retry_commits() {
     assert_inventory(&f.pool).await;
 }
 #[tokio::test]
-async fn classified_legacy_reservation_refuses_before_writes() {
-    let f = fixture().await;
-    assert!(
-        f.store
-            .reserve_queue(
-                "task", "delivery", "endpoint", "room", None, "sender", "idem", "hash", 1, "now"
-            )
-            .await
-            .is_err()
-    );
-    assert_inventory(&f.pool).await;
-    assert_eq!(
-        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM agent_queue_counters")
-            .fetch_one(&f.pool)
-            .await
-            .unwrap(),
-        0
-    );
-}
-
-#[tokio::test]
 async fn workflow_pause_resume_and_recovery_control_keep_classification() {
     let f = fixture().await;
     let e = envelope();
@@ -282,3 +261,6 @@ async fn workflow_pause_resume_and_recovery_control_keep_classification() {
     );
     bootstrap_nonadmin(&f.pool, true).await.unwrap();
 }
+
+#[path = "legacy_queue_guard_tests.rs"]
+mod legacy_queue_guard_tests;
