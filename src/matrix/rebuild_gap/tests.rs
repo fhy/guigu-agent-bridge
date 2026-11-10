@@ -230,13 +230,94 @@ fn gap_event_size_identity_and_limit_fail_closed_with_distinct_predicates() {
     huge["content"]["body"] = "x".repeat(16 * 1024 * 1024).into();
     let huge = TimelineEvent::from_plaintext(serde_json::from_value(huge).unwrap());
     assert_eq!(validate_events(&[huge]).unwrap_err().reason, "byte-limit");
-    let mut events = vec![event("$existing"); 1600];
+    let mut events = vec![event("$existing"); MAX_RECOVERY_EVENTS];
     assert_eq!(
         append_page(&anchor(), &mut events, vec![event("$extra")])
             .unwrap_err()
             .reason,
         "event-limit"
     );
+}
+
+async fn mount_pages(server: &MockServer, count: usize, anchor_page: Option<usize>) {
+    for page_number in 1..=count {
+        let cursor = format!("page-{page_number}");
+        let end = format!("page-{}", page_number + 1);
+        let chunk = if anchor_page == Some(page_number) {
+            vec![value("$anchor")]
+        } else {
+            vec![value(&format!("$page-{page_number}"))]
+        };
+        Mock::given(method("GET"))
+            .and(path_regex("/_matrix/client/.*/rooms/.*/messages"))
+            .and(query_param("from", cursor.clone()))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_body_json(json!({"start":cursor,"end":end,"chunk":chunk})),
+            )
+            .expect(1)
+            .mount(server)
+            .await;
+    }
+}
+
+#[tokio::test]
+async fn succession_gap_covers_history_past_original_page_window() {
+    let server = MockServer::start().await;
+    let client = client(&server).await;
+    let mut response = client
+        .inner
+        .sync_once(SyncSettings::default())
+        .await
+        .unwrap();
+    let f = crate::storage::recovery_eligibility::writer::succession::tests::fixture(false).await;
+    sqlx::query("INSERT INTO matrix_recovery_receipts(account_id,room_id,event_id,cutover_operation_id,payload_digest,state,batch_id,created_at,updated_at) VALUES('@bridge:example.test','!room:example.test','$anchor',?,?,'dispositioned','prior','t','t')")
+        .bind(&f.operation)
+        .bind(&anchor().digest)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    mount_pages(&server, 17, Some(17)).await;
+
+    let anchors = fill(&client, &f.pool, &f.operation, &mut response)
+        .await
+        .unwrap();
+    assert_eq!(anchors.len(), 1);
+    let timeline = &response.rooms.joined.values().next().unwrap().timeline;
+    assert!(!timeline.limited);
+    assert_eq!(timeline.events.len(), 17);
+    f.pool.close().await;
+}
+
+#[tokio::test]
+async fn succession_gap_retains_a_finite_page_limit_after_window_extension() {
+    let server = MockServer::start().await;
+    let client = client(&server).await;
+    let mut response = client
+        .inner
+        .sync_once(SyncSettings::default())
+        .await
+        .unwrap();
+    let f = crate::storage::recovery_eligibility::writer::succession::tests::fixture(false).await;
+    sqlx::query("INSERT INTO matrix_recovery_receipts(account_id,room_id,event_id,cutover_operation_id,payload_digest,state,batch_id,created_at,updated_at) VALUES('@bridge:example.test','!room:example.test','$anchor',?,?,'dispositioned','prior','t','t')")
+        .bind(&f.operation)
+        .bind(&anchor().digest)
+        .execute(&f.pool)
+        .await
+        .unwrap();
+    mount_pages(&server, MAX_RECOVERY_PAGES, None).await;
+
+    let capture = crate::test_diagnostics::Capture::default();
+    let failure = fill(&client, &f.pool, &f.operation, &mut response)
+        .await
+        .unwrap_err();
+    assert_eq!(failure.reason, "page-limit");
+    tracing::subscriber::with_default(capture.subscriber(), || failure.report());
+    let output = capture.output();
+    assert!(output.contains("page-limit"));
+    assert!(output.contains("page=32"));
+    assert!(output.contains("events=32"));
+    f.pool.close().await;
 }
 
 async fn predicate_page(server: &MockServer, mode: &str) {

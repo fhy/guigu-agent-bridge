@@ -17,6 +17,12 @@ use std::{collections::BTreeSet, time::Duration};
 mod diagnostics;
 pub(crate) use diagnostics::Failure;
 
+// Keep history recovery finite while covering retained rooms whose overlap is
+// just beyond the original sixteen-page window. The outer sync_rebuild
+// deadline remains the final wall-clock bound.
+pub(crate) const MAX_RECOVERY_PAGES: usize = 32;
+pub(crate) const MAX_RECOVERY_EVENTS: usize = 3_200;
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub(crate) struct Anchor {
     pub room: String,
@@ -81,7 +87,7 @@ async fn pages(
 ) -> Result<Vec<TimelineEvent>, Failure> {
     let mut earlier = Vec::new();
     let mut cursors = BTreeSet::new();
-    for page_number in 1..=16 {
+    for page_number in 1..=MAX_RECOVERY_PAGES {
         let context = |failure: Failure| failure.at(page_number, earlier.len());
         if !cursors.insert(cursor.clone()) {
             return Err(context(Failure::new("cursor-repeat")));
@@ -105,7 +111,7 @@ async fn pages(
             .end
             .ok_or_else(|| Failure::new("page-end-absent").at(page_number, earlier.len()))?;
     }
-    Err(Failure::new("page-limit").at(16, earlier.len()))
+    Err(Failure::new("page-limit").at(MAX_RECOVERY_PAGES, earlier.len()))
 }
 
 fn append_page(
@@ -122,7 +128,7 @@ fn append_page(
             }
             return Ok(true);
         }
-        if events.len() >= 1600 {
+        if events.len() >= MAX_RECOVERY_EVENTS {
             return Err(Failure::new("event-limit"));
         }
         events.push(event);
@@ -199,7 +205,7 @@ pub(crate) async fn fetch(
         }
     }
     expected.sort();
-    if expected.len() > 1600 || expected.windows(2).any(|w| w[0] == w[1]) {
+    if expected.len() > MAX_RECOVERY_EVENTS || expected.windows(2).any(|w| w[0] == w[1]) {
         return Err(MatrixError::CutoverRefused);
     }
     let epoch = state
