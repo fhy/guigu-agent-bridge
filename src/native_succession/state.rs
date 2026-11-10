@@ -44,6 +44,12 @@ pub(crate) struct State {
     pub pre_accept: Option<super::pre_accept::Delivery>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub history: Vec<(String, String)>,
+    /// The current MatrixSync owner whose controlled stop is the exact
+    /// durable rebuild-history-gap hold.  This is deliberately explicit so
+    /// the writer can narrow its one exceptional retirement predicate without
+    /// weakening ordinary closed-joined rejection.
+    #[serde(default)]
+    pub history_hold_owner: bool,
 }
 
 pub(crate) async fn read(connection: &mut SqliteConnection) -> Result<Option<State>> {
@@ -60,8 +66,24 @@ pub(crate) async fn read(connection: &mut SqliteConnection) -> Result<Option<Sta
         .fetch_optional(&mut *connection).await?.ok_or_else(||refuse("not-native"))?;
     let generation: &str = control.get("generation");
     let operation: &str = control.get("cutover_operation_id");
+    let rebuild_hold = control.get::<&str, _>("phase") == "refused"
+        && control.get::<Option<&str>, _>("restart_hold_state") == Some("refused")
+        && control.get::<Option<&str>, _>("restart_hold_reason") == Some("rebuild-history-gap")
+        && control
+            .get::<Option<&str>, _>("restart_hold_event_id")
+            .is_none();
+    let matrix_sync_owner: Option<String> = if rebuild_hold {
+        sqlx::query_scalar(
+            "SELECT owner_token FROM matrix_component_leases WHERE component='MatrixSync'",
+        )
+        .fetch_optional(&mut *connection)
+        .await?
+    } else {
+        None
+    };
     let mut candidates = Vec::new();
     let mut history = Vec::new();
+    let mut history_hold_owner = false;
     for row in &rows {
         match super::history::completed(
             connection,
@@ -72,11 +94,29 @@ pub(crate) async fn read(connection: &mut SqliteConnection) -> Result<Option<Sta
         )
         .await?
         {
+            Some(binding)
+                if rebuild_hold
+                    && matrix_sync_owner.as_deref() == Some(row.get("instance_token"))
+                    && row.get::<&str, _>("state") == "observing"
+                    && row.get::<&str, _>("runtime_state") == "stopped"
+                    && row.get::<&str, _>("barrier_state") == "closed_joined" =>
+            {
+                // The full completed-history validator above still authenticates
+                // identity, lineage and effects.  Keep this exact owner as the
+                // durable hold's successor candidate so publication can consume
+                // the hold atomically.
+                candidates.push(row);
+                history_hold_owner = true;
+                history.push(binding);
+            }
             Some(binding) => history.push(binding),
             None => candidates.push(row),
         }
     }
     if candidates.is_empty() {
+        if rebuild_hold {
+            return Err(refuse("rebuild-owner-absent"));
+        }
         // No publisher will check effects on this path. A single owner's
         // succession must instead fence leases and close pre-accept work first.
         if !crate::storage::owner_restart::guards::work_clear(connection).await? {
@@ -89,14 +129,19 @@ pub(crate) async fn read(connection: &mut SqliteConnection) -> Result<Option<Sta
     }
     let row = candidates[0];
     if row.get::<String, _>("process_fingerprint") != row.get::<String, _>("runtime_fingerprint")
-        || row.get::<&str, _>("barrier_state") == "closed_joined"
-        || !matches!(
-            (
-                row.get::<&str, _>("state"),
-                row.get::<&str, _>("barrier_state")
-            ),
-            ("live" | "scan_pending", _) | ("unknown", "open")
-        )
+        || (!history_hold_owner && row.get::<&str, _>("barrier_state") == "closed_joined")
+        || (!history_hold_owner
+            && !matches!(
+                (
+                    row.get::<&str, _>("state"),
+                    row.get::<&str, _>("barrier_state")
+                ),
+                ("live" | "scan_pending", _) | ("unknown", "open")
+            ))
+        || (history_hold_owner
+            && (row.get::<&str, _>("state") != "observing"
+                || row.get::<&str, _>("runtime_state") != "stopped"
+                || row.get::<&str, _>("barrier_state") != "closed_joined"))
     {
         return Err(refuse("owner-identity"));
     }
@@ -154,6 +199,7 @@ pub(crate) async fn read(connection: &mut SqliteConnection) -> Result<Option<Sta
         isolated_projections,
         pre_accept,
         history,
+        history_hold_owner,
     };
     for (_, lease_owner, _, status, _) in &state.leases {
         if lease_owner != &state.owner.token {

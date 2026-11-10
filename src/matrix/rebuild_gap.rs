@@ -177,7 +177,7 @@ pub(crate) async fn fetch(
         .await
         .map_err(|_| MatrixError::Transport)?;
     if response.next_batch.is_empty() {
-        return Err(MatrixError::CutoverRefused);
+        return Err(Failure::new("response-token-absent").reported());
     }
     let anchors = fill(client, pool, &state.operation, &mut response)
         .await

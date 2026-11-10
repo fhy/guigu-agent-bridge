@@ -17,7 +17,7 @@ pub(crate) async fn fixture(batch: bool) -> Fixture {
     fixture_with_options(batch, true).await
 }
 
-async fn fixture_with_options(batch: bool, stop: bool) -> Fixture {
+pub(super) async fn fixture_with_options(batch: bool, stop: bool) -> Fixture {
     let root = tempfile::Builder::new()
         .prefix("r105-succession-")
         .tempdir_in("/tmp")

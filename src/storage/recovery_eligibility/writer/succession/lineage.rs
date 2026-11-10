@@ -89,16 +89,13 @@ pub(super) async fn reconstruct_control(
     if state.hold.is_none() {
         return Ok(());
     }
-    let times:Vec<String>=sqlx::query_scalar("SELECT DISTINCT updated_at FROM matrix_recovery_batches WHERE response_token=? AND state='terminal'").bind(&state.watermark).fetch_all(&mut *c).await?;
-    if times.len() != 1 {
-        return Err(refused());
-    }
+    let time = super::control_time::authenticated(c, state).await?;
     let changed = if state.hold.as_deref() == Some("refused") {
         sqlx::query("UPDATE matrix_recovery_control SET phase='active',restart_hold_state=NULL,restart_hold_reason=NULL,updated_at=? WHERE control_id=1 AND cutover_operation_id=? AND watermark=? AND phase='refused' AND restart_hold_state='refused' AND restart_hold_event_id IS NULL AND restart_hold_reason='rebuild-history-gap'")
-            .bind(&times[0]).bind(&state.operation).bind(&state.watermark).execute(&mut *c).await?
+            .bind(&time).bind(&state.operation).bind(&state.watermark).execute(&mut *c).await?
     } else {
         sqlx::query("UPDATE matrix_recovery_control SET restart_hold_state=NULL,restart_hold_event_id=NULL,restart_hold_reason=NULL,updated_at=? WHERE control_id=1 AND cutover_operation_id=? AND watermark=? AND restart_hold_state='processing' AND restart_hold_event_id=? AND restart_hold_reason='incomplete response coverage requires reconciliation'")
-        .bind(&times[0]).bind(&state.operation).bind(&state.watermark).bind(format!("batch:{}",state.batch.as_ref().ok_or_else(refused)?.id)).execute(&mut *c).await?
+        .bind(&time).bind(&state.operation).bind(&state.watermark).bind(format!("batch:{}",state.batch.as_ref().ok_or_else(refused)?.id)).execute(&mut *c).await?
     };
     if changed.rows_affected() != 1 {
         return Err(refused());

@@ -117,7 +117,12 @@ async fn payloads(
         })
         .await
         .map_err(|_| state::refuse("rebuild-deadline"))?
-        .map_err(|_| state::refuse("rebuild-coverage-or-effect"))?;
+        .map_err(|error| {
+            // MatrixError contains only static, redacted adapter categories.
+            tracing::warn!(phase = "native-succession", stage = "rebuild-coverage", reason = %error,
+                outcome = "hold-preserved", "native rebuild refused before publication");
+            state::refuse("rebuild-coverage-or-effect")
+        })?;
         proof.rebuild = Some(rebuild);
         payloads
     } else if let Some(batch) = &expected.batch {

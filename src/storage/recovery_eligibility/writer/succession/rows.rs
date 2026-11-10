@@ -152,17 +152,23 @@ pub(super) async fn retire_owner(
     let mutation = lineage::prepare(c, s, &id).await?;
     let id = evidence_id(c, &owner.token, owner.revision).await?;
     let previous = lineage::prepare(c, s, &id).await?;
-    let changed=sqlx::query("UPDATE runtime_owner_evidence SET is_current=0 WHERE instance_token=? AND runtime_generation=? AND evidence_revision=? AND is_current=1 AND state IN ('live','scan_pending','unknown') AND process_fingerprint=? AND barrier_state!='closed_joined'")
-        .bind(&owner.token).bind(owner.generation).bind(owner.revision).bind(&owner.fingerprint).execute(&mut *c).await?;
+    let changed = if state.history_hold_owner {
+        sqlx::query("UPDATE runtime_owner_evidence SET is_current=0 WHERE instance_token=? AND runtime_generation=? AND evidence_revision=? AND is_current=1 AND state='observing' AND process_fingerprint=? AND barrier_state='closed_joined' AND in_flight_spawns=0 AND child_scan_state='inaccessible'")
+            .bind(&owner.token).bind(owner.generation).bind(owner.revision).bind(&owner.fingerprint).execute(&mut *c).await?
+    } else {
+        sqlx::query("UPDATE runtime_owner_evidence SET is_current=0 WHERE instance_token=? AND runtime_generation=? AND evidence_revision=? AND is_current=1 AND state IN ('live','scan_pending','unknown') AND process_fingerprint=? AND barrier_state!='closed_joined'")
+            .bind(&owner.token).bind(owner.generation).bind(owner.revision).bind(&owner.fingerprint).execute(&mut *c).await?
+    };
     if changed.rows_affected() != 1 {
         return Err(refused());
     }
     lineage::complete(c, s, previous).await?;
     let next = owner.revision.checked_add(1).ok_or_else(refused)?;
-    // Preserve the original clock/barrier observations. This is explicitly not
-    // a JoinedChildren, controlled-stop, reaped or historical containment proof.
-    sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current,max_age_seconds) SELECT instance_token,runtime_generation,?,'observing',pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,?,1,max_age_seconds FROM runtime_owner_evidence WHERE instance_token=? AND evidence_revision=?")
-        .bind(next).bind(record).bind(&owner.token).bind(owner.revision).execute(&mut *c).await?;
+    // Preserve historical evidence. A new succession record uses an open barrier:
+    // it proves current exclusion, never a new historical join or controlled stop.
+    // The former closed-joined record remains intact at its original revision.
+    sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current,max_age_seconds) SELECT instance_token,runtime_generation,?,'observing',pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,CASE WHEN ? THEN 'open' ELSE barrier_state END,in_flight_spawns,child_scan_state,?,1,max_age_seconds FROM runtime_owner_evidence WHERE instance_token=? AND evidence_revision=?")
+        .bind(next).bind(state.history_hold_owner).bind(record).bind(&owner.token).bind(owner.revision).execute(&mut *c).await?;
     let id = evidence_id(c, &owner.token, next).await?;
     lineage::inserted(c, s, &id).await?;
     let changed=sqlx::query("UPDATE runtime_instances SET state='stopped',heartbeat_at=? WHERE instance_token=? AND state IN ('active','stopping','stopped') AND process_fingerprint=?")

@@ -1,15 +1,25 @@
 //! One matched synthetic store through failure, success, abrupt exit and restart.
 use super::*;
 use crate::runtime::lifecycle_tests::task_cycle;
+use tracing::instrument::WithSubscriber;
 
-async fn start(root: &std::path::Path, server: &str) -> AppRuntime {
+pub(super) async fn start(root: &std::path::Path, server: &str) -> AppRuntime {
+    let captured = crate::test_diagnostics::Capture::default();
     let runtime = AppRuntime::start_with_config_and_a2a_faults(
         root.join("bridge.toml"),
         Fixture::config_at(root, true, server),
         Arc::new(crate::a2a::NoFault),
     )
+    .with_subscriber(captured.subscriber())
     .await
     .unwrap();
+    for line in captured.output().lines().filter(|line| {
+        line.contains("native-succession")
+            || line.contains("bootstrap_nonadmin")
+            || line.contains("rebuild-")
+    }) {
+        println!("{line}");
+    }
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let state = runtime.health_state().snapshot().await.readiness;

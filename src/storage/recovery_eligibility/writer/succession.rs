@@ -12,6 +12,9 @@ use sqlx::{Connection, SqliteConnection, SqlitePool};
 use std::path::Path;
 #[cfg(test)]
 mod boundary_tests;
+mod control_time;
+#[cfg(test)]
+mod controlled_hold_tests;
 mod lineage;
 mod pre_accept;
 #[cfg(test)]
@@ -43,7 +46,9 @@ pub(crate) async fn publish(
         return Err(refused());
     }
     revalidate()?;
-    lineage::reconstruct_control(&mut tx, state).await?;
+    lineage::reconstruct_control(&mut tx, state)
+        .await
+        .map_err(|_| state::refuse("control-preimage"))?;
     let scope = RecoveryScope::new(
         EligibilityContext::NonAdmin {
             generation: state.native_generation.clone(),
@@ -54,24 +59,38 @@ pub(crate) async fn publish(
         EffectDomain::Local,
         None,
     );
-    super::super::authority::validate_identity(&mut tx, &scope.context()).await?;
-    super::super::native_context::validate(&mut tx, &scope.context()).await?;
+    super::super::authority::validate_identity(&mut tx, &scope.context())
+        .await
+        .map_err(|_| state::refuse("context-identity"))?;
+    super::super::native_context::validate(&mut tx, &scope.context())
+        .await
+        .map_err(|_| state::refuse("native-context"))?;
     if let Some(witness) = &proof.stop_metadata {
         stop_metadata::apply(&mut tx, &scope, state, witness).await?;
     }
-    super::super::bootstrap::readback::inventory(&mut tx, &scope.context()).await?;
+    super::super::bootstrap::readback::inventory(&mut tx, &scope.context())
+        .await
+        .map_err(|_| state::refuse("inventory-before"))?;
     let now = chrono::Utc::now().to_rfc3339();
-    rows::retire_leases(&mut tx, &scope, state, &now).await?;
+    rows::retire_leases(&mut tx, &scope, state, &now)
+        .await
+        .map_err(|_| state::refuse("retire-leases"))?;
     pre_accept::close(&mut tx, &scope, state, &now).await?;
     if !crate::storage::owner_restart::guards::work_clear(&mut tx).await? {
         return Err(state::refuse("business-effects"));
     }
     rows::invocations_clear(&mut tx).await?;
     let control = lineage::prepare(&mut tx, &scope, &lineage::control()).await?;
-    let effective = rebuild::prepare(&mut tx, &scope, state, proof, &now).await?;
-    rows::complete_batch(&mut tx, &scope, &effective, proof, payloads, &now).await?;
+    let effective = rebuild::prepare(&mut tx, &scope, state, proof, &now)
+        .await
+        .map_err(|_| state::refuse("rebuild-prepare"))?;
+    rows::complete_batch(&mut tx, &scope, &effective, proof, payloads, &now)
+        .await
+        .map_err(|_| state::refuse("complete-batch"))?;
     let record = record(state, proof)?;
-    rows::retire_owner(&mut tx, &scope, state, &record, &now).await?;
+    rows::retire_owner(&mut tx, &scope, state, &record, &now)
+        .await
+        .map_err(|_| state::refuse("retire-owner"))?;
     let watermark = effective
         .batch
         .as_ref()
@@ -95,7 +114,9 @@ pub(crate) async fn publish(
     };
     super::super::authority::validate_identity(&mut tx, &next).await?;
     super::super::native_context::validate(&mut tx, &next).await?;
-    super::super::bootstrap::readback::inventory(&mut tx, &next).await?;
+    super::super::bootstrap::readback::inventory(&mut tx, &next)
+        .await
+        .map_err(|_| state::refuse("inventory-after"))?;
     revalidate()?;
     tx.commit().await
 }

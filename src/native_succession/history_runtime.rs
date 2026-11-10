@@ -1,6 +1,8 @@
 //! Disposable loopback runtime and separately scoped producer process.
 #[path = "history_effects_tests.rs"]
 mod effects;
+#[path = "history_hold_runtime.rs"]
+mod hold;
 #[path = "history_lifecycle_tests.rs"]
 mod lifecycle;
 use super::history_fixture;
@@ -132,7 +134,7 @@ async fn mount_server(server: &MockServer) {
             {"type":"m.room.create","state_key":"","content":{"creator":"@bridge:example.test","room_version":"10"},"sender":"@bridge:example.test","event_id":"$create","origin_server_ts":1},
             {"type":"m.room.member","state_key":"@bridge:example.test","content":{"membership":"join"},"sender":"@bridge:example.test","event_id":"$member","origin_server_ts":1},
             {"type":"m.room.name","state_key":"","content":{"name":"Recovery room"},"sender":"@bridge:example.test","event_id":"$name","origin_server_ts":1}
-        ]}}}}}))).with_priority(1).mount(server).await;
+        ]}}}}}))).with_priority(2).mount(server).await;
     Mock::given(method("GET"))
         .and(path_regex("/_matrix/client/.*/sync"))
         .and(query_param("since", "C"))
@@ -141,7 +143,7 @@ async fn mount_server(server: &MockServer) {
                 .set_body_json(json!({"next_batch":"C"}))
                 .set_delay(std::time::Duration::from_secs(1)),
         )
-        .with_priority(1)
+        .with_priority(2)
         .mount(server)
         .await;
 }
