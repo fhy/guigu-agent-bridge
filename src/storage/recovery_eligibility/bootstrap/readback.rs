@@ -76,13 +76,30 @@ pub(crate) async fn inventory(
         );
         return Err(refusal("inventory", "classification-cardinality"));
     }
+    let indexed = rows
+        .iter()
+        .map(|r| {
+            (
+                (
+                    r.get::<&str, _>("table_name"),
+                    r.get::<&str, _>("canonical_pk"),
+                ),
+                r,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut live = std::collections::BTreeMap::new();
+    // This helper performs no writes: snapshot every row once on this connection.
+    // Parent checks use that same inventory, not a cross-transaction/global cache.
+    for id in &identities {
+        let snapshot = snapshots::snapshot(connection, id)
+            .await
+            .map_err(|e| stage("snapshot", e))?;
+        live.insert((id.table.as_str(), id.key.as_str()), snapshot);
+    }
     for identity in &deleted {
-        let row = rows
-            .iter()
-            .find(|row| {
-                row.get::<&str, _>("table_name") == identity.table
-                    && row.get::<&str, _>("canonical_pk") == identity.key
-            })
+        let row = *indexed
+            .get(&(identity.table.as_str(), identity.key.as_str()))
             .ok_or_else(refused)?;
         context
             .matches_classification(row)
@@ -94,13 +111,9 @@ pub(crate) async fn inventory(
             return Err(refused());
         }
     }
-    for identity in identities {
-        let row = rows
-            .iter()
-            .find(|row| {
-                row.get::<&str, _>("table_name") == identity.table
-                    && row.get::<&str, _>("canonical_pk") == identity.key
-            })
+    for identity in &identities {
+        let row = *indexed
+            .get(&(identity.table.as_str(), identity.key.as_str()))
             .ok_or_else(refused)?;
         context
             .matches_classification(row)
@@ -111,9 +124,9 @@ pub(crate) async fn inventory(
         ) {
             return Err(refusal("classification", "held-disposition"));
         }
-        let snapshot = snapshots::snapshot(connection, &identity)
-            .await
-            .map_err(|error| stage("snapshot", error))?;
+        let snapshot = live
+            .get(&(identity.table.as_str(), identity.key.as_str()))
+            .ok_or_else(refused)?;
         if row.try_get::<&str, _>("original_revision")? != snapshot.revision
             || row.try_get::<&str, _>("original_digest")? != snapshot.digest
         {
@@ -139,9 +152,9 @@ pub(crate) async fn inventory(
             {
                 return Err(refusal("parents", "role-or-identity"));
             }
-            let actual = snapshots::snapshot(connection, &parent.identity)
-                .await
-                .map_err(|error| stage("parent-snapshot", error))?;
+            let actual = live
+                .get(&(parent.identity.table.as_str(), parent.identity.key.as_str()))
+                .ok_or_else(refused)?;
             if actual.revision != parent.revision || actual.digest != parent.digest {
                 return Err(refusal("parents", "row-binding"));
             }

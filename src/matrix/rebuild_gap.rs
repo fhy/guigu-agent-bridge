@@ -23,7 +23,7 @@ pub(crate) use diagnostics::Failure;
 pub(crate) const MAX_RECOVERY_PAGES: usize = 32;
 pub(crate) const MAX_RECOVERY_EVENTS: usize = 3_200;
 
-#[derive(Clone, Debug, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct Anchor {
     pub room: String,
     pub event: String,

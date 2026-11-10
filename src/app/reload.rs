@@ -44,7 +44,7 @@ pub struct HotConfig {
 }
 
 impl HotConfig {
-    fn build(config: &Config, registry: &EndpointRegistry) -> Result<Self, ReloadError> {
+    pub(crate) fn build(config: &Config, registry: &EndpointRegistry) -> Result<Self, ReloadError> {
         let matrix = &config.transports.matrix;
         let mut route = RoutePolicy::new();
         for (alias, agent) in &matrix.routes.aliases {

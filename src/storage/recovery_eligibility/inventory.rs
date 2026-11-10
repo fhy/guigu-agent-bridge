@@ -32,6 +32,7 @@ pub(super) const TABLES: &[&str] = &[
     "runtime_owner_evidence",
     "session_owner_bindings",
     "matrix_recovery_batches",
+    "matrix_recovery_coverage",
     "matrix_recovery_receipts",
     "matrix_component_leases",
     "matrix_recovery_control",
@@ -129,10 +130,22 @@ pub(crate) async fn values(
         .iter()
         .map(|column| encoded(column.get("name")))
         .collect::<Vec<_>>();
-    let predicates = primary
+    // Preserve exact encoded-key comparison, while letting the receipt primary key
+    // avoid an O(n) scan for each member of a bounded recovery batch.
+    let indexed = (identity.table == "matrix_recovery_receipts")
+        .then(|| keys.iter().map(|k| text_key(k)).collect::<Option<Vec<_>>>())
+        .flatten();
+    let mut predicates = primary
         .iter()
         .map(|(_, column)| format!("{}=?", encoded(column)))
         .collect::<Vec<_>>();
+    if indexed.is_some() {
+        predicates.extend(
+            primary
+                .iter()
+                .map(|(_, name)| format!("{}=?", quoted(name))),
+        );
+    }
     let query = AssertSqlSafe(format!(
         "SELECT {} FROM {} WHERE {}",
         expressions.join(","),
@@ -142,6 +155,9 @@ pub(crate) async fn values(
     let mut query = sqlx::query(query);
     for key in keys {
         query = query.bind(key);
+    }
+    for value in indexed.into_iter().flatten() {
+        query = query.bind(value);
     }
     let row = query
         .fetch_optional(&mut *connection)
@@ -177,6 +193,17 @@ pub(crate) async fn identities(
             .collect::<Vec<_>>();
         primary.sort();
         if primary.is_empty() {
+            // Explicit schema-25 offline operations retain their original inventory.
+            // An applied 0026 ledger with a missing table is always corruption.
+            if *table == "matrix_recovery_coverage" {
+                let applied: i64 =
+                    sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version>=26")
+                        .fetch_one(&mut *connection)
+                        .await?;
+                if applied == 0 {
+                    continue;
+                }
+            }
             return Err(refused());
         }
         let selection = primary
@@ -291,4 +318,16 @@ async fn foreign_keys(
     )))
     .fetch_all(connection)
     .await
+}
+
+fn text_key(key: &str) -> Option<String> {
+    let hex = key.strip_prefix("text:")?;
+    if hex.len() % 2 != 0 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+        return None;
+    }
+    let bytes = (0..hex.len())
+        .step_by(2)
+        .map(|n| u8::from_str_radix(&hex[n..n + 2], 16).ok())
+        .collect::<Option<Vec<_>>>()?;
+    String::from_utf8(bytes).ok()
 }

@@ -68,8 +68,10 @@ pub(super) async fn complete_batch(
         .map_err(|_| state::refuse("payload-drift-or-actionable"))?;
     let mutation =
         lineage::prepare(c, s, &text_identity("matrix_recovery_batches", &batch.id)?).await?;
+    let mut receipt_parents = super::receipt_lineage::Parents::default();
     for (room, value) in payloads {
-        disposition(c, s, state, proof, room, value, now).await?;
+        super::coverage::publication_deadline(proof)?;
+        disposition(c, s, state, proof, room, value, now, &mut receipt_parents).await?;
     }
     let covered = serde_json::to_string(&batch.expected).map_err(|_| refused())?;
     let changed=sqlx::query("UPDATE matrix_recovery_batches SET covered_events_json=?,state='terminal',updated_at=? WHERE batch_id=? AND owner_token=? AND owner_epoch=? AND response_digest=? AND state='processing'")
@@ -80,6 +82,7 @@ pub(super) async fn complete_batch(
     lineage::complete(c, s, mutation).await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn disposition(
     c: &mut SqliteConnection,
     s: &RecoveryScope,
@@ -88,6 +91,7 @@ async fn disposition(
     room: &str,
     value: &Value,
     now: &str,
+    parents: &mut super::receipt_lineage::Parents,
 ) -> Result<(), sqlx::Error> {
     let batch = state.batch.as_ref().ok_or_else(refused)?;
     let event = value
@@ -119,6 +123,9 @@ async fn disposition(
     if effects != 0 {
         return Err(state::refuse("unreceipted-effect"));
     }
+    if let Some(config) = &proof.decision_config {
+        crate::matrix::ingress_decision::no_effect(c, config, room, value).await?;
+    }
     // reserve-before-deliver is preserved. Here delivery is solely the normal
     // adapter's ignored-event result, so the whole disposition can be atomic.
     sqlx::query("INSERT INTO matrix_recovery_receipts(account_id,room_id,event_id,cutover_operation_id,payload_digest,state,batch_id,created_at,updated_at) VALUES(?,?,?,?,?,'pending',?,?,?)")
@@ -127,6 +134,7 @@ async fn disposition(
         .bind(&proof.account).bind(room).bind(event).bind(&state.operation).execute(&mut *c).await?;
     if !crate::matrix::succession_payload::ignored(value, room, &proof.account)
         .map_err(|_| refused())?
+        && proof.decision_config.is_none()
         && !proof.unrouted.iter().any(|e| e == event)
         && !proof
             .rebuild
@@ -137,7 +145,7 @@ async fn disposition(
     }
     sqlx::query("UPDATE matrix_recovery_receipts SET state='dispositioned' WHERE account_id=? AND room_id=? AND event_id=? AND cutover_operation_id=? AND state='processing'")
         .bind(&proof.account).bind(room).bind(event).bind(&state.operation).execute(&mut *c).await?;
-    lineage::inserted(c, s, &id).await
+    parents.inserted(c, s, &id).await
 }
 
 pub(super) async fn retire_owner(

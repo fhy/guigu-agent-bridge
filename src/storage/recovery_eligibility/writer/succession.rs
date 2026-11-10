@@ -15,6 +15,18 @@ mod boundary_tests;
 mod control_time;
 #[cfg(test)]
 mod controlled_hold_tests;
+pub(crate) mod coverage;
+#[cfg(test)]
+mod coverage_boundary_tests;
+#[cfg(test)]
+mod coverage_cost_fixture;
+#[cfg(test)]
+mod coverage_cost_tests;
+#[cfg(test)]
+mod coverage_crash_tests;
+#[cfg(test)]
+mod coverage_tests;
+mod coverage_transition;
 mod lineage;
 mod pre_accept;
 #[cfg(test)]
@@ -24,6 +36,7 @@ mod projection_tests;
 mod rebuild;
 #[cfg(test)]
 mod rebuild_tests;
+mod receipt_lineage;
 mod rows;
 pub(crate) mod stop_metadata;
 #[cfg(test)]
@@ -36,6 +49,7 @@ pub(crate) async fn publish(
     payloads: &[(String, Value)],
     revalidate: impl Fn() -> Result<(), sqlx::Error>,
 ) -> Result<(), sqlx::Error> {
+    coverage::publication_deadline(proof)?;
     let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     if crate::native_succession::state::read(&mut tx)
         .await?
@@ -71,6 +85,7 @@ pub(crate) async fn publish(
     super::super::bootstrap::readback::inventory(&mut tx, &scope.context())
         .await
         .map_err(|_| state::refuse("inventory-before"))?;
+    coverage_transition::publication(&mut tx, state, proof, payloads).await?;
     let now = chrono::Utc::now().to_rfc3339();
     rows::retire_leases(&mut tx, &scope, state, &now)
         .await
@@ -86,8 +101,16 @@ pub(crate) async fn publish(
         .map_err(|_| state::refuse("rebuild-prepare"))?;
     rows::complete_batch(&mut tx, &scope, &effective, proof, payloads, &now)
         .await
-        .map_err(|_| state::refuse("complete-batch"))?;
+        .map_err(|error| match error {
+            sqlx::Error::Protocol(ref reason)
+                if reason == "native-succession/coverage-publication-deadline" =>
+            {
+                error
+            }
+            _ => state::refuse("complete-batch"),
+        })?;
     let record = record(state, proof)?;
+    coverage::finish(&mut tx, &scope, proof).await?;
     rows::retire_owner(&mut tx, &scope, state, &record, &now)
         .await
         .map_err(|_| state::refuse("retire-owner"))?;
@@ -118,6 +141,7 @@ pub(crate) async fn publish(
         .await
         .map_err(|_| state::refuse("inventory-after"))?;
     revalidate()?;
+    coverage::publication_deadline(proof)?;
     tx.commit().await
 }
 
@@ -146,6 +170,9 @@ pub(crate) async fn confirmed(
         return Ok(false);
     }
     let checkpoint:Option<(String,Option<String>)>=sqlx::query_as("SELECT watermark,restart_hold_state FROM matrix_recovery_control WHERE control_id=1 AND cutover_operation_id=?").bind(&state.operation).fetch_optional(&mut c).await?;
+    if !coverage::confirmed(&mut c, proof).await? {
+        return Ok(false);
+    }
     let effective = rebuild::effective(state, proof)?;
     let watermark = effective
         .batch

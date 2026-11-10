@@ -18,6 +18,7 @@ pub(super) async fn prepare(
             | "matrix_component_leases"
             | "matrix_recovery_control"
             | "matrix_recovery_batches"
+            | "matrix_recovery_coverage"
     ) {
         return Err(refused());
     }
@@ -57,6 +58,7 @@ pub(super) async fn inserted(
         "runtime_owner_evidence"
             | "matrix_recovery_receipts"
             | "matrix_recovery_batches"
+            | "matrix_recovery_coverage"
             | "task_events"
             | "projection_outbox"
     ) {

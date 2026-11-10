@@ -11,8 +11,7 @@ pub(super) async fn start(root: &std::path::Path, server: &str) -> AppRuntime {
         Arc::new(crate::a2a::NoFault),
     )
     .with_subscriber(captured.subscriber())
-    .await
-    .unwrap();
+    .await;
     for line in captured.output().lines().filter(|line| {
         line.contains("native-succession")
             || line.contains("bootstrap_nonadmin")
@@ -20,6 +19,7 @@ pub(super) async fn start(root: &std::path::Path, server: &str) -> AppRuntime {
     }) {
         println!("{line}");
     }
+    let runtime = runtime.unwrap();
     tokio::time::timeout(Duration::from_secs(45), async {
         loop {
             let state = runtime.health_state().snapshot().await.readiness;

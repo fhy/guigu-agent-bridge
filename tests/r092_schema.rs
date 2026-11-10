@@ -9,7 +9,19 @@ async fn pool() -> (sqlx::SqlitePool, tempfile::TempDir) {
     let pool = storage::connect(root.path().join("state.db"))
         .await
         .unwrap();
-    storage::migrate(&pool).await.unwrap();
+    // This contract belongs to schema25; schema26 compatibility is tested separately.
+    let embedded = sqlx::migrate!("./migrations");
+    let schema25 = sqlx::migrate::Migrator {
+        migrations: std::borrow::Cow::Owned(
+            embedded
+                .iter()
+                .filter(|m| m.version <= 25)
+                .cloned()
+                .collect(),
+        ),
+        ..sqlx::migrate::Migrator::DEFAULT
+    };
+    schema25.run(&pool).await.unwrap();
     (pool, root)
 }
 

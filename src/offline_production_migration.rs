@@ -3,6 +3,8 @@ mod arguments;
 pub(crate) mod cli_exclusion;
 mod configuration;
 #[cfg(test)]
+mod coverage_schema_tests;
+#[cfg(test)]
 mod crash_tests;
 mod discovery;
 mod discovery_snapshot;

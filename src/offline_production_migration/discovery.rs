@@ -29,7 +29,7 @@ pub(super) fn check(database: &Path) -> io::Result<()> {
     let rows = connection.rows(c"SELECT CAST(version AS TEXT),description,CAST(success AS TEXT),hex(checksum) FROM _sqlx_migrations ORDER BY version")
         .map_err(|_| io::Error::other("maintenance discovery ledger read refused"))?;
     validate_ledger(&rows).map_err(|_| io::Error::other("maintenance discovery ledger refused"))?;
-    if rows.len() == 25 {
+    if rows.len() >= 25 {
         check_binding(&connection)
             .map_err(|_| io::Error::other("maintenance discovery binding refused"))?;
     }
@@ -41,7 +41,7 @@ pub(super) fn check(database: &Path) -> io::Result<()> {
 }
 
 fn validate_ledger(rows: &[Vec<String>]) -> io::Result<()> {
-    if rows.is_empty() || rows.len() > 25 {
+    if rows.is_empty() || rows.len() > 26 {
         return Err(refused());
     }
     let migrator = super::verification::embedded_through(rows.len() as i64);

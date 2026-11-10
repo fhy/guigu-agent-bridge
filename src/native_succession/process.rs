@@ -112,6 +112,10 @@ pub(crate) struct Exclusion {
     pub boot: Option<BootObservation>,
     pub rebuild: Option<crate::matrix::rebuild_gap::Rebuild>,
     pub unrouted: Vec<String>,
+    #[serde(skip)]
+    pub coverage: Option<crate::matrix::coverage::Coverage>,
+    #[serde(skip)]
+    pub decision_config: Option<Config>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_metadata:
         Option<crate::storage::recovery_eligibility::writer::succession::stop_metadata::Witness>,
@@ -176,10 +180,22 @@ fn capture_at(proc_root: &Path, owner: &Owner, config: &Config, path: &Path) -> 
         boot: Some(boot),
         rebuild: None,
         unrouted: Vec::new(),
+        coverage: None,
+        decision_config: Some(config.clone()),
         stop_metadata: None,
     })
 }
 impl Exclusion {
+    pub(crate) fn pairing(&self, config: &Config) -> Result<String> {
+        let bytes = serde_json::to_vec(&(
+            &self.account,
+            &self.device,
+            &self.physical,
+            format!("{config:?}"),
+        ))
+        .map_err(|_| refuse("coverage-pairing"))?;
+        Ok(format!("{:x}", Sha256::digest(bytes)))
+    }
     #[cfg(test)]
     pub(crate) fn modeled(owner: Owner) -> Self {
         Self {
@@ -194,6 +210,8 @@ impl Exclusion {
             boot: None,
             rebuild: None,
             unrouted: Vec::new(),
+            coverage: None,
+            decision_config: None,
             stop_metadata: None,
         }
     }

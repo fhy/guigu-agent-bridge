@@ -60,7 +60,7 @@ pub(crate) async fn attempt_with_archive(
         let mut c = pool.acquire().await?;
         proof.stop_metadata = Some(stop_recovery::witness(&mut c, archive, &expected).await?);
     }
-    let payloads = payloads(pool, config, &expected, &mut proof).await?;
+    let payloads = collect_payloads(pool, config, path, &expected, &mut proof, &guard).await?;
     proof.unrouted = payloads
         .iter()
         .filter_map(|(room, value)| {
@@ -102,6 +102,39 @@ pub(crate) async fn attempt_with_archive(
         outcome?;
         Err(state::refuse("publication-not-confirmed"))
     }
+}
+
+async fn collect_payloads(
+    pool: &SqlitePool,
+    config: &Config,
+    path: &Path,
+    expected: &state::State,
+    proof: &mut process::Exclusion,
+    guard: &Guard,
+) -> Result<Vec<(String, serde_json::Value)>, sqlx::Error> {
+    // Archive-qualified stop metadata retains its existing bounded atomic path.
+    // It cannot bypass an already initialized coverage operation or its budgets.
+    if proof.stop_metadata.is_some() {
+        let mut c = pool.acquire().await?;
+        crate::storage::recovery_eligibility::writer::succession::coverage::legacy_allowed(&mut c)
+            .await?;
+    }
+    let result = if expected.hold.as_deref() == Some("refused") && proof.stop_metadata.is_none() {
+        let (rebuild, values, coverage) =
+            crate::matrix::coverage::recover(pool, config, expected, proof, &|| {
+                guard
+                    .revalidate()
+                    .map_err(|_| state::refuse("admission-drift"))?;
+                proof.revalidate(config, path)
+            })
+            .await?;
+        proof.rebuild = Some(rebuild);
+        proof.coverage = Some(coverage);
+        values
+    } else {
+        payloads(pool, config, expected, proof).await?
+    };
+    Ok(result)
 }
 
 async fn payloads(

@@ -9,10 +9,14 @@ mod client;
 #[cfg(test)]
 pub(crate) use client::COPY_LOOPBACK;
 mod conversation;
+pub(crate) mod coverage;
 mod dedup;
 mod error;
 mod event;
 mod identity;
+pub(crate) mod ingress_decision;
+#[cfg(test)]
+mod ingress_decision_tests;
 pub(crate) mod outbound;
 mod permission;
 pub(crate) mod rebuild_gap;

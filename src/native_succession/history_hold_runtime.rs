@@ -104,16 +104,19 @@ async fn history_hold_actual_refusal_ready_and_normal_restart() {
     println!("refusal_then_ready=true same_db_store_restart=true no_replay=true");
 }
 
-async fn initialize(f: &Fixture, server: &MockServer) {
+pub(super) async fn initialize(f: &Fixture, server: &MockServer) {
+    initialize_response(f, server, response("C", false, vec![anchor()])).await;
+}
+pub(super) async fn initialize_response(
+    f: &Fixture,
+    server: &MockServer,
+    initial: serde_json::Value,
+) {
     Mock::given(method("GET"))
         .and(path_regex("/_matrix/client/.*/sync"))
         .and(query_param("since", "B"))
         .and(query_param("full_state", "true"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(response(
-            "C",
-            false,
-            vec![anchor()],
-        )))
+        .respond_with(ResponseTemplate::new(200).set_body_json(initial))
         .with_priority(1)
         .up_to_n_times(1)
         .expect(1)
@@ -162,12 +165,16 @@ async fn initialize(f: &Fixture, server: &MockServer) {
     runtime.shutdown().await.unwrap();
 }
 
-fn anchor() -> serde_json::Value {
+pub(super) fn anchor() -> serde_json::Value {
     json!({"type":"m.room.message","event_id":"$anchor","sender":"@bridge:example.test",
         "origin_server_ts":2,"content":{"msgtype":"m.notice","body":"synthetic own event"}})
 }
 
-fn response(next: &str, limited: bool, events: Vec<serde_json::Value>) -> serde_json::Value {
+pub(super) fn response(
+    next: &str,
+    limited: bool,
+    events: Vec<serde_json::Value>,
+) -> serde_json::Value {
     json!({"next_batch":next,"rooms":{"join":{"!room:example.test":{
     "timeline":{"events":events,"limited":limited,"prev_batch":"recover-page"},
     "state":{"events":[
@@ -205,7 +212,7 @@ async fn recovered_server(server: &MockServer) {
         .await;
 }
 
-async fn produce_refusal(f: &Fixture, server: &MockServer) {
+pub(super) async fn produce_refusal(f: &Fixture, server: &MockServer) {
     let unit = format!("r112-held-{}", uuid::Uuid::now_v7());
     let output = tokio::time::timeout(
         Duration::from_secs(90),
