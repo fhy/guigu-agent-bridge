@@ -290,7 +290,11 @@ fn inspect(
             Err(e) if !path.exists() => {
                 let _ = e;
             }
-            Err(e) => return Err(e),
+            Err(e) => {
+                #[cfg(test)]
+                eprintln!("exclusion_refusal pid={pid} self_pid={self_pid} reason={e}");
+                return Err(e);
+            }
         }
         if scanned.len() > 16384 {
             return Err(refuse("process-bound"));
