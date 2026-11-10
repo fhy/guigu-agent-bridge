@@ -57,11 +57,11 @@ async fn recover_inner(
             .await?;
         }
         collect(pool, config, state, &mut row, &client, revalidate).await?;
+        mutate(pool, config, state, &mut row, revalidate, |r| {
+            r.charge_publish(Clock::read()?)
+        })
+        .await?;
     }
-    mutate(pool, config, state, &mut row, revalidate, |r| {
-        r.charge_publish(Clock::read()?)
-    })
-    .await?;
     reconstruction(state, row)
 }
 fn resume(old: Option<&Coverage>, state: &State, pairing: String) -> Result<Coverage> {
@@ -77,7 +77,14 @@ fn resume(old: Option<&Coverage>, state: &State, pairing: String) -> Result<Cove
                 return Err(refuse("coverage-binding-drift"));
             }
             let mut next = v.clone();
-            next.segment(Clock::read()?)?;
+            if v.status == "ready" {
+                // Persist the new publication reservation directly: completed
+                // collection keeps its counters and may have an expired segment.
+                // The scoped writer checks this reservation's publication deadline.
+                next.charge_publish(Clock::read()?)?;
+            } else {
+                next.segment(Clock::read()?)?;
+            }
             next.revision += 1;
             next
         }

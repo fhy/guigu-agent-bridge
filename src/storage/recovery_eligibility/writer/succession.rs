@@ -25,6 +25,8 @@ mod coverage_cost_tests;
 #[cfg(test)]
 mod coverage_crash_tests;
 #[cfg(test)]
+mod coverage_resume_tests;
+#[cfg(test)]
 mod coverage_tests;
 mod coverage_transition;
 mod lineage;
