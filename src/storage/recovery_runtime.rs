@@ -47,13 +47,24 @@ impl MatrixRecoveryStore {
         reason: &str,
         now: &str,
     ) -> Result<(), sqlx::Error> {
+        use crate::storage::recovery_eligibility::writer;
+        let (mut tx, mutation) = writer::begin_response_refusal(
+            &self.pool,
+            self.recovery.as_ref(),
+            operation,
+            owner,
+            epoch,
+        )
+        .await?;
         let result = sqlx::query("UPDATE matrix_recovery_control SET phase='refused',restart_hold_state='refused',restart_hold_reason=?,updated_at=? WHERE control_id=1 AND cutover_operation_id=? AND phase='active' AND EXISTS (SELECT 1 FROM matrix_component_leases WHERE component='MatrixSync' AND owner_token=? AND epoch=? AND state='active' AND expires_at>=?)")
-            .bind(reason).bind(now).bind(operation).bind(owner).bind(epoch).bind(now).execute(&self.pool).await?;
+            .bind(reason).bind(now).bind(operation).bind(owner).bind(epoch).bind(now).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Err(sqlx::Error::Protocol(
                 "response refusal fence failed".into(),
             ));
         }
+        writer::complete_hold(&mut tx, self.recovery.as_ref(), mutation).await?;
+        tx.commit().await?;
         Ok(())
     }
 

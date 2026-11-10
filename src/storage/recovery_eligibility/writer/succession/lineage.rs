@@ -91,7 +91,18 @@ pub(super) async fn reconstruct_control(
     if state.hold.is_none() {
         return Ok(());
     }
-    let time = super::control_time::authenticated(c, state).await?;
+    let id = control();
+    let held = inventory::snapshot(c, &id).await?;
+    let expected: (String, String) = sqlx::query_as("SELECT original_revision,original_digest FROM offline_recovery_rows WHERE table_name='matrix_recovery_control' AND canonical_pk=? AND parent_relations='[]' AND disposition IN ('eligible_new','eligible_preserved')")
+        .bind(&id.key).fetch_one(&mut *c).await?;
+    let classified_hold = expected == (held.revision.clone(), held.digest.clone());
+    let time = if classified_hold {
+        sqlx::query_scalar("SELECT updated_at FROM matrix_recovery_control WHERE control_id=1")
+            .fetch_one(&mut *c)
+            .await?
+    } else {
+        super::control_time::authenticated(c, state).await?
+    };
     let changed = if state.hold.as_deref() == Some("refused") {
         sqlx::query("UPDATE matrix_recovery_control SET phase='active',restart_hold_state=NULL,restart_hold_reason=NULL,updated_at=? WHERE control_id=1 AND cutover_operation_id=? AND watermark=? AND phase='refused' AND restart_hold_state='refused' AND restart_hold_event_id IS NULL AND restart_hold_reason='rebuild-history-gap'")
             .bind(&time).bind(&state.operation).bind(&state.watermark).execute(&mut *c).await?
@@ -102,8 +113,14 @@ pub(super) async fn reconstruct_control(
     if changed.rows_affected() != 1 {
         return Err(refused());
     }
-    let id = control();
     let actual = inventory::snapshot(c, &id).await?;
+    if classified_hold {
+        let changed = sqlx::query("UPDATE offline_recovery_rows SET original_revision=?,original_digest=? WHERE table_name='matrix_recovery_control' AND canonical_pk=? AND original_revision=? AND original_digest=? AND parent_relations='[]' AND disposition IN ('eligible_new','eligible_preserved')")
+            .bind(&actual.revision).bind(&actual.digest).bind(&id.key).bind(held.revision).bind(held.digest).execute(&mut *c).await?;
+        if changed.rows_affected() != 1 {
+            return Err(refused());
+        }
+    }
     let expected:(String,String)=sqlx::query_as("SELECT original_revision,original_digest FROM offline_recovery_rows WHERE table_name='matrix_recovery_control' AND canonical_pk=?").bind(&id.key).fetch_one(c).await?;
     if expected != (actual.revision, actual.digest) {
         return Err(refused());

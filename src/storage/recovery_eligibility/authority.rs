@@ -143,24 +143,37 @@ async fn validate_effect(
     if held != 0 {
         return Err(refused());
     }
+    if let Some(fence) = fence {
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM matrix_component_leases WHERE component=? AND owner_token=? AND epoch=? AND state='active' AND julianday(expires_at)>julianday('now')")
+            .bind(&fence.component).bind(&fence.owner).bind(fence.epoch).fetch_one(&mut *connection).await?;
+        if count != 1 {
+            return Err(refused());
+        }
+    }
     if domain == EffectDomain::Matrix {
         if !enabled || fence.is_none() {
             return Err(refused());
         }
         let operation = context.matrix_operation().ok_or_else(refused)?;
         let fence = fence.ok_or_else(refused)?;
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM matrix_recovery_control AS control JOIN matrix_recovery_compatibility AS compat ON compat.native_operation_id=control.cutover_operation_id WHERE control.control_id=1 AND control.phase='active' AND control.watermark IS NOT NULL AND control.cutover_operation_id=? AND control.restart_hold_state IS NULL AND compat.decision='native' AND NOT EXISTS(SELECT 1 FROM matrix_recovery_receipts WHERE state IN ('unknown','refused')) AND NOT EXISTS(SELECT 1 FROM matrix_recovery_batches WHERE state IN ('unknown','refused') OR (state IN ('pending','processing') AND NOT(component=? AND owner_token=? AND owner_epoch=?)))")
-            .bind(operation).bind(&fence.component).bind(&fence.owner).bind(fence.epoch).fetch_one(&mut *connection).await?;
+        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM matrix_recovery_control AS control JOIN matrix_recovery_compatibility AS compat ON compat.native_operation_id=control.cutover_operation_id WHERE control.control_id=1 AND control.phase='active' AND control.watermark IS NOT NULL AND control.cutover_operation_id=? AND control.restart_hold_state IS NULL AND compat.decision='native' AND NOT EXISTS(SELECT 1 FROM matrix_recovery_receipts WHERE state IN ('unknown','refused')) AND NOT EXISTS(SELECT 1 FROM matrix_recovery_batches WHERE state IN ('unknown','refused'))")
+            .bind(operation).fetch_one(&mut *connection).await?;
         if count != 1 {
             return Err(refused());
         }
-    }
-    if let Some(fence) = fence {
-        let count: i64 = sqlx::query_scalar("SELECT count(*) FROM matrix_component_leases WHERE component=? AND owner_token=? AND epoch=? AND state='active' AND julianday(expires_at)>julianday('now')")
-            .bind(&fence.component).bind(&fence.owner).bind(fence.epoch).fetch_one(connection).await?;
-        if count != 1 {
-            return Err(refused());
+        let busy: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM matrix_recovery_batches WHERE state IN ('pending','processing') AND NOT(component=? AND owner_token=? AND owner_epoch=?))")
+            .bind(&fence.component).bind(&fence.owner).bind(fence.epoch).fetch_one(&mut *connection).await?;
+        if busy {
+            // No permission is granted. Only a live, otherwise-valid pre-effect
+            // caller may distinguish ordinary sync work from lost authority.
+            return Err(sqlx::Error::Protocol(MATRIX_EFFECT_BUSY.into()));
         }
     }
     Ok(())
+}
+
+const MATRIX_EFFECT_BUSY: &str = "offline-recovery-matrix-effect-busy";
+
+pub(crate) fn matrix_effect_busy(error: &sqlx::Error) -> bool {
+    matches!(error, sqlx::Error::Protocol(reason) if reason == MATRIX_EFFECT_BUSY)
 }

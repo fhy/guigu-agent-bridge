@@ -83,9 +83,29 @@ async fn abrupt(root: &std::path::Path, server: &str) {
     assert!(String::from_utf8_lossy(&output.stdout).contains("idle-child-ready"));
 }
 
+// Share the actual runtime's revision and serialization, like its production stores.
+// A separately bootstrapped scope can become stale on the next sync checkpoint.
+async fn cycle(
+    runtime: &AppRuntime,
+    workspace: &std::path::Path,
+    endpoint: crate::models::EndpointId,
+    failed: bool,
+) -> crate::models::TaskId {
+    task_cycle(
+        &runtime.test_storage_pool(),
+        workspace,
+        endpoint,
+        failed,
+        runtime.test_recovery_scope(),
+    )
+    .await
+}
+
 #[tokio::test]
 #[ignore = "explicit same-store AppRuntime lifecycle, private systemd child required"]
 async fn scoped_failure_new_work_abrupt_exit_and_same_store_restart() {
+    let captured = crate::test_diagnostics::Capture::default();
+    let _diagnostics = tracing::subscriber::set_default(captured.subscriber());
     let f = Fixture::new();
     let server = MockServer::start().await;
     mount_server(&server).await;
@@ -111,18 +131,20 @@ async fn scoped_failure_new_work_abrupt_exit_and_same_store_restart() {
     let endpoint = crate::models::EndpointId::generate();
     let workspace = f.root.path().join("workspace");
     let runtime = start(f.root.path(), &server.uri()).await;
-    let pool = runtime.test_storage_pool();
-    let failed = task_cycle(&pool, &workspace, endpoint, true).await;
-    let success = task_cycle(&pool, &workspace, endpoint, false).await;
+    let failed = cycle(&runtime, &workspace, endpoint, true).await;
+    let success = cycle(&runtime, &workspace, endpoint, false).await;
     assert_ne!(failed, success);
-    drop(pool);
-    runtime.shutdown().await.unwrap();
+    let stopped = runtime.shutdown().await;
+    if stopped.is_err() {
+        eprintln!("{}", captured.output());
+    }
+    stopped.unwrap();
     abrupt(f.root.path(), &server.uri()).await;
     let mut ids = vec![failed, success];
     for _ in 0..2 {
         let runtime = start(f.root.path(), &server.uri()).await;
         let pool = runtime.test_storage_pool();
-        ids.push(task_cycle(&pool, &workspace, endpoint, false).await);
+        ids.push(cycle(&runtime, &workspace, endpoint, false).await);
         for task in &ids {
             assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM task_events WHERE task_id=? AND status IN ('failed','completed')")
                 .bind(task.to_string()).fetch_one(&pool).await.unwrap(), 1);
@@ -145,7 +167,11 @@ async fn scoped_failure_new_work_abrupt_exit_and_same_store_restart() {
             .fetch_one(&pool).await.unwrap();
         assert_eq!(recovered, 1);
         drop(pool);
-        runtime.shutdown().await.unwrap();
+        let stopped = runtime.shutdown().await;
+        if stopped.is_err() {
+            eprintln!("{}", captured.output());
+        }
+        stopped.unwrap();
     }
     println!(
         "same_pair=true failed=1 completed=3 terminal_events=4 abrupt_exits=1 normal_shutdowns=3 replay=0"

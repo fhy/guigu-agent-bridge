@@ -11,6 +11,7 @@ pub(crate) mod output_drain;
 pub(crate) mod output_projection;
 mod projection;
 mod reload;
+pub(crate) mod required_owner;
 mod retry;
 mod runtime;
 

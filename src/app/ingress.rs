@@ -1,9 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
 use tokio::sync::{mpsc, watch};
@@ -220,14 +217,22 @@ impl MatrixIngress {
     }
 
     pub fn start(self) -> MatrixIngressHandle {
+        self.start_supervised(|_| {})
+    }
+
+    pub(crate) fn start_supervised(
+        self,
+        on_exit: impl FnOnce(&'static str) + Send + 'static,
+    ) -> MatrixIngressHandle {
         #[cfg(test)]
         let test_inject = self.test_inject.clone();
         let (shutdown, receiver) = watch::channel(false);
         let alive = Arc::new(AtomicBool::new(true));
-        let task_alive = Arc::clone(&alive);
+        let owner =
+            crate::app::required_owner::RequiredOwner::observed(Arc::clone(&alive), on_exit);
         let join = tokio::spawn(async move {
+            let _owner = owner;
             self.run(receiver).await;
-            task_alive.store(false, Ordering::Release);
         });
         MatrixIngressHandle {
             shutdown,
@@ -362,3 +367,7 @@ impl MatrixIngressHandle {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ingress_liveness_tests.rs"]
+mod liveness_tests;

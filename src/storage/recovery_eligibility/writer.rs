@@ -22,7 +22,9 @@ pub(crate) use mutation::{
     Mutation, complete_mutation, complete_reassigned_lease, complete_refused_receipt,
     prepare_mutation,
 };
-pub(crate) use native_control::{complete_control, prepare_control};
+pub(crate) use native_control::{
+    begin_response_refusal, complete_control, complete_hold, prepare_control,
+};
 pub(crate) use native_lease::{complete_expired_lease, complete_lease, prepare_lease};
 pub(crate) use transaction::ScopedTransaction;
 pub(crate) use workspace::delete_workspace;

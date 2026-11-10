@@ -62,6 +62,15 @@ async fn prepare(
         EffectDomain::Local,
         None,
     );
+    prepare_scoped(pool, workspace, endpoint, scope).await
+}
+
+async fn prepare_scoped(
+    pool: &SqlitePool,
+    workspace: &Path,
+    endpoint: crate::models::EndpointId,
+    scope: RecoveryScope,
+) -> (SqliteRuntimeStore, SqliteTaskLifecycle, Lease, Continuation) {
     let task = insert_task(pool, &scope, endpoint).await;
     let lifecycle = SqliteTaskLifecycle::new_scoped(pool.clone(), Some(scope.clone()));
     let delivery = DeliveryId::generate();
@@ -130,8 +139,9 @@ pub(crate) async fn task_cycle(
     workspace: &Path,
     endpoint: crate::models::EndpointId,
     failed: bool,
+    scope: RecoveryScope,
 ) -> TaskId {
-    let (store, lifecycle, lease, claimed) = prepare(pool, workspace, endpoint).await;
+    let (store, lifecycle, lease, claimed) = prepare_scoped(pool, workspace, endpoint, scope).await;
     let task = lease.task_id;
     let now = Utc::now();
     if !failed {
@@ -216,7 +226,7 @@ async fn assert_terminal(pool: &SqlitePool, task: TaskId) {
     bootstrap_nonadmin(pool, true).await.unwrap();
 }
 
-// Opt-in baseline diagnostics: these assert the observed defect, not repair success.
+// Production scoped writer regressions (baseline failures retained in R112 evidence).
 async fn mechanism_diagnostic_fixture() -> (tempfile::TempDir, SqlitePool) {
     let root = tempfile::tempdir().unwrap();
     let pool = crate::storage::connect(root.path().join("state.db"))
@@ -234,8 +244,7 @@ async fn mechanism_diagnostic_fixture() -> (tempfile::TempDir, SqlitePool) {
 }
 
 #[tokio::test]
-#[ignore = "R112 baseline defect reproduction, not a repaired-behavior gate"]
-async fn mechanism_diagnostic_continue_commits_unclassified_receipt() {
+async fn scoped_continue_receipt_survives_reopen() {
     let (root, pool) = mechanism_diagnostic_fixture().await;
     let (store, _, lease, claimed) =
         prepare(&pool, root.path(), crate::models::EndpointId::generate()).await;
@@ -262,23 +271,19 @@ async fn mechanism_diagnostic_continue_commits_unclassified_receipt() {
             .unwrap(),
         1
     );
-    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM offline_recovery_rows WHERE table_name='continuation_response_receipts'").fetch_one(&pool).await.unwrap(), 0);
+    assert_eq!(sqlx::query_scalar::<_, i64>("SELECT count(*) FROM offline_recovery_rows WHERE table_name='continuation_response_receipts'").fetch_one(&pool).await.unwrap(), 1);
     drop(store);
     pool.close().await;
     let reopened = crate::storage::connect(root.path().join("state.db"))
         .await
         .unwrap();
-    let error = bootstrap_nonadmin(&reopened, true).await.unwrap_err();
-    assert_eq!(mechanism_diagnostic_drift(&reopened).await, (1, 1));
-    println!(
-        "continue=committed receipt=1 classified_receipt=0 drift=1 missing=1 reopened_bootstrap={error}"
-    );
+    bootstrap_nonadmin(&reopened, true).await.unwrap();
+    assert_eq!(mechanism_diagnostic_drift(&reopened).await, (0, 0));
     reopened.close().await;
 }
 
 #[tokio::test]
-#[ignore = "R112 baseline defect reproduction, not a repaired-behavior gate"]
-async fn mechanism_diagnostic_unknown_finish_commits_digest_drift() {
+async fn scoped_unknown_finish_preserves_inventory() {
     let (root, pool) = mechanism_diagnostic_fixture().await;
     let (store, _, lease, claimed) =
         prepare(&pool, root.path(), crate::models::EndpointId::generate()).await;
@@ -308,21 +313,23 @@ async fn mechanism_diagnostic_unknown_finish_commits_digest_drift() {
     let reopened = crate::storage::connect(root.path().join("state.db"))
         .await
         .unwrap();
-    let error = bootstrap_nonadmin(&reopened, true).await.unwrap_err();
-    assert_eq!(mechanism_diagnostic_drift(&reopened).await, (3, 0));
-    println!(
-        "unknown_finish=committed unknown_effect=preserved drift=3 missing=0 reopened_bootstrap={error}"
-    );
+    assert_eq!(mechanism_diagnostic_drift(&reopened).await, (0, 0));
+    // Unknown work remains unknown; integrity does not grant execution.
+    bootstrap_nonadmin(&reopened, true).await.unwrap();
     reopened.close().await;
 }
 
 #[tokio::test]
-#[ignore = "R112 scoped producer positive control"]
-async fn mechanism_diagnostic_scoped_terminal_control() {
+async fn scoped_terminal_control() {
     let (root, pool) = mechanism_diagnostic_fixture().await;
     let endpoint = crate::models::EndpointId::generate();
     for failed in [true, false] {
-        task_cycle(&pool, root.path(), endpoint, failed).await;
+        let scope = RecoveryScope::new(
+            bootstrap_nonadmin(&pool, true).await.unwrap(),
+            EffectDomain::Local,
+            None,
+        );
+        task_cycle(&pool, root.path(), endpoint, failed, scope).await;
     }
     pool.close().await;
     let reopened = crate::storage::connect(root.path().join("state.db"))
@@ -358,3 +365,9 @@ async fn mechanism_diagnostic_drift(pool: &SqlitePool) -> (usize, usize) {
     }
     (drift, missing)
 }
+
+#[path = "writer_rollback_tests.rs"]
+mod writer_rollback_tests;
+
+#[path = "scoped_dispatch_tests.rs"]
+mod scoped_dispatch_tests;

@@ -198,3 +198,7 @@ pub(super) async fn prepare_sync(
     sync.rebuild_state().await.map_err(|_| AppError::Matrix)?;
     Ok((active, sync))
 }
+
+#[cfg(test)]
+#[path = "cutover_lifecycle_tests.rs"]
+mod cutover_lifecycle_tests;

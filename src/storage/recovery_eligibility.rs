@@ -28,6 +28,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use sqlx::{Row, SqliteConnection};
 
+pub(crate) use authority::matrix_effect_busy;
 pub use authority::{EffectDomain, EligibilityContext, LiveFence};
 pub use bootstrap::bootstrap_nonadmin;
 pub(crate) use bootstrap::readback_nonadmin;

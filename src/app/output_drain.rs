@@ -110,7 +110,16 @@ impl OutputSetDrain {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn start(self, interval: Duration) -> OutputSetDrainHandle {
+        self.start_supervised(interval, None)
+    }
+
+    pub(crate) fn start_supervised(
+        self,
+        interval: Duration,
+        owner: Option<super::required_owner::RequiredOwner>,
+    ) -> OutputSetDrainHandle {
         let shutdown_timeout = self
             .spool
             .policy()
@@ -118,10 +127,24 @@ impl OutputSetDrain {
             .saturating_add(SHUTDOWN_SETTLE);
         let (shutdown, mut receiver) = watch::channel(false);
         let join = tokio::spawn(async move {
+            let mut owner = owner;
             loop {
-                let _ = self.drain_once().await;
+                if *receiver.borrow() {
+                    break;
+                }
+                if self.drain_once().await.is_err() {
+                    if let Some(owner) = owner.as_mut() {
+                        owner.fail("persistence-or-fence-refused");
+                    }
+                    tracing::error!(
+                        component = "output-drain",
+                        class = "persistence-or-fence-refused"
+                    );
+                    return Err(());
+                }
                 tokio::select! { biased; _=receiver.changed()=>break, _=tokio::time::sleep(interval)=>{} }
             }
+            Ok(())
         });
         OutputSetDrainHandle {
             shutdown,
@@ -133,21 +156,18 @@ impl OutputSetDrain {
 
 pub(crate) struct OutputSetDrainHandle {
     shutdown: watch::Sender<bool>,
-    join: tokio::task::JoinHandle<()>,
+    join: tokio::task::JoinHandle<Result<(), ()>>,
     shutdown_timeout: Duration,
 }
 impl OutputSetDrainHandle {
-    pub(crate) async fn shutdown(self) -> Result<(), tokio::task::JoinError> {
+    pub(crate) async fn shutdown(self) -> Result<Result<(), ()>, tokio::task::JoinError> {
         let _ = self.shutdown.send(true);
         let mut join = self.join;
         match tokio::time::timeout(self.shutdown_timeout, &mut join).await {
             Ok(result) => result,
             Err(_) => {
                 join.abort();
-                match join.await {
-                    Err(error) if error.is_cancelled() => Ok(()),
-                    result => result,
-                }
+                join.await
             }
         }
     }
@@ -362,6 +382,7 @@ mod tests {
         tokio::time::timeout(Duration::from_millis(200), handle.shutdown())
             .await
             .unwrap()
+            .unwrap()
             .unwrap();
         {
             let calls = sender.calls.lock().unwrap();
@@ -382,6 +403,7 @@ mod tests {
             .start(Duration::from_secs(60))
             .shutdown()
             .await
+            .unwrap()
             .unwrap();
         assert_eq!(sender.calls.lock().unwrap().len(), 3);
         let state: String =
@@ -390,5 +412,45 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(state, "cleaned");
+    }
+    #[tokio::test]
+    async fn output_completion_storage_failure_is_unhealthy_before_shutdown() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_t, drain, sender, pool) = fixture(vec![]).await;
+        sqlx::query("CREATE TRIGGER fail_output_ack BEFORE UPDATE ON acp_output_sets WHEN NEW.acknowledged_cursor>OLD.acknowledged_cursor BEGIN SELECT RAISE(ABORT,'ack storage failure'); END").execute(&pool).await.unwrap();
+        let health = crate::app::HealthState::new(
+            crate::runtime::SqliteRuntimeStore::new(pool.clone()),
+            Arc::new(crate::runtime::RuntimeMetrics::default()),
+            Arc::new(crate::app::ProjectionMetrics::default()),
+        );
+        health.set_owner(crate::app::OwnerState::Running);
+        health.set_adapter_ready(true);
+        let alive = Arc::new(AtomicBool::new(true));
+        health.register_required(alive.clone());
+        let cause = Arc::new(Mutex::new(None));
+        let observed = cause.clone();
+        let guard =
+            crate::app::required_owner::RequiredOwner::observed(alive.clone(), move |class| {
+                *observed.lock().unwrap() = Some(class);
+            });
+        let handle = drain
+            .clone()
+            .start_supervised(Duration::from_millis(1), Some(guard));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while alive.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_ne!(
+            health.snapshot().await.readiness,
+            crate::runtime::Readiness::Ready
+        );
+        assert_eq!(*cause.lock().unwrap(), Some("persistence-or-fence-refused"));
+        assert!(handle.shutdown().await.unwrap().is_err());
+        assert_eq!(sender.calls.lock().unwrap().len(), 1);
+        assert_eq!(drain.drain_once().await, Ok(0));
+        assert_eq!(sender.calls.lock().unwrap().len(), 1);
     }
 }

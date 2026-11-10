@@ -284,18 +284,35 @@ fn record_task_worker_result(
     }
 }
 
+fn required_owner(
+    health: Arc<HealthState>,
+    slot: Arc<Mutex<Option<RequiredOwnerFailure>>>,
+    component: &'static str,
+    alive: Arc<std::sync::atomic::AtomicBool>,
+) -> super::required_owner::RequiredOwner {
+    super::required_owner::RequiredOwner::observed(alive, move |class| {
+        if class != "unexpected-exit"
+            || !matches!(health.owner(), OwnerState::Stopping | OwnerState::Stopped)
+        {
+            retain_failure(&slot, RequiredOwnerFailure { component, class });
+        }
+    })
+}
+
 fn spawn_task_worker<F>(
     future: F,
     alive: Arc<std::sync::atomic::AtomicBool>,
     failure: Arc<Mutex<Option<RequiredOwnerFailure>>>,
+    health: Arc<HealthState>,
 ) -> tokio::task::JoinHandle<Result<(), crate::bus::WorkerError>>
 where
     F: Future<Output = Result<(), crate::bus::WorkerError>> + Send + 'static,
 {
+    let owner = required_owner(health, Arc::clone(&failure), "task-worker", alive);
     tokio::spawn(async move {
+        let _owner = owner;
         let result = future.await;
         record_task_worker_result(&result, &failure);
-        alive.store(false, std::sync::atomic::Ordering::Release);
         result
     })
 }
@@ -306,6 +323,9 @@ fn record_matrix_owner_failure(
     generation: u64,
     error: &crate::matrix::MatrixError,
 ) {
+    if matches!(health.owner(), OwnerState::Stopping | OwnerState::Stopped) {
+        return;
+    }
     let reason = matrix_runtime_failure(error);
     retain_failure(
         slot,
@@ -881,7 +901,19 @@ impl AppRuntime {
                 let heartbeat_token = runtime_instance.clone();
                 let heartbeat_interval =
                     Duration::from_millis(config.bridge.owner_evidence_max_age_seconds * 1_000 / 3);
+                let heartbeat_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                runtime
+                    .health_state
+                    .register_required(heartbeat_alive.clone());
+                let owner = required_owner(
+                    runtime.health_state.clone(),
+                    first_failure.clone(),
+                    "owner-heartbeat",
+                    heartbeat_alive,
+                );
+                let heartbeat_failure = first_failure.clone();
                 runtime.heartbeat = Some(tokio::spawn(async move {
+                    let _owner = owner;
                     let mut tick = tokio::time::interval(heartbeat_interval);
                     loop {
                         tick.tick().await;
@@ -906,6 +938,13 @@ impl AppRuntime {
                             .await
                             .unwrap_or(false)
                         {
+                            retain_failure(
+                                &heartbeat_failure,
+                                RequiredOwnerFailure {
+                                    component: "owner-heartbeat",
+                                    class: "persistence-refused",
+                                },
+                            );
                             break;
                         }
                     }
@@ -1210,13 +1249,31 @@ impl AppRuntime {
                 )
                 .await?;
                 let outbox = crate::app::OutboxDrain::new(outbox_store, outbox_sender, 64);
-                let outbox_owner = outbox.clone().start(Duration::from_secs(1));
+                let outbox_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                runtime.health_state.register_required(outbox_alive.clone());
+                let guard = required_owner(
+                    runtime.health_state.clone(),
+                    first_failure.clone(),
+                    "outbox-drain",
+                    outbox_alive,
+                );
+                let outbox_owner = outbox
+                    .clone()
+                    .start_supervised(Duration::from_secs(1), Some(guard));
+                let output_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+                runtime.health_state.register_required(output_alive.clone());
+                let output_guard = required_owner(
+                    runtime.health_state.clone(),
+                    first_failure.clone(),
+                    "output-drain",
+                    output_alive,
+                );
                 let output_owner = crate::app::output_drain::OutputSetDrain::new(
                     output_store.clone(),
                     output_spool.clone(),
                     durable_sender,
                 )
-                .start(Duration::from_secs(1));
+                .start_supervised(Duration::from_secs(1), Some(output_guard));
                 let replies = Arc::new(ReplyRegistry::default());
 
                 runtime.health_state.matrix().transition(
@@ -1234,6 +1291,8 @@ impl AppRuntime {
                         outbox,
                         runtime_instance.clone(),
                     ));
+                let ingress_health = runtime.health_state.clone();
+                let ingress_failure = first_failure.clone();
                 let ingress = MatrixIngress::new(
                     receiver,
                     repository_trait.clone(),
@@ -1250,7 +1309,20 @@ impl AppRuntime {
                 .with_queue_control_store(Arc::new(reliability.clone()))
                 .with_reap_control(acp.clone())
                 .with_retry_admission(retry)
-                .start();
+                .start_supervised(move |class| {
+                    if !matches!(
+                        ingress_health.owner(),
+                        OwnerState::Stopping | OwnerState::Stopped
+                    ) {
+                        retain_failure(
+                            &ingress_failure,
+                            RequiredOwnerFailure {
+                                component: "matrix-ingress",
+                                class,
+                            },
+                        );
+                    }
+                });
                 runtime
                     .health_state
                     .register_matrix_required(sync_handle.alive());
@@ -1282,14 +1354,21 @@ impl AppRuntime {
                 async move { worker.run().await },
                 worker_alive,
                 worker_failure,
+                Arc::clone(&runtime.health_state),
             ));
             let broadcaster_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
             runtime
                 .health_state
                 .register_required(Arc::clone(&broadcaster_alive));
+            let owner = required_owner(
+                runtime.health_state.clone(),
+                first_failure.clone(),
+                "event-broadcaster",
+                broadcaster_alive,
+            );
             runtime.broadcaster = Some(tokio::spawn(async move {
+                let _owner = owner;
                 EventBroadcaster::new(events, vec![projection]).run().await;
-                broadcaster_alive.store(false, std::sync::atomic::Ordering::Release);
             }));
             runtime.bus = Some(bus);
             runtime.acp = Some(acp);
@@ -1359,6 +1438,15 @@ impl AppRuntime {
     #[cfg(feature = "test-support")]
     pub fn test_storage_pool(&self) -> SqlitePool {
         self.pool.as_ref().expect("running test runtime").clone()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_recovery_scope(
+        &self,
+    ) -> crate::storage::recovery_eligibility::RecoveryScope {
+        self.reliability
+            .test_recovery_scope()
+            .expect("scoped runtime")
     }
 
     pub fn health_addr(&self) -> Option<std::net::SocketAddr> {
@@ -1502,7 +1590,7 @@ impl AppRuntime {
             }
         }
         if let Some(output) = self.output_drain.take()
-            && output.shutdown().await.is_err()
+            && !matches!(output.shutdown().await, Ok(Ok(())))
         {
             shutdown_error.get_or_insert(AppError::Assembly("durable output owner join failed"));
         }
@@ -2027,7 +2115,7 @@ enabled = true
         }
     }
 
-    async fn runtime_fixture() -> (AppRuntime, std::path::PathBuf) {
+    pub(super) async fn runtime_fixture() -> (AppRuntime, std::path::PathBuf) {
         let root = std::env::temp_dir().join(format!("t044-runtime-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir_all(&root).unwrap();
         let config = root.join("bridge.toml");
@@ -2044,8 +2132,7 @@ enabled = true
     }
 
     #[tokio::test]
-    #[ignore = "R112 baseline panic/readiness diagnostic, not repair success"]
-    async fn mechanism_diagnostic_panicked_worker_still_ready() {
+    async fn required_worker_panic_and_abort_are_unhealthy() {
         let (mut runtime, root) = runtime_fixture().await;
         let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         runtime.health_state.register_required(alive.clone());
@@ -2053,32 +2140,39 @@ enabled = true
             async { panic!("synthetic required-owner panic") },
             alive.clone(),
             runtime.first_failure.clone(),
+            runtime.health_state.clone(),
         );
         assert!(handle.await.unwrap_err().is_panic());
-        assert!(alive.load(std::sync::atomic::Ordering::Acquire));
-        assert!(runtime.first_failure.lock().unwrap().is_none());
+        assert!(!alive.load(std::sync::atomic::Ordering::Acquire));
+        assert!(runtime.first_failure.lock().unwrap().is_some());
         let state = runtime.health_state.snapshot().await;
-        assert_eq!(state.readiness, crate::runtime::Readiness::Ready);
+        assert_ne!(state.readiness, crate::runtime::Readiness::Ready);
         // Mirror loss of the real worker too; abort currently skips the same epilogue.
         let worker = runtime.worker.take().unwrap();
         worker.abort();
         assert!(worker.await.unwrap_err().is_cancelled());
-        assert_eq!(
+        assert_ne!(
             runtime.health_state.snapshot().await.readiness,
             crate::runtime::Readiness::Ready
         );
         println!(
-            "panic_join=observed worker_aborted=true alive=true readiness=Ready first_error=absent"
+            "panic_join=observed worker_aborted=true alive=false readiness=unhealthy first_error=retained"
         );
-        runtime.shutdown().await.unwrap();
+        assert!(runtime.shutdown().await.is_err());
         std::fs::remove_dir_all(root).unwrap();
     }
 
     async fn replace_worker_with_failure(runtime: &mut AppRuntime) {
+        runtime
+            .health_state
+            .set_owner(crate::app::OwnerState::Stopping);
         if let Some(worker) = runtime.worker.take() {
             worker.abort();
             let _ = worker.await;
         }
+        runtime
+            .health_state
+            .set_owner(crate::app::OwnerState::Running);
         let slot = std::sync::Arc::clone(&runtime.first_failure);
         let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
         let observed_alive = std::sync::Arc::clone(&alive);
@@ -2091,6 +2185,7 @@ enabled = true
             },
             alive,
             slot,
+            runtime.health_state.clone(),
         ));
         while observed_alive.load(std::sync::atomic::Ordering::Acquire) {
             tokio::task::yield_now().await;
@@ -2295,3 +2390,7 @@ enabled = true
         std::fs::remove_dir_all(root).unwrap();
     }
 }
+
+#[cfg(test)]
+#[path = "mechanism_health_tests.rs"]
+mod mechanism_health_tests;

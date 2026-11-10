@@ -519,21 +519,8 @@ impl SqliteRuntimeStore {
         revision: u64,
         now: DateTime<Utc>,
     ) -> Result<Continuation, RuntimeError> {
-        self.ensure_runtime_generation(lease.task_id).await?;
-        let mut tx = self.pool.begin().await?;
-        let result=sqlx::query("UPDATE task_continuations SET state='in_flight',revision=revision+1,heartbeat_at=? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND state='ready' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
-            .bind(ts(now)).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
-        if result.rows_affected() != 1 {
-            return Err(RuntimeError::Fenced);
-        }
-        let row = sqlx::query("SELECT * FROM task_continuations WHERE task_id=?")
-            .bind(lease.task_id.to_string())
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(RuntimeError::Malformed)?;
-        let continuation = decode_continuation(&row)?;
-        tx.commit().await?;
-        Ok(continuation)
+        self.claim_turn_with_generation(lease, revision, CONTINUATION_RUNTIME_GENERATION, now)
+            .await
     }
 
     pub async fn claim_turn_with_generation(
@@ -580,7 +567,10 @@ impl SqliteRuntimeStore {
     ) -> Result<Continuation, RuntimeError> {
         self.ensure_runtime_generation(lease.task_id).await?;
         let prompt = bounded_prompt(next_prompt)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.transaction().await?;
+        let mutation = self
+            .prepare(&mut tx, "task_continuations", &lease.task_id.to_string())
+            .await?;
         let result=sqlx::query("UPDATE task_continuations SET state='ready',revision=revision+1,next_turn=next_turn+1,completed_turns=completed_turns+1,consecutive_no_progress=consecutive_no_progress+1,next_prompt=?,heartbeat_at=?,observed_output_bytes=observed_output_bytes+? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND state='in_flight' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
             .bind(prompt).bind(ts(now)).bind(to_i64(observed_bytes)?).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
@@ -592,6 +582,7 @@ impl SqliteRuntimeStore {
             .await?
             .ok_or(RuntimeError::Malformed)?;
         let continuation = decode_continuation(&row)?;
+        self.complete(&mut tx, mutation).await?;
         tx.commit().await?;
         Ok(continuation)
     }
@@ -617,7 +608,10 @@ impl SqliteRuntimeStore {
             revision
         );
         let hash = Uuid::new_v5(&OUTBOX_BODY_NAMESPACE, response.as_bytes()).to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.transaction().await?;
+        let mutation = self
+            .prepare(&mut tx, "task_continuations", &lease.task_id.to_string())
+            .await?;
         let result = sqlx::query("UPDATE task_continuations SET state='ready',revision=revision+1,next_turn=next_turn+1,completed_turns=completed_turns+1,consecutive_no_progress=consecutive_no_progress+1,next_prompt=?,heartbeat_at=?,observed_output_bytes=observed_output_bytes+? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='in_flight' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
             .bind(prompt).bind(ts(now)).bind(to_i64(observed_bytes)?).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(generation).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
@@ -628,11 +622,14 @@ impl SqliteRuntimeStore {
         if inserted.rows_affected() != 1 {
             return Err(RuntimeError::Continuation);
         }
+        self.insert(&mut tx, "continuation_response_receipts", &key)
+            .await?;
         let row = sqlx::query("SELECT * FROM task_continuations WHERE task_id=?")
             .bind(lease.task_id.to_string())
             .fetch_one(&mut *tx)
             .await?;
         let continuation = decode_continuation(&row)?;
+        self.complete(&mut tx, mutation).await?;
         tx.commit().await?;
         Ok(continuation)
     }
@@ -741,23 +738,37 @@ impl SqliteRuntimeStore {
         if current.as_deref() != Some(generation) {
             return Err(RuntimeError::Fenced);
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.transaction().await?;
+        let mutation = self
+            .prepare(&mut tx, "task_continuations", &lease.task_id.to_string())
+            .await?;
         let result=sqlx::query("UPDATE task_continuations SET state=?,revision=revision+1,completed_turns=completed_turns+1,heartbeat_at=?,observed_output_bytes=observed_output_bytes+? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='in_flight' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
             .bind(state.as_str()).bind(ts(now)).bind(to_i64(observed_bytes)?).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(generation).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Err(RuntimeError::Fenced);
         }
+        self.complete(&mut tx, mutation).await?;
         let lease_state = if state == ContinuationState::RecoveryNeeded {
             "recovery_needed"
         } else {
             "released"
         };
+        let lease_mutation = self
+            .prepare(&mut tx, "execution_leases", &lease.resource.to_string())
+            .await?;
         let result=sqlx::query("UPDATE execution_leases SET state=?,heartbeat_at=?,expires_at=? WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
             .bind(lease_state).bind(ts(now)).bind(ts(now)).bind(lease.resource.to_string()).bind(lease.task_id.to_string()).bind(lease.owner.to_string()).bind(to_i64(lease.fence)?).bind(ts(now)).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Err(RuntimeError::Fenced);
         }
+        self.complete(&mut tx, lease_mutation).await?;
         if state == ContinuationState::RecoveryNeeded {
+            let delivery: Option<String> = sqlx::query_scalar("SELECT d.delivery_id FROM delivery_dispositions d JOIN task_continuations c USING(delivery_id) WHERE c.task_id=? AND d.state IN ('prepared','acknowledged')")
+                .bind(lease.task_id.to_string()).fetch_optional(&mut *tx).await?;
+            let disposition = match delivery.as_deref() {
+                Some(id) => self.prepare(&mut tx, "delivery_dispositions", id).await?,
+                None => None,
+            };
             sqlx::query(
                 "UPDATE delivery_dispositions SET state='outcome_unknown',reason_code='recovery_needed' \
                  WHERE delivery_id=(SELECT delivery_id FROM task_continuations WHERE task_id=?) \
@@ -767,6 +778,7 @@ impl SqliteRuntimeStore {
             .bind(lease.task_id.to_string())
             .execute(&mut *tx)
             .await?;
+            self.complete(&mut tx, disposition).await?;
         }
         tx.commit().await?;
         Ok(())

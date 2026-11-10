@@ -107,7 +107,8 @@ impl MatrixRecoveryStore {
     }
 
     pub async fn reconcile_restart(&self) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        use crate::storage::recovery_eligibility::writer;
+        let mut tx = writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let existing: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT restart_hold_state,restart_hold_event_id,restart_hold_reason FROM matrix_recovery_control WHERE control_id=1",
         )
@@ -136,12 +137,14 @@ impl MatrixRecoveryStore {
                     _ => "invalid recovery receipt state",
                 }
             };
+            let mutation = writer::prepare_control(&mut tx, self.recovery.as_ref()).await?;
             sqlx::query("UPDATE matrix_recovery_control SET restart_hold_state=?,restart_hold_event_id=?,restart_hold_reason=?,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE control_id=1 AND restart_hold_state IS NULL")
                 .bind(state)
                 .bind(event_id)
                 .bind(reason)
                 .execute(&mut *tx)
                 .await?;
+            writer::complete_hold(&mut tx, self.recovery.as_ref(), mutation).await?;
             tx.commit().await?;
             return Err(sqlx::Error::Protocol(format!(
                 "restart hold for {event_id}: {reason}"

@@ -213,3 +213,7 @@ pub(crate) async fn confirmed(
     c.close().await?;
     Ok(true)
 }
+
+#[cfg(test)]
+#[path = "succession/hold_writer_tests.rs"]
+mod hold_writer_tests;

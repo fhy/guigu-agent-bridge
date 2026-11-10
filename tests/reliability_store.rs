@@ -612,7 +612,12 @@ async fn outbox_sent_cas_false_is_not_replayed() {
     });
     let drain = OutboxDrain::new(store, probe.clone(), 8);
     assert!(drain.drain_once().await.is_err());
-    assert_eq!(drain.drain_once().await.unwrap(), 0);
+    assert!(drain.clone().drain_once().await.is_err());
+    let state: String = sqlx::query_scalar("SELECT state FROM projection_outbox LIMIT 1")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "sending");
     assert_eq!(*probe.calls.lock().unwrap(), 1);
 }
 
@@ -693,7 +698,15 @@ async fn concurrent_drains_do_not_replay_stale_sending_claims() {
     let a = OutboxDrain::new(store.clone(), probe.clone(), 8);
     let b = OutboxDrain::new(store.clone(), probe.clone(), 8);
     let (left, right) = tokio::join!(a.drain_once(), b.drain_once());
-    assert_eq!(left.unwrap() + right.unwrap(), 0);
+    assert!(left.is_err());
+    assert!(right.is_err());
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM projection_outbox")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "sending"
+    );
     assert_eq!(probe.0.lock().unwrap().len(), 0);
 }
 

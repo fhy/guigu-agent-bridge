@@ -13,10 +13,17 @@ impl MatrixSync {
         let (dispositions_tx, dispositions_rx) = mpsc::channel(1);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let alive = Arc::new(AtomicBool::new(true));
-        let task_alive = Arc::clone(&alive);
+        let observer = self.failure_observer.clone();
+        let owner =
+            crate::app::required_owner::RequiredOwner::observed(Arc::clone(&alive), move |_| {
+                if let Some(observer) = observer {
+                    observer(&MatrixError::Join);
+                }
+            });
         let failure_observer = self.failure_observer.clone();
         let recovery_lease = self.recovery.clone().map(MatrixSyncLease::new);
         let join = tokio::spawn(async move {
+            let _owner = owner;
             let result = self
                 .run(
                     events_tx,
@@ -27,7 +34,6 @@ impl MatrixSync {
             if let (Err(error), Some(observer)) = (&result, failure_observer) {
                 observer(error);
             }
-            task_alive.store(false, Ordering::Release);
             result
         });
         (
@@ -169,5 +175,48 @@ pub(super) fn classify_sdk_error(error: matrix_sdk::Error) -> MatrixError {
         ) => MatrixError::DeviceKicked,
         Some(_) => MatrixError::CutoverRefused,
         None => MatrixError::Transport,
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+    struct PanickingTokens;
+    impl SyncTokenStore for PanickingTokens {
+        fn load<'a>(&'a self) -> SyncTokenFuture<'a, Result<Option<String>, MatrixError>> {
+            Box::pin(async { panic!("injected sync owner panic") })
+        }
+        fn save<'a>(&'a self, _: &'a str) -> SyncTokenFuture<'a, Result<(), MatrixError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    #[tokio::test]
+    async fn sync_panic_and_unpolled_abort_publish_owner_loss() {
+        for abort in [false, true] {
+            let observed = Arc::new(AtomicBool::new(false));
+            let result = observed.clone();
+            let sync =
+                MatrixSync::new(MatrixClient::for_test().await, Arc::new(PanickingTokens), 1)
+                    .unwrap()
+                    .with_failure_observer(Arc::new(move |_| {
+                        result.store(true, Ordering::Release);
+                    }));
+            let (handle, _events, _dispositions) = sync.start_with_dispositions();
+            let alive = handle.alive();
+            if abort {
+                handle.join.abort();
+            }
+            let error = tokio::time::timeout(Duration::from_secs(3), handle.join)
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(if abort {
+                error.is_cancelled()
+            } else {
+                error.is_panic()
+            });
+            assert!(!alive.load(Ordering::Acquire));
+            assert!(observed.load(Ordering::Acquire));
+        }
     }
 }

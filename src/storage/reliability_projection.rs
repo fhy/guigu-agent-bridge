@@ -4,6 +4,14 @@ use super::{PendingProjection, ReliabilityError, ReliabilityStore};
 use crate::storage::recovery_eligibility::{RowIdentity, writer};
 
 impl ReliabilityStore {
+    pub(crate) async fn has_sending_projection(&self) -> Result<bool, ReliabilityError> {
+        Ok(sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM projection_outbox WHERE state='sending')",
+        )
+        .fetch_one(&self.pool)
+        .await?)
+    }
+
     pub async fn claim_projections(
         &self,
         owner: &str,

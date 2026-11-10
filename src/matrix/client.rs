@@ -61,6 +61,33 @@ impl MatrixClient {
         }
     }
 
+    #[cfg(test)]
+    pub(crate) async fn for_test_session(origin: &str) -> Self {
+        let inner = Client::builder()
+            .homeserver_url(origin)
+            .build()
+            .await
+            .unwrap();
+        inner
+            .restore_session(MatrixSession {
+                meta: matrix_sdk::SessionMeta {
+                    user_id: "@bridge:example.test".parse().unwrap(),
+                    device_id: "SYNTHETIC".into(),
+                },
+                tokens: SessionTokens {
+                    access_token: "loopback-only".into(),
+                    refresh_token: None,
+                },
+            })
+            .await
+            .unwrap();
+        Self {
+            inner,
+            user_id: "@bridge:example.test".into(),
+            device_id: "SYNTHETIC".into(),
+        }
+    }
+
     pub(crate) async fn isolated_active(&self) -> Result<Self, MatrixError> {
         Ok(Self {
             inner: self
