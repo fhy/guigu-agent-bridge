@@ -916,3 +916,30 @@ async fn queue_pause_rejects_forged_reap_binding_and_recovery_classifies_send_st
         .unwrap();
     assert_eq!(state, "recovery_needed");
 }
+
+#[tokio::test]
+#[ignore = "R112 return-contract diagnostic; preserves the original failing test"]
+async fn mechanism_diagnostic_cas_false_retains_single_send() {
+    let pool = database().await;
+    let store = seed_outbox(&pool).await;
+    let probe = std::sync::Arc::new(CasFailureProbe {
+        pool: pool.clone(),
+        calls: Mutex::new(0),
+        close_pool: false,
+    });
+    let drain = OutboxDrain::new(store, probe.clone(), 8);
+    assert!(drain.drain_once().await.is_err());
+    assert!(drain.clone().drain_once().await.is_err());
+    let calls = *probe.calls.lock().unwrap();
+    assert_eq!(calls, 1);
+    let states: Vec<(String, i64)> =
+        sqlx::query_as("SELECT state,claim_revision FROM projection_outbox ORDER BY stable_txn_id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(states, vec![("sending".into(), 2)]);
+    println!(
+        "completion_cas=false repeated_drain=Err send_calls={calls} state=sending claim_revision=2"
+    );
+    pool.close().await;
+}

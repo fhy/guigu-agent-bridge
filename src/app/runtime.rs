@@ -2043,6 +2043,37 @@ enabled = true
         (AppRuntime::start(config).await.unwrap(), root)
     }
 
+    #[tokio::test]
+    #[ignore = "R112 baseline panic/readiness diagnostic, not repair success"]
+    async fn mechanism_diagnostic_panicked_worker_still_ready() {
+        let (mut runtime, root) = runtime_fixture().await;
+        let alive = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        runtime.health_state.register_required(alive.clone());
+        let handle = spawn_task_worker(
+            async { panic!("synthetic required-owner panic") },
+            alive.clone(),
+            runtime.first_failure.clone(),
+        );
+        assert!(handle.await.unwrap_err().is_panic());
+        assert!(alive.load(std::sync::atomic::Ordering::Acquire));
+        assert!(runtime.first_failure.lock().unwrap().is_none());
+        let state = runtime.health_state.snapshot().await;
+        assert_eq!(state.readiness, crate::runtime::Readiness::Ready);
+        // Mirror loss of the real worker too; abort currently skips the same epilogue.
+        let worker = runtime.worker.take().unwrap();
+        worker.abort();
+        assert!(worker.await.unwrap_err().is_cancelled());
+        assert_eq!(
+            runtime.health_state.snapshot().await.readiness,
+            crate::runtime::Readiness::Ready
+        );
+        println!(
+            "panic_join=observed worker_aborted=true alive=true readiness=Ready first_error=absent"
+        );
+        runtime.shutdown().await.unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
     async fn replace_worker_with_failure(runtime: &mut AppRuntime) {
         if let Some(worker) = runtime.worker.take() {
             worker.abort();
