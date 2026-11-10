@@ -134,15 +134,29 @@ async fn validate_new_events(
         && let Some(t) = &next.target
     {
         for room in &t.rooms {
-            for v in &room.initial {
-                crate::matrix::ingress_decision::no_effect(c, config, &room.id, v).await?;
+            for (ordinal, v) in room.initial.iter().enumerate() {
+                crate::matrix::intent_diagnostic::check(
+                    c,
+                    config,
+                    &room.id,
+                    v,
+                    crate::matrix::intent_diagnostic::Position::target(ordinal, room.initial.len()),
+                )
+                .await?;
             }
         }
     }
     let offset = old.map_or(0, |v| v.pages.len());
     for page in next.pages.iter().skip(offset) {
-        for v in &page.events {
-            crate::matrix::ingress_decision::no_effect(c, config, &page.room, v).await?;
+        for (ordinal, v) in page.events.iter().enumerate() {
+            crate::matrix::intent_diagnostic::check(
+                c,
+                config,
+                &page.room,
+                v,
+                crate::matrix::intent_diagnostic::Position::page(ordinal, page.events.len()),
+            )
+            .await?;
         }
     }
     Ok(())

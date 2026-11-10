@@ -93,6 +93,12 @@ pub(crate) async fn no_effect(
         {
             Ok(())
         }
-        _ => Err(refuse("task-or-reply-intent")),
+        Ok(_) => Err(refuse("route-admission-intent")),
+        Err(RouteError::Forbidden) => Err(refuse("permission-reply-intent")),
+        Err(RouteError::NoRoute) => Err(refuse("unavailable-reply-intent")),
+        Err(RouteError::Target) => Err(refuse("route-target-invalid")),
+        Err(RouteError::Ambiguous) => Err(refuse("route-ambiguous")),
+        Err(RouteError::Identity) => Err(refuse("route-identity-invalid")),
+        Err(_) => Err(refuse("route-unexpected")),
     }
 }

@@ -5,12 +5,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 pub(crate) mod budget;
+#[cfg(test)]
+mod observation_tests;
 mod run;
 mod sdk;
 #[cfg(test)]
 mod tests;
 mod validation;
 pub(crate) use budget::Clock;
+#[cfg(test)]
+pub(crate) use run::failure as persist_failure;
 pub(crate) use run::recover;
 pub(crate) type Result<T> = std::result::Result<T, sqlx::Error>;
 pub(crate) const MAX_BYTES: usize = 16 * 1024 * 1024;

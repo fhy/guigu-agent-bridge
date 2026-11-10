@@ -17,6 +17,9 @@ mod identity;
 pub(crate) mod ingress_decision;
 #[cfg(test)]
 mod ingress_decision_tests;
+pub(crate) mod intent_diagnostic;
+#[cfg(test)]
+mod intent_diagnostic_tests;
 pub(crate) mod outbound;
 mod permission;
 pub(crate) mod rebuild_gap;
@@ -26,6 +29,8 @@ mod router;
 mod store_identity;
 pub(crate) mod succession_payload;
 mod sync;
+#[cfg(test)]
+mod target_classification_tests;
 
 pub use admin::{
     AdminHandler, AdminPermissionPolicy, AdminResult, CommandLedger, ReapAck, ReapControl,

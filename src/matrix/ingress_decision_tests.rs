@@ -77,7 +77,12 @@ async fn coverage_decision_reads_uncommitted_intent_on_supplied_connection() {
         no_effect(&mut tx, &cfg, ROOM, &value).await.unwrap();
         sqlx::query("INSERT INTO transport_receipts(transport,external_event_id,room_id,reply_event_id,receipt_kind,route_kind,state,result_code,created_at,updated_at) VALUES('matrix',?,?,?,'ordinary','fixture','reserved','unknown','time','time')")
             .bind(if reply {"$another"} else {"$input"}).bind(ROOM).bind(if reply {Some("$input")} else {None}).execute(&mut *tx).await.unwrap();
-        assert!(no_effect(&mut tx, &cfg, ROOM, &value).await.is_err());
+        assert_eq!(
+            super::intent_diagnostic::predicate(
+                &no_effect(&mut tx, &cfg, ROOM, &value).await.unwrap_err()
+            ),
+            "durable-event-intent"
+        );
         // A second pool connection cannot see this uncommitted intent.
         let external: i64 = sqlx::query_scalar("SELECT count(*) FROM transport_receipts")
             .fetch_one(&pool)

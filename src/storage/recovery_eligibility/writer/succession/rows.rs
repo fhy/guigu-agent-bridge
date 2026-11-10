@@ -124,7 +124,21 @@ async fn disposition(
         return Err(state::refuse("unreceipted-effect"));
     }
     if let Some(config) = &proof.decision_config {
-        crate::matrix::ingress_decision::no_effect(c, config, room, value).await?;
+        crate::matrix::intent_diagnostic::check(
+            c,
+            config,
+            room,
+            value,
+            crate::matrix::intent_diagnostic::Position::publication(
+                batch
+                    .expected
+                    .iter()
+                    .position(|id| id == event)
+                    .unwrap_or(batch.expected.len()),
+                batch.expected.len(),
+            ),
+        )
+        .await?;
     }
     // reserve-before-deliver is preserved. Here delivery is solely the normal
     // adapter's ignored-event result, so the whole disposition can be atomic.

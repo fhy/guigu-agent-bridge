@@ -210,7 +210,7 @@ async fn mutate(
 }
 
 // Persist the first static failure only when the same exclusion/binding still holds.
-async fn failure(
+pub(crate) async fn failure(
     pool: &SqlitePool,
     config: &Config,
     state: &State,
