@@ -7,9 +7,9 @@ pub(super) async fn require_current_process(
     connection: &mut SqliteConnection,
     scope: &RecoveryScope,
     token: &str,
+    fingerprint: &str,
 ) -> Result<(), sqlx::Error> {
     let observation = RuntimeOwnerEvidence::capture().ok_or_else(refused)?;
-    let fingerprint = RuntimeOwnerEvidence::fingerprint().ok_or_else(refused)?;
     let count: i64 = sqlx::query_scalar("SELECT count(*) FROM runtime_instances r JOIN runtime_owner_evidence e USING(instance_token) WHERE r.instance_token=? AND r.state IN ('active','stopping') AND r.process_fingerprint=? AND e.is_current=1 AND e.state IN ('live','scan_pending') AND e.process_fingerprint=r.process_fingerprint AND e.pid=? AND e.proc_starttime=? AND e.boot_id=?")
         .bind(token).bind(fingerprint).bind(observation.pid).bind(observation.proc_starttime).bind(observation.boot_id).fetch_one(&mut *connection).await?;
     if count != 1 {
@@ -44,6 +44,7 @@ pub(crate) async fn stopping_runtime(
     now: &str,
 ) -> Result<bool, sqlx::Error> {
     let scope = scope.ok_or_else(refused)?;
+    let fingerprint = scope.runtime_fingerprint().await?;
     let mut transaction = begin(pool, scope).await?;
     if scope
         .matrix_fence
@@ -52,7 +53,7 @@ pub(crate) async fn stopping_runtime(
     {
         return Err(refused());
     }
-    require_current_process(&mut transaction, scope, token).await?;
+    require_current_process(&mut transaction, scope, token, &fingerprint).await?;
     let observation = RuntimeOwnerEvidence::capture().ok_or_else(refused)?;
     if !crate::storage::owner_observation::current_timestamp(now) {
         return Err(refused());
@@ -100,6 +101,7 @@ pub(crate) async fn finish_controlled_stop(
     joined: &crate::acp::JoinedChildren,
 ) -> Result<bool, ReliabilityError> {
     let scope = scope.ok_or_else(refused)?;
+    let fingerprint = scope.runtime_fingerprint().await?;
     let mut transaction = begin(pool, scope).await?;
     if scope
         .matrix_fence
@@ -117,9 +119,16 @@ pub(crate) async fn finish_controlled_stop(
         prepare(&mut transaction, scope, &identity).await?;
         return Ok(true);
     }
-    require_current_process(&mut transaction, scope, token).await?;
+    require_current_process(&mut transaction, scope, token, &fingerprint).await?;
     let Some(record) = store
-        .prepare_controlled_stop(&mut transaction, token, now, observation, joined)
+        .prepare_controlled_stop(
+            &mut transaction,
+            token,
+            now,
+            observation,
+            joined,
+            &fingerprint,
+        )
         .await?
     else {
         return Ok(false);

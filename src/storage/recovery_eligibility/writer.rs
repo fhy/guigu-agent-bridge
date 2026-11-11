@@ -38,9 +38,30 @@ pub struct RecoveryScope {
     revision: Arc<AtomicI64>,
     serial: Arc<Mutex<()>>,
     matrix_fence: Arc<OnceLock<LiveFence>>,
+    runtime_executable: Arc<OnceLock<crate::storage::owner_executable::RuntimeExecutable>>,
 }
 
 impl RecoveryScope {
+    pub(crate) fn install_runtime_executable(
+        &self,
+        executable: crate::storage::owner_executable::RuntimeExecutable,
+    ) -> Result<(), sqlx::Error> {
+        let installed = self.runtime_executable.get_or_init(|| executable.clone());
+        if !installed.same_cache(&executable) {
+            return Err(refused());
+        }
+        Ok(())
+    }
+
+    // Call before acquiring the scope serialization guard or a SQL transaction.
+    pub(crate) async fn runtime_fingerprint(&self) -> Result<String, sqlx::Error> {
+        match self.runtime_executable.get() {
+            Some(executable) => executable.validate().await,
+            None => crate::storage::RuntimeOwnerEvidence::fingerprint(),
+        }
+        .ok_or_else(refused)
+    }
+
     // Lease renewal maintains an existing authority; it authorizes no Matrix
     // effect. Keep the exact live fence and shared serialization while another
     // component processes a response. Holds and expired fences still refuse.
@@ -106,6 +127,7 @@ impl RecoveryScope {
             revision: Arc::new(AtomicI64::new(revision)),
             serial: Arc::new(Mutex::new(())),
             matrix_fence: Arc::new(OnceLock::new()),
+            runtime_executable: Arc::new(OnceLock::new()),
         }
     }
 

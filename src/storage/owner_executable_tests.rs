@@ -142,8 +142,25 @@ async fn actual_running_object_uses_legacy_format_and_domain_drift_refuses() {
         Some(fingerprint.clone()),
         crate::storage::RuntimeOwnerEvidence::fingerprint()
     );
-    assert_eq!(owner.validate().await, Some(fingerprint.as_str()));
+    assert_eq!(
+        owner.validate().await.as_deref(),
+        Some(fingerprint.as_str())
+    );
     owner.cgroup.push_str("/drift");
     assert!(owner.validate().await.is_none());
     assert!(owner.validate().await.is_none());
+}
+
+#[tokio::test]
+async fn cancelled_validation_does_not_lose_shared_stop_identity() {
+    let owner = RuntimeExecutable::capture().await.unwrap();
+    let sibling = owner.clone();
+    assert!(owner.same_cache(&sibling));
+    let lock = owner.inner.lock().unwrap();
+    let task = tokio::spawn(async move { sibling.validate().await });
+    tokio::task::yield_now().await;
+    task.abort();
+    drop(lock);
+    assert!(task.await.unwrap_err().is_cancelled());
+    assert_eq!(owner.validate().await.as_deref(), Some(owner.fingerprint()));
 }

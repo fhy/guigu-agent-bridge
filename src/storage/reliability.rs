@@ -171,6 +171,7 @@ pub struct ReliabilityStore {
     pool: SqlitePool,
     owner_evidence_max_age: i64,
     recovery: Option<super::recovery_eligibility::RecoveryScope>,
+    executable: Option<super::owner_executable::RuntimeExecutable>,
 }
 
 impl ReliabilityStore {
@@ -216,6 +217,7 @@ impl ReliabilityStore {
             pool,
             owner_evidence_max_age: OWNER_EVIDENCE_MAX_AGE_SECS,
             recovery: None,
+            executable: None,
         }
     }
 
@@ -227,6 +229,7 @@ impl ReliabilityStore {
             pool,
             owner_evidence_max_age: OWNER_EVIDENCE_MAX_AGE_SECS,
             recovery: Some(recovery),
+            executable: None,
         }
     }
 
@@ -241,6 +244,7 @@ impl ReliabilityStore {
             pool,
             owner_evidence_max_age: seconds,
             recovery: None,
+            executable: None,
         })
     }
 

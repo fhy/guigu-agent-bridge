@@ -580,6 +580,9 @@ impl AppRuntime {
             .await
             .ok_or(AppError::Runtime)?;
         let process_fingerprint = executable.fingerprint().to_owned();
+        let reliability = reliability
+            .with_runtime_executable(executable.clone())
+            .map_err(|_| AppError::Runtime)?;
         let startup_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         let evidence = crate::storage::RuntimeOwnerEvidence::capture().ok_or(AppError::Runtime)?;
         let mut owns_runtime = reliability
@@ -727,13 +730,16 @@ impl AppRuntime {
         reliability: crate::storage::ReliabilityStore,
         runtime_instance: String,
         owns_runtime: bool,
-        mut executable: crate::storage::owner_executable::RuntimeExecutable,
+        executable: crate::storage::owner_executable::RuntimeExecutable,
         maintenance_lock: Arc<crate::offline_production_migration::RuntimeLock>,
         recovery_scope: Option<crate::storage::recovery_eligibility::RecoveryScope>,
         a2a_faults: Arc<dyn crate::a2a::IngressFaultInjector>,
         spawn_gate: crate::acp::AcpSpawnGate,
         assembly_started: Arc<std::sync::atomic::AtomicBool>,
     ) -> Result<Self, AppError> {
+        let reliability = reliability
+            .with_runtime_executable(executable.clone())
+            .map_err(|_| AppError::Runtime)?;
         let repository = Arc::new(match recovery_scope.clone() {
             Some(scope) => SqliteRepository::with_recovery(pool.clone(), scope),
             None => SqliteRepository::new(pool.clone()),
@@ -934,7 +940,7 @@ impl AppRuntime {
                         if !heartbeat_store
                             .publish_owner_heartbeat(
                                 &heartbeat_token,
-                                heartbeat_fingerprint,
+                                &heartbeat_fingerprint,
                                 &now,
                                 &evidence,
                             )

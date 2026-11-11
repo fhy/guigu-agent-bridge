@@ -253,8 +253,9 @@ pub(crate) async fn release_component_lease(
     if fence.component != component || fence.owner != owner || fence.epoch != epoch {
         return Err(refused());
     }
+    let fingerprint = scope.runtime_fingerprint().await?;
     let mut transaction = begin(pool, scope).await?;
-    owner::require_current_process(&mut transaction, scope, owner).await?;
+    owner::require_current_process(&mut transaction, scope, owner, &fingerprint).await?;
     let identity = super::text_identity("matrix_component_leases", component)?;
     let mutation = prepare(&mut transaction, scope, &identity).await?;
     let changed = sqlx::query("UPDATE matrix_component_leases SET state='expired',expires_at=?,updated_at=? WHERE component=? AND owner_token=? AND epoch=? AND state='active'")

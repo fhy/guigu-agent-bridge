@@ -80,6 +80,28 @@ pub(crate) async fn bootstrap_evidence(
 }
 
 impl ReliabilityStore {
+    pub(crate) fn with_runtime_executable(
+        mut self,
+        executable: crate::storage::owner_executable::RuntimeExecutable,
+    ) -> Result<Self, ReliabilityError> {
+        if let Some(scope) = &self.recovery {
+            scope.install_runtime_executable(executable.clone())?;
+        }
+        self.executable = Some(executable);
+        Ok(self)
+    }
+
+    pub(crate) async fn runtime_fingerprint(&self) -> Result<String, ReliabilityError> {
+        let value = match &self.executable {
+            Some(executable) => executable.validate().await,
+            None => match &self.recovery {
+                Some(scope) => return Ok(scope.runtime_fingerprint().await?),
+                None => RuntimeOwnerEvidence::fingerprint(),
+            },
+        };
+        value.ok_or(ReliabilityError::Malformed)
+    }
+
     pub(crate) async fn finish_controlled_stop(
         &self,
         token: &str,
@@ -99,12 +121,13 @@ impl ReliabilityStore {
             )
             .await;
         }
+        let fingerprint = self.runtime_fingerprint().await?;
         let mut transaction = writer::begin(&self.pool, self.recovery.as_ref()).await?;
         if restart_eligible(&mut transaction, token).await? {
             return Ok(true);
         }
         let Some(record) = self
-            .prepare_controlled_stop(&mut transaction, token, now, evidence, joined)
+            .prepare_controlled_stop(&mut transaction, token, now, evidence, joined, &fingerprint)
             .await?
         else {
             return Ok(false);
@@ -139,9 +162,9 @@ impl ReliabilityStore {
         now: &str,
         evidence: &RuntimeOwnerEvidence,
         joined: &crate::acp::JoinedChildren,
+        fingerprint: &str,
     ) -> Result<Option<ControlledStop>, ReliabilityError> {
         let (generation, epoch) = joined.identity();
-        let fingerprint = RuntimeOwnerEvidence::fingerprint().unwrap_or_default();
         if generation != token || epoch <= 0 || evidence.pid != i64::from(std::process::id()) {
             return Ok(None);
         }
@@ -151,7 +174,7 @@ impl ReliabilityStore {
         let refusal = if sqlx::query_scalar::<_, i64>("SELECT count(*) FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1")
             .bind(token).fetch_one(&mut *connection).await? != 1 {
             Some("current-evidence-count")
-        } else if !self.matches_clock(&row, &fingerprint, now, evidence) {
+        } else if !self.matches_clock(&row, fingerprint, now, evidence) {
             Some("owner-identity-or-clock")
         } else if !guards::work_clear(connection).await? {
             Some("unresolved-work")
@@ -172,7 +195,7 @@ impl ReliabilityStore {
         }
         let revision: i64 = row.get("evidence_revision");
         let chain: (i64, i64, i64, i64) = sqlx::query_as("SELECT count(*),min(evidence_revision),max(evidence_revision),sum(CASE WHEN state NOT IN ('live','scan_pending') OR process_fingerprint!=? OR pid!=? OR proc_starttime!=? OR boot_id!=? THEN 1 ELSE 0 END) FROM runtime_owner_evidence WHERE instance_token=? AND runtime_generation=?")
-            .bind(&fingerprint).bind(evidence.pid).bind(evidence.proc_starttime).bind(&evidence.boot_id)
+            .bind(fingerprint).bind(evidence.pid).bind(evidence.proc_starttime).bind(&evidence.boot_id)
             .bind(token).bind(row.get::<i64, _>("runtime_generation")).fetch_one(&mut *connection).await?;
         let total: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM runtime_owner_evidence WHERE instance_token=?",
@@ -188,7 +211,7 @@ impl ReliabilityStore {
             owner: token.into(),
             generation: row.get("runtime_generation"),
             source_revision: revision,
-            fingerprint,
+            fingerprint: fingerprint.to_owned(),
             epoch,
         }))
     }

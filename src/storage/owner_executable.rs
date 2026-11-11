@@ -39,6 +39,7 @@ impl Stamp {
     }
 }
 
+#[derive(Debug)]
 struct Executable {
     file: File,
     stamp: Stamp,
@@ -157,8 +158,9 @@ fn cgroup() -> Option<String> {
 
 /// Cache belongs to one heartbeat task, never global and never copied across startups.
 /// On timeout the read-only worker may finish, but cannot publish or replace this cache.
+#[derive(Clone, Debug)]
 pub(crate) struct RuntimeExecutable {
-    inner: Option<Executable>,
+    inner: std::sync::Arc<std::sync::Mutex<Option<Executable>>>,
     fingerprint: String,
     cgroup: String,
 }
@@ -186,7 +188,7 @@ impl RuntimeExecutable {
                     domain
                 );
                 Some(Self {
-                    inner: Some(executable),
+                    inner: std::sync::Arc::new(std::sync::Mutex::new(Some(executable))),
                     fingerprint,
                     cgroup: domain,
                 })
@@ -200,27 +202,39 @@ impl RuntimeExecutable {
         &self.fingerprint
     }
 
-    pub(crate) async fn validate(&mut self) -> Option<&str> {
-        let mut executable = self.inner.take()?;
+    pub(crate) fn same_cache(&self, other: &Self) -> bool {
+        std::sync::Arc::ptr_eq(&self.inner, &other.inner)
+    }
+
+    pub(crate) async fn validate(&self) -> Option<String> {
+        let inner = self.inner.clone();
         let domain = self.cgroup.clone();
-        self.inner = tokio::time::timeout(
+        tokio::time::timeout(
             BUDGET,
             tokio::task::spawn_blocking(move || {
-                if cgroup()? != domain {
-                    return None;
+                let mut guard = inner.lock().ok()?;
+                let valid = (|| {
+                    if cgroup()? != domain {
+                        return None;
+                    }
+                    guard
+                        .as_mut()?
+                        .validate(File::open("/proc/self/exe").ok()?, Instant::now() + BUDGET)?;
+                    if cgroup()? != domain {
+                        return None;
+                    }
+                    Some(())
+                })();
+                if valid.is_none() {
+                    *guard = None;
                 }
-                executable.validate(File::open("/proc/self/exe").ok()?, Instant::now() + BUDGET)?;
-                if cgroup()? != domain {
-                    return None;
-                }
-                Some(executable)
+                valid
             }),
         )
         .await
         .ok()?
-        .ok()?;
-        self.inner.as_ref()?;
-        Some(&self.fingerprint)
+        .ok()??;
+        Some(self.fingerprint.clone())
     }
 }
 
