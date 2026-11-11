@@ -131,6 +131,7 @@ async fn scoped_failure_new_work_abrupt_exit_and_same_store_restart() {
     let endpoint = crate::models::EndpointId::generate();
     let workspace = f.root.path().join("workspace");
     let runtime = start(f.root.path(), &server.uri()).await;
+    super::ctime::check_if_private(&runtime).await;
     let failed = cycle(&runtime, &workspace, endpoint, true).await;
     let success = cycle(&runtime, &workspace, endpoint, false).await;
     assert_ne!(failed, success);

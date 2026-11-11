@@ -576,8 +576,10 @@ impl AppRuntime {
             )
             .await;
         }
-        let process_fingerprint =
-            crate::storage::RuntimeOwnerEvidence::fingerprint().ok_or(AppError::Runtime)?;
+        let executable = crate::storage::owner_executable::RuntimeExecutable::capture()
+            .await
+            .ok_or(AppError::Runtime)?;
+        let process_fingerprint = executable.fingerprint().to_owned();
         let startup_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         let evidence = crate::storage::RuntimeOwnerEvidence::capture().ok_or(AppError::Runtime)?;
         let mut owns_runtime = reliability
@@ -667,6 +669,7 @@ impl AppRuntime {
             reliability.clone(),
             runtime_instance.clone(),
             owns_runtime,
+            executable,
             maintenance_lock.clone(),
             recovery_scope.clone(),
             a2a_faults,
@@ -724,6 +727,7 @@ impl AppRuntime {
         reliability: crate::storage::ReliabilityStore,
         runtime_instance: String,
         owns_runtime: bool,
+        mut executable: crate::storage::owner_executable::RuntimeExecutable,
         maintenance_lock: Arc<crate::offline_production_migration::RuntimeLock>,
         recovery_scope: Option<crate::storage::recovery_eligibility::RecoveryScope>,
         a2a_faults: Arc<dyn crate::a2a::IngressFaultInjector>,
@@ -926,12 +930,11 @@ impl AppRuntime {
                                 boottime_ns: 0,
                             },
                         );
-                        let heartbeat_fingerprint =
-                            crate::storage::RuntimeOwnerEvidence::fingerprint().unwrap_or_default();
+                        let heartbeat_fingerprint = executable.validate().await.unwrap_or_default();
                         if !heartbeat_store
                             .publish_owner_heartbeat(
                                 &heartbeat_token,
-                                &heartbeat_fingerprint,
+                                heartbeat_fingerprint,
                                 &now,
                                 &evidence,
                             )

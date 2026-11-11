@@ -1,6 +1,8 @@
 //! Disposable loopback runtime and separately scoped producer process.
 #[path = "history_coverage_runtime.rs"]
 mod coverage;
+#[path = "history_ctime_tests.rs"]
+mod ctime;
 #[path = "history_effects_tests.rs"]
 mod effects;
 #[path = "history_hold_runtime.rs"]

@@ -10,7 +10,7 @@ fn version_reports_package_version() {
     assert!(output.status.success());
     assert_eq!(
         String::from_utf8(output.stdout).expect("version output is utf8"),
-        "guigu-agent-bridge 0.2.26\n"
+        "guigu-agent-bridge 0.2.27\n"
     );
     assert!(output.stderr.is_empty());
 }

@@ -151,6 +151,7 @@ mod output_delivery;
 mod output_producer;
 mod output_recovery;
 mod output_spool;
+pub(crate) mod owner_executable;
 pub(crate) mod owner_observation;
 mod pool;
 mod recovery;

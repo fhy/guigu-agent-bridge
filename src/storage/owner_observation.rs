@@ -144,6 +144,7 @@ impl FinalObservation {
 }
 
 impl RuntimeOwnerEvidence {
+    #[cfg(test)]
     pub(crate) fn fingerprint() -> Option<String> {
         let metadata = std::fs::metadata("/proc/self/exe").ok()?;
         let cgroup = std::fs::read_to_string("/proc/self/cgroup").ok()?;

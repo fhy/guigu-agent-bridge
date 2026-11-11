@@ -1,12 +1,14 @@
 # Release Checklist
 
-## Current local candidate: v0.2.20
+## Current local candidate: v0.2.27
 
-Version `0.2.20` is prepared locally, not published or deployed. See
-[candidate notes](RELEASE-0.2.20.md) for package portability and accepted evidence
-limits. Registry publication, tag creation and production rollout require separate
-decisions. The historical v0.2.1 checklist below remains historical guidance, not
-proof of current deployment readiness.
+Version `0.2.27` is prepared locally, not published or deployed. See
+[candidate notes](RELEASE-0.2.27.md) for schema25-to26 upgrade, rollback limits,
+new-baseline versus historical-recovery boundaries and scoped validation limits.
+Publication and deployment require exact reviewed artifacts and separate execution.
+The checklist below is historical guidance; its schema/rollback details do not apply
+to the current candidate. Do not downgrade a migrated database or roll back only one
+part of a device/database/session/crypto pair.
 
 ## Historical v0.2.1 checklist
 
