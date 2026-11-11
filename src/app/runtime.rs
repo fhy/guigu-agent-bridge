@@ -2034,6 +2034,9 @@ enabled = true
             reliability,
             instance,
             true,
+            crate::storage::owner_executable::RuntimeExecutable::capture()
+                .await
+                .unwrap(),
             Arc::new(crate::offline_production_migration::acquire_runtime_lock(&database).unwrap()),
             None,
             Arc::new(crate::a2a::NoFault),
@@ -2371,6 +2374,9 @@ enabled = true
             reliability,
             runtime_instance,
             true,
+            crate::storage::owner_executable::RuntimeExecutable::capture()
+                .await
+                .unwrap(),
             Arc::new(crate::offline_production_migration::acquire_runtime_lock(&database).unwrap()),
             None,
             Arc::new(crate::a2a::NoFault),

@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 
 const BUDGET: Duration = Duration::from_secs(10);
 const MAX_BYTES: u64 = 1024 * 1024 * 1024;
+type Attributes = Vec<(Vec<u8>, Vec<u8>)>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct Stamp {
@@ -41,7 +42,7 @@ impl Stamp {
 struct Executable {
     file: File,
     stamp: Stamp,
-    attributes: Vec<(Vec<u8>, Vec<u8>)>,
+    attributes: Attributes,
     digest: [u8; 32],
 }
 impl Executable {
@@ -64,13 +65,12 @@ impl Executable {
         if !self.stamp.same_identity(&before) || Stamp::read(&self.file)? != before {
             return None;
         }
-        if before != self.stamp {
-            if attributes(&current)? != self.attributes
+        if before != self.stamp
+            && (attributes(&current)? != self.attributes
                 || digest(&self.file, &before, deadline)? != self.digest
-                || attributes(&current)? != self.attributes
-            {
-                return None;
-            }
+                || attributes(&current)? != self.attributes)
+        {
+            return None;
         }
         // Even a cached hit authenticates both the pinned and current running object.
         if Stamp::read(&self.file)? != before || Stamp::read(&current)? != before {
@@ -108,7 +108,7 @@ fn digest(file: &File, before: &Stamp, deadline: Instant) -> Option<[u8; 32]> {
 
 // ACLs, capabilities and other security labels are part of effective authority.
 // Bound every syscall buffer; unreadable or changing attribute sets fail closed.
-fn attributes(file: &File) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+fn attributes(file: &File) -> Option<Attributes> {
     let mut names = vec![0u8; 65536];
     let count =
         unsafe { libc::flistxattr(file.as_raw_fd(), names.as_mut_ptr().cast(), names.len()) };
