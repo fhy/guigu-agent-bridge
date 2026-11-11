@@ -7,6 +7,8 @@ fn fixture() -> (tempfile::TempDir, std::path::PathBuf, Executable) {
     fs::write(&path, b"initial executable contents").unwrap();
     fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
     let pinned = Executable::pin(File::open(&path).unwrap(), Instant::now() + BUDGET).unwrap();
+    // ext4 timestamps can share one kernel tick, even with nanosecond fields.
+    std::thread::sleep(Duration::from_millis(25));
     (root, path, pinned)
 }
 
@@ -16,7 +18,7 @@ fn repeated_ctime_only_changes_revalidate_without_adopting_content() {
     let original = pinned.digest;
     for _ in 0..3 {
         let previous = pinned.stamp.clone();
-        std::thread::sleep(Duration::from_millis(2));
+        std::thread::sleep(Duration::from_millis(25));
         fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
         assert_ne!(previous.changed, Stamp::read(&pinned.file).unwrap().changed);
         assert!(

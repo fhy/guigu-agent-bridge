@@ -62,18 +62,20 @@ impl Executable {
     }
     fn validate(&mut self, current: File, deadline: Instant) -> Option<()> {
         let before = Stamp::read(&current)?;
-        if !self.stamp.same_identity(&before) || Stamp::read(&self.file)? != before {
-            return None;
-        }
-        if before != self.stamp
-            && (attributes(&current)? != self.attributes
-                || digest(&self.file, &before, deadline)? != self.digest
-                || attributes(&current)? != self.attributes)
+        if !self.stamp.same_identity(&before)
+            || Stamp::read(&self.file)? != before
+            || attributes(&current)? != self.attributes
         {
             return None;
         }
+        if before != self.stamp && digest(&self.file, &before, deadline)? != self.digest {
+            return None;
+        }
         // Even a cached hit authenticates both the pinned and current running object.
-        if Stamp::read(&self.file)? != before || Stamp::read(&current)? != before {
+        if attributes(&current)? != self.attributes
+            || Stamp::read(&self.file)? != before
+            || Stamp::read(&current)? != before
+        {
             return None;
         }
         self.stamp = before;
