@@ -1,14 +1,17 @@
 # Release Checklist
 
-## Current local candidate: v0.2.27
+## Current local candidate: v0.2.28
 
-Version `0.2.27` is prepared locally, not published or deployed. See
-[candidate notes](RELEASE-0.2.27.md) for schema25-to26 upgrade, rollback limits,
-new-baseline versus historical-recovery boundaries and scoped validation limits.
+Version `0.2.28` is prepared locally, not published or deployed. See
+[candidate notes](RELEASE-0.2.28.md) for the bounded post-send completion repair
+and deployment limits. Schema remains 26, identical to v0.2.27; this candidate
+adds no migration or dependency change. An unresolved `sending` row is not made
+complete by installing or restarting this version.
+
 Publication and deployment require exact reviewed artifacts and separate execution.
 The checklist below is historical guidance; its schema/rollback details do not apply
-to the current candidate. Do not downgrade a migrated database or roll back only one
-part of a device/database/session/crypto pair.
+to the current candidate. Preserve a complete device/database/session/crypto pair;
+never infer authority to replay unresolved effects from an upgrade or rollback.
 
 ## Historical v0.2.1 checklist
 

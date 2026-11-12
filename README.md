@@ -8,12 +8,12 @@
 
 ## 快速开始
 
-当前源码版本为 `0.2.27`，变更与兼容边界见
-[0.2.27 发布说明](docs/RELEASE-0.2.27.md)。以下安装命令需在该版本已发布至
+当前源码版本为 `0.2.28`，变更与兼容边界见
+[0.2.28 发布说明](docs/RELEASE-0.2.28.md)。以下安装命令需在该版本已发布至
 crates.io 后执行；本地候选、公开制品与已运行的服务分别验证。
 
 ```bash
-cargo install guigu-agent-bridge --version 0.2.27 --locked
+cargo install guigu-agent-bridge --version 0.2.28 --locked
 install -m 600 config.example.toml "$HOME/.config/guigu-agent-bridge.toml"
 export MATRIX_USER_ID='@bridge:example.org'
 export MATRIX_ACCESS_TOKEN='replace-with-secret-manager-value'
@@ -27,7 +27,7 @@ guigu-agent-bridge "$HOME/.config/guigu-agent-bridge.toml"
 
 ## 文档
 
-- [0.2.27 发布说明](docs/RELEASE-0.2.27.md)
+- [0.2.28 发布说明](docs/RELEASE-0.2.28.md)
 
 - [0.2.5 发布说明](docs/RELEASE-0.2.5.md)
 - [0.2.6 发布说明](docs/RELEASE-0.2.6.md)
