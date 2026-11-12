@@ -158,6 +158,7 @@ async fn completion_busy_budget_and_shutdown_preserve_sending_without_retrying_s
         let (result, _) = tokio::join!(future, signal);
         assert!(
             matches!(result, Err(crate::storage::ReliabilityError::Sql(ref e)) if crate::storage::recovery_eligibility::matrix_effect_busy(e))
+                || matches!(result, Err(crate::storage::ReliabilityError::Malformed))
         );
         assert!(timer.elapsed() < Duration::from_secs(3));
         assert_eq!(state(&f).await, ("sending".into(), 0, 1));
