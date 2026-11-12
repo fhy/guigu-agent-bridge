@@ -74,6 +74,13 @@ impl OutboxDrain {
     }
 
     async fn drain_checked(&self) -> Result<usize, DrainFailure> {
+        self.drain_with_shutdown(None).await
+    }
+
+    async fn drain_with_shutdown(
+        &self,
+        shutdown: Option<watch::Receiver<bool>>,
+    ) -> Result<usize, DrainFailure> {
         let mut pending = self.pending.lock().await;
         let now = chrono::Utc::now();
         let stale = (now - chrono::Duration::minutes(5))
@@ -98,41 +105,17 @@ impl OutboxDrain {
         }
         let mut sent = 0;
         while let Some(next) = pending.front_mut() {
+            self.send_prepared(next).await?;
             let row = &next.row;
-            if matches!(next.sent, SendState::Started) {
-                // A cancelled network future has no known outcome. Retain the
-                // sending claim; neither this instance nor a clone may retry it.
-                return Err(DrainFailure::UnknownSend);
-            }
-            if matches!(next.sent, SendState::Prepared) {
-                if !self
-                    .store
-                    .authorize_projection_send(row)
-                    .await
-                    .map_err(before_send_failure)?
-                {
-                    return Err(DrainFailure::Authority);
-                }
-                next.sent = SendState::Started;
-                let send = self.sender.send_stable(
-                    &row.room_id,
-                    row.thread_root.as_deref(),
-                    row.reply_event_id.as_deref(),
-                    &row.body,
-                    &row.stable_txn_id,
-                );
-                let Ok(outcome) = tokio::time::timeout(SEND_TIMEOUT, send).await else {
-                    // Leave Started/sending: timeout does not establish a failed send.
-                    return Err(DrainFailure::UnknownSend);
-                };
-                next.sent = SendState::Complete(outcome.is_ok());
-            }
             let success = matches!(next.sent, SendState::Complete(true));
-            let completed = if success {
-                self.store.mark_projection_sent(row).await
-            } else {
-                self.store.mark_projection_abandoned(row).await
-            };
+            let completed = completion::finish(
+                &self.store,
+                row,
+                success,
+                shutdown.clone(),
+                completion::WAIT_BUDGET,
+            )
+            .await;
             match completed {
                 Ok(true) => {
                     sent += usize::from(success);
@@ -148,6 +131,39 @@ impl OutboxDrain {
             }
         }
         Ok(sent)
+    }
+
+    async fn send_prepared(&self, next: &mut PendingSend) -> Result<(), DrainFailure> {
+        let row = &next.row;
+        if matches!(next.sent, SendState::Started) {
+            // A cancelled network future has no known outcome. Retain the
+            // sending claim; neither this instance nor a clone may retry it.
+            return Err(DrainFailure::UnknownSend);
+        }
+        if matches!(next.sent, SendState::Prepared) {
+            if !self
+                .store
+                .authorize_projection_send(row)
+                .await
+                .map_err(before_send_failure)?
+            {
+                return Err(DrainFailure::Authority);
+            }
+            next.sent = SendState::Started;
+            let send = self.sender.send_stable(
+                &row.room_id,
+                row.thread_root.as_deref(),
+                row.reply_event_id.as_deref(),
+                &row.body,
+                &row.stable_txn_id,
+            );
+            let Ok(outcome) = tokio::time::timeout(SEND_TIMEOUT, send).await else {
+                // Leave Started/sending: timeout does not establish a failed send.
+                return Err(DrainFailure::UnknownSend);
+            };
+            next.sent = SendState::Complete(outcome.is_ok());
+        }
+        Ok(())
     }
 
     pub fn start(self, interval: std::time::Duration) -> OutboxDrainHandle {
@@ -179,7 +195,7 @@ impl OutboxDrain {
                 let result = if busy_since.is_some_and(|at| at.elapsed() >= busy_budget) {
                     Err(DrainFailure::SyncBusy)
                 } else {
-                    self.drain_checked().await
+                    self.drain_with_shutdown(Some(receiver.clone())).await
                 };
                 let mut next_poll = interval;
                 if matches!(result, Err(DrainFailure::SyncBusy))
@@ -240,6 +256,9 @@ fn before_send_failure(error: crate::storage::ReliabilityError) -> DrainFailure 
         _ => DrainFailure::Storage,
     }
 }
+
+#[path = "outbox_completion.rs"]
+pub(crate) mod completion;
 
 #[cfg(test)]
 #[path = "outbox_sync_tests.rs"]

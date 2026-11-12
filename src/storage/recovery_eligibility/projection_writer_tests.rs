@@ -297,3 +297,12 @@ async fn projection_wrong_component_and_local_domain_cannot_claim_matrix_send() 
 
 #[path = "projection_race_tests.rs"]
 mod race_tests;
+
+#[path = "projection_completion_tests.rs"]
+mod completion_tests;
+
+#[path = "projection_diagnostic_tests.rs"]
+mod diagnostic_tests;
+
+#[path = "projection_crash_tests.rs"]
+mod crash_tests;

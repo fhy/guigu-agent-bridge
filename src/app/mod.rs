@@ -33,3 +33,6 @@ pub use reload::{
 };
 pub use retry::DurableRetryAdmission;
 pub use runtime::{AppError, AppRuntime, run_config_with_shutdown};
+
+#[cfg(test)]
+pub(crate) use outbox::completion::finish as test_finish_projection;

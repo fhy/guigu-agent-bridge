@@ -95,20 +95,38 @@ impl ReliabilityStore {
         row: &PendingProjection,
         state: &str,
     ) -> Result<bool, ReliabilityError> {
-        self.require_projection_component()?;
-        let mut transaction = writer::begin(&self.pool, self.recovery.as_ref()).await?;
-        let identity = identity(&row.source_kind, &row.source_id, &row.projection)?;
+        self.require_projection_component()
+            .map_err(|error| completion_failure("component", error))?;
+        let mut transaction = writer::begin(&self.pool, self.recovery.as_ref())
+            .await
+            .map_err(|error| completion_failure("begin", error.into()))?;
+        let identity = identity(&row.source_kind, &row.source_id, &row.projection)
+            .map_err(|error| completion_failure("identity", error.into()))?;
         let mutation =
-            writer::prepare_mutation(&mut transaction, self.recovery.as_ref(), &identity).await?;
+            writer::prepare_mutation(&mut transaction, self.recovery.as_ref(), &identity)
+                .await
+                .map_err(|error| completion_failure("prepare", error.into()))?;
         let result = sqlx::query("UPDATE projection_outbox SET state=?,attempt_count=attempt_count+1,updated_at=CASE WHEN ?='abandoned' THEN ? ELSE updated_at END WHERE source_kind=? AND source_id=? AND projection=? AND state='sending' AND claim_owner=? AND claim_revision=?")
             .bind(state).bind(state).bind(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
             .bind(&row.source_kind).bind(&row.source_id).bind(&row.projection)
-            .bind(&row.claim_owner).bind(row.claim_revision).execute(&mut *transaction).await?;
+            .bind(&row.claim_owner).bind(row.claim_revision).execute(&mut *transaction).await
+            .map_err(|error| completion_failure("update", error.into()))?;
         if result.rows_affected() != 1 {
+            tracing::error!(
+                stage = "outbox-completion",
+                step = "claim-cas",
+                class = "cas-mismatch",
+                outcome = "retained-without-resend"
+            );
             return Ok(false);
         }
-        writer::complete_mutation(&mut transaction, self.recovery.as_ref(), mutation).await?;
-        transaction.commit().await?;
+        writer::complete_mutation(&mut transaction, self.recovery.as_ref(), mutation)
+            .await
+            .map_err(|error| completion_failure("classification", error.into()))?;
+        transaction
+            .commit()
+            .await
+            .map_err(|error| completion_failure("commit", error.into()))?;
         Ok(true)
     }
 }
@@ -133,4 +151,36 @@ fn identity(
         key: serde_json::to_string(&keys)
             .map_err(|_| sqlx::Error::Protocol("offline-recovery-eligibility-refused".into()))?,
     })
+}
+
+// Never render SQL errors: their messages may contain database values or paths.
+fn completion_failure(step: &'static str, error: ReliabilityError) -> ReliabilityError {
+    let class = match &error {
+        ReliabilityError::Sql(error)
+            if crate::storage::recovery_eligibility::matrix_effect_busy(error) =>
+        {
+            "sync-busy"
+        }
+        ReliabilityError::Sql(sqlx::Error::Protocol(_)) => "authority-or-classification",
+        ReliabilityError::Sql(sqlx::Error::Database(_)) => "database",
+        ReliabilityError::Sql(sqlx::Error::PoolTimedOut) => "pool-timeout",
+        ReliabilityError::Sql(_) => "storage",
+        _ => "component",
+    };
+    if class == "sync-busy" {
+        tracing::debug!(
+            stage = "outbox-completion",
+            step,
+            class,
+            outcome = "retained-without-resend"
+        );
+    } else {
+        tracing::error!(
+            stage = "outbox-completion",
+            step,
+            class,
+            outcome = "retained-without-resend"
+        );
+    }
+    error
 }

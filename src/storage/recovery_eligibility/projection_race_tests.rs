@@ -1,8 +1,8 @@
 use super::*;
 
-struct OverlapSender {
-    pool: sqlx::SqlitePool,
-    calls: std::sync::atomic::AtomicUsize,
+pub(super) struct OverlapSender {
+    pub(super) pool: sqlx::SqlitePool,
+    pub(super) calls: std::sync::atomic::AtomicUsize,
 }
 impl crate::matrix::MatrixOutboxSender for OverlapSender {
     fn send_stable<'a>(
@@ -30,13 +30,24 @@ async fn projection_sync_overlap_retries_only_completion_without_resending() {
         calls: Default::default(),
     });
     let drain = crate::app::OutboxDrain::new(store, sender.clone(), 4);
-    assert!(drain.drain_once().await.is_err());
+    let completion = tokio::spawn({
+        let drain = drain.clone();
+        async move { drain.drain_once().await }
+    });
+    tokio::time::timeout(std::time::Duration::from_secs(3), async {
+        while sender.calls.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     assert_eq!(state(&fixture).await, ("sending".into(), 0, 1));
     sqlx::query("UPDATE matrix_recovery_batches SET state='terminal' WHERE batch_id='overlap'")
         .execute(&fixture.pool)
         .await
         .unwrap();
-    assert_eq!(drain.clone().drain_once().await.unwrap(), 1);
+    assert_eq!(completion.await.unwrap().unwrap(), 1);
     assert_eq!(state(&fixture).await, ("sent".into(), 1, 1));
     assert_eq!(drain.drain_once().await.unwrap(), 0);
     assert_eq!(sender.calls.load(std::sync::atomic::Ordering::SeqCst), 1);
