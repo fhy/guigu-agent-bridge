@@ -15,7 +15,7 @@ mod mutation;
 mod native_control;
 mod native_lease;
 pub(crate) mod succession;
-pub(crate) mod teardown;
+mod teardown;
 mod transaction;
 mod workspace;
 pub(crate) use mutation::{
@@ -26,6 +26,9 @@ pub(crate) use native_control::{
     begin_response_refusal, complete_control, complete_hold, prepare_control,
 };
 pub(crate) use native_lease::{complete_expired_lease, complete_lease, prepare_lease};
+pub(crate) use teardown::{
+    finish_controlled_stop, is_refused, release_component_lease, stopping_runtime,
+};
 pub(crate) use transaction::ScopedTransaction;
 pub(crate) use workspace::delete_workspace;
 

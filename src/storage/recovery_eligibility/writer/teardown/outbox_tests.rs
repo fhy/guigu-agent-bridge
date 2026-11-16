@@ -1,6 +1,47 @@
 use super::*;
 
 #[tokio::test]
+async fn repeated_component_release_refuses_without_mutation_or_blocking_other_component() {
+    let fixture = fixture(true).await;
+    let preserved_before = preserved(&fixture.pool).await;
+    let (outbox, epoch) = fixture.outbox.as_ref().unwrap();
+    let now = Utc::now().to_rfc3339();
+    outbox
+        .release_component_lease("OutboxDrain", "owner", *epoch, &now)
+        .await
+        .unwrap();
+    let snapshot_sql = "SELECT json_array(l.state,l.expires_at,l.updated_at,r.original_revision,r.original_digest,r.parent_relations) FROM matrix_component_leases l JOIN offline_recovery_rows r ON r.table_name='matrix_component_leases' WHERE l.component='OutboxDrain' AND r.canonical_pk=json_array('text:'||hex(CAST(l.component AS BLOB)))";
+    let before: String = sqlx::query_scalar(snapshot_sql)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+    assert!(
+        outbox
+            .release_component_lease("OutboxDrain", "owner", *epoch, &Utc::now().to_rfc3339())
+            .await
+            .is_err()
+    );
+    let after: String = sqlx::query_scalar(snapshot_sql)
+        .fetch_one(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(after, before);
+    fixture
+        .sync
+        .release_component_lease("MatrixSync", "owner", fixture.epoch, &now)
+        .await
+        .unwrap();
+    let active: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM matrix_component_leases WHERE state='active'")
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(active, 0);
+    assert_eq!(preserved(&fixture.pool).await, preserved_before);
+    fixture.pool.close().await;
+}
+
+#[tokio::test]
 async fn refused_stop_samples_current_owner_after_heartbeat_expires() {
     let fixture = fixture(true).await;
     let future = (Utc::now() + chrono::Duration::minutes(5)).to_rfc3339();

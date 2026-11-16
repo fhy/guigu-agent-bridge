@@ -1,41 +1,10 @@
-use sqlx::{SqliteConnection, SqlitePool};
+use sqlx::SqlitePool;
 
-use super::{RecoveryScope, RowIdentity, begin, complete, inserted, prepare, refused};
+use super::{
+    RecoveryScope, begin, complete, evidence_identity, inserted, prepare, refused,
+    require_current_process,
+};
 use crate::storage::{ReliabilityError, ReliabilityStore, RuntimeOwnerEvidence};
-
-pub(super) async fn require_current_process(
-    connection: &mut SqliteConnection,
-    scope: &RecoveryScope,
-    token: &str,
-    fingerprint: &str,
-) -> Result<(), sqlx::Error> {
-    let observation = RuntimeOwnerEvidence::capture().ok_or_else(refused)?;
-    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM runtime_instances r JOIN runtime_owner_evidence e USING(instance_token) WHERE r.instance_token=? AND r.state IN ('active','stopping') AND r.process_fingerprint=? AND e.is_current=1 AND e.state IN ('live','scan_pending') AND e.process_fingerprint=r.process_fingerprint AND e.pid=? AND e.proc_starttime=? AND e.boot_id=?")
-        .bind(token).bind(fingerprint).bind(observation.pid).bind(observation.proc_starttime).bind(observation.boot_id).fetch_one(&mut *connection).await?;
-    if count != 1 {
-        return Err(refused());
-    }
-    let identity = super::super::text_identity("runtime_instances", token)?;
-    prepare(connection, scope, &identity).await?;
-    let revision = sqlx::query_scalar("SELECT evidence_revision FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1")
-        .bind(token).fetch_one(&mut *connection).await?;
-    let identity = evidence_identity(connection, token, revision).await?;
-    prepare(connection, scope, &identity).await?;
-    Ok(())
-}
-
-async fn evidence_identity(
-    connection: &mut SqliteConnection,
-    token: &str,
-    revision: i64,
-) -> Result<RowIdentity, sqlx::Error> {
-    let key = sqlx::query_scalar("SELECT json_array('text:'||hex(CAST(instance_token AS BLOB)),'integer:'||hex(CAST(runtime_generation AS BLOB)),'integer:'||hex(CAST(evidence_revision AS BLOB))) FROM runtime_owner_evidence WHERE instance_token=? AND evidence_revision=?")
-        .bind(token).bind(revision).fetch_one(connection).await?;
-    Ok(RowIdentity {
-        table: "runtime_owner_evidence".into(),
-        key,
-    })
-}
 
 pub(crate) async fn stopping_runtime(
     pool: &SqlitePool,

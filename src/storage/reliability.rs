@@ -1134,8 +1134,8 @@ impl ReliabilityStore {
     }
 
     pub async fn stopping_runtime(&self, token: &str, now: &str) -> Result<bool, ReliabilityError> {
-        if super::recovery_eligibility::writer::teardown::is_refused(&self.pool).await? {
-            return super::recovery_eligibility::writer::teardown::stopping_runtime(
+        if super::recovery_eligibility::writer::is_refused(&self.pool).await? {
+            return super::recovery_eligibility::writer::stopping_runtime(
                 &self.pool,
                 self.recovery.as_ref(),
                 token,

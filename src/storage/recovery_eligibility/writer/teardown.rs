@@ -3,9 +3,12 @@ use sqlx::{Row, SqliteConnection, SqlitePool};
 use super::{
     EffectDomain, Mutation, RecoveryScope, RowIdentity, ScopedTransaction, inventory, refused,
 };
+use crate::storage::RuntimeOwnerEvidence;
 
-mod owner;
-pub(crate) use owner::{finish_controlled_stop, stopping_runtime};
+mod component_release;
+mod stop_proof;
+pub(crate) use component_release::release_component_lease;
+pub(crate) use stop_proof::{finish_controlled_stop, stopping_runtime};
 
 #[cfg(test)]
 mod tests;
@@ -13,6 +16,40 @@ mod tests;
 pub(crate) async fn is_refused(pool: &SqlitePool) -> Result<bool, sqlx::Error> {
     sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM matrix_recovery_control WHERE control_id=1 AND phase='refused' AND restart_hold_state='refused')")
         .fetch_one(pool).await
+}
+
+async fn require_current_process(
+    connection: &mut SqliteConnection,
+    scope: &RecoveryScope,
+    token: &str,
+    fingerprint: &str,
+) -> Result<(), sqlx::Error> {
+    let observation = RuntimeOwnerEvidence::capture().ok_or_else(refused)?;
+    let count: i64 = sqlx::query_scalar("SELECT count(*) FROM runtime_instances r JOIN runtime_owner_evidence e USING(instance_token) WHERE r.instance_token=? AND r.state IN ('active','stopping') AND r.process_fingerprint=? AND e.is_current=1 AND e.state IN ('live','scan_pending') AND e.process_fingerprint=r.process_fingerprint AND e.pid=? AND e.proc_starttime=? AND e.boot_id=?")
+        .bind(token).bind(fingerprint).bind(observation.pid).bind(observation.proc_starttime).bind(observation.boot_id).fetch_one(&mut *connection).await?;
+    if count != 1 {
+        return Err(refused());
+    }
+    let identity = super::text_identity("runtime_instances", token)?;
+    prepare(connection, scope, &identity).await?;
+    let revision = sqlx::query_scalar("SELECT evidence_revision FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1")
+        .bind(token).fetch_one(&mut *connection).await?;
+    let identity = evidence_identity(connection, token, revision).await?;
+    prepare(connection, scope, &identity).await?;
+    Ok(())
+}
+
+async fn evidence_identity(
+    connection: &mut SqliteConnection,
+    token: &str,
+    revision: i64,
+) -> Result<RowIdentity, sqlx::Error> {
+    let key = sqlx::query_scalar("SELECT json_array('text:'||hex(CAST(instance_token AS BLOB)),'integer:'||hex(CAST(runtime_generation AS BLOB)),'integer:'||hex(CAST(evidence_revision AS BLOB))) FROM runtime_owner_evidence WHERE instance_token=? AND evidence_revision=?")
+        .bind(token).bind(revision).fetch_one(connection).await?;
+    Ok(RowIdentity {
+        table: "runtime_owner_evidence".into(),
+        key,
+    })
 }
 
 async fn begin<'pool>(
@@ -232,47 +269,4 @@ async fn inserted(
     super::insert_classification(connection, scope, identity, &snapshot, &encoded, true).await?;
     super::super::require_lineage(connection, &scope.context(), EffectDomain::Matrix, identity)
         .await
-}
-
-pub(crate) async fn release_component_lease(
-    pool: &SqlitePool,
-    scope: &RecoveryScope,
-    component: &str,
-    owner: &str,
-    epoch: i64,
-    now: &str,
-) -> Result<(), sqlx::Error> {
-    if !matches!(component, "MatrixSync" | "OutboxDrain") || epoch <= 0 {
-        return Err(refused());
-    }
-    let fence = scope
-        .fence
-        .as_ref()
-        .or_else(|| scope.matrix_fence.get())
-        .ok_or_else(refused)?;
-    if fence.component != component || fence.owner != owner || fence.epoch != epoch {
-        return Err(refused());
-    }
-    let fingerprint = scope.runtime_fingerprint().await?;
-    let mut transaction = begin(pool, scope).await?;
-    owner::require_current_process(&mut transaction, scope, owner, &fingerprint).await?;
-    let identity = super::text_identity("matrix_component_leases", component)?;
-    let mutation = prepare(&mut transaction, scope, &identity).await?;
-    let changed = sqlx::query("UPDATE matrix_component_leases SET state='expired',expires_at=?,updated_at=? WHERE component=? AND owner_token=? AND epoch=? AND state='active'")
-        .bind(now).bind(now).bind(component).bind(owner).bind(epoch).execute(&mut *transaction).await?;
-    if changed.rows_affected() != 1 {
-        return Err(refused());
-    }
-    complete(&mut transaction, scope, mutation).await?;
-    transaction.commit().await?;
-    tracing::info!(
-        stage = "component-teardown",
-        component,
-        owner,
-        epoch,
-        committed = true,
-        stream_held = true,
-        "exact component released without restoring effect authority"
-    );
-    Ok(())
 }

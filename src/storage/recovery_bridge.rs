@@ -263,8 +263,8 @@ impl MatrixRecoveryStore {
         now: &str,
     ) -> Result<(), sqlx::Error> {
         use crate::storage::recovery_eligibility::writer;
-        if writer::teardown::is_refused(&self.pool).await? {
-            return writer::teardown::release_component_lease(
+        if writer::is_refused(&self.pool).await? {
+            return writer::release_component_lease(
                 &self.pool,
                 self.recovery
                     .as_ref()

@@ -109,8 +109,8 @@ impl ReliabilityStore {
         evidence: &RuntimeOwnerEvidence,
         joined: &crate::acp::JoinedChildren,
     ) -> Result<bool, ReliabilityError> {
-        if writer::teardown::is_refused(&self.pool).await? {
-            return writer::teardown::finish_controlled_stop(
+        if writer::is_refused(&self.pool).await? {
+            return writer::finish_controlled_stop(
                 &self.pool,
                 self.recovery.as_ref(),
                 self,
