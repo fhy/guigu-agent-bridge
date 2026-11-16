@@ -488,6 +488,48 @@ impl SqliteRuntimeStore {
         }
     }
 
+    pub(super) async fn ensure_unstarted_continuation(
+        &self,
+        lease: &Lease,
+        delivery: DeliveryId,
+        prompt: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), RuntimeError> {
+        let prompt = bounded_prompt(prompt)?;
+        let mut tx = self.transaction().await?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_continuations WHERE task_id=?)")
+                .bind(lease.task_id.to_string())
+                .fetch_one(&mut *tx)
+                .await?;
+        if !exists {
+            tx.rollback().await?;
+            // Ordinary writer retains its exact active lease CAS. A concurrent creation
+            // fails closed; this is not an UPSERT or permission to overwrite a row.
+            return self.begin_continuation(lease, delivery, prompt, now).await;
+        }
+        for (table, key) in [
+            ("execution_leases", lease.resource.to_string()),
+            ("task_continuations", lease.task_id.to_string()),
+        ] {
+            crate::storage::recovery_eligibility::writer::require(
+                &mut tx,
+                self.recovery.as_ref(),
+                &crate::storage::recovery_eligibility::writer::text_identity(table, &key)?,
+            )
+            .await?;
+        }
+        let matches: i64 = sqlx::query_scalar("SELECT count(*) FROM task_continuations c JOIN execution_leases l ON l.resource_key=c.resource_key AND l.task_id=c.task_id AND l.fence=c.lease_fence WHERE c.task_id=? AND c.resource_key=? AND c.delivery_id=? AND c.lease_fence=? AND c.runtime_generation=? AND c.runtime_generation_version=1 AND c.state='ready' AND c.revision=1 AND c.next_turn=1 AND c.completed_turns=0 AND c.consecutive_no_progress=0 AND c.observed_output_bytes=0 AND c.next_prompt=? AND c.started_at=c.heartbeat_at AND c.started_at=c.last_progress_at AND l.owner_token=? AND l.state='active' AND l.expires_at>? AND NOT EXISTS(SELECT 1 FROM continuation_response_receipts r WHERE r.task_id=c.task_id) AND NOT EXISTS(SELECT 1 FROM acp_output_sets o WHERE o.task_id=c.task_id)")
+            .bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(delivery.to_string())
+            .bind(to_i64(lease.fence)?).bind(CONTINUATION_RUNTIME_GENERATION).bind(prompt)
+            .bind(lease.owner.to_string()).bind(ts(now)).fetch_one(&mut *tx).await?;
+        if matches != 1 {
+            return Err(RuntimeError::Fenced);
+        }
+        tx.commit().await?;
+        Ok(())
+    }
+
     pub async fn continuation(
         &self,
         task_id: TaskId,
@@ -1446,6 +1488,7 @@ impl RuntimeTimer for TokioRuntimeTimer {
 struct PendingLease {
     lease: Lease,
     claimed: tokio::sync::oneshot::Sender<()>,
+    preserved: bool,
 }
 
 struct ExecutionGuard {
@@ -1594,17 +1637,20 @@ impl LeasedAcpDispatcher {
     }
 
     pub async fn shutdown(&self) {
-        let leases: Vec<_> = self
+        let drained: Vec<_> = self
             .pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .drain()
-            .map(|(_, pending)| pending.lease)
+            .map(|(_, pending)| (pending.lease, pending.preserved))
             .collect();
-        if !leases.is_empty() {
+        if !drained.is_empty() {
             let _ = self.dispatcher.shutdown().await;
         }
-        for lease in leases {
+        for (lease, preserved) in drained {
+            if preserved {
+                continue;
+            }
             let _ = self
                 .store
                 .release(&lease, ReleaseDisposition::RecoveryNeeded, self.clock.now())
@@ -2110,6 +2156,60 @@ impl LeasedAcpDispatcher {
             }
         }
     }
+
+    async fn finish_failed_setup(
+        &self,
+        request: &DispatchRequest<'_>,
+        lease: &Lease,
+        event: &crate::models::TaskEvent,
+    ) -> Result<(), DispatchError> {
+        self.store
+            .ensure_unstarted_continuation(
+                lease,
+                request.delivery_id,
+                &request.task.text,
+                self.clock.now(),
+            )
+            .await
+            .map_err(Self::execution_error)?;
+        let state = self
+            .store
+            .claim_turn_with_generation(lease, 1, CONTINUATION_RUNTIME_GENERATION, self.clock.now())
+            .await
+            .map_err(Self::execution_error)?;
+        let result = self
+            .store
+            .finalize_terminal(
+                lease,
+                state.revision,
+                &state.runtime_generation,
+                ContinuationState::Terminal,
+                0,
+                event,
+                self.clock.now(),
+            )
+            .await
+            .map_err(Self::execution_error)?;
+        if matches!(result, FinalizeResult::Committed) {
+            Ok(())
+        } else {
+            Err(DispatchError::RecoveryNeeded)
+        }
+    }
+
+    async fn preserve_uncertain_pending(
+        pending: &Arc<Mutex<std::collections::HashMap<TaskId, PendingLease>>>,
+        task_id: TaskId,
+        value: PendingLease,
+    ) -> Result<(), DispatchError> {
+        let mut preserved = value;
+        preserved.preserved = true;
+        pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(task_id, preserved);
+        Err(DispatchError::RecoveryNeeded)
+    }
 }
 
 impl TaskDispatcher for LeasedAcpDispatcher {
@@ -2190,6 +2290,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                         PendingLease {
                             lease,
                             claimed: tokio::sync::oneshot::channel().0,
+                            preserved: false,
                         },
                     );
                 return Err(error);
@@ -2205,11 +2306,18 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                 .await
             {
                 tracing::error!(task_id = %request.task.task_id, delivery_id = %request.delivery_id, stage = "continuation-setup", fence = lease.fence, lease_expired = self.clock.now() >= lease.expires_at, acknowledged = true, "continuation setup failed before any task prompt; preserving recovery state");
-                let _ = self.dispatcher.shutdown().await;
-                let _ = self
-                    .store
-                    .release(&lease, ReleaseDisposition::RecoveryNeeded, self.clock.now())
-                    .await;
+                let _ = self.dispatcher.shutdown_reaped().await;
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(
+                        request.task.task_id,
+                        PendingLease {
+                            lease,
+                            claimed: tokio::sync::oneshot::channel().0,
+                            preserved: false,
+                        },
+                    );
                 return Err(Self::execution_error(error));
             }
             let (claimed, receiver) = tokio::sync::oneshot::channel();
@@ -2222,6 +2330,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                     PendingLease {
                         lease: lease.clone(),
                         claimed,
+                        preserved: false,
                     },
                 );
             self.active
@@ -2243,16 +2352,16 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                     command = cancel_rx.recv() => {
                         active.lock().unwrap_or_else(|p|p.into_inner()).remove(&task_id);
                         let Some(command) = command else { return; };
-                        let Some(pending) = pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&task_id) else {
+                        let Some(entry) = pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&task_id) else {
                             let _ = command.response.send(Err(DispatchError::RecoveryNeeded));
                             return;
                         };
-                        let lease = pending.lease;
                         if !dispatcher.shutdown_reaped().await {
-                            let _ = store.release(&lease,ReleaseDisposition::RecoveryNeeded,clock.now()).await;
+                            let _ = Self::preserve_uncertain_pending(&pending, task_id, entry).await;
                             let _ = command.response.send(Err(DispatchError::RecoveryNeeded));
                             return;
                         }
+                        let lease = entry.lease;
                         if command.reap_only {
                             let result = store.release(&lease, ReleaseDisposition::Released, clock.now()).await;
                             let response = result.map(|_| FinalizationCapability { task_id, command: None }).map_err(|_| DispatchError::RecoveryNeeded);
@@ -2288,8 +2397,11 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                     }
                     _ = timer.sleep(ttl) => {
                         active.lock().unwrap_or_else(|p|p.into_inner()).remove(&task_id);
-                        let stale=pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&task_id).map(|v|v.lease);
-                        if let Some(stale)=stale { let _=dispatcher.shutdown().await; let _=store.release(&stale,ReleaseDisposition::RecoveryNeeded,clock.now()).await; }
+                        let stale = pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&task_id);
+                        if let Some(stale) = stale {
+                            let _=dispatcher.shutdown_reaped().await;
+                            let _=Self::preserve_uncertain_pending(&pending, task_id, stale).await;
+                        }
                     }
                 }
             });
@@ -2364,6 +2476,15 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                 "closing ACP delivery failure before any prompt"
             );
             if !reaped {
+                let _ =
+                    Self::preserve_uncertain_pending(&self.pending, request.task.task_id, pending)
+                        .await;
+                return Err(DispatchError::RecoveryNeeded);
+            }
+            if let Err(error) = self
+                .finish_failed_setup(&request, &pending.lease, &event)
+                .await
+            {
                 let _ = self
                     .store
                     .release(
@@ -2372,51 +2493,9 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                         self.clock.now(),
                     )
                     .await;
-                return Err(DispatchError::RecoveryNeeded);
+                return Err(error);
             }
-            self.store
-                .begin_continuation(
-                    &pending.lease,
-                    request.delivery_id,
-                    &request.task.text,
-                    self.clock.now(),
-                )
-                .await
-                .map_err(Self::execution_error)?;
-            let ready = self
-                .store
-                .continuation(request.task.task_id)
-                .await
-                .map_err(Self::execution_error)?
-                .ok_or(DispatchError::RecoveryNeeded)?;
-            let state = self
-                .store
-                .claim_turn_with_generation(
-                    &pending.lease,
-                    ready.revision,
-                    &ready.runtime_generation,
-                    self.clock.now(),
-                )
-                .await
-                .map_err(Self::execution_error)?;
-            let result = self
-                .store
-                .finalize_terminal(
-                    &pending.lease,
-                    state.revision,
-                    &state.runtime_generation,
-                    ContinuationState::Terminal,
-                    0,
-                    &event,
-                    self.clock.now(),
-                )
-                .await
-                .map_err(Self::execution_error)?;
-            if matches!(result, FinalizeResult::Committed) {
-                Ok(())
-            } else {
-                Err(DispatchError::RecoveryNeeded)
-            }
+            Ok(())
         })
     }
 
@@ -2431,6 +2510,12 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&request.task.task_id)
                 .ok_or(DispatchError::RecoveryNeeded)?;
+            if pending.preserved {
+                let _ =
+                    Self::preserve_uncertain_pending(&self.pending, request.task.task_id, pending)
+                        .await;
+                return Err(DispatchError::RecoveryNeeded);
+            }
             self.active
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())

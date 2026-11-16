@@ -143,6 +143,53 @@ async fn cancellation_before_commit_releases_scoped_writer_and_rolls_back() {
 }
 
 #[tokio::test]
+async fn f3_false_reap_zero_mutation_and_preserved_reinsertion() {
+    let (root, pool) = mechanism_diagnostic_fixture().await;
+    let endpoint = crate::models::EndpointId::generate();
+    let (_store, _lifecycle, lease, _delivery) =
+        prepare_unstarted(&pool, root.path(), endpoint).await;
+    let before = inventory_image(&pool).await;
+
+    // Build a PendingLease and verify preserve_uncertain_pending reinserts it
+    // with preserved=true and makes zero durable mutations.
+    let (tx, _rx) = tokio::sync::oneshot::channel();
+    let pending = Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let value = PendingLease {
+        lease: lease.clone(),
+        claimed: tx,
+        preserved: false,
+    };
+    let result =
+        LeasedAcpDispatcher::preserve_uncertain_pending(&pending, lease.task_id, value).await;
+    assert!(matches!(result, Err(DispatchError::RecoveryNeeded)));
+
+    // The PendingLease is reinserted with preserved=true.
+    let map = pending.lock().unwrap();
+    let reinserted = map.get(&lease.task_id).expect("pending reinserted");
+    assert!(reinserted.preserved);
+    drop(map);
+
+    // Zero durable mutations: inventory unchanged, lease still active, no receipts.
+    assert_eq!(inventory_image(&pool).await, before);
+    let lease_state: String =
+        sqlx::query_scalar("SELECT state FROM execution_leases WHERE task_id=?")
+            .bind(lease.task_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(lease_state, "active");
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM continuation_response_receipts WHERE task_id=?")
+            .bind(lease.task_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(receipts, 0);
+
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn legacy_helpers_maintain_classification_and_stale_generation_refuses() {
     let (root, pool) = mechanism_diagnostic_fixture().await;
     let (store, _, lease, claimed) =

@@ -1,8 +1,13 @@
 //! Scoped production consumers reused by the actual same-store runtime fixture.
 use super::*;
-use crate::models::{EventId, TaskEvent, TaskEventPayload, TaskStatus};
+use crate::acp::SqliteSessionStore;
+use crate::bus::{DispatchRequest, EndpointRegistry, TaskDispatcher, derive_endpoint_id};
+use crate::models::{
+    AgentTask, ConversationId, DeliveryId, EventId, Priority, TaskEvent, TaskEventPayload,
+    TaskStatus,
+};
 use crate::storage::{
-    ReliabilityStore,
+    ReliabilityStore, SqliteRepository,
     recovery_eligibility::{EffectDomain, RecoveryScope, bootstrap_nonadmin, writer},
 };
 
@@ -364,6 +369,484 @@ async fn mechanism_diagnostic_drift(pool: &SqlitePool) -> (usize, usize) {
         }
     }
     (drift, missing)
+}
+
+/// Fixture that stops before `claim_turn_with_generation`, leaving the
+/// continuation in the exact unstarted state (ready / rev-1 / next_turn-1).
+async fn prepare_unstarted(
+    pool: &SqlitePool,
+    workspace: &Path,
+    endpoint: crate::models::EndpointId,
+) -> (SqliteRuntimeStore, SqliteTaskLifecycle, Lease, DeliveryId) {
+    let scope = RecoveryScope::new(
+        bootstrap_nonadmin(pool, true).await.unwrap(),
+        EffectDomain::Local,
+        None,
+    );
+    let task = insert_task(pool, &scope, endpoint).await;
+    let lifecycle = SqliteTaskLifecycle::new_scoped(pool.clone(), Some(scope.clone()));
+    let delivery = DeliveryId::generate();
+    let now = Utc::now();
+    let dispatched = TaskEvent {
+        id: EventId::generate(),
+        task_id: task,
+        seq: 2,
+        status: TaskStatus::Dispatched,
+        timestamp: now,
+        payload: TaskEventPayload::Dispatched {
+            delivery_id: delivery,
+            attempt: 1,
+        },
+    };
+    assert_eq!(
+        lifecycle.transition(&dispatched).await.unwrap(),
+        LifecycleResult::Committed
+    );
+    let reliability = ReliabilityStore::with_recovery(pool.clone(), scope.clone());
+    reliability
+        .prepare_delivery(
+            &delivery.to_string(),
+            &task.to_string(),
+            1,
+            &endpoint.to_string(),
+            &now.to_rfc3339(),
+        )
+        .await
+        .unwrap();
+    reliability
+        .acknowledge_delivery(&delivery.to_string(), "synthetic", &now.to_rfc3339())
+        .await
+        .unwrap();
+    let store = SqliteRuntimeStore::new_scoped(pool.clone(), Some(scope));
+    let resource = ExecutionResourceKey::new(
+        endpoint,
+        WorkspaceId::from_canonical_path(workspace).unwrap(),
+    );
+    let AcquireOutcome::Acquired(lease) = store
+        .acquire(resource, task, now, Duration::from_secs(120))
+        .await
+        .unwrap()
+    else {
+        panic!("new work refused")
+    };
+    store
+        .claim_workspaces(&lease, &[workspace.to_path_buf()])
+        .await
+        .unwrap();
+    store
+        .begin_continuation(&lease, delivery, "synthetic", now)
+        .await
+        .unwrap();
+    (store, lifecycle, lease, delivery)
+}
+
+#[tokio::test]
+async fn f1_ensure_unstarted_continuation_create_or_validate() {
+    let (root, pool) = mechanism_diagnostic_fixture().await;
+    let endpoint = crate::models::EndpointId::generate();
+    let (store, _lifecycle, lease, delivery) =
+        prepare_unstarted(&pool, root.path(), endpoint).await;
+    let now = Utc::now();
+
+    // Existing unstarted row validates cleanly.
+    store
+        .ensure_unstarted_continuation(&lease, delivery, "synthetic", now)
+        .await
+        .unwrap();
+
+    // Mismatched prompt is fenced.
+    assert!(matches!(
+        store
+            .ensure_unstarted_continuation(&lease, delivery, "other", now)
+            .await,
+        Err(RuntimeError::Fenced)
+    ));
+
+    // A receipt row fences the continuation.
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query(
+        "INSERT INTO continuation_response_receipts(idempotency_key,task_id,delivery_id,resource_key,lease_fence,continuation_revision,response_hash,outcome,output_bytes,runtime_generation,created_at) VALUES('f1-receipt',?,?,?,1,1,'hash','structured',0,'generation.v1:strict','now')",
+    )
+    .bind(lease.task_id.to_string())
+    .bind(delivery.to_string())
+    .bind(lease.resource.to_string())
+    .execute(&mut *tx)
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert!(matches!(
+        store
+            .ensure_unstarted_continuation(&lease, delivery, "synthetic", now)
+            .await,
+        Err(RuntimeError::Fenced)
+    ));
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn f2_finish_failed_setup_true_reap_terminal() {
+    let (root, pool) = mechanism_diagnostic_fixture().await;
+    let endpoint = crate::models::EndpointId::generate();
+    let (store, _lifecycle, lease, delivery) =
+        prepare_unstarted(&pool, root.path(), endpoint).await;
+    let now = Utc::now();
+
+    // Validate the unstarted continuation.
+    store
+        .ensure_unstarted_continuation(&lease, delivery, "synthetic", now)
+        .await
+        .unwrap();
+
+    // Claim turn 1 (advances revision to 2).
+    let claimed = store
+        .claim_turn_with_generation(&lease, 1, "generation.v1:strict", now)
+        .await
+        .unwrap();
+    assert_eq!(claimed.revision, 2);
+
+    // Finalize terminal — commits exactly once.
+    let event = TaskEvent {
+        id: EventId::generate(),
+        task_id: lease.task_id,
+        seq: 3,
+        status: TaskStatus::Failed,
+        timestamp: now,
+        payload: TaskEventPayload::Failed {
+            error: "setup_failed".into(),
+        },
+    };
+    assert!(matches!(
+        store
+            .finalize_terminal(
+                &lease,
+                claimed.revision,
+                &claimed.runtime_generation,
+                ContinuationState::Terminal,
+                0,
+                &event,
+                now
+            )
+            .await
+            .unwrap(),
+        FinalizeResult::Committed
+    ));
+
+    // Second attempt is fenced.
+    assert!(!matches!(
+        store
+            .finalize_terminal(
+                &lease,
+                claimed.revision,
+                &claimed.runtime_generation,
+                ContinuationState::Terminal,
+                0,
+                &event,
+                now
+            )
+            .await
+            .unwrap(),
+        FinalizeResult::Committed
+    ));
+
+    assert_terminal(&pool, lease.task_id).await;
+    pool.close().await;
+}
+
+fn test_target(workspace: &Path) -> crate::bus::RegisteredEndpoint {
+    let config = format!(
+        "[agents.worker]\ntransport='acp'\ncommand='true'\nworkspace={}\n",
+        serde_json::to_string(workspace.to_str().unwrap()).unwrap()
+    );
+    EndpointRegistry::from_config(&crate::config::load_from_str(&config).unwrap())
+        .get(derive_endpoint_id("worker"))
+        .unwrap()
+        .clone()
+}
+
+fn test_request<'a>(
+    task: &'a AgentTask,
+    target: &'a crate::bus::RegisteredEndpoint,
+    delivery_id: DeliveryId,
+) -> DispatchRequest<'a> {
+    DispatchRequest {
+        task,
+        target,
+        delivery_id,
+        attempt: 1,
+        queue_lease: None,
+    }
+}
+
+#[tokio::test]
+async fn f4_uncertain_reap_then_supported_finalizer_is_terminal_once() {
+    let (root, pool) = mechanism_diagnostic_fixture().await;
+    let endpoint = crate::models::EndpointId::generate();
+    let (_store, _lifecycle, lease, delivery) =
+        prepare_unstarted(&pool, root.path(), endpoint).await;
+    let (_dispatcher_root, leased) = build_leased(&pool, root.path()).await;
+    let (claimed_tx, mut claimed_rx) = tokio::sync::oneshot::channel();
+    let pending = Arc::clone(&leased.pending);
+    let value = PendingLease {
+        lease: lease.clone(),
+        claimed: claimed_tx,
+        preserved: false,
+    };
+
+    // The uncertain-reap arm preserves the exact active lease and does not touch
+    // continuation, receipt or terminal rows.
+    assert!(matches!(
+        LeasedAcpDispatcher::preserve_uncertain_pending(&pending, lease.task_id, value).await,
+        Err(DispatchError::RecoveryNeeded)
+    ));
+    assert!(
+        pending
+            .lock()
+            .unwrap()
+            .get(&lease.task_id)
+            .is_some_and(|entry| entry.preserved)
+    );
+    assert!(claimed_rx.try_recv().is_err());
+    let state: String = sqlx::query_scalar("SELECT state FROM execution_leases WHERE task_id=?")
+        .bind(lease.task_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "active");
+
+    // A later supported current-caller finalizer consumes the preserved capability
+    // and uses the exact public true-reap terminal path.
+    let entry = pending.lock().unwrap().remove(&lease.task_id).unwrap();
+    let target = test_target(root.path());
+    let task = AgentTask {
+        task_id: lease.task_id,
+        root_task_id: lease.task_id,
+        parent_task_id: None,
+        from_agent: target.id(),
+        to_agent: target.id(),
+        conversation_id: ConversationId::generate(),
+        reply_to: None,
+        text: "synthetic".into(),
+        priority: Priority::DEFAULT,
+        depth: 0,
+        hops: 0,
+        deadline: None,
+        version: 0,
+    };
+    let request = test_request(&task, &target, delivery);
+    let event = TaskEvent {
+        id: EventId::generate(),
+        task_id: lease.task_id,
+        seq: 3,
+        status: TaskStatus::Failed,
+        timestamp: Utc::now(),
+        payload: TaskEventPayload::Failed {
+            error: "setup_failed".into(),
+        },
+    };
+    leased
+        .finish_failed_setup(&request, &entry.lease, &event)
+        .await
+        .unwrap();
+    assert_terminal(&pool, lease.task_id).await;
+    let terminal_events: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM task_events WHERE task_id=? AND status='failed'")
+            .bind(lease.task_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(terminal_events, 1);
+    let receipts_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM continuation_response_receipts WHERE task_id=?")
+            .bind(lease.task_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(receipts_before >= 1);
+
+    // Repeating the disposition cannot create a second terminal effect.
+    assert!(
+        leased
+            .finish_failed_setup(&request, &entry.lease, &event)
+            .await
+            .is_err()
+    );
+    let receipts_after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM continuation_response_receipts WHERE task_id=?")
+            .bind(lease.task_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(receipts_after, receipts_before);
+    pool.close().await;
+}
+
+/// Build a minimal `LeasedAcpDispatcher` for supervisor-arm tests.
+async fn build_leased(
+    pool: &SqlitePool,
+    workspace: &Path,
+) -> (tempfile::TempDir, LeasedAcpDispatcher) {
+    let root = tempfile::tempdir().unwrap();
+    let dispatcher = crate::acp::AcpDispatcher::builder()
+        .cwd(root.path())
+        .sessions(SqliteSessionStore::new(pool.clone()))
+        .repository(Arc::new(SqliteRepository::new(pool.clone())))
+        .build()
+        .unwrap();
+    let scope = RecoveryScope::new(
+        bootstrap_nonadmin(pool, true).await.unwrap(),
+        EffectDomain::Local,
+        None,
+    );
+    let store = SqliteRuntimeStore::new_scoped(pool.clone(), Some(scope));
+    let leased = LeasedAcpDispatcher::new(
+        dispatcher,
+        store,
+        WorkspaceId::from_canonical_path(workspace).unwrap(),
+        ContinuationPolicy {
+            max_turns: 2,
+            max_wall_time: Duration::from_secs(30),
+            max_inactivity: Duration::from_secs(30),
+            max_consecutive_no_progress: 2,
+            max_observed_output_bytes: 4096,
+            lease_ttl: Duration::from_secs(30),
+        },
+        Arc::new(SystemRuntimeClock),
+        Arc::new(TokioRuntimeTimer),
+        Arc::new(RuntimeMetrics::default()),
+    );
+    (root, leased)
+}
+
+#[tokio::test]
+async fn f6_shutdown_skips_preserved_releases_normal() {
+    let (root, pool) = mechanism_diagnostic_fixture().await;
+    let endpoint = crate::models::EndpointId::generate();
+    let (store, _lifecycle, lease, _delivery) =
+        prepare_unstarted(&pool, root.path(), endpoint).await;
+    let (_root2, leased) = build_leased(&pool, root.path()).await;
+
+    // Create a second lease for the "normal" path by directly inserting
+    // into the execution_leases table (bypassing the full delivery pipeline).
+    let endpoint2 = crate::models::EndpointId::generate();
+    let scope2 = RecoveryScope::new(
+        bootstrap_nonadmin(&pool, true).await.unwrap(),
+        EffectDomain::Local,
+        None,
+    );
+    let task2 = insert_task(&pool, &scope2, endpoint2).await;
+    let now = Utc::now();
+    let resource2 = ExecutionResourceKey::new(
+        endpoint2,
+        WorkspaceId::from_canonical_path(root.path()).unwrap(),
+    );
+    let AcquireOutcome::Acquired(lease2) = store
+        .acquire(resource2, task2, now, Duration::from_secs(120))
+        .await
+        .unwrap()
+    else {
+        panic!("second lease refused")
+    };
+
+    // Insert a preserved PendingLease (task 1) and a normal PendingLease (task 2).
+    let (tx1, _rx1) = tokio::sync::oneshot::channel();
+    let (tx2, _rx2) = tokio::sync::oneshot::channel();
+    let pending = leased.pending.clone();
+    let mut map = pending.lock().unwrap_or_else(|p| p.into_inner());
+    map.insert(
+        lease.task_id,
+        PendingLease {
+            lease: lease.clone(),
+            claimed: tx1,
+            preserved: true,
+        },
+    );
+    map.insert(
+        task2,
+        PendingLease {
+            lease: lease2.clone(),
+            claimed: tx2,
+            preserved: false,
+        },
+    );
+    drop(map);
+
+    // Shutdown: preserved lease stays active, normal lease is released.
+    leased.shutdown().await;
+
+    let preserved_state: String =
+        sqlx::query_scalar("SELECT state FROM execution_leases WHERE task_id=?")
+            .bind(lease.task_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(preserved_state, "active");
+
+    let normal_state: String =
+        sqlx::query_scalar("SELECT state FROM execution_leases WHERE task_id=?")
+            .bind(task2.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(normal_state, "recovery_needed");
+
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn f6_execute_prepared_refuses_preserved_before_claim_or_prompt() {
+    let (root, pool) = mechanism_diagnostic_fixture().await;
+    let endpoint = crate::models::EndpointId::generate();
+    let (_store, _lifecycle, lease, delivery) =
+        prepare_unstarted(&pool, root.path(), endpoint).await;
+    let (_dispatcher_root, leased) = build_leased(&pool, root.path()).await;
+    let (claimed_tx, mut claimed_rx) = tokio::sync::oneshot::channel();
+    leased.pending.lock().unwrap().insert(
+        lease.task_id,
+        PendingLease {
+            lease: lease.clone(),
+            claimed: claimed_tx,
+            preserved: true,
+        },
+    );
+    let target = test_target(root.path());
+    let task = AgentTask {
+        task_id: lease.task_id,
+        root_task_id: lease.task_id,
+        parent_task_id: None,
+        from_agent: target.id(),
+        to_agent: target.id(),
+        conversation_id: ConversationId::generate(),
+        reply_to: None,
+        text: "must not prompt".into(),
+        priority: Priority::DEFAULT,
+        depth: 0,
+        hops: 0,
+        deadline: None,
+        version: 0,
+    };
+    let request = test_request(&task, &target, delivery);
+    assert!(matches!(
+        leased.execute_prepared(request).await,
+        Err(DispatchError::RecoveryNeeded)
+    ));
+    assert!(claimed_rx.try_recv().is_err());
+    assert!(
+        leased
+            .pending
+            .lock()
+            .unwrap()
+            .get(&lease.task_id)
+            .is_some_and(|entry| entry.preserved)
+    );
+    let continuation_state: String =
+        sqlx::query_scalar("SELECT state FROM task_continuations WHERE task_id=?")
+            .bind(lease.task_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(continuation_state, "ready");
+    pool.close().await;
 }
 
 #[path = "writer_rollback_tests.rs"]

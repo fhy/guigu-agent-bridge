@@ -158,8 +158,10 @@ impl Fixture {
             Arc::new(TokioRuntimeTimer),
             Arc::new(RuntimeMetrics::default()),
         ));
-        let router =
-            AcpDispatcherRouter::with_gate(HashMap::from([(target.id(), leased)]), gate.clone());
+        let router = AcpDispatcherRouter::with_gate(
+            HashMap::from([(target.id(), leased.clone())]),
+            gate.clone(),
+        );
         Self {
             root,
             pool,

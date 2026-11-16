@@ -28,7 +28,7 @@ impl LeasedAcpDispatcher {
                         Err(error) => {
                             tracing::error!(task_id = %request.task.task_id, stage = "delivery-lease", fence = lease.fence, category = renewal_category(&error), "lease renewal failed; retaining bounded setup before backend reap");
                             let _ = delivery.await;
-                            return self.hold_setup_lease(lease).await;
+                            return self.reap_setup_lease(lease).await;
                         }
                     }
                 }
@@ -42,7 +42,7 @@ impl LeasedAcpDispatcher {
                         }
                         Err(error) => {
                             tracing::error!(task_id = %request.task.task_id, stage = "delivery-lease", fence = lease.fence, category = renewal_category(&error), acknowledged = true, "post-setup lease refresh failed before any task prompt");
-                            return self.hold_setup_lease(lease).await;
+                            return self.reap_setup_lease(lease).await;
                         }
                     }
                 }
@@ -50,14 +50,9 @@ impl LeasedAcpDispatcher {
         }
     }
 
-    async fn hold_setup_lease(&self, lease: &Lease) -> Result<(), DispatchError> {
+    async fn reap_setup_lease(&self, lease: &Lease) -> Result<(), DispatchError> {
         let reaped = self.dispatcher.shutdown_reaped().await;
-        let held = self
-            .store
-            .release(lease, ReleaseDisposition::RecoveryNeeded, self.clock.now())
-            .await
-            .is_ok();
-        tracing::error!(task_id = %lease.task_id, stage = "delivery-lease", fence = lease.fence, category = "lease-lost-before-prompt", reaped, held, "setup ownership was lost; no task prompt or automatic replay permitted");
+        tracing::error!(task_id = %lease.task_id, stage = "delivery-lease", fence = lease.fence, category = "lease-lost-before-prompt", reaped, "setup ownership was lost; no task prompt or automatic replay permitted");
         Err(DispatchError::RecoveryNeeded)
     }
 }
