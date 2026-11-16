@@ -13,9 +13,7 @@ impl LeasedAcpDispatcher {
             let previous = lease.clone();
             let renewal = async {
                 self.timer.sleep(heartbeat).await;
-                self.store
-                    .renew(&previous, self.clock.now(), self.policy.lease_ttl)
-                    .await
+                self.renew_lease(&previous).await
             };
             tokio::select! {
                 biased;
@@ -34,7 +32,7 @@ impl LeasedAcpDispatcher {
                 }
                 result = &mut delivery => {
                     result?;
-                    match self.store.renew(lease, self.clock.now(), self.policy.lease_ttl).await {
+                    match self.renew_lease(lease).await {
                         Ok(renewed) => {
                             *lease = renewed;
                             tracing::debug!(task_id = %request.task.task_id, stage = "delivery-lease", fence = lease.fence, acknowledged = true, "session setup completed with a renewed execution lease");
@@ -48,6 +46,15 @@ impl LeasedAcpDispatcher {
                 }
             }
         }
+    }
+
+    async fn renew_lease(&self, lease: &Lease) -> Result<Lease, RuntimeError> {
+        if self.renewal_fault.swap(false, Ordering::SeqCst) {
+            return Err(RuntimeError::Expired);
+        }
+        self.store
+            .renew(lease, self.clock.now(), self.policy.lease_ttl)
+            .await
     }
 
     async fn reap_setup_lease(&self, lease: &Lease) -> Result<(), DispatchError> {

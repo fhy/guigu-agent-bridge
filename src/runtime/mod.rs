@@ -26,7 +26,10 @@ use std::{
     path::Path,
     pin::Pin,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use uuid::Uuid;
@@ -1550,6 +1553,7 @@ pub struct LeasedAcpDispatcher {
     active:
         Arc<Mutex<std::collections::HashMap<TaskId, tokio::sync::mpsc::Sender<SupervisorCommand>>>>,
     reap_results: Arc<Mutex<VecDeque<bool>>>,
+    renewal_fault: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1637,6 +1641,7 @@ impl LeasedAcpDispatcher {
             cleanup: Arc::new(Mutex::new(Vec::new())),
             active: Arc::new(Mutex::new(std::collections::HashMap::new())),
             reap_results: Arc::new(Mutex::new(VecDeque::new())),
+            renewal_fault: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -1646,6 +1651,11 @@ impl LeasedAcpDispatcher {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .extend(results);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_test_renewal_fault(&self) {
+        self.renewal_fault.store(true, Ordering::SeqCst);
     }
 
     async fn shutdown_reaped(&self) -> bool {

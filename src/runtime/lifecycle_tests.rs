@@ -2,7 +2,8 @@
 use super::*;
 use crate::acp::{AcpDispatcher, SqliteSessionStore};
 use crate::bus::{
-    DispatchRequest, EndpointRegistry, RegisteredEndpoint, TaskDispatcher, derive_endpoint_id,
+    DispatchRequest, EndpointRegistry, FinalizeCommand, FinalizeResult, RegisteredEndpoint,
+    TaskDispatcher, derive_endpoint_id,
 };
 use crate::models::{
     AgentTask, ConversationId, DeliveryId, EventId, Priority, TaskEvent, TaskEventPayload,
@@ -837,13 +838,23 @@ async fn production_snapshot(
 async fn f3_production_finalize_delivery_failure_preserves_uncertain() {
     let (root, pool) = mechanism_diagnostic_fixture().await;
     let endpoint = derive_endpoint_id("worker");
-    let (task, delivery) = insert_production_task(&pool, endpoint, "f3 production", true).await;
-    let target = production_target(root.path(), "__r132_missing_backend__", &[]);
+    let (task, delivery) = insert_production_task(&pool, endpoint, "f3 production", false).await;
+    let target = production_target(root.path(), &mock_backend().to_string_lossy(), &["happy"]);
     let request = test_request(&task, &target, delivery);
     let timer = Arc::new(ControlledTimer::default());
     let (_dispatcher_root, leased) = build_production_leased(&pool, root.path(), timer).await;
-    leased.queue_test_reap_results([false]);
-    assert!(leased.deliver(request.clone()).await.is_err());
+    // Arm a one-shot renewal fault so the real `deliver` entry drives
+    // `deliver_with_renewal` into `reap_setup_lease` (P1) on the post-setup
+    // renewal, then queue two uncertain reap outcomes: the first is consumed by
+    // the P1 reap, the second by the P9 `finalize_delivery_failure` reap.
+    leased.arm_test_renewal_fault();
+    leased.queue_test_reap_results([false, false]);
+    assert!(matches!(
+        leased.deliver(request.clone()).await,
+        Err(DispatchError::RecoveryNeeded)
+    ));
+    // P1 consumed exactly one queued reap outcome; one remains for P9.
+    assert_eq!(leased.reap_results.lock().unwrap().len(), 1);
     let before = production_snapshot(&pool, task.task_id, delivery).await;
     assert!(matches!(
         leased
@@ -863,6 +874,8 @@ async fn f3_production_finalize_delivery_failure_preserves_uncertain() {
             .await,
         Err(DispatchError::RecoveryNeeded)
     ));
+    // P9 consumed the second queued reap outcome; the queue is now empty.
+    assert!(leased.reap_results.lock().unwrap().is_empty());
     assert_eq!(
         production_snapshot(&pool, task.task_id, delivery).await,
         before
@@ -1015,6 +1028,53 @@ async fn f6_p4_production_supervisor_cancel_reap_branches() {
             .unwrap(),
         "released"
     );
+    leased.shutdown().await;
+    pool.close().await;
+
+    // Third branch: the real `cancel_prepared` entry (reap_only=false) returns a
+    // `FinalizationCapability`; completing it through the capability API commits
+    // exactly one terminal event/receipt with no prompt or replay.
+    let (root, pool) = mechanism_diagnostic_fixture().await;
+    let (task, delivery) = insert_production_task(&pool, endpoint, "f6 p4 capability", false).await;
+    let target = production_target(root.path(), &mock_backend().to_string_lossy(), &["happy"]);
+    let request = test_request(&task, &target, delivery);
+    let timer = Arc::new(ControlledTimer::default());
+    let (_dispatcher_root, leased) = build_production_leased(&pool, root.path(), timer).await;
+    leased.queue_test_reap_results([true]);
+    leased.deliver(request.clone()).await.unwrap();
+    let mut capability = leased
+        .cancel_prepared(request.clone(), "capability cancel")
+        .await
+        .unwrap();
+    let event = TaskEvent {
+        id: EventId::generate(),
+        task_id: task.task_id,
+        seq: 3,
+        status: TaskStatus::Cancelled,
+        timestamp: Utc::now(),
+        payload: TaskEventPayload::Cancelled {
+            reason: "capability cancel".into(),
+        },
+    };
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    capability
+        .command
+        .take()
+        .unwrap()
+        .send(FinalizeCommand {
+            task_id: task.task_id,
+            event: event.clone(),
+            response: tx,
+        })
+        .unwrap();
+    assert!(matches!(rx.await.unwrap(), FinalizeResult::Committed));
+    let terminal = production_snapshot(&pool, task.task_id, delivery).await;
+    assert_eq!(terminal.0, "released");
+    assert_eq!(terminal.1, 1);
+    assert_eq!(terminal.2, 1);
+    assert_eq!(terminal.3, 2);
+    assert_eq!(terminal.4, "terminal");
+    assert_eq!(terminal.5, "terminal");
     leased.shutdown().await;
     pool.close().await;
 }
