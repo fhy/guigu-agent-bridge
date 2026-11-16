@@ -143,7 +143,7 @@ async fn cancellation_before_commit_releases_scoped_writer_and_rolls_back() {
 }
 
 #[tokio::test]
-async fn f3_false_reap_zero_mutation_and_preserved_reinsertion() {
+async fn f3_preserve_helper_zero_mutation_contract() {
     let (root, pool) = mechanism_diagnostic_fixture().await;
     let endpoint = crate::models::EndpointId::generate();
     let (_store, _lifecycle, lease, _delivery) =

@@ -1,7 +1,9 @@
 //! Scoped production consumers reused by the actual same-store runtime fixture.
 use super::*;
-use crate::acp::SqliteSessionStore;
-use crate::bus::{DispatchRequest, EndpointRegistry, TaskDispatcher, derive_endpoint_id};
+use crate::acp::{AcpDispatcher, SqliteSessionStore};
+use crate::bus::{
+    DispatchRequest, EndpointRegistry, RegisteredEndpoint, TaskDispatcher, derive_endpoint_id,
+};
 use crate::models::{
     AgentTask, ConversationId, DeliveryId, EventId, Priority, TaskEvent, TaskEventPayload,
     TaskStatus,
@@ -578,8 +580,515 @@ fn test_request<'a>(
     }
 }
 
+#[derive(Clone, Default)]
+struct ControlledTimer {
+    notify: Arc<tokio::sync::Notify>,
+}
+
+impl ControlledTimer {
+    fn fire(&self) {
+        self.notify.notify_one();
+    }
+}
+
+impl RuntimeTimer for ControlledTimer {
+    fn sleep<'a>(&'a self, _duration: Duration) -> Pin<Box<dyn Future<Output = ()> + Send + 'a>> {
+        Box::pin(self.notify.notified())
+    }
+}
+
+fn production_target(workspace: &Path, command: &str, args: &[&str]) -> RegisteredEndpoint {
+    let config = format!(
+        "[agents.worker]\ntransport='acp'\ncommand={}\nargs={}\nworkspace={}\n",
+        serde_json::to_string(command).unwrap(),
+        serde_json::to_string(args).unwrap(),
+        serde_json::to_string(workspace.to_str().unwrap()).unwrap(),
+    );
+    EndpointRegistry::from_config(&crate::config::load_from_str(&config).unwrap())
+        .get(derive_endpoint_id("worker"))
+        .unwrap()
+        .clone()
+}
+
+fn mock_backend() -> std::path::PathBuf {
+    let mut path = std::env::current_exe().unwrap();
+    path.pop();
+    path.pop();
+    path.push("examples/acp-mock-backend");
+    path.set_extension(std::env::consts::EXE_EXTENSION);
+    assert!(
+        path.exists(),
+        "build the local acp-mock-backend example first"
+    );
+    path
+}
+
+async fn insert_production_task(
+    pool: &SqlitePool,
+    endpoint: crate::models::EndpointId,
+    text: &str,
+    seed_delivery: bool,
+) -> (AgentTask, DeliveryId) {
+    let scope = RecoveryScope::new(
+        bootstrap_nonadmin(pool, true).await.unwrap(),
+        EffectDomain::Local,
+        None,
+    );
+    let task_id = TaskId::generate();
+    let conversation = ConversationId::generate();
+    let delivery = DeliveryId::generate();
+    let mut tx = writer::begin(pool, Some(&scope)).await.unwrap();
+    for query in [
+        "INSERT INTO agents(endpoint_id,agent_id,transport,enabled,capabilities_json) VALUES(?,'production-worker','acp',1,'[]')",
+        "INSERT INTO conversations(conversation_id,participants_json) VALUES(?,'[]')",
+        "INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES(?,?,?,?,?,?,5,0,0,0)",
+        "INSERT INTO task_admissions(task_id,state,revision,render_version,created_at,updated_at) VALUES(?,'enqueued',0,'v1','now','now')",
+    ] {
+        let statement = sqlx::query(query);
+        match query {
+            value if value.contains("agents") => statement
+                .bind(endpoint.to_string())
+                .execute(&mut *tx)
+                .await
+                .unwrap(),
+            value if value.contains("conversations") => statement
+                .bind(conversation.to_string())
+                .execute(&mut *tx)
+                .await
+                .unwrap(),
+            value if value.contains("tasks") => statement
+                .bind(task_id.to_string())
+                .bind(task_id.to_string())
+                .bind(endpoint.to_string())
+                .bind(endpoint.to_string())
+                .bind(conversation.to_string())
+                .bind(text)
+                .execute(&mut *tx)
+                .await
+                .unwrap(),
+            _ => statement
+                .bind(task_id.to_string())
+                .execute(&mut *tx)
+                .await
+                .unwrap(),
+        };
+    }
+    for (table, key) in [
+        ("agents", endpoint.to_string()),
+        ("conversations", conversation.to_string()),
+        ("tasks", task_id.to_string()),
+        ("task_admissions", task_id.to_string()),
+    ] {
+        writer::inserted(
+            &mut tx,
+            Some(&scope),
+            &writer::text_identity(table, &key).unwrap(),
+        )
+        .await
+        .unwrap();
+    }
+    tx.commit().await.unwrap();
+    let now = Utc::now();
+    SqliteTaskLifecycle::new_scoped(pool.clone(), Some(scope.clone()))
+        .transition(&TaskEvent {
+            id: EventId::generate(),
+            task_id,
+            seq: 2,
+            status: TaskStatus::Dispatched,
+            timestamp: now,
+            payload: TaskEventPayload::Dispatched {
+                delivery_id: delivery,
+                attempt: 1,
+            },
+        })
+        .await
+        .unwrap();
+    if seed_delivery {
+        let reliability = ReliabilityStore::with_recovery(pool.clone(), scope);
+        reliability
+            .prepare_delivery(
+                &delivery.to_string(),
+                &task_id.to_string(),
+                1,
+                &endpoint.to_string(),
+                &now.to_rfc3339(),
+            )
+            .await
+            .unwrap();
+        reliability
+            .acknowledge_delivery(&delivery.to_string(), "synthetic", &now.to_rfc3339())
+            .await
+            .unwrap();
+    }
+    (
+        AgentTask {
+            task_id,
+            root_task_id: task_id,
+            parent_task_id: None,
+            from_agent: endpoint,
+            to_agent: endpoint,
+            conversation_id: conversation,
+            reply_to: None,
+            text: text.into(),
+            priority: Priority::DEFAULT,
+            depth: 0,
+            hops: 0,
+            deadline: None,
+            version: 1,
+        },
+        delivery,
+    )
+}
+
+async fn build_production_leased(
+    pool: &SqlitePool,
+    workspace: &Path,
+    timer: Arc<ControlledTimer>,
+) -> (tempfile::TempDir, LeasedAcpDispatcher) {
+    let root = tempfile::tempdir().unwrap();
+    let scope = RecoveryScope::new(
+        bootstrap_nonadmin(pool, true).await.unwrap(),
+        EffectDomain::Local,
+        None,
+    );
+    let dispatcher = AcpDispatcher::builder()
+        .cwd(root.path())
+        .sessions(SqliteSessionStore::new_scoped(
+            pool.clone(),
+            Some(scope.clone()),
+        ))
+        .repository(Arc::new(SqliteRepository::with_recovery(
+            pool.clone(),
+            scope.clone(),
+        )))
+        .reliability(ReliabilityStore::with_recovery(pool.clone(), scope.clone()))
+        .build()
+        .unwrap();
+    let leased = LeasedAcpDispatcher::new(
+        dispatcher,
+        SqliteRuntimeStore::new_scoped(pool.clone(), Some(scope)),
+        WorkspaceId::from_canonical_path(workspace).unwrap(),
+        ContinuationPolicy {
+            max_turns: 2,
+            max_wall_time: Duration::from_secs(30),
+            max_inactivity: Duration::from_secs(30),
+            max_consecutive_no_progress: 2,
+            max_observed_output_bytes: 4096,
+            lease_ttl: Duration::from_secs(30),
+        },
+        Arc::new(SystemRuntimeClock),
+        timer,
+        Arc::new(RuntimeMetrics::default()),
+    );
+    (root, leased)
+}
+
+async fn production_snapshot(
+    pool: &SqlitePool,
+    task_id: TaskId,
+    delivery_id: DeliveryId,
+) -> (String, i64, i64, i64, String, String) {
+    let lease: String = sqlx::query_scalar("SELECT state FROM execution_leases WHERE task_id=?")
+        .bind(task_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let continuations: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM task_continuations WHERE task_id=?")
+            .bind(task_id.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM continuation_response_receipts WHERE task_id=?")
+            .bind(task_id.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let events: i64 = sqlx::query_scalar("SELECT count(*) FROM task_events WHERE task_id=?")
+        .bind(task_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let admission: String = sqlx::query_scalar("SELECT state FROM task_admissions WHERE task_id=?")
+        .bind(task_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let disposition: String = sqlx::query_scalar(
+        "SELECT state FROM delivery_dispositions WHERE delivery_id=? AND task_id=?",
+    )
+    .bind(delivery_id.to_string())
+    .bind(task_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    (
+        lease,
+        continuations,
+        receipts,
+        events,
+        admission,
+        disposition,
+    )
+}
+
 #[tokio::test]
-async fn f4_uncertain_reap_then_supported_finalizer_is_terminal_once() {
+async fn f3_production_finalize_delivery_failure_preserves_uncertain() {
+    let (root, pool) = mechanism_diagnostic_fixture().await;
+    let endpoint = derive_endpoint_id("worker");
+    let (task, delivery) = insert_production_task(&pool, endpoint, "f3 production", true).await;
+    let target = production_target(root.path(), "__r132_missing_backend__", &[]);
+    let request = test_request(&task, &target, delivery);
+    let timer = Arc::new(ControlledTimer::default());
+    let (_dispatcher_root, leased) = build_production_leased(&pool, root.path(), timer).await;
+    leased.queue_test_reap_results([false]);
+    assert!(leased.deliver(request.clone()).await.is_err());
+    let before = production_snapshot(&pool, task.task_id, delivery).await;
+    assert!(matches!(
+        leased
+            .finalize_delivery_failure(
+                request.clone(),
+                TaskEvent {
+                    id: EventId::generate(),
+                    task_id: task.task_id,
+                    seq: 3,
+                    status: TaskStatus::Failed,
+                    timestamp: Utc::now(),
+                    payload: TaskEventPayload::Failed {
+                        error: "failed_before_prompt".into(),
+                    },
+                },
+            )
+            .await,
+        Err(DispatchError::RecoveryNeeded)
+    ));
+    assert_eq!(
+        production_snapshot(&pool, task.task_id, delivery).await,
+        before
+    );
+    assert!(
+        leased
+            .pending
+            .lock()
+            .unwrap()
+            .get(&task.task_id)
+            .is_some_and(|entry| entry.preserved)
+    );
+    leased.shutdown().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn f4_production_finalize_delivery_failure_terminalizes_once() {
+    let (root, pool) = mechanism_diagnostic_fixture().await;
+    let endpoint = derive_endpoint_id("worker");
+    let (task, delivery) = insert_production_task(&pool, endpoint, "f4 production", true).await;
+    let target = production_target(root.path(), "__r132_missing_backend__", &[]);
+    let request = test_request(&task, &target, delivery);
+    let timer = Arc::new(ControlledTimer::default());
+    let (_dispatcher_root, leased) = build_production_leased(&pool, root.path(), timer).await;
+    leased.queue_test_reap_results([false, true]);
+    assert!(leased.deliver(request.clone()).await.is_err());
+    let event = TaskEvent {
+        id: EventId::generate(),
+        task_id: task.task_id,
+        seq: 3,
+        status: TaskStatus::Failed,
+        timestamp: Utc::now(),
+        payload: TaskEventPayload::Failed {
+            error: "failed_before_prompt".into(),
+        },
+    };
+    assert!(
+        leased
+            .finalize_delivery_failure(request.clone(), event.clone())
+            .await
+            .is_err()
+    );
+    assert!(
+        leased
+            .pending
+            .lock()
+            .unwrap()
+            .get(&task.task_id)
+            .is_some_and(|entry| entry.preserved)
+    );
+
+    assert!(
+        leased
+            .finalize_delivery_failure(request, event)
+            .await
+            .is_ok()
+    );
+    let terminal = production_snapshot(&pool, task.task_id, delivery).await;
+    assert_eq!(terminal.0, "released");
+    assert_eq!(terminal.1, 1);
+    assert_eq!(terminal.2, 1);
+    assert_eq!(terminal.3, 2);
+    assert_eq!(terminal.4, "terminal");
+    assert_eq!(terminal.5, "terminal");
+    assert!(
+        leased
+            .finalize_delivery_failure(
+                test_request(&task, &target, delivery,),
+                TaskEvent {
+                    id: EventId::generate(),
+                    task_id: task.task_id,
+                    seq: 3,
+                    status: TaskStatus::Failed,
+                    timestamp: Utc::now(),
+                    payload: TaskEventPayload::Failed {
+                        error: "failed_before_prompt".into(),
+                    },
+                },
+            )
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM continuation_response_receipts WHERE task_id=?",
+        )
+        .bind(task.task_id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap(),
+        1
+    );
+    leased.shutdown().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn f6_p4_production_supervisor_cancel_reap_branches() {
+    let (root, pool) = mechanism_diagnostic_fixture().await;
+    let endpoint = derive_endpoint_id("worker");
+    let (task, delivery) = insert_production_task(&pool, endpoint, "f6 p4 uncertain", false).await;
+    let target = production_target(root.path(), &mock_backend().to_string_lossy(), &["happy"]);
+    let request = test_request(&task, &target, delivery);
+    let timer = Arc::new(ControlledTimer::default());
+    let (_dispatcher_root, leased) = build_production_leased(&pool, root.path(), timer).await;
+    leased.queue_test_reap_results([false]);
+    leased.deliver(request.clone()).await.unwrap();
+    let before = production_snapshot(&pool, task.task_id, delivery).await;
+    assert!(
+        leased
+            .cancel_and_reap_task(task.task_id, "uncertain cancel")
+            .await
+            .is_none()
+    );
+    assert_eq!(
+        production_snapshot(&pool, task.task_id, delivery).await,
+        before
+    );
+    assert!(
+        leased
+            .pending
+            .lock()
+            .unwrap()
+            .get(&task.task_id)
+            .is_some_and(|entry| entry.preserved)
+    );
+    leased.shutdown().await;
+    pool.close().await;
+
+    let (root, pool) = mechanism_diagnostic_fixture().await;
+    let (task, delivery) = insert_production_task(&pool, endpoint, "f6 p4 positive", false).await;
+    let target = production_target(root.path(), &mock_backend().to_string_lossy(), &["happy"]);
+    let request = test_request(&task, &target, delivery);
+    let timer = Arc::new(ControlledTimer::default());
+    let (_dispatcher_root, leased) = build_production_leased(&pool, root.path(), timer).await;
+    leased.queue_test_reap_results([true]);
+    leased.deliver(request).await.unwrap();
+    assert!(
+        leased
+            .cancel_and_reap_task(task.task_id, "positive cancel")
+            .await
+            .is_some()
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM execution_leases WHERE task_id=?")
+            .bind(task.task_id.to_string())
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        "released"
+    );
+    leased.shutdown().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn f6_p5_production_supervisor_timeout_reap_branches() {
+    let endpoint = derive_endpoint_id("worker");
+    let (root, pool) = mechanism_diagnostic_fixture().await;
+    let (task, delivery) = insert_production_task(&pool, endpoint, "f6 p5 uncertain", false).await;
+    let target = production_target(root.path(), &mock_backend().to_string_lossy(), &["happy"]);
+    let request = test_request(&task, &target, delivery);
+    let timer = Arc::new(ControlledTimer::default());
+    let (_dispatcher_root, leased) =
+        build_production_leased(&pool, root.path(), timer.clone()).await;
+    leased.queue_test_reap_results([false]);
+    leased.deliver(request.clone()).await.unwrap();
+    let before = production_snapshot(&pool, task.task_id, delivery).await;
+    timer.fire();
+    for _ in 0..1_000 {
+        if leased
+            .pending
+            .lock()
+            .unwrap()
+            .get(&task.task_id)
+            .is_some_and(|entry| entry.preserved)
+        {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(matches!(
+        leased.execute_prepared(request).await,
+        Err(DispatchError::RecoveryNeeded)
+    ));
+    assert_eq!(
+        production_snapshot(&pool, task.task_id, delivery).await,
+        before
+    );
+    leased.shutdown().await;
+    pool.close().await;
+
+    let (root, pool) = mechanism_diagnostic_fixture().await;
+    let (task, delivery) = insert_production_task(&pool, endpoint, "f6 p5 positive", false).await;
+    let target = production_target(root.path(), &mock_backend().to_string_lossy(), &["happy"]);
+    let request = test_request(&task, &target, delivery);
+    let timer = Arc::new(ControlledTimer::default());
+    let (_dispatcher_root, leased) =
+        build_production_leased(&pool, root.path(), timer.clone()).await;
+    leased.queue_test_reap_results([true]);
+    leased.deliver(request).await.unwrap();
+    timer.fire();
+    for _ in 0..1_000 {
+        if matches!(
+            production_snapshot(&pool, task.task_id, delivery).await,
+            (ref lease, 1, 1, 2, ref admission, ref disposition)
+                if lease == "released" && admission == "terminal" && disposition == "terminal"
+        ) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    let terminal = production_snapshot(&pool, task.task_id, delivery).await;
+    assert_eq!(terminal.0, "released");
+    assert_eq!(terminal.1, 1);
+    assert_eq!(terminal.2, 1);
+    assert_eq!(terminal.3, 2);
+    assert_eq!(terminal.4, "terminal");
+    assert_eq!(terminal.5, "terminal");
+    leased.shutdown().await;
+    pool.close().await;
+}
+
+#[tokio::test]
+async fn f4_storage_terminal_idempotency_contract() {
     let (root, pool) = mechanism_diagnostic_fixture().await;
     let endpoint = crate::models::EndpointId::generate();
     let (_store, _lifecycle, lease, delivery) =
@@ -719,7 +1228,7 @@ async fn build_leased(
 }
 
 #[tokio::test]
-async fn f6_shutdown_skips_preserved_releases_normal() {
+async fn f6_preserved_shutdown_drain_contract() {
     let (root, pool) = mechanism_diagnostic_fixture().await;
     let endpoint = crate::models::EndpointId::generate();
     let (store, _lifecycle, lease, _delivery) =
@@ -794,7 +1303,7 @@ async fn f6_shutdown_skips_preserved_releases_normal() {
 }
 
 #[tokio::test]
-async fn f6_execute_prepared_refuses_preserved_before_claim_or_prompt() {
+async fn f6_preserved_execute_refusal_contract() {
     let (root, pool) = mechanism_diagnostic_fixture().await;
     let endpoint = crate::models::EndpointId::generate();
     let (_store, _lifecycle, lease, delivery) =

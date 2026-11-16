@@ -13,13 +13,15 @@ use crate::{
         FinalizeResult, LifecycleResult, PreparedExecution, QueueLeaseContext, TaskDispatcher,
         TaskLifecycle,
     },
-    models::{AgentTask, DeliveryId, EndpointId, TaskId},
+    models::{
+        AgentTask, DeliveryId, EndpointId, EventId, TaskEvent, TaskEventPayload, TaskId, TaskStatus,
+    },
     storage::StorageError,
 };
 use chrono::{DateTime, Utc};
 use sqlx::{Row, SqlitePool};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
     path::Path,
     pin::Pin,
@@ -1547,6 +1549,7 @@ pub struct LeasedAcpDispatcher {
     cleanup: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     active:
         Arc<Mutex<std::collections::HashMap<TaskId, tokio::sync::mpsc::Sender<SupervisorCommand>>>>,
+    reap_results: Arc<Mutex<VecDeque<bool>>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1633,7 +1636,20 @@ impl LeasedAcpDispatcher {
             pending: Arc::new(Mutex::new(std::collections::HashMap::new())),
             cleanup: Arc::new(Mutex::new(Vec::new())),
             active: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            reap_results: Arc::new(Mutex::new(VecDeque::new())),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn queue_test_reap_results(&self, results: impl IntoIterator<Item = bool>) {
+        self.reap_results
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend(results);
+    }
+
+    async fn shutdown_reaped(&self) -> bool {
+        reap_with_override(&self.dispatcher, &self.reap_results).await
     }
 
     pub async fn shutdown(&self) {
@@ -2163,38 +2179,18 @@ impl LeasedAcpDispatcher {
         lease: &Lease,
         event: &crate::models::TaskEvent,
     ) -> Result<(), DispatchError> {
-        self.store
-            .ensure_unstarted_continuation(
-                lease,
-                request.delivery_id,
-                &request.task.text,
-                self.clock.now(),
-            )
+        self.finish_failed_setup_for(lease, request.delivery_id, &request.task.text, event)
             .await
-            .map_err(Self::execution_error)?;
-        let state = self
-            .store
-            .claim_turn_with_generation(lease, 1, CONTINUATION_RUNTIME_GENERATION, self.clock.now())
-            .await
-            .map_err(Self::execution_error)?;
-        let result = self
-            .store
-            .finalize_terminal(
-                lease,
-                state.revision,
-                &state.runtime_generation,
-                ContinuationState::Terminal,
-                0,
-                event,
-                self.clock.now(),
-            )
-            .await
-            .map_err(Self::execution_error)?;
-        if matches!(result, FinalizeResult::Committed) {
-            Ok(())
-        } else {
-            Err(DispatchError::RecoveryNeeded)
-        }
+    }
+
+    async fn finish_failed_setup_for(
+        &self,
+        lease: &Lease,
+        delivery_id: DeliveryId,
+        prompt: &str,
+        event: &crate::models::TaskEvent,
+    ) -> Result<(), DispatchError> {
+        finish_failed_setup_store(&self.store, &self.clock, lease, delivery_id, prompt, event).await
     }
 
     async fn preserve_uncertain_pending(
@@ -2208,6 +2204,81 @@ impl LeasedAcpDispatcher {
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .insert(task_id, preserved);
+        Err(DispatchError::RecoveryNeeded)
+    }
+}
+
+async fn reap_with_override(
+    dispatcher: &AcpDispatcher,
+    results: &Arc<Mutex<VecDeque<bool>>>,
+) -> bool {
+    let actual = dispatcher.shutdown_reaped().await;
+    results
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pop_front()
+        .unwrap_or(actual)
+}
+
+async fn failed_setup_event_store(
+    store: &SqliteRuntimeStore,
+    clock: &Arc<dyn RuntimeClock>,
+    task_id: TaskId,
+) -> Result<TaskEvent, DispatchError> {
+    let latest: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(seq) FROM task_events WHERE task_id=?")
+            .bind(task_id.to_string())
+            .fetch_one(&store.pool)
+            .await
+            .map_err(LeasedAcpDispatcher::execution_error)?;
+    let next = latest
+        .unwrap_or_default()
+        .checked_add(1)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(DispatchError::RecoveryNeeded)?;
+    Ok(TaskEvent {
+        id: EventId::generate(),
+        task_id,
+        seq: next,
+        status: TaskStatus::Failed,
+        timestamp: clock.now(),
+        payload: TaskEventPayload::Failed {
+            error: "failed_before_prompt".into(),
+        },
+    })
+}
+
+async fn finish_failed_setup_store(
+    store: &SqliteRuntimeStore,
+    clock: &Arc<dyn RuntimeClock>,
+    lease: &Lease,
+    delivery_id: DeliveryId,
+    prompt: &str,
+    event: &TaskEvent,
+) -> Result<(), DispatchError> {
+    store
+        .ensure_unstarted_continuation(lease, delivery_id, prompt, clock.now())
+        .await
+        .map_err(LeasedAcpDispatcher::execution_error)?;
+    let state = store
+        .claim_turn_with_generation(lease, 1, CONTINUATION_RUNTIME_GENERATION, clock.now())
+        .await
+        .map_err(LeasedAcpDispatcher::execution_error)?;
+    let result = store
+        .finalize_terminal(
+            lease,
+            state.revision,
+            &state.runtime_generation,
+            ContinuationState::Terminal,
+            0,
+            event,
+            clock.now(),
+        )
+        .await
+        .map_err(LeasedAcpDispatcher::execution_error)?;
+    if matches!(result, FinalizeResult::Committed) {
+        Ok(())
+    } else {
         Err(DispatchError::RecoveryNeeded)
     }
 }
@@ -2343,7 +2414,10 @@ impl TaskDispatcher for LeasedAcpDispatcher {
             let store = self.store.clone();
             let clock = Arc::clone(&self.clock);
             let timer = Arc::clone(&self.timer);
+            let reap_results = Arc::clone(&self.reap_results);
             let task_id = request.task.task_id;
+            let delivery_id = request.delivery_id;
+            let prompt = request.task.text.clone();
             let ttl = self.policy.lease_ttl;
             let supervisor = tokio::spawn(async move {
                 tokio::select! {
@@ -2356,7 +2430,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                             let _ = command.response.send(Err(DispatchError::RecoveryNeeded));
                             return;
                         };
-                        if !dispatcher.shutdown_reaped().await {
+                        if !reap_with_override(&dispatcher, &reap_results).await {
                             let _ = Self::preserve_uncertain_pending(&pending, task_id, entry).await;
                             let _ = command.response.send(Err(DispatchError::RecoveryNeeded));
                             return;
@@ -2399,8 +2473,33 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                         active.lock().unwrap_or_else(|p|p.into_inner()).remove(&task_id);
                         let stale = pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&task_id);
                         if let Some(stale) = stale {
-                            let _=dispatcher.shutdown_reaped().await;
-                            let _=Self::preserve_uncertain_pending(&pending, task_id, stale).await;
+                            if !reap_with_override(&dispatcher, &reap_results).await {
+                                let _ = Self::preserve_uncertain_pending(&pending, task_id, stale).await;
+                            } else {
+                                let result = match
+                                    failed_setup_event_store(&store, &clock, task_id).await
+                                {
+                                    Ok(event) => finish_failed_setup_store(
+                                        &store,
+                                        &clock,
+                                        &stale.lease,
+                                        delivery_id,
+                                        &prompt,
+                                        &event,
+                                    )
+                                    .await,
+                                    Err(error) => Err(error),
+                                };
+                                if result.is_err() {
+                                    let _ = store
+                                        .release(
+                                            &stale.lease,
+                                            ReleaseDisposition::RecoveryNeeded,
+                                            clock.now(),
+                                        )
+                                        .await;
+                                }
+                            }
                         }
                     }
                 }
@@ -2465,7 +2564,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&request.task.task_id)
                 .ok_or(DispatchError::RecoveryNeeded)?;
-            let reaped = self.dispatcher.shutdown_reaped().await;
+            let reaped = self.shutdown_reaped().await;
             tracing::warn!(
                 task_id = %request.task.task_id,
                 delivery_id = %request.delivery_id,

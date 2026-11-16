@@ -51,7 +51,7 @@ impl LeasedAcpDispatcher {
     }
 
     async fn reap_setup_lease(&self, lease: &Lease) -> Result<(), DispatchError> {
-        let reaped = self.dispatcher.shutdown_reaped().await;
+        let reaped = self.shutdown_reaped().await;
         tracing::error!(task_id = %lease.task_id, stage = "delivery-lease", fence = lease.fence, category = "lease-lost-before-prompt", reaped, "setup ownership was lost; no task prompt or automatic replay permitted");
         Err(DispatchError::RecoveryNeeded)
     }
