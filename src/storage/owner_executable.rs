@@ -13,9 +13,10 @@ use std::{
 use sha2::{Digest, Sha256};
 
 // Cold reads of the retained 662-MB object took 13 s; under measured I/O
-// pressure a 20-s read reached only 521 MB. Give startup a finite 60-s
+// pressure a 60-s read reached only 706 MB while a concurrent read completed
+// in 56 s. Give startup a finite 90-s
 // window, including queueing, while keeping periodic validation at 10 s.
-const CAPTURE_BUDGET: Duration = Duration::from_secs(60);
+const CAPTURE_BUDGET: Duration = Duration::from_secs(90);
 const BUDGET: Duration = Duration::from_secs(10);
 const MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const DIGEST_CHUNK: usize = 1024 * 1024;
