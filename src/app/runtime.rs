@@ -226,6 +226,58 @@ pub enum AppError {
     Shutdown(#[source] std::io::Error),
 }
 
+// Only static stage/class labels reach either diagnostic sink. In particular,
+// opaque Option refusals cannot safely be labelled as a specific timeout.
+fn startup_runtime_error(phase: &'static str, error_class: &'static str) -> AppError {
+    use std::io::Write as _;
+
+    // Fixtures may have no tracing subscriber. Ignore sink failure so the
+    // original Runtime error is preserved; drop the stderr lock before tracing.
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "startup-runtime-error phase={phase} error_class={error_class}"
+    );
+    tracing::warn!(phase, error_class, "startup runtime failed");
+    AppError::Runtime
+}
+
+fn startup_io_error(phase: &'static str, error: std::io::Error) -> AppError {
+    let class = match error.kind() {
+        std::io::ErrorKind::TimedOut => "timeout",
+        _ => "io",
+    };
+    startup_runtime_error(phase, class)
+}
+
+fn startup_sql_error(phase: &'static str, error: sqlx::Error) -> AppError {
+    startup_runtime_error(
+        phase,
+        crate::storage::recovery_eligibility::diagnostics::class(&error),
+    )
+}
+
+fn startup_reliability_error(
+    phase: &'static str,
+    error: crate::storage::ReliabilityError,
+) -> AppError {
+    match error {
+        crate::storage::ReliabilityError::Sql(error) => startup_sql_error(phase, error),
+        _ => startup_runtime_error(phase, "invalid-state"),
+    }
+}
+
+fn startup_control_error(phase: &'static str, error: crate::runtime::RuntimeError) -> AppError {
+    match error {
+        crate::runtime::RuntimeError::Storage(StorageError::Open { source, .. })
+        | crate::runtime::RuntimeError::Storage(StorageError::Query(source)) => {
+            startup_sql_error(phase, source)
+        }
+        crate::runtime::RuntimeError::Storage(_) => startup_runtime_error(phase, "storage"),
+        crate::runtime::RuntimeError::Workspace => startup_runtime_error(phase, "unknown"),
+        _ => startup_runtime_error(phase, "invalid-state"),
+    }
+}
+
 pub struct AppRuntime {
     pool: Option<SqlitePool>,
     reload: Arc<ReloadController>,
@@ -387,11 +439,11 @@ impl AppRuntime {
         a2a_faults: Arc<dyn crate::a2a::IngressFaultInjector>,
     ) -> Result<Self, AppError> {
         crate::offline_production_migration::check_runtime_discovery(&config.bridge.database)
-            .map_err(|_| AppError::Runtime)?;
+            .map_err(|error| startup_io_error("runtime-discovery", error))?;
         prepare_directories(&config).map_err(AppError::Health)?;
         let maintenance_lock = Arc::new(
             crate::offline_production_migration::acquire_runtime_lock(&config.bridge.database)
-                .map_err(|_| AppError::Runtime)?,
+                .map_err(|error| startup_io_error("maintenance-lock", error))?,
         );
         let pool =
             crate::storage::connect_for_runtime(&config.bridge.database, maintenance_lock.clone())
@@ -421,17 +473,17 @@ impl AppRuntime {
             sqlx::query_scalar("SELECT count(*) FROM offline_recovery_binding")
                 .fetch_one(&pool)
                 .await
-                .map_err(|_| AppError::Runtime)?;
+                .map_err(|error| startup_sql_error("admin-bindings", error))?;
         let sentinel: Option<String> =
             sqlx::query_scalar("SELECT state FROM runtime_eligibility_bootstrap WHERE singleton=1")
                 .fetch_optional(&pool)
                 .await
-                .map_err(|_| AppError::Runtime)?;
+                .map_err(|error| startup_sql_error("bootstrap-state", error))?;
         let base_reliability = crate::storage::ReliabilityStore::with_owner_evidence_window(
             pool.clone(),
             config.bridge.owner_evidence_max_age_seconds as i64,
         )
-        .map_err(|_| AppError::Runtime)?;
+        .map_err(|error| startup_reliability_error("owner-evidence-window", error))?;
         if native_refusal {
             return Self::compatibility_held(
                 path,
@@ -460,7 +512,7 @@ impl AppRuntime {
                             config.transports.matrix.crypto_store_path.as_deref(),
                         )
                         .await
-                        .map_err(|_| AppError::Runtime)?;
+                        .map_err(|error| startup_sql_error("pending-compatibility-gate", error))?;
                     if let crate::storage::CompatibilityGate::Held(reason) = gate {
                         return Self::compatibility_held(
                             path,
@@ -478,7 +530,7 @@ impl AppRuntime {
                 )
                 .fetch_optional(&pool)
                 .await
-                .map_err(|_| AppError::Runtime)?;
+                .map_err(|error| startup_sql_error("restart-hold", error))?;
                 if hold.flatten().is_some() {
                     return Self::compatibility_held(
                         path,
@@ -494,7 +546,7 @@ impl AppRuntime {
                     sqlx::query_scalar("SELECT count(*) FROM matrix_recovery_control")
                         .fetch_one(&pool)
                         .await
-                        .map_err(|_| AppError::Runtime)?;
+                        .map_err(|error| startup_sql_error("recovery-control-count", error))?;
                 if !config.transports.matrix.enabled && control_rows == 0 {
                     None
                 } else {
@@ -541,11 +593,14 @@ impl AppRuntime {
                     &runtime_instance,
                 )
                 .await
-                .map_err(|_| AppError::Runtime)?,
+                .map_err(|_| startup_runtime_error("administrative-startup", "unknown"))?,
             ),
             recovery_startup::StartupEligibility::Legacy => None,
             recovery_startup::StartupEligibility::Refused => {
-                return Err(AppError::Runtime);
+                return Err(startup_runtime_error(
+                    "startup-eligibility",
+                    "invalid-state",
+                ));
             }
         };
         let reliability = if let Some(scope) = recovery_scope.clone() {
@@ -555,7 +610,7 @@ impl AppRuntime {
         };
         let admission_guard =
             crate::runtime_admission::Guard::acquire(&config.bridge.database, &path, "startup")
-                .map_err(|_| AppError::Runtime)?;
+                .map_err(|error| startup_io_error("admission-lock", error))?;
         let gate = crate::storage::MatrixCompatibilityStore::new(pool.clone())
             .gate_scoped(
                 config.transports.matrix.enabled,
@@ -563,7 +618,7 @@ impl AppRuntime {
                 recovery_scope.as_ref(),
             )
             .await
-            .map_err(|_| AppError::Runtime)?;
+            .map_err(|error| startup_sql_error("compatibility-gate", error))?;
         if let crate::storage::CompatibilityGate::Held(reason) = gate {
             drop(admission_guard);
             return Self::compatibility_held(
@@ -578,13 +633,14 @@ impl AppRuntime {
         }
         let executable = crate::storage::owner_executable::RuntimeExecutable::capture()
             .await
-            .ok_or(AppError::Runtime)?;
+            .ok_or_else(|| startup_runtime_error("executable-capture", "unknown"))?;
         let process_fingerprint = executable.fingerprint().to_owned();
         let reliability = reliability
             .with_runtime_executable(executable.clone())
-            .map_err(|_| AppError::Runtime)?;
+            .map_err(|error| startup_reliability_error("runtime-executable-install", error))?;
         let startup_at = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
-        let evidence = crate::storage::RuntimeOwnerEvidence::capture().ok_or(AppError::Runtime)?;
+        let evidence = crate::storage::RuntimeOwnerEvidence::capture()
+            .ok_or_else(|| startup_runtime_error("owner-evidence-capture", "unknown"))?;
         let mut owns_runtime = reliability
             .begin_runtime_with_evidence(
                 &runtime_instance,
@@ -593,7 +649,7 @@ impl AppRuntime {
                 &evidence,
             )
             .await
-            .map_err(|_| AppError::Runtime)?;
+            .map_err(|error| startup_reliability_error("runtime-owner-begin", error))?;
         if !owns_runtime && recovery_scope.is_none() {
             // A prior isolated generation may have stopped before publishing its
             // terminal runtime row. Reuse the reviewed CAS recovery boundary for
@@ -603,17 +659,17 @@ impl AppRuntime {
             )
             .fetch_all(&pool)
             .await
-            .map_err(|_| AppError::Runtime)?;
+            .map_err(|error| startup_sql_error("stale-runtime-scan", error))?;
             let mut proven_stale = false;
             let mut blocked = false;
             let mut live_count = 0usize;
             let mut unknown_count = 0usize;
             let mut stale_count = 0usize;
             for row in stale {
-                let token: String =
-                    sqlx::Row::try_get(&row, "instance_token").map_err(|_| AppError::Runtime)?;
+                let token: String = sqlx::Row::try_get(&row, "instance_token")
+                    .map_err(|error| startup_sql_error("stale-runtime-token", error))?;
                 let fingerprint: String = sqlx::Row::try_get(&row, "process_fingerprint")
-                    .map_err(|_| AppError::Runtime)?;
+                    .map_err(|error| startup_sql_error("stale-runtime-fingerprint", error))?;
                 match owner_fingerprint_liveness(&fingerprint) {
                     OwnerLiveness::Live => {
                         live_count += 1;
@@ -656,12 +712,12 @@ impl AppRuntime {
                         &evidence,
                     )
                     .await
-                    .map_err(|_| AppError::Runtime)?;
+                    .map_err(|error| startup_reliability_error("runtime-owner-retry", error))?;
             }
         }
         admission_guard
             .revalidate()
-            .map_err(|_| AppError::Runtime)?;
+            .map_err(|error| startup_io_error("admission-revalidate", error))?;
         drop(admission_guard);
         let spawn_gate = crate::acp::AcpSpawnGate::for_generation(&runtime_instance);
         let assembly_started = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -739,7 +795,7 @@ impl AppRuntime {
     ) -> Result<Self, AppError> {
         let reliability = reliability
             .with_runtime_executable(executable.clone())
-            .map_err(|_| AppError::Runtime)?;
+            .map_err(|error| startup_reliability_error("build-executable-install", error))?;
         let repository = Arc::new(match recovery_scope.clone() {
             Some(scope) => SqliteRepository::with_recovery(pool.clone(), scope),
             None => SqliteRepository::new(pool.clone()),
@@ -812,7 +868,7 @@ impl AppRuntime {
         reliability
             .recover_orphaned_queues(&recovery_at)
             .await
-            .map_err(|_| AppError::Runtime)?;
+            .map_err(|error| startup_reliability_error("orphaned-queue-recovery", error))?;
         tracing::info!(
             category = "startup-recovery",
             phase = "queues-recovered",
@@ -823,7 +879,7 @@ impl AppRuntime {
         let mut admission_recovery = reliability
             .classify_admissions(4096)
             .await
-            .map_err(|_| AppError::Runtime)?;
+            .map_err(|error| startup_reliability_error("admission-classification", error))?;
         if admission_recovery.eligible.len() > config.bridge.queue_capacity {
             admission_recovery.blocked = true;
         }
@@ -831,11 +887,11 @@ impl AppRuntime {
         let runtime_recovery = runtime_store
             .recovery_snapshot(Utc::now(), 4096)
             .await
-            .map_err(|_| AppError::Runtime)?;
+            .map_err(|error| startup_control_error("runtime-recovery-snapshot", error))?;
         let counts = runtime_store
             .counts()
             .await
-            .map_err(|_| AppError::Runtime)?;
+            .map_err(|error| startup_control_error("runtime-counts", error))?;
         let recovery_diagnostic =
             RecoveryDiagnostic::classify(RecoveryFixture::from_runtime_facts(
                 owns_runtime,
@@ -977,7 +1033,10 @@ impl AppRuntime {
                     action = "startup-terminated",
                     emission = "recovery-blocked-startup-terminated"
                 );
-                return Err(AppError::Runtime);
+                return Err(startup_runtime_error(
+                    "recovery-service-gate",
+                    "invalid-state",
+                ));
             }
 
             // Only a recovery-safe runtime may expose the health listener.  The
@@ -1035,8 +1094,8 @@ impl AppRuntime {
                     .spawn_gate(spawn_gate.clone())
                     .build()
                     .map_err(AppError::Assembly)?;
-                let workspace =
-                    WorkspaceId::from_canonical_path(workspace).map_err(|_| AppError::Runtime)?;
+                let workspace = WorkspaceId::from_canonical_path(workspace)
+                    .map_err(|error| startup_control_error("workspace-identity", error))?;
                 endpoint_dispatchers.insert(
                     endpoint.id(),
                     Arc::new(LeasedAcpDispatcher::new_with_paths(
@@ -1098,7 +1157,9 @@ impl AppRuntime {
                 ));
             }
             for (task_id, revision) in admission_recovery.eligible {
-                let parsed = task_id.parse().map_err(|_| AppError::Runtime)?;
+                let parsed = task_id
+                    .parse()
+                    .map_err(|_| startup_runtime_error("admission-task-id", "invalid-state"))?;
                 if let Some(task) = repository_trait.get_task(parsed).await? {
                     let gateway_task: bool = sqlx::query_scalar(
                         "SELECT EXISTS(SELECT 1 FROM gateway_envelopes WHERE internal_task_id=?)",
@@ -1106,12 +1167,12 @@ impl AppRuntime {
                     .bind(&task_id)
                     .fetch_one(&pool)
                     .await
-                    .map_err(|_| AppError::Runtime)?;
+                    .map_err(|error| startup_sql_error("gateway-task-query", error))?;
                     if gateway_task {
                         gateway_handoff
                             .handoff(task, revision)
                             .await
-                            .map_err(|_| AppError::Runtime)?;
+                            .map_err(|_| startup_runtime_error("gateway-handoff", "unknown"))?;
                         continue;
                     }
                     let now = Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
@@ -1120,17 +1181,19 @@ impl AppRuntime {
                             .bind(&task_id)
                             .fetch_optional(&pool)
                             .await
-                            .map_err(|_| AppError::Runtime)?;
+                            .map_err(|error| startup_sql_error("admission-state", error))?;
                     let claimed = if state.as_deref() == Some("ready") {
                         reliability
                             .claim_admission(&task_id, revision, Some(&runtime_instance), &now)
                             .await
-                            .map_err(|_| AppError::Runtime)?
+                            .map_err(|error| startup_reliability_error("admission-claim", error))?
                     } else {
                         reliability
                             .reclaim_stopped_admission(&task_id, revision, &runtime_instance, &now)
                             .await
-                            .map_err(|_| AppError::Runtime)?
+                            .map_err(|error| {
+                                startup_reliability_error("admission-reclaim", error)
+                            })?
                     };
                     if claimed && durable_bus.enqueue_persisted(task).await.is_err() {
                         let _ = reliability

@@ -7,6 +7,74 @@ use guigu_agent_bridge::{
 };
 use serde_json::{Value, json};
 use std::{collections::BTreeMap, path::PathBuf, sync::Arc};
+
+#[test]
+fn startup_runtime_diagnostic_is_redacted_and_preserves_error_contract() {
+    const CHILD: &str = "R137_STARTUP_DIAGNOSTIC_CHILD";
+    if std::env::var_os(CHILD).is_some() {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(async {
+                for invalid_locator in [true, false] {
+                    let fixture = Fixture::new();
+                    let mut config = fixture.config.clone();
+                    if invalid_locator {
+                        let parent = fixture.root.join("private-path-sentinel");
+                        std::fs::write(&parent, b"not a directory").unwrap();
+                        config.bridge.database = parent.join("state.db");
+                    } else {
+                        config.bridge.owner_evidence_max_age_seconds = 0;
+                    }
+                    let error = match AppRuntime::start_with_config_and_a2a_faults(
+                        &fixture.config_path,
+                        config,
+                        Arc::new(NoFault),
+                    )
+                    .await
+                    {
+                        Err(error) => error,
+                        Ok(runtime) => {
+                            runtime.shutdown().await.unwrap();
+                            panic!("invalid startup unexpectedly succeeded");
+                        }
+                    };
+                    assert!(matches!(error, AppError::Runtime));
+                    assert_eq!(error.to_string(), "application runtime control failed");
+                }
+            });
+        return;
+    }
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args([
+            "--exact",
+            "startup_runtime_diagnostic_is_redacted_and_preserves_error_contract",
+            "--nocapture",
+            "--test-threads=1",
+        ])
+        .env(CHILD, "1")
+        .output()
+        .unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    assert!(output.status.success(), "{stdout}\n{stderr}");
+    assert_eq!(
+        stderr.lines().collect::<Vec<_>>(),
+        [
+            "startup-runtime-error phase=runtime-discovery error_class=io",
+            "startup-runtime-error phase=owner-evidence-window error_class=invalid-state",
+        ]
+    );
+    for secret in [
+        "private-path-sentinel",
+        "t049-secret-sentinel",
+        "t049-peer-b-sentinel",
+    ] {
+        assert!(!stdout.contains(secret) && !stderr.contains(secret));
+    }
+}
+
 struct Fixture {
     root: PathBuf,
     config_path: PathBuf,
