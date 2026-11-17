@@ -13,7 +13,7 @@
 //! |--------|-------|-----|
 //! | `journal_mode` | `WAL` | one writer with concurrent readers |
 //! | `foreign_keys` | `ON` | referential integrity is enforced by the database |
-//! | `busy_timeout` | 5 s | writer contention is queued, not failed |
+//! | `busy_timeout` | 15 s | writer contention is queued, not failed |
 //! | `synchronous` | `FULL` | the event store is the source of truth: fsync per commit |
 //! | `create_if_missing` | `true` | a fresh deployment creates the file |
 //! | pool `max_connections` | 5 | WAL serves read concurrency; SQLite has one writer |
@@ -36,11 +36,10 @@ use crate::storage::StorageError;
 
 /// How long a writer waits for the SQLite write lock before failing.
 ///
-/// Every write in this project is a single statement or a short transaction, so
-/// a held lock is measured in microseconds to milliseconds and this value is an
-/// abnormal-path backstop rather than a normal waiting path. It matches the sqlx
-/// default, so no new semantics are introduced.
-pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// FULL durability can hold the writer during a slow fsync: measured commits
+/// exceeded five seconds. Allow bounded transient contention while retaining a
+/// refusal for a continuously held writer; this does not retry transactions.
+pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Maximum number of pooled connections.
 ///
@@ -141,7 +140,7 @@ mod tests {
     fn connection_options_are_frozen() {
         // Pins the values declared in the design gate (D8): a change here is a
         // durability/locking change and must be re-confirmed by Coordinator.
-        assert_eq!(DEFAULT_BUSY_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(DEFAULT_BUSY_TIMEOUT, Duration::from_secs(15));
         assert_eq!(MAX_CONNECTIONS, 5);
     }
 

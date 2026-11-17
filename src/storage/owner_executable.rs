@@ -5,13 +5,17 @@ use std::{
     os::{fd::AsRawFd, unix::fs::MetadataExt},
     sync::{
         Arc, OnceLock,
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
 
 use sha2::{Digest, Sha256};
 
+// Cold reads of the retained 662-MB object took 13 s; under measured I/O
+// pressure a 20-s read reached only 521 MB. Give startup a finite 60-s
+// window, including queueing, while keeping periodic validation at 10 s.
+const CAPTURE_BUDGET: Duration = Duration::from_secs(60);
 const BUDGET: Duration = Duration::from_secs(10);
 const MAX_BYTES: u64 = 1024 * 1024 * 1024;
 const DIGEST_CHUNK: usize = 1024 * 1024;
@@ -44,6 +48,7 @@ struct CaptureProgress {
     bytes: AtomicU64,
     read_us: AtomicU64,
     hash_us: AtomicU64,
+    cancelled: AtomicBool,
 }
 impl CaptureProgress {
     fn new() -> Self {
@@ -56,6 +61,7 @@ impl CaptureProgress {
             bytes: AtomicU64::new(0),
             read_us: AtomicU64::new(0),
             hash_us: AtomicU64::new(0),
+            cancelled: AtomicBool::new(false),
         }
     }
     fn phase(progress: Option<&Self>, phase: usize) {
@@ -197,9 +203,7 @@ fn digest_checked(
     let mut offset = 0;
     CaptureProgress::phase(progress, 5);
     loop {
-        if Instant::now() >= deadline {
-            return Err("digest-deadline");
-        }
+        capture_checkpoint(deadline, progress)?;
         let read_at = Instant::now();
         let result = file.read_at(&mut buffer, offset);
         if let Some(p) = progress {
@@ -207,6 +211,7 @@ fn digest_checked(
                 .fetch_add(read_at.elapsed().as_micros() as u64, Ordering::Relaxed);
         }
         let count = result.map_err(|_| "digest-read-io")?;
+        capture_checkpoint(deadline, progress)?;
         if count == 0 {
             break;
         }
@@ -227,11 +232,35 @@ fn digest_checked(
     if offset != before.object.2 {
         return Err("digest-length-mismatch");
     }
+    capture_checkpoint(deadline, progress)?;
     CaptureProgress::phase(progress, 6);
     if Stamp::read_checked(file)? != *before {
         return Err("digest-stamp-changed");
     }
     Ok(hash.finalize().into())
+}
+
+fn capture_checkpoint(deadline: Instant, progress: Option<&CaptureProgress>) -> CaptureResult<()> {
+    if progress.is_some_and(|p| p.cancelled.load(Ordering::Acquire)) {
+        return Err("capture-cancelled");
+    }
+    if Instant::now() >= deadline {
+        return Err("digest-deadline");
+    }
+    Ok(())
+}
+
+// Abort workers that have not started, and stop running read-only workers at the
+// next checkpoint. A kernel read itself cannot be interrupted by dropping an await.
+struct CaptureCancellation {
+    progress: Arc<CaptureProgress>,
+    abort: tokio::task::AbortHandle,
+}
+impl Drop for CaptureCancellation {
+    fn drop(&mut self) {
+        self.progress.cancelled.store(true, Ordering::Release);
+        self.abort.abort();
+    }
 }
 
 // ACLs, capabilities and other security labels are part of effective authority.
@@ -306,18 +335,30 @@ pub(crate) struct RuntimeExecutable {
 }
 impl RuntimeExecutable {
     pub(crate) async fn capture() -> Option<Self> {
+        Self::capture_with(CAPTURE_BUDGET, Self::capture_checked).await
+    }
+    async fn capture_with(
+        budget: Duration,
+        work: impl FnOnce(&CaptureProgress, Instant) -> CaptureResult<Self> + Send + 'static,
+    ) -> Option<Self> {
         let progress = Arc::new(CaptureProgress::new());
+        let deadline = progress.requested + budget;
         let worker_progress = progress.clone();
         let worker = tokio::task::spawn_blocking(move || {
             let _ = worker_progress.started.set(Instant::now());
-            let result = Self::capture_checked(&worker_progress);
+            let result = capture_checkpoint(deadline, Some(&worker_progress))
+                .and_then(|()| work(&worker_progress, deadline));
             worker_progress.emit(
                 "worker-finished",
                 result.as_ref().err().copied().unwrap_or("ok"),
             );
             result
         });
-        match tokio::time::timeout(BUDGET, worker).await {
+        let _cancellation = CaptureCancellation {
+            progress: progress.clone(),
+            abort: worker.abort_handle(),
+        };
+        match tokio::time::timeout_at(deadline.into(), worker).await {
             Err(_) => {
                 progress.emit("outer-timeout", "deadline");
                 None
@@ -329,12 +370,12 @@ impl RuntimeExecutable {
             Ok(Ok(result)) => result.ok(),
         }
     }
-    fn capture_checked(progress: &CaptureProgress) -> CaptureResult<Self> {
+    fn capture_checked(progress: &CaptureProgress, deadline: Instant) -> CaptureResult<Self> {
         CaptureProgress::phase(Some(progress), 1);
         let domain = cgroup_checked()?;
         CaptureProgress::phase(Some(progress), 2);
         let file = File::open("/proc/self/exe").map_err(|_| "pinned-open-io")?;
-        let executable = Executable::pin_checked(file, Instant::now() + BUDGET, Some(progress))?;
+        let executable = Executable::pin_checked(file, deadline, Some(progress))?;
         CaptureProgress::phase(Some(progress), 9);
         let current = File::open("/proc/self/exe").map_err(|_| "current-open-io")?;
         CaptureProgress::phase(Some(progress), 10);
@@ -345,6 +386,7 @@ impl RuntimeExecutable {
         if cgroup_checked()? != domain {
             return Err("final-domain-changed");
         }
+        capture_checkpoint(deadline, Some(progress))?;
         let s = &executable.stamp;
         let fingerprint = format!(
             "pid:{};exe:{}:{}:{}:{}:{};cgroup:{}",

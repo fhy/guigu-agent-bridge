@@ -323,7 +323,7 @@ async fn connection_pragmas_are_applied_to_every_pooled_connection() {
             .fetch_one(&mut **connection)
             .await
             .expect("busy_timeout");
-        assert_eq!(busy_timeout, 5_000);
+        assert_eq!(busy_timeout, 15_000);
     }
 
     drop(connections);
@@ -870,5 +870,65 @@ async fn the_schema_survives_a_close_and_reopen() {
     assert_eq!(row.get::<String, _>("timestamp"), TIMESTAMP);
     reopened.close().await;
 
+    remove_db_files(&path);
+}
+
+#[tokio::test]
+async fn slow_writer_is_bounded_and_new_work_succeeds_after_release() {
+    use std::time::{Duration, Instant};
+    let path = temp_db_path("slow-writer");
+    let pool = connect(&path).await.unwrap();
+    sqlx::query("CREATE TABLE effects (id INTEGER PRIMARY KEY)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let other = pool.acquire().await.unwrap();
+    let writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    drop(other);
+    let waiting_pool = pool.clone();
+    let waiting = tokio::spawn(async move {
+        sqlx::query("INSERT INTO effects VALUES (1)")
+            .execute(&waiting_pool)
+            .await
+    });
+    // The measured FULL commit took 5.933 s, longer than the old 5-s limit.
+    tokio::time::sleep(Duration::from_secs(6)).await;
+    writer.commit().await.unwrap();
+    assert_eq!(waiting.await.unwrap().unwrap().rows_affected(), 1);
+
+    let writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let started = Instant::now();
+    let refused = tokio::time::timeout(
+        Duration::from_secs(30),
+        sqlx::query("INSERT INTO effects VALUES (2)").execute(&pool),
+    )
+    .await
+    .unwrap()
+    .unwrap_err();
+    assert!(started.elapsed() >= Duration::from_secs(15));
+    assert_eq!(
+        refused.as_database_error().unwrap().code().as_deref(),
+        Some("5")
+    );
+    writer.rollback().await.unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM effects")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        1
+    );
+    sqlx::query("INSERT INTO effects VALUES (2)")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT COUNT(*) FROM effects")
+            .fetch_one(&pool)
+            .await
+            .unwrap(),
+        2
+    );
+    pool.close().await;
     remove_db_files(&path);
 }

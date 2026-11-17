@@ -10,6 +10,10 @@ use std::{
     time::Duration,
 };
 
+#[path = "support/native_clock.rs"]
+mod native_clock;
+use native_clock::NativeClock;
+
 struct Fixture {
     root: tempfile::TempDir,
     legacy: bool,
@@ -21,6 +25,15 @@ impl Fixture {
     }
 
     async fn start_scenario(&self, scenario: &str, timeout: u64) -> AppRuntime {
+        self.start_timed_scenario(scenario, timeout, None).await
+    }
+
+    async fn start_timed_scenario(
+        &self,
+        scenario: &str,
+        timeout: u64,
+        time: Option<Arc<NativeClock>>,
+    ) -> AppRuntime {
         let root = self.root.path();
         let executable = std::env::current_exe().unwrap();
         let mock = executable
@@ -66,9 +79,21 @@ enabled = true
         let config = load_from_str_with_env(&source, &env).unwrap();
         let path = root.join("bridge.toml");
         std::fs::write(&path, source).unwrap();
-        AppRuntime::start_with_config_and_a2a_faults(&path, config, Arc::new(NoFault))
+        if let Some(time) = time {
+            AppRuntime::start_with_config_and_a2a_faults_and_time(
+                &path,
+                config,
+                Arc::new(NoFault),
+                time.clock(),
+                time,
+            )
             .await
             .unwrap()
+        } else {
+            AppRuntime::start_with_config_and_a2a_faults(&path, config, Arc::new(NoFault))
+                .await
+                .unwrap()
+        }
     }
 }
 
@@ -87,8 +112,10 @@ async fn rpc_id(runtime: &AppRuntime, method: &str, params: Value, id: &str) -> 
         .send()
         .await
         .unwrap();
-    assert_eq!(response.status(), 200);
-    response.json::<Value>().await.unwrap()["result"].clone()
+    let status = response.status();
+    let body = response.text().await.unwrap();
+    assert_eq!(status, 200, "status={status} body={body}");
+    serde_json::from_str::<Value>(&body).unwrap()["result"].clone()
 }
 
 fn send() -> Value {
@@ -252,18 +279,28 @@ async fn streaming_deadline_commits_once_and_shutdown_reaps() {
         root: tempfile::tempdir().unwrap(),
         legacy: true,
     };
-    let runtime = fixture.start_scenario("chunks-then-hang", 2).await;
+    let time = NativeClock::new();
+    let runtime = fixture
+        .start_timed_scenario("chunks-then-hang", 2, Some(time.clone()))
+        .await;
     let accepted = rpc(&runtime, "message/send", send()).await;
-    assert_eq!(terminal(&runtime, &accepted).await["status"], "failed");
     let pool = connect(fixture.root.path().join("state.db").to_str().unwrap())
         .await
         .unwrap();
+    wait_running(&pool).await;
+    time.expire();
+    assert_eq!(terminal(&runtime, &accepted).await["status"], "failed");
     let terminal_count: i64 =
         sqlx::query_scalar("SELECT COUNT(*) FROM task_events WHERE status='timed_out'")
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(terminal_count, 1);
+    let events: Vec<String> = sqlx::query_scalar("SELECT status FROM task_events ORDER BY seq")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(events, ["queued", "dispatched", "running", "timed_out"]);
     let disposition: String = sqlx::query_scalar("SELECT state FROM delivery_dispositions")
         .fetch_one(&pool)
         .await
@@ -283,7 +320,10 @@ async fn immediate_cancel_after_restart_keeps_worker_available() {
     let accepted = rpc(&runtime, "message/send", send()).await;
     assert_eq!(terminal(&runtime, &accepted).await["status"], "completed");
     runtime.shutdown().await.unwrap();
-    let runtime = fixture.start_scenario("chunks-then-hang", 2).await;
+    let time = NativeClock::new();
+    let runtime = fixture
+        .start_timed_scenario("chunks-then-hang", 2, Some(time.clone()))
+        .await;
     let mut next = send();
     next["message"]["messageId"] = json!("cancel-message");
     let accepted = rpc_id(&runtime, "message/send", next, "cancel-send").await;
@@ -292,7 +332,11 @@ async fn immediate_cancel_after_restart_keeps_worker_available() {
     let mut next = send();
     next["message"]["messageId"] = json!("after-cancel");
     let accepted = rpc_id(&runtime, "message/send", next, "after-cancel").await;
+    let pool = connect(fixture.root.path().join("state.db")).await.unwrap();
+    wait_running(&pool).await;
+    time.expire();
     assert_eq!(terminal(&runtime, &accepted).await["status"], "failed");
+    pool.close().await;
     runtime.shutdown().await.unwrap();
 }
 
@@ -352,8 +396,13 @@ async fn interrupted_delivery_closes_before_restart(cancel: bool) {
         root: tempfile::tempdir().unwrap(),
         legacy: true,
     };
+    let time = NativeClock::new();
     let runtime = fixture
-        .start_scenario("delayed-initialize", if cancel { 120 } else { 1 })
+        .start_timed_scenario(
+            "delayed-initialize",
+            if cancel { 120 } else { 1 },
+            if cancel { None } else { Some(time.clone()) },
+        )
         .await;
     let accepted = rpc(&runtime, "message/send", send()).await;
     let pool = connect(fixture.root.path().join("state.db")).await.unwrap();
@@ -375,6 +424,8 @@ async fn interrupted_delivery_closes_before_restart(cancel: bool) {
     .unwrap();
     if cancel {
         rpc(&runtime, "tasks/cancel", json!({"id":accepted["id"]})).await;
+    } else {
+        time.expire();
     }
     assert_eq!(
         terminal(&runtime, &accepted).await["status"],
@@ -387,4 +438,23 @@ async fn interrupted_delivery_closes_before_restart(cancel: bool) {
     runtime.shutdown().await.unwrap();
     let runtime = fixture.start().await;
     runtime.shutdown().await.unwrap();
+}
+
+async fn wait_running(pool: &sqlx::SqlitePool) {
+    tokio::time::timeout(Duration::from_secs(60), async {
+        loop {
+            let running: i64 = sqlx::query_scalar(
+                "SELECT COUNT(*) FROM task_continuations c WHERE state='in_flight' AND (SELECT status FROM task_events e WHERE e.task_id=c.task_id ORDER BY seq DESC LIMIT 1)='running'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if running == 1 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    })
+    .await
+    .unwrap();
 }

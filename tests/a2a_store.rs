@@ -245,3 +245,41 @@ async fn terminal_projection_advances_inbound_and_outbound_from_authoritative_ev
     pool.close().await;
     std::fs::remove_file(path).unwrap();
 }
+
+#[tokio::test]
+async fn committed_reservation_replay_does_not_need_the_writer_lock() {
+    let (pool, path) = database().await;
+    let store = A2aStore::new(pool.clone());
+    let original = store
+        .reserve_inbound("peer", "replay", "hash", "context", Utc::now())
+        .await
+        .unwrap();
+    let InboundReservation::New(original) = original else {
+        panic!("first reservation must be new");
+    };
+    // Establish both connections before the competing writer. The committed
+    // reservation is readable under WAL even while another transaction writes.
+    let first = pool.acquire().await.unwrap();
+    let second = pool.acquire().await.unwrap();
+    drop(first);
+    drop(second);
+    let writer = pool.begin_with("BEGIN IMMEDIATE").await.unwrap();
+    let replay = store
+        .reserve_inbound("peer", "replay", "hash", "context", Utc::now())
+        .await;
+    let conflict = store
+        .reserve_inbound("peer", "replay", "other", "context", Utc::now())
+        .await;
+    writer.rollback().await.unwrap();
+    assert!(
+        matches!(replay, Ok(InboundReservation::Replay(ref row)) if row == &original),
+        "{replay:?}"
+    );
+    assert!(
+        matches!(conflict, Err(guigu_agent_bridge::a2a::A2aError::Conflict)),
+        "{conflict:?}"
+    );
+    drop(store);
+    pool.close().await;
+    std::fs::remove_file(path).unwrap();
+}

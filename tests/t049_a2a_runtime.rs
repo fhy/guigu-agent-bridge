@@ -155,20 +155,9 @@ enabled = true
     }
 
     async fn start_with(&self, faults: Arc<dyn IngressFaultInjector>) -> AppRuntime {
-        let runtime = AppRuntime::start_with_config_and_a2a_faults(
-            &self.config_path,
-            self.config.clone(),
-            faults,
-        )
-        .await
-        .unwrap();
-        let pool = connect(&self.database).await.unwrap();
-        sqlx::raw_sql("BEGIN IMMEDIATE; COMMIT;")
-            .execute(&pool)
+        AppRuntime::start_with_config_and_a2a_faults(&self.config_path, self.config.clone(), faults)
             .await
-            .unwrap();
-        pool.close().await;
-        runtime
+            .unwrap()
     }
 }
 

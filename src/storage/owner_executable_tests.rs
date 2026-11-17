@@ -193,7 +193,9 @@ fn checked_capture_preserves_first_refusal_and_deadline_progress() {
 fn checked_digest_authenticates_every_chunk_and_rejects_a_changed_stamp() {
     let root = tempfile::tempdir().unwrap();
     let path = root.path().join("chunked-object");
-    let contents: Vec<_> = (0..(2 * 65536 + 17)).map(|i| (i % 251) as u8).collect();
+    let contents: Vec<_> = (0..(2 * DIGEST_CHUNK + 17))
+        .map(|i| (i % 251) as u8)
+        .collect();
     fs::write(&path, &contents).unwrap();
     let file = File::open(&path).unwrap();
     let before = Stamp::read(&file).unwrap();
@@ -211,4 +213,85 @@ fn checked_digest_authenticates_every_chunk_and_rejects_a_changed_stamp() {
         digest_checked(&file, &different, Instant::now() + BUDGET, None).unwrap_err(),
         "digest-stamp-changed"
     );
+}
+
+#[tokio::test]
+async fn timed_out_capture_stops_before_resuming_work() {
+    let (started, start) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let (finished, finish) = tokio::sync::oneshot::channel();
+    let capture = tokio::spawn(RuntimeExecutable::capture_with(
+        Duration::from_millis(100),
+        move |progress, deadline| {
+            let _ = started.send(());
+            wait.recv().unwrap();
+            let checkpoint = capture_checkpoint(deadline, Some(progress));
+            let _ = finished.send(checkpoint);
+            Err("test-stall")
+        },
+    ));
+    start.await.unwrap();
+    assert!(capture.await.unwrap().is_none());
+    release.send(()).unwrap();
+    assert_eq!(finish.await.unwrap(), Err("capture-cancelled"));
+}
+
+#[tokio::test]
+async fn dropped_capture_stops_before_resuming_work() {
+    let (started, start) = tokio::sync::oneshot::channel();
+    let (release, wait) = std::sync::mpsc::channel();
+    let (finished, finish) = tokio::sync::oneshot::channel();
+    let capture = tokio::spawn(RuntimeExecutable::capture_with(
+        CAPTURE_BUDGET,
+        move |progress, deadline| {
+            let _ = started.send(());
+            wait.recv().unwrap();
+            let checkpoint = capture_checkpoint(deadline, Some(progress));
+            let _ = finished.send(checkpoint);
+            Err("test-stall")
+        },
+    ));
+    start.await.unwrap();
+    capture.abort();
+    assert!(capture.await.unwrap_err().is_cancelled());
+    release.send(()).unwrap();
+    assert_eq!(finish.await.unwrap(), Err("capture-cancelled"));
+}
+
+#[test]
+fn dropped_queued_capture_never_opens_the_object() {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(1)
+        .build()
+        .unwrap();
+    runtime.block_on(async {
+        let (release, wait) = std::sync::mpsc::channel();
+        let (started, start) = tokio::sync::oneshot::channel();
+        let occupied = tokio::task::spawn_blocking(move || {
+            let _ = started.send(());
+            wait.recv().unwrap();
+        });
+        start.await.unwrap();
+        let invoked = Arc::new(AtomicBool::new(false));
+        let worker_invoked = invoked.clone();
+        let mut capture = Box::pin(RuntimeExecutable::capture_with(
+            CAPTURE_BUDGET,
+            move |_, _| {
+                worker_invoked.store(true, Ordering::Release);
+                Err("unexpected-work")
+            },
+        ));
+        std::future::poll_fn(|cx| {
+            use std::future::Future;
+            assert!(capture.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        })
+        .await;
+        drop(capture);
+        release.send(()).unwrap();
+        occupied.await.unwrap();
+        tokio::task::spawn_blocking(|| ()).await.unwrap();
+        assert!(!invoked.load(Ordering::Acquire));
+    });
 }

@@ -403,6 +403,21 @@ fn matrix_failure_observer(
     })
 }
 
+// Production always uses wall time. The fixture entry point can control only
+// bus deadlines; runtime ownership, lease and shutdown clocks stay unchanged.
+struct WorkerTime {
+    clock: Clock,
+    timer: Arc<dyn crate::bus::Timer>,
+}
+impl Default for WorkerTime {
+    fn default() -> Self {
+        Self {
+            clock: Clock::system(),
+            timer: Arc::new(TokioTimer),
+        }
+    }
+}
+
 impl AppRuntime {
     pub async fn start(path: impl AsRef<Path>) -> Result<Self, AppError> {
         Self::start_inner(path.as_ref().to_path_buf(), Arc::new(crate::a2a::NoFault)).await
@@ -422,7 +437,31 @@ impl AppRuntime {
         config: Config,
         faults: Arc<dyn crate::a2a::IngressFaultInjector>,
     ) -> Result<Self, AppError> {
-        Self::start_config_inner(path.as_ref().to_path_buf(), config, faults).await
+        Self::start_config_inner(
+            path.as_ref().to_path_buf(),
+            config,
+            faults,
+            WorkerTime::default(),
+        )
+        .await
+    }
+
+    /// Exercise real runtime wiring with controlled bus deadlines in fixtures.
+    #[cfg(feature = "test-support")]
+    pub async fn start_with_config_and_a2a_faults_and_time(
+        path: impl AsRef<Path>,
+        config: Config,
+        faults: Arc<dyn crate::a2a::IngressFaultInjector>,
+        clock: Clock,
+        timer: Arc<dyn crate::bus::Timer>,
+    ) -> Result<Self, AppError> {
+        Self::start_config_inner(
+            path.as_ref().to_path_buf(),
+            config,
+            faults,
+            WorkerTime { clock, timer },
+        )
+        .await
     }
 
     async fn start_inner(
@@ -430,13 +469,14 @@ impl AppRuntime {
         a2a_faults: Arc<dyn crate::a2a::IngressFaultInjector>,
     ) -> Result<Self, AppError> {
         let config = crate::config::load(&path)?;
-        Self::start_config_inner(path, config, a2a_faults).await
+        Self::start_config_inner(path, config, a2a_faults, WorkerTime::default()).await
     }
 
     async fn start_config_inner(
         path: PathBuf,
         config: Config,
         a2a_faults: Arc<dyn crate::a2a::IngressFaultInjector>,
+        worker_time: WorkerTime,
     ) -> Result<Self, AppError> {
         crate::offline_production_migration::check_runtime_discovery(&config.bridge.database)
             .map_err(|error| startup_io_error("runtime-discovery", error))?;
@@ -734,6 +774,7 @@ impl AppRuntime {
             a2a_faults,
             spawn_gate.clone(),
             Arc::clone(&assembly_started),
+            worker_time,
         )
         .await
         {
@@ -792,6 +833,7 @@ impl AppRuntime {
         a2a_faults: Arc<dyn crate::a2a::IngressFaultInjector>,
         spawn_gate: crate::acp::AcpSpawnGate,
         assembly_started: Arc<std::sync::atomic::AtomicBool>,
+        worker_time: WorkerTime,
     ) -> Result<Self, AppError> {
         let reliability = reliability
             .with_runtime_executable(executable.clone())
@@ -1135,7 +1177,7 @@ impl AppRuntime {
                 config.bridge.queue_capacity,
                 Arc::clone(&event_sink),
                 repository.as_ref().clone(),
-                Clock::system(),
+                worker_time.clock.clone(),
             );
             let bus = bus
                 .with_default_timeout(default_timeout)
@@ -1208,7 +1250,7 @@ impl AppRuntime {
                 Arc::clone(&registry),
                 tasks,
                 Arc::clone(&event_sink),
-                Clock::system(),
+                worker_time.clock.clone(),
                 dispatchers,
             )
             .lifecycle(Arc::new(crate::runtime::SqliteTaskLifecycle::new_scoped(
@@ -1219,7 +1261,7 @@ impl AppRuntime {
                 limits: crate::bus::LoopLimits::from_bridge(&config.bridge),
                 retry: Default::default(),
                 cancellation: Some(cancellation.clone()),
-                timer: Some(Arc::new(TokioTimer)),
+                timer: Some(worker_time.timer.clone()),
             })
             .build();
 
