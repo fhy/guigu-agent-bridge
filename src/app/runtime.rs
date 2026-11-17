@@ -441,7 +441,7 @@ impl AppRuntime {
             path.as_ref().to_path_buf(),
             config,
             faults,
-            super::WorkerTime::default(),
+            WorkerTime::default(),
         )
         .await
     }
@@ -469,7 +469,7 @@ impl AppRuntime {
         a2a_faults: Arc<dyn crate::a2a::IngressFaultInjector>,
     ) -> Result<Self, AppError> {
         let config = crate::config::load(&path)?;
-        Self::start_config_inner(path, config, a2a_faults, super::WorkerTime::default()).await
+        Self::start_config_inner(path, config, a2a_faults, WorkerTime::default()).await
     }
 
     async fn start_config_inner(
