@@ -164,3 +164,51 @@ async fn cancelled_validation_does_not_lose_shared_stop_identity() {
     assert!(task.await.unwrap_err().is_cancelled());
     assert_eq!(owner.validate().await.as_deref(), Some(owner.fingerprint()));
 }
+
+#[test]
+fn checked_capture_preserves_first_refusal_and_deadline_progress() {
+    let (_root, path, _) = fixture();
+    let progress = CaptureProgress::new();
+    let expired =
+        Executable::pin_checked(File::open(&path).unwrap(), Instant::now(), Some(&progress));
+    assert_eq!(expired.unwrap_err(), "digest-deadline");
+    assert_eq!(
+        CAPTURE_PHASES[progress.phase.load(Ordering::Relaxed)],
+        "digest"
+    );
+    assert_eq!(progress.bytes.load(Ordering::Relaxed), 0);
+    assert_eq!(progress.hash_us.load(Ordering::Relaxed), 0);
+
+    let write_only = File::options().write(true).open(&path).unwrap();
+    let unreadable = Executable::pin_checked(write_only, Instant::now() + BUDGET, None);
+    assert_eq!(unreadable.unwrap_err(), "digest-read-io");
+    let file = File::options().write(true).open(&path).unwrap();
+    file.set_len(MAX_BYTES + 1).unwrap();
+    // Type/size validation still precedes digest and cannot be hidden by its deadline.
+    let oversized = Executable::pin_checked(file, Instant::now(), None);
+    assert_eq!(oversized.unwrap_err(), "size-limit");
+}
+
+#[test]
+fn checked_digest_authenticates_every_chunk_and_rejects_a_changed_stamp() {
+    let root = tempfile::tempdir().unwrap();
+    let path = root.path().join("chunked-object");
+    let contents: Vec<_> = (0..(2 * 65536 + 17)).map(|i| (i % 251) as u8).collect();
+    fs::write(&path, &contents).unwrap();
+    let file = File::open(&path).unwrap();
+    let before = Stamp::read(&file).unwrap();
+    let progress = CaptureProgress::new();
+    let actual = digest_checked(&file, &before, Instant::now() + BUDGET, Some(&progress)).unwrap();
+    let expected: [u8; 32] = Sha256::digest(&contents).into();
+    assert_eq!(actual, expected);
+    assert_eq!(
+        progress.bytes.load(Ordering::Relaxed),
+        contents.len() as u64
+    );
+    let mut different = before.clone();
+    different.changed.0 = different.changed.0.wrapping_add(1);
+    assert_eq!(
+        digest_checked(&file, &different, Instant::now() + BUDGET, None).unwrap_err(),
+        "digest-stamp-changed"
+    );
+}
