@@ -441,7 +441,7 @@ impl AppRuntime {
             path.as_ref().to_path_buf(),
             config,
             faults,
-            WorkerTime::default(),
+            super::WorkerTime::default(),
         )
         .await
     }
@@ -469,7 +469,7 @@ impl AppRuntime {
         a2a_faults: Arc<dyn crate::a2a::IngressFaultInjector>,
     ) -> Result<Self, AppError> {
         let config = crate::config::load(&path)?;
-        Self::start_config_inner(path, config, a2a_faults, WorkerTime::default()).await
+        Self::start_config_inner(path, config, a2a_faults, super::WorkerTime::default()).await
     }
 
     async fn start_config_inner(
@@ -2153,7 +2153,7 @@ enabled = true
             Arc::new(crate::a2a::NoFault),
             gate,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            WorkerTime::default(),
+            super::WorkerTime::default(),
         );
         tokio::pin!(build);
         let address = format!("127.0.0.1:{health_port}");
@@ -2494,7 +2494,7 @@ enabled = true
             Arc::new(crate::a2a::NoFault),
             gate,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            WorkerTime::default(),
+            super::WorkerTime::default(),
         )
         .await;
         assert!(matches!(result, Err(AppError::Runtime)));
