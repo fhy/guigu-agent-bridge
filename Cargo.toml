@@ -116,3 +116,6 @@ tempfile = "3"
 
 [build-dependencies]
 sha2 = "0.10"
+
+[profile.dev.package."sha2:0.10.9"]
+opt-level = 3
