@@ -14,6 +14,7 @@ use sha2::{Digest, Sha256};
 
 const BUDGET: Duration = Duration::from_secs(10);
 const MAX_BYTES: u64 = 1024 * 1024 * 1024;
+const DIGEST_CHUNK: usize = 1024 * 1024;
 type Attributes = Vec<(Vec<u8>, Vec<u8>)>;
 
 type CaptureResult<T> = Result<T, &'static str>;
@@ -192,7 +193,7 @@ fn digest_checked(
 ) -> CaptureResult<[u8; 32]> {
     use std::os::unix::fs::FileExt;
     let mut hash = Sha256::new();
-    let mut buffer = [0; 64 * 1024];
+    let mut buffer = [0; DIGEST_CHUNK];
     let mut offset = 0;
     CaptureProgress::phase(progress, 5);
     loop {
