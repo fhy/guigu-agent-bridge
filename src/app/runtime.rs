@@ -2153,6 +2153,7 @@ enabled = true
             Arc::new(crate::a2a::NoFault),
             gate,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            WorkerTime::default(),
         );
         tokio::pin!(build);
         let address = format!("127.0.0.1:{health_port}");
@@ -2493,6 +2494,7 @@ enabled = true
             Arc::new(crate::a2a::NoFault),
             gate,
             Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            WorkerTime::default(),
         )
         .await;
         assert!(matches!(result, Err(AppError::Runtime)));
