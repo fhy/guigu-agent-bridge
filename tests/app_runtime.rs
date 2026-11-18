@@ -1030,7 +1030,12 @@ async fn concurrent_second_start_rejects_live_owner_without_takeover() {
     .expect("blocked second runtime did not exit");
     assert_eq!(status.code(), Some(1));
     let diagnostic = std::fs::read_to_string(second_stderr).unwrap();
-    assert_eq!(diagnostic.trim(), "Error: Application(Runtime)");
+    let lines: Vec<_> = diagnostic.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("startup-runtime-error phase=maintenance-lock error_class=io")
+    );
+    assert_eq!(lines.get(1).copied(), Some("Error: Application(Runtime)"));
     assert!(first.try_wait().unwrap().is_none());
     let after: (i64, String, String) = sqlx::query_as(
         "SELECT count(*),state,process_fingerprint FROM runtime_instances WHERE state='active'",
