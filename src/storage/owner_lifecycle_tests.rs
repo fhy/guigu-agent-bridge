@@ -192,6 +192,74 @@ async fn owner_conditional_start_heartbeat_finalizer_and_consumer() {
 }
 
 #[tokio::test]
+async fn heartbeat_diagnostic_distinguishes_owner_evidence_and_sql_refusals() {
+    let fixture = Fixture::new().await;
+    assert_eq!(
+        fixture
+            .store
+            .publish_owner_heartbeat(
+                &fixture.token,
+                "fingerprint",
+                &Utc::now().to_rfc3339(),
+                &fixture.evidence,
+            )
+            .await
+            .unwrap(),
+        false
+    );
+    assert_eq!(
+        fixture
+            .store
+            .publish_owner_heartbeat_diagnostic(
+                &fixture.token,
+                "fingerprint",
+                &Utc::now().to_rfc3339(),
+                &fixture.evidence,
+            )
+            .await
+            .unwrap(),
+        crate::storage::OwnerHeartbeatOutcome::NoOwner
+    );
+    fixture.start().await;
+    assert_eq!(
+        fixture
+            .store
+            .publish_owner_heartbeat_diagnostic(
+                &fixture.token,
+                "wrong-fingerprint",
+                &Utc::now().to_rfc3339(),
+                &fixture.evidence,
+            )
+            .await
+            .unwrap(),
+        crate::storage::OwnerHeartbeatOutcome::EvidenceRefused
+    );
+    fixture.pool.close().await;
+
+    let fixture = Fixture::new().await;
+    fixture.start().await;
+    sqlx::query(
+        "CREATE TRIGGER fail_heartbeat BEFORE UPDATE ON runtime_instances WHEN NEW.heartbeat_at != OLD.heartbeat_at BEGIN SELECT RAISE(ABORT,'injected heartbeat'); END",
+    )
+    .execute(&fixture.pool)
+    .await
+    .unwrap();
+    assert!(matches!(
+        fixture
+            .store
+            .publish_owner_heartbeat_diagnostic(
+                &fixture.token,
+                "fingerprint",
+                &Utc::now().to_rfc3339(),
+                &fixture.evidence,
+            )
+            .await,
+        Err(ReliabilityError::Sql(_))
+    ));
+    fixture.pool.close().await;
+}
+
+#[tokio::test]
 async fn owner_publication_failures_roll_back_startup_and_final_pair() {
     let fixture = Fixture::new().await;
     sqlx::query("CREATE TRIGGER fail_start BEFORE INSERT ON runtime_owner_evidence BEGIN SELECT RAISE(ABORT,'injected'); END").execute(&fixture.pool).await.unwrap();

@@ -179,6 +179,7 @@ pub use recovery::{
     RecoveryBlocker, RecoveryDiagnostic, RecoveryFixture, RecoveryPlan, RecoverySignals,
     plan_recovery, sync_agents,
 };
+pub(crate) use reliability::OwnerHeartbeatOutcome;
 pub use reliability::{
     AdmissionRecovery, PendingProjection, QueueReservation, ReceiptOutcome, ReliabilityError,
     ReliabilityStore, RetryTaskInput, RuntimeOwnerEvidence, WorkflowAdmission,

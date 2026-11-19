@@ -102,11 +102,25 @@ impl ReliabilityStore {
         now: &str,
         evidence: &RuntimeOwnerEvidence,
     ) -> Result<bool, ReliabilityError> {
+        Ok(matches!(
+            self.publish_owner_heartbeat_diagnostic(token, fingerprint, now, evidence)
+                .await?,
+            super::OwnerHeartbeatOutcome::Published
+        ))
+    }
+
+    pub(crate) async fn publish_owner_heartbeat_diagnostic(
+        &self,
+        token: &str,
+        fingerprint: &str,
+        now: &str,
+        evidence: &RuntimeOwnerEvidence,
+    ) -> Result<super::OwnerHeartbeatOutcome, ReliabilityError> {
         let mut transaction = writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let current = sqlx::query("SELECT e.* FROM runtime_owner_evidence e JOIN runtime_instances r USING(instance_token) WHERE e.instance_token=? AND e.is_current=1 AND e.state='live' AND r.state='active'")
             .bind(token).fetch_optional(&mut *transaction).await?;
         let Some(current) = current else {
-            return Ok(false);
+            return Ok(super::OwnerHeartbeatOutcome::NoOwner);
         };
         let same_capture = chrono::DateTime::parse_from_rfc3339(now)
             .ok()
@@ -142,7 +156,11 @@ impl ReliabilityStore {
                 .await?;
         }
         transaction.commit().await?;
-        Ok(valid)
+        Ok(if valid {
+            super::OwnerHeartbeatOutcome::Published
+        } else {
+            super::OwnerHeartbeatOutcome::EvidenceRefused
+        })
     }
 
     pub(super) fn matches_clock(

@@ -100,9 +100,11 @@ struct Stamp {
     changed: (i64, i64),
 }
 impl Stamp {
+    #[cfg(test)]
     fn read(file: &File) -> Option<Self> {
         Self::read_checked(file).ok()
     }
+
     fn read_checked(file: &File) -> CaptureResult<Self> {
         let m = file.metadata().map_err(|_| "metadata-io")?;
         if !m.is_file() {
@@ -165,31 +167,34 @@ impl Executable {
             digest,
         })
     }
-    fn validate(&mut self, current: File, deadline: Instant) -> Option<()> {
-        let before = Stamp::read(&current)?;
+    fn validate_checked(&mut self, current: File, deadline: Instant) -> CaptureResult<()> {
+        let before = Stamp::read_checked(&current)?;
         if !self.stamp.same_identity(&before)
-            || Stamp::read(&self.file)? != before
-            || attributes(&current)? != self.attributes
+            || Stamp::read_checked(&self.file)? != before
+            || attributes_checked(&current)? != self.attributes
         {
-            return None;
+            return Err("identity-or-attributes-mismatch");
         }
-        if before != self.stamp && digest(&self.file, &before, deadline)? != self.digest {
-            return None;
+        if before != self.stamp
+            && digest_checked(&self.file, &before, deadline, None)? != self.digest
+        {
+            return Err("digest-mismatch");
         }
         // Even a cached hit authenticates both the pinned and current running object.
-        if attributes(&current)? != self.attributes
-            || Stamp::read(&self.file)? != before
-            || Stamp::read(&current)? != before
+        if attributes_checked(&current)? != self.attributes
+            || Stamp::read_checked(&self.file)? != before
+            || Stamp::read_checked(&current)? != before
         {
-            return None;
+            return Err("identity-or-attributes-changed");
         }
         self.stamp = before;
-        Some(())
+        Ok(())
     }
-}
 
-fn digest(file: &File, before: &Stamp, deadline: Instant) -> Option<[u8; 32]> {
-    digest_checked(file, before, deadline, None).ok()
+    #[cfg(test)]
+    fn validate(&mut self, current: File, deadline: Instant) -> Option<()> {
+        self.validate_checked(current, deadline).ok()
+    }
 }
 
 fn digest_checked(
@@ -241,6 +246,11 @@ fn digest_checked(
     Ok(hash.finalize().into())
 }
 
+#[cfg(test)]
+fn digest(file: &File, before: &Stamp, deadline: Instant) -> Option<[u8; 32]> {
+    digest_checked(file, before, deadline, None).ok()
+}
+
 fn capture_checkpoint(deadline: Instant, progress: Option<&CaptureProgress>) -> CaptureResult<()> {
     if progress.is_some_and(|p| p.cancelled.load(Ordering::Acquire)) {
         return Err("capture-cancelled");
@@ -266,9 +276,6 @@ impl Drop for CaptureCancellation {
 
 // ACLs, capabilities and other security labels are part of effective authority.
 // Bound every syscall buffer; unreadable or changing attribute sets fail closed.
-fn attributes(file: &File) -> Option<Attributes> {
-    attributes_checked(file).ok()
-}
 fn attributes_checked(file: &File) -> CaptureResult<Attributes> {
     let mut names = vec![0u8; 65536];
     let count =
@@ -310,9 +317,6 @@ fn attributes_checked(file: &File) -> CaptureResult<Attributes> {
     Ok(result)
 }
 
-fn cgroup() -> Option<String> {
-    cgroup_checked().ok()
-}
 fn cgroup_checked() -> CaptureResult<String> {
     let mut text = String::new();
     File::open("/proc/self/cgroup")
@@ -415,34 +419,39 @@ impl RuntimeExecutable {
     }
 
     pub(crate) async fn validate(&self) -> Option<String> {
+        self.validate_with_reason().await.ok()
+    }
+
+    pub(crate) async fn validate_with_reason(&self) -> Result<String, &'static str> {
         let inner = self.inner.clone();
         let domain = self.cgroup.clone();
-        tokio::time::timeout(
+        let result = tokio::time::timeout(
             BUDGET,
             tokio::task::spawn_blocking(move || {
-                let mut guard = inner.lock().ok()?;
+                let mut guard = inner.lock().map_err(|_| "cache-lock")?;
                 let valid = (|| {
-                    if cgroup()? != domain {
-                        return None;
+                    if cgroup_checked()? != domain {
+                        return Err("domain-before-mismatch");
                     }
-                    guard
-                        .as_mut()?
-                        .validate(File::open("/proc/self/exe").ok()?, Instant::now() + BUDGET)?;
-                    if cgroup()? != domain {
-                        return None;
+                    let executable = guard.as_mut().ok_or("cache-empty")?;
+                    let current = File::open("/proc/self/exe").map_err(|_| "current-open-io")?;
+                    executable.validate_checked(current, Instant::now() + BUDGET)?;
+                    if cgroup_checked()? != domain {
+                        return Err("domain-after-mismatch");
                     }
-                    Some(())
+                    Ok(())
                 })();
-                if valid.is_none() {
+                if valid.is_err() {
                     *guard = None;
                 }
                 valid
             }),
         )
         .await
-        .ok()?
-        .ok()??;
-        Some(self.fingerprint.clone())
+        .map_err(|_| "validation-timeout")?
+        .map_err(|_| "validation-join")?;
+        result?;
+        Ok(self.fingerprint.clone())
     }
 }
 

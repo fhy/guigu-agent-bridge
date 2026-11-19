@@ -114,6 +114,13 @@ pub enum ReliabilityError {
     QueueFull,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerHeartbeatOutcome {
+    Published,
+    NoOwner,
+    EvidenceRefused,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ReceiptOutcome {
     Inserted,

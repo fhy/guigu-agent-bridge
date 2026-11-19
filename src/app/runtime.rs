@@ -320,6 +320,22 @@ fn retain_failure(slot: &Arc<Mutex<Option<RequiredOwnerFailure>>>, failure: Requ
     value.get_or_insert(failure);
 }
 
+fn emit_owner_heartbeat_diagnostic(phase: &'static str, reason: &'static str, elapsed: Duration) {
+    use std::io::Write as _;
+    let _ = writeln!(
+        std::io::stderr().lock(),
+        "owner-heartbeat phase={phase} reason={reason} elapsed_ms={}",
+        elapsed.as_millis()
+    );
+    tracing::warn!(
+        component = "owner-heartbeat",
+        phase,
+        reason,
+        elapsed_ms = elapsed.as_millis() as u64,
+        "owner heartbeat refused"
+    );
+}
+
 fn record_task_worker_result(
     result: &Result<(), crate::bus::WorkerError>,
     slot: &Arc<Mutex<Option<RequiredOwnerFailure>>>,
@@ -1034,17 +1050,52 @@ impl AppRuntime {
                                 boottime_ns: 0,
                             },
                         );
-                        let heartbeat_fingerprint = executable.validate().await.unwrap_or_default();
-                        if !heartbeat_store
-                            .publish_owner_heartbeat(
+                        let validation_started = Instant::now();
+                        let heartbeat_fingerprint = match executable.validate_with_reason().await {
+                            Ok(fingerprint) => fingerprint,
+                            Err(reason) => {
+                                emit_owner_heartbeat_diagnostic(
+                                    "validation",
+                                    reason,
+                                    validation_started.elapsed(),
+                                );
+                                retain_failure(
+                                    &heartbeat_failure,
+                                    RequiredOwnerFailure {
+                                        component: "owner-heartbeat",
+                                        class: "persistence-refused",
+                                    },
+                                );
+                                break;
+                            }
+                        };
+                        let publication_started = Instant::now();
+                        let publication = heartbeat_store
+                            .publish_owner_heartbeat_diagnostic(
                                 &heartbeat_token,
                                 &heartbeat_fingerprint,
                                 &now,
                                 &evidence,
                             )
-                            .await
-                            .unwrap_or(false)
-                        {
+                            .await;
+                        let refusal_reason = match publication {
+                            Ok(crate::storage::OwnerHeartbeatOutcome::Published) => None,
+                            Ok(crate::storage::OwnerHeartbeatOutcome::NoOwner) => {
+                                Some("owner-missing")
+                            }
+                            Ok(crate::storage::OwnerHeartbeatOutcome::EvidenceRefused) => {
+                                Some("evidence-refused")
+                            }
+                            Err(crate::storage::ReliabilityError::Sql(_)) => Some("sql-error"),
+                            Err(crate::storage::ReliabilityError::Malformed) => Some("malformed"),
+                            Err(_) => Some("storage-error"),
+                        };
+                        if let Some(reason) = refusal_reason {
+                            emit_owner_heartbeat_diagnostic(
+                                "publication",
+                                reason,
+                                publication_started.elapsed(),
+                            );
                             retain_failure(
                                 &heartbeat_failure,
                                 RequiredOwnerFailure {
@@ -2125,11 +2176,18 @@ enabled = true
         migrate(&pool).await.unwrap();
         let reliability = ReliabilityStore::new(pool.clone());
         let instance = uuid::Uuid::now_v7().to_string();
+        // Match the production order: capture and authenticate the executable
+        // before opening the owner lease, so a parallel cold capture cannot make
+        // the freshly inserted evidence stale before the first heartbeat.
+        let executable = crate::storage::owner_executable::RuntimeExecutable::capture()
+            .await
+            .unwrap();
+        let process_fingerprint = executable.fingerprint().to_owned();
         assert!(
             reliability
                 .begin_runtime_with_evidence(
                     &instance,
-                    &crate::storage::RuntimeOwnerEvidence::fingerprint().unwrap(),
+                    &process_fingerprint,
                     &chrono::Utc::now().to_rfc3339(),
                     &crate::storage::RuntimeOwnerEvidence::capture().unwrap(),
                 )
@@ -2145,9 +2203,7 @@ enabled = true
             reliability,
             instance,
             true,
-            crate::storage::owner_executable::RuntimeExecutable::capture()
-                .await
-                .unwrap(),
+            executable,
             Arc::new(crate::offline_production_migration::acquire_runtime_lock(&database).unwrap()),
             None,
             Arc::new(crate::a2a::NoFault),
