@@ -3,11 +3,63 @@ use std::io;
 #[cfg(unix)]
 use std::net::TcpListener;
 #[cfg(unix)]
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
 #[cfg(unix)]
 use std::time::Duration;
 
 use guigu_agent_bridge::Error;
+
+#[cfg(unix)]
+struct FixtureChild(Child);
+
+#[cfg(unix)]
+impl std::ops::Deref for FixtureChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.0
+    }
+}
+
+#[cfg(unix)]
+impl std::ops::DerefMut for FixtureChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.0
+    }
+}
+
+#[cfg(unix)]
+impl Drop for FixtureChild {
+    fn drop(&mut self) {
+        // Readiness/assertion failures must not leave a runtime behind. A Child
+        // remembers a reaped exit, so normal SIGTERM/wait keeps its assertions.
+        if !matches!(self.0.try_wait(), Ok(Some(_))) {
+            let _ = self.0.kill();
+        }
+        let _ = self.0.wait();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn fixture_panic_reaps_the_child() {
+    let mut pid = 0;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        pid = child.id();
+        let _owned = FixtureChild(child);
+        panic!("fixture readiness failure");
+    }));
+    assert!(result.is_err());
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
 
 struct ConfigFile(std::path::PathBuf);
 
@@ -53,12 +105,14 @@ async fn sigterm_gracefully_stops_the_owner_and_allows_the_next_generation() {
     .unwrap();
 
     for generation in 0..2 {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
-            .arg(&config)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
+        let mut child = FixtureChild(
+            Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+                .arg(&config)
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .unwrap(),
+        );
         let ready = format!("http://127.0.0.1:{port}/ready");
         tokio::time::timeout(Duration::from_secs(30), async {
             loop {
