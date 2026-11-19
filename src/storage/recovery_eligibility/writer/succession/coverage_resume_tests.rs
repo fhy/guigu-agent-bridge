@@ -6,19 +6,13 @@ use crate::{
 };
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-async fn seed(
-    segments: usize,
-    complete: bool,
-    aged: bool,
-) -> (tests::Fixture, State, Config, Coverage) {
+async fn seed(segments: usize, complete: bool) -> (tests::Fixture, State, Config, Coverage) {
     let (f, state, mut config, _) = coverage_tests::setup().await;
     // An unfinished row fails SDK identity parsing BEFORE any network or store access.
     config.transports.matrix.user_id = "invalid-fixture-user".into();
-    let mut clock = Clock::read().unwrap();
-    if aged {
-        clock.utc_ms -= 80_000;
-        clock.boot_ms -= 80_000;
-    }
+    // Preparation must not spend the collection window before the scenario.
+    // Expiry tests wait on the persisted segment only after all seed writes.
+    let clock = Clock::read().unwrap();
     let mut row = Coverage::new(
         &state,
         Exclusion::modeled(state.owner.clone())
@@ -30,13 +24,13 @@ async fn seed(
     coverage_tests::save(&f, &state, &config, None, &row).await;
     for _ in 1..segments {
         let mut next = row.clone();
-        next.segment(clock.clone()).unwrap();
+        next.segment(Clock::read().unwrap()).unwrap();
         next.revision += 1;
         coverage_tests::save(&f, &state, &config, Some(&row), &next).await;
         row = next;
     }
     let mut next = row.clone();
-    next.charge_sync(clock).unwrap();
+    next.charge_sync(Clock::read().unwrap()).unwrap();
     next.revision += 1;
     coverage_tests::save(&f, &state, &config, Some(&row), &next).await;
     row = next;
@@ -127,7 +121,7 @@ async fn fail_publication(f: &tests::Fixture, state: &State, proof: &Exclusion) 
 
 #[tokio::test]
 async fn ready_segment16_reopens_after_rollback_without_spending_collection() {
-    let (mut f, state, config, row) = seed(16, true, true).await;
+    let (mut f, state, config, row) = seed(16, true).await;
     // Seed the already-spent first attempt, as in the reported failing restart.
     let mut first = row.clone();
     first.charge_publish(Clock::read().unwrap()).unwrap();
@@ -168,7 +162,7 @@ async fn ready_segment16_reopens_after_rollback_without_spending_collection() {
 
 #[tokio::test]
 async fn ready_segment15_allows_three_publications_then_refuses_fourth() {
-    let (mut f, state, config, mut row) = seed(15, true, false).await;
+    let (mut f, state, config, mut row) = seed(15, true).await;
     for attempt in 1..=3 {
         let proof = resume_ready(&f, &state, &config, &row).await;
         assert_eq!(proof.coverage.as_ref().unwrap().publications, attempt);
@@ -204,7 +198,7 @@ async fn ready_segment15_allows_three_publications_then_refuses_fourth() {
 
 #[tokio::test]
 async fn collecting_segment15_reserves16_and_next_resume_refuses() {
-    let (mut f, state, config, row) = seed(15, false, false).await;
+    let (mut f, state, config, row) = seed(15, false).await;
     let calls = AtomicUsize::new(0);
     let error = recover(
         &f.pool,
@@ -260,7 +254,7 @@ async fn collecting_segment15_reserves16_and_next_resume_refuses() {
 
 #[tokio::test]
 async fn confirmed_publication_retry_is_read_only_after_reopen() {
-    let (mut f, state, config, row) = seed(1, true, false).await;
+    let (mut f, state, config, row) = seed(1, true).await;
     let proof = resume_ready(&f, &state, &config, &row).await;
     publish(&f.pool, &state, &proof, &row.payloads().unwrap(), || Ok(()))
         .await
@@ -295,7 +289,7 @@ async fn confirmed_publication_retry_is_read_only_after_reopen() {
 
 #[tokio::test]
 async fn ready_without_publication_resumes_after_collection_deadline() {
-    let (mut f, state, config, row) = seed(16, true, true).await;
+    let (mut f, state, config, row) = seed(16, true).await;
     let now = Clock::read().unwrap();
     let remaining = (row.segment_start.boot_ms + 90_010 - now.boot_ms).max(0);
     tokio::time::sleep(std::time::Duration::from_millis(remaining as u64)).await;
@@ -310,7 +304,7 @@ async fn ready_without_publication_resumes_after_collection_deadline() {
 
 #[tokio::test]
 async fn ready_reservation_exclusion_loss_rolls_back_and_binding_drift_refuses() {
-    let (mut f, state, config, row) = seed(16, true, false).await;
+    let (mut f, state, config, row) = seed(16, true).await;
     let calls = AtomicUsize::new(0);
     let error = recover(
         &f.pool,
