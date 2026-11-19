@@ -118,7 +118,7 @@ pub enum ReliabilityError {
 pub(crate) enum OwnerHeartbeatOutcome {
     Published,
     NoOwner,
-    EvidenceRefused,
+    EvidenceRefused(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

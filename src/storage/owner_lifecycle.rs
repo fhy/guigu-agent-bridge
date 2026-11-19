@@ -128,7 +128,10 @@ impl ReliabilityStore {
                 chrono::DateTime::parse_from_rfc3339(&current.get::<String, _>("captured_at")).ok(),
             )
             .is_some_and(|(now, previous)| now == previous);
-        let valid = self.matches_clock(&current, fingerprint, now, evidence) && !same_capture;
+        let refusal = self
+            .clock_refusal(&current, fingerprint, now, evidence)
+            .or(same_capture.then_some("duplicate-capture"));
+        let valid = refusal.is_none();
         let revision = current
             .get::<i64, _>("evidence_revision")
             .checked_add(1)
@@ -156,10 +159,9 @@ impl ReliabilityStore {
                 .await?;
         }
         transaction.commit().await?;
-        Ok(if valid {
-            super::OwnerHeartbeatOutcome::Published
-        } else {
-            super::OwnerHeartbeatOutcome::EvidenceRefused
+        Ok(match refusal {
+            None => super::OwnerHeartbeatOutcome::Published,
+            Some(reason) => super::OwnerHeartbeatOutcome::EvidenceRefused(reason),
         })
     }
 
@@ -170,17 +172,49 @@ impl ReliabilityStore {
         now: &str,
         evidence: &RuntimeOwnerEvidence,
     ) -> bool {
-        let previous: String = row.get("captured_at");
-        valid_owner_clock(evidence, now)
-            && fresh_timestamp(&previous, now, self.owner_evidence_max_age)
-            && boot_identity_matches(&row.get::<String, _>("boot_id"), &evidence.boot_id)
-            && boottime_monotonic(row.get("boottime_ns"), evidence.boottime_ns)
-            && evidence.boottime_ns - row.get::<i64, _>("boottime_ns")
-                <= self.owner_evidence_max_age * 1_000_000_000
-            && row.get::<i64, _>("pid") == evidence.pid
-            && row.get::<i64, _>("proc_starttime") == evidence.proc_starttime
-            && row.get::<String, _>("process_fingerprint") == fingerprint
-            && row.get::<i64, _>("max_age_seconds") == self.owner_evidence_max_age
+        self.clock_refusal(row, fingerprint, now, evidence)
+            .is_none()
+    }
+
+    fn clock_refusal(
+        &self,
+        row: &sqlx::sqlite::SqliteRow,
+        fingerprint: &str,
+        now: &str,
+        evidence: &RuntimeOwnerEvidence,
+    ) -> Option<&'static str> {
+        if !valid_owner_clock(evidence, now) {
+            return Some("capture-clock");
+        }
+        if !fresh_timestamp(
+            &row.get::<String, _>("captured_at"),
+            now,
+            self.owner_evidence_max_age,
+        ) {
+            return Some("previous-capture-expired");
+        }
+        if !boot_identity_matches(&row.get::<String, _>("boot_id"), &evidence.boot_id) {
+            return Some("boot-identity");
+        }
+        let previous = row.get::<i64, _>("boottime_ns");
+        if !boottime_monotonic(previous, evidence.boottime_ns) {
+            return Some("boottime-regressed");
+        }
+        if evidence.boottime_ns - previous > self.owner_evidence_max_age * 1_000_000_000 {
+            return Some("boottime-expired");
+        }
+        if row.get::<i64, _>("pid") != evidence.pid
+            || row.get::<i64, _>("proc_starttime") != evidence.proc_starttime
+        {
+            return Some("process-identity");
+        }
+        if row.get::<String, _>("process_fingerprint") != fingerprint {
+            return Some("fingerprint");
+        }
+        if row.get::<i64, _>("max_age_seconds") != self.owner_evidence_max_age {
+            return Some("age-policy");
+        }
+        None
     }
 
     pub async fn publish_runtime_reaped(

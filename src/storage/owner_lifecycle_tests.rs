@@ -232,7 +232,7 @@ async fn heartbeat_diagnostic_distinguishes_owner_evidence_and_sql_refusals() {
             )
             .await
             .unwrap(),
-        crate::storage::OwnerHeartbeatOutcome::EvidenceRefused
+        crate::storage::OwnerHeartbeatOutcome::EvidenceRefused("fingerprint")
     );
     fixture.pool.close().await;
 
@@ -256,6 +256,29 @@ async fn heartbeat_diagnostic_distinguishes_owner_evidence_and_sql_refusals() {
             .await,
         Err(ReliabilityError::Sql(_))
     ));
+    let revision: i64 = sqlx::query_scalar(
+        "SELECT evidence_revision FROM runtime_owner_evidence WHERE is_current=1",
+    )
+    .fetch_one(&fixture.pool)
+    .await
+    .unwrap();
+    assert_eq!(revision, 1, "failed heartbeat transaction must roll back");
+    sqlx::query("DROP TRIGGER fail_heartbeat")
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    assert!(
+        fixture
+            .store
+            .publish_owner_heartbeat(
+                &fixture.token,
+                "fingerprint",
+                &Utc::now().to_rfc3339(),
+                &fixture.evidence
+            )
+            .await
+            .unwrap()
+    );
     fixture.pool.close().await;
 }
 
@@ -479,4 +502,93 @@ fn owner_window_and_clock_policy() {
         crate::config::load_from_str("[bridge]\nowner_evidence_max_age_seconds=1").unwrap();
     assert_eq!(config.bridge.owner_evidence_max_age_seconds, 1);
     assert!(crate::config::load_from_str("[bridge]\nowner_evidence_max_age_seconds=0").is_err());
+}
+
+#[tokio::test]
+async fn heartbeat_stale_preparation_refuses_and_fresh_generation_publishes() {
+    let fixture = Fixture::new().await;
+    fixture.start().await;
+    // Model time consumed by preparation after owner creation. Use the real
+    // predicate without relying on scheduler timing to manufacture expiry.
+    let stale = (Utc::now() - chrono::Duration::seconds(40)).to_rfc3339();
+    sqlx::query("UPDATE runtime_owner_evidence SET captured_at=? WHERE is_current=1")
+        .bind(stale)
+        .execute(&fixture.pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        fixture
+            .store
+            .publish_owner_heartbeat_diagnostic(
+                &fixture.token,
+                "fingerprint",
+                &Utc::now().to_rfc3339(),
+                &fixture.evidence,
+            )
+            .await
+            .unwrap(),
+        crate::storage::OwnerHeartbeatOutcome::EvidenceRefused("previous-capture-expired")
+    );
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM runtime_owner_evidence WHERE is_current=1")
+            .fetch_one(&fixture.pool)
+            .await
+            .unwrap();
+    assert_eq!(state, "unknown");
+    assert!(
+        !fixture
+            .store
+            .begin_runtime_with_evidence(
+                "next",
+                "fingerprint",
+                &Utc::now().to_rfc3339(),
+                &fixture.evidence
+            )
+            .await
+            .unwrap()
+    );
+    fixture.pool.close().await;
+
+    // Separate fresh generation after preparation, with no reset of refused history.
+    let fixture = Fixture::new().await;
+    fixture.start().await;
+    assert_eq!(
+        fixture
+            .store
+            .publish_owner_heartbeat_diagnostic(
+                &fixture.token,
+                "fingerprint",
+                &Utc::now().to_rfc3339(),
+                &fixture.evidence,
+            )
+            .await
+            .unwrap(),
+        crate::storage::OwnerHeartbeatOutcome::Published
+    );
+    fixture.stop().await;
+    assert!(
+        fixture
+            .store
+            .finalize_owner(
+                &fixture.token,
+                &Utc::now().to_rfc3339(),
+                &fixture.evidence,
+                &fixture.observation(ScanOutcome::Complete)
+            )
+            .await
+            .unwrap()
+    );
+    assert!(
+        fixture
+            .store
+            .begin_runtime_with_evidence(
+                "next",
+                "fingerprint",
+                &Utc::now().to_rfc3339(),
+                &fixture.evidence
+            )
+            .await
+            .unwrap()
+    );
+    fixture.pool.close().await;
 }

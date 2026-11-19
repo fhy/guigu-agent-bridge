@@ -1059,14 +1059,8 @@ impl AppRuntime {
                                     reason,
                                     validation_started.elapsed(),
                                 );
-                                retain_failure(
-                                    &heartbeat_failure,
-                                    RequiredOwnerFailure {
-                                        component: "owner-heartbeat",
-                                        class: "persistence-refused",
-                                    },
-                                );
-                                break;
+                                // Preserve the durable unknown transition on failed identity.
+                                String::new()
                             }
                         };
                         let publication_started = Instant::now();
@@ -1083,10 +1077,17 @@ impl AppRuntime {
                             Ok(crate::storage::OwnerHeartbeatOutcome::NoOwner) => {
                                 Some("owner-missing")
                             }
-                            Ok(crate::storage::OwnerHeartbeatOutcome::EvidenceRefused) => {
-                                Some("evidence-refused")
+                            Ok(crate::storage::OwnerHeartbeatOutcome::EvidenceRefused(reason)) => {
+                                Some(reason)
                             }
-                            Err(crate::storage::ReliabilityError::Sql(_)) => Some("sql-error"),
+                            Err(crate::storage::ReliabilityError::Sql(ref error)) => {
+                                emit_owner_heartbeat_diagnostic(
+                                    "sql",
+                                    crate::storage::recovery_eligibility::diagnostics::class(error),
+                                    publication_started.elapsed(),
+                                );
+                                Some("sql-error")
+                            }
                             Err(crate::storage::ReliabilityError::Malformed) => Some("malformed"),
                             Err(_) => Some("storage-error"),
                         };
