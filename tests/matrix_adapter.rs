@@ -393,7 +393,7 @@ async fn initial_response_checkpoint_is_owned_before_the_second_sync() {
     .unwrap()
     .with_initial_response(initial);
     let (handle, _events) = sync.start();
-    tokio::time::timeout(Duration::from_secs(1), async {
+    let reached_sync = tokio::time::timeout(Duration::from_secs(1), async {
         loop {
             if server
                 .received_requests()
@@ -407,8 +407,19 @@ async fn initial_response_checkpoint_is_owned_before_the_second_sync() {
             tokio::task::yield_now().await;
         }
     })
-    .await
-    .unwrap();
+    .await;
+    assert!(
+        reached_sync.is_ok(),
+        "sync not reached: checkpoint={:?}; requests={:?}",
+        tokens.load().await.unwrap(),
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| request.url.path().to_owned())
+            .collect::<Vec<_>>()
+    );
     assert_eq!(
         tokens.load().await.unwrap().as_deref(),
         Some("initial-batch")

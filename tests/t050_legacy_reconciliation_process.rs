@@ -337,7 +337,7 @@ impl Fixture {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    fn listener_process(&self, port: u16) -> FixtureChild {
+    async fn listener_process(&self, port: u16) -> FixtureChild {
         fn owns_listener(pid: u32, port: u16) -> bool {
             let wanted = format!(":{port:04X}");
             let mut inodes = Vec::<String>::new();
@@ -367,7 +367,6 @@ impl Fixture {
             })
         }
 
-        let port_guard = LISTENER_PORT.lock().unwrap_or_else(|e| e.into_inner());
         let runtime_root =
             std::env::temp_dir().join(format!("t050-listener-runtime-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir(&runtime_root).unwrap();
@@ -381,10 +380,17 @@ impl Fixture {
             ),
         )
         .unwrap();
+        // This scenario requires a real listener, not a timed empty-schema migration.
+        // Prepare durable schema before starting the unchanged readiness deadline.
+        let pool = connect(runtime_root.join("state.db")).await.unwrap();
+        migrate(&pool).await.unwrap();
+        pool.close().await;
+        let port_guard = LISTENER_PORT.lock().unwrap_or_else(|e| e.into_inner());
+        let output = tempfile::NamedTempFile::new().unwrap();
         let child = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
             .arg(config)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
+            .stdout(output.as_file().try_clone().unwrap())
+            .stderr(output.as_file().try_clone().unwrap())
             .spawn()
             .unwrap();
         let mut child = FixtureChild {
@@ -395,15 +401,19 @@ impl Fixture {
         loop {
             assert!(
                 child.try_wait().unwrap().is_none(),
-                "listener fixture process exited"
+                "listener fixture process exited: {}",
+                std::fs::read_to_string(output.path()).unwrap()
             );
             if owns_listener(child.id(), port) {
                 return child;
             }
             if Instant::now() >= deadline {
                 let _ = child.kill();
-                let _ = child.wait();
-                panic!("listener fixture was not observable");
+                let status = child.wait();
+                panic!(
+                    "listener fixture was not observable: status={status:?}; {}",
+                    std::fs::read_to_string(output.path()).unwrap()
+                );
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -495,7 +505,7 @@ async fn manifest_prepare_rejects_mapped_process_without_database_or_tree_mutati
     assert_eq!(f.rows().await, before_rows);
     assert_eq!(tree(&f.root), before_tree);
 
-    let mut listener = f.listener_process(9292);
+    let mut listener = f.listener_process(9292).await;
     let listener_proc = foreign_uid_proc_view(listener.id(), true, f.foreign_uid());
     let before_tree = tree(&f.root);
     let rejected = f
@@ -628,7 +638,7 @@ async fn process_listener_and_unknown_proc_facts_fail_closed_before_and_after_op
     mapped.kill().unwrap();
     assert!(!mapped.wait().unwrap().success());
 
-    let mut listener = f.listener_process(9292);
+    let mut listener = f.listener_process(9292).await;
     let listener_proc = foreign_uid_proc_view(listener.id(), true, f.foreign_uid());
     let before = tree(&f.root);
     let rejected = f
@@ -712,7 +722,7 @@ async fn process_listener_and_unknown_proc_facts_fail_closed_before_and_after_op
         assert!(Instant::now() < deadline, "precommit pause was not reached");
         std::thread::sleep(Duration::from_millis(10));
     }
-    let mut listener = f.listener_process(9292);
+    let mut listener = f.listener_process(9292).await;
     add_foreign_uid_process(&precommit_proc, listener.id(), f.foreign_uid());
     std::fs::write(pause.with_extension("continue"), b"continue\n").unwrap();
     assert_eq!(reconcile.wait().unwrap().code(), Some(3));
