@@ -3,7 +3,7 @@ use std::io;
 #[cfg(unix)]
 use std::net::TcpListener;
 #[cfg(unix)]
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, Command};
 #[cfg(unix)]
 use std::time::Duration;
 
@@ -104,17 +104,26 @@ async fn sigterm_gracefully_stops_the_owner_and_allows_the_next_generation() {
     )
     .unwrap();
 
+    // Schema installation belongs to fixture preparation. The timed scenario
+    // below exercises two real owner generations and SIGTERM shutdown.
+    let pool = guigu_agent_bridge::storage::connect(&database)
+        .await
+        .unwrap();
+    guigu_agent_bridge::storage::migrate(&pool).await.unwrap();
+    pool.close().await;
+
     for generation in 0..2 {
+        let output = tempfile::NamedTempFile::new().unwrap();
         let mut child = FixtureChild(
             Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
                 .arg(&config)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
+                .stdout(output.as_file().try_clone().unwrap())
+                .stderr(output.as_file().try_clone().unwrap())
                 .spawn()
                 .unwrap(),
         );
         let ready = format!("http://127.0.0.1:{port}/ready");
-        tokio::time::timeout(Duration::from_secs(30), async {
+        let readiness = tokio::time::timeout(Duration::from_secs(30), async {
             loop {
                 if reqwest::get(&ready)
                     .await
@@ -124,13 +133,18 @@ async fn sigterm_gracefully_stops_the_owner_and_allows_the_next_generation() {
                 }
                 assert!(
                     child.try_wait().unwrap().is_none(),
-                    "bridge exited before readiness"
+                    "bridge exited before readiness: {}",
+                    std::fs::read_to_string(output.path()).unwrap()
                 );
                 tokio::time::sleep(Duration::from_millis(25)).await;
             }
         })
-        .await
-        .expect("bridge becomes ready");
+        .await;
+        assert!(
+            readiness.is_ok(),
+            "generation {generation} readiness expired: {}",
+            std::fs::read_to_string(output.path()).unwrap()
+        );
 
         assert!(
             Command::new("kill")
