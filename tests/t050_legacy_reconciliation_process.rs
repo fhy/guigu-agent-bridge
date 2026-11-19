@@ -7,6 +7,66 @@ use std::{
 use guigu_agent_bridge::storage::{connect, migrate};
 use sqlx::{Connection, SqliteConnection, sqlite::SqliteConnectOptions};
 
+// Production reconciliation checks fixed deployment ports. Hold only the
+// listener lifetime exclusive, not the test or its database/CLI work.
+static LISTENER_PORT: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+struct FixtureChild {
+    child: Child,
+    _listener_port: Option<std::sync::MutexGuard<'static, ()>>,
+}
+
+impl std::ops::Deref for FixtureChild {
+    type Target = Child;
+    fn deref(&self) -> &Child {
+        &self.child
+    }
+}
+
+impl std::ops::DerefMut for FixtureChild {
+    fn deref_mut(&mut self) -> &mut Child {
+        &mut self.child
+    }
+}
+
+impl Drop for FixtureChild {
+    fn drop(&mut self) {
+        // Reap before releasing the port, including assertion unwinding. Child
+        // remembers a previously waited exit, so this cannot signal a reused PID.
+        if !matches!(self.child.try_wait(), Ok(Some(_))) {
+            let _ = self.child.kill();
+        }
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn fixture_panic_reaps_child_before_releasing_listener_port() {
+    let mut pid = 0;
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        let port = LISTENER_PORT.lock().unwrap_or_else(|e| e.into_inner());
+        let child = Command::new("sleep").arg("30").spawn().unwrap();
+        pid = child.id();
+        let _owned = FixtureChild {
+            child,
+            _listener_port: Some(port),
+        };
+        panic!("fixture assertion failure");
+    }));
+    assert!(result.is_err());
+    let _port = LISTENER_PORT.lock().unwrap_or_else(|e| e.into_inner());
+    // A killed but unreaped child would return its PID here, not ECHILD.
+    let mut status = 0;
+    assert_eq!(
+        unsafe { libc::waitpid(pid as i32, &mut status, libc::WNOHANG) },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::ECHILD)
+    );
+}
+
 fn tree(root: &Path) -> Vec<(String, u32, Vec<u8>)> {
     use std::os::unix::{ffi::OsStrExt, fs::MetadataExt};
     fn walk(root: &std::path::Path, path: &std::path::Path, out: &mut Vec<(String, u32, Vec<u8>)>) {
@@ -246,13 +306,17 @@ impl Fixture {
         connection.close().await.unwrap();
         rows
     }
-    fn mapped_process(&self) -> Child {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+    fn mapped_process(&self) -> FixtureChild {
+        let child = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
             .arg(&self.config)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        let mut child = FixtureChild {
+            child,
+            _listener_port: None,
+        };
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             assert!(
@@ -273,7 +337,37 @@ impl Fixture {
             std::thread::sleep(Duration::from_millis(10));
         }
     }
-    fn listener_process(&self, port: u16) -> Child {
+    fn listener_process(&self, port: u16) -> FixtureChild {
+        fn owns_listener(pid: u32, port: u16) -> bool {
+            let wanted = format!(":{port:04X}");
+            let mut inodes = Vec::<String>::new();
+            for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+                let Ok(text) = std::fs::read_to_string(table) else {
+                    continue;
+                };
+                for line in text.lines().skip(1) {
+                    let fields = line.split_whitespace().collect::<Vec<_>>();
+                    if fields.len() >= 10 && fields[1].ends_with(&wanted) && fields[3] == "0A" {
+                        inodes.push(fields[9].to_owned());
+                    }
+                }
+            }
+            let Ok(entries) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+                return false;
+            };
+            entries.flatten().any(|entry| {
+                std::fs::read_link(entry.path())
+                    .ok()
+                    .and_then(|target| target.to_str().map(str::to_owned))
+                    .is_some_and(|target| {
+                        inodes
+                            .iter()
+                            .any(|inode| target == format!("socket:[{inode}]"))
+                    })
+            })
+        }
+
+        let port_guard = LISTENER_PORT.lock().unwrap_or_else(|e| e.into_inner());
         let runtime_root =
             std::env::temp_dir().join(format!("t050-listener-runtime-{}", uuid::Uuid::now_v7()));
         std::fs::create_dir(&runtime_root).unwrap();
@@ -287,25 +381,30 @@ impl Fixture {
             ),
         )
         .unwrap();
-        let mut child = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        let child = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
             .arg(config)
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
             .unwrap();
+        let mut child = FixtureChild {
+            child,
+            _listener_port: Some(port_guard),
+        };
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             assert!(
                 child.try_wait().unwrap().is_none(),
                 "listener fixture process exited"
             );
-            if std::net::TcpStream::connect((std::net::Ipv4Addr::LOCALHOST, port)).is_ok() {
+            if owns_listener(child.id(), port) {
                 return child;
             }
-            assert!(
-                Instant::now() < deadline,
-                "listener fixture was not observable"
-            );
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("listener fixture was not observable");
+            }
             std::thread::sleep(Duration::from_millis(10));
         }
     }
@@ -409,6 +508,7 @@ async fn manifest_prepare_rejects_mapped_process_without_database_or_tree_mutati
     assert_eq!(tree(&f.root), before_tree);
     listener.kill().unwrap();
     assert!(!listener.wait().unwrap().success());
+    drop(listener);
 }
 
 #[tokio::test]
@@ -542,6 +642,7 @@ async fn process_listener_and_unknown_proc_facts_fail_closed_before_and_after_op
     assert_eq!(tree(&f.root), before);
     listener.kill().unwrap();
     assert!(!listener.wait().unwrap().success());
+    drop(listener);
 
     let fake_proc = f.root.join("fake-proc");
     std::fs::create_dir_all(fake_proc.join("net")).unwrap();
@@ -617,6 +718,7 @@ async fn process_listener_and_unknown_proc_facts_fail_closed_before_and_after_op
     assert_eq!(reconcile.wait().unwrap().code(), Some(3));
     listener.kill().unwrap();
     assert!(!listener.wait().unwrap().success());
+    drop(listener);
     assert_eq!(f.rows().await, before_rows);
     let pool = connect(&f.db).await.unwrap();
     let receipts: i64 =
