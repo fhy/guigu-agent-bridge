@@ -35,6 +35,10 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 #[path = "support/r107_ingress_feedback.rs"]
 mod r107_ingress_feedback;
 
+#[path = "support/runtime_child.rs"]
+mod runtime_child;
+use runtime_child::RuntimeChild;
+
 struct TempDir(std::path::PathBuf);
 impl TempDir {
     fn new() -> Self {
@@ -867,7 +871,7 @@ async fn wait_for_port_free() {
     .expect("9292 remained occupied before child spawn");
 }
 
-fn stop_child(mut child: Child) {
+fn stop_child(mut child: RuntimeChild) {
     Command::new("kill")
         .args(["-INT", &child.id().to_string()])
         .status()
@@ -881,8 +885,9 @@ async fn wait_for_child_diagnostic(child: &mut Child, path: &std::path::Path, ne
     loop {
         assert!(
             child.try_wait().unwrap().is_none(),
-            "runtime exited before diagnostic; expected={needle:?}; stderr={:?}",
-            std::fs::read_to_string(path).unwrap_or_default()
+            "runtime exited before diagnostic; expected={needle:?}; stderr={:?}; stdout={:?}",
+            std::fs::read_to_string(path).unwrap_or_default(),
+            std::fs::read_to_string(path.with_extension("stdout")).unwrap_or_default()
         );
         if std::fs::read_to_string(path)
             .unwrap_or_default()
@@ -892,8 +897,9 @@ async fn wait_for_child_diagnostic(child: &mut Child, path: &std::path::Path, ne
         }
         assert!(
             tokio::time::Instant::now() < deadline,
-            "runtime diagnostic timed out; stderr={:?}",
-            std::fs::read_to_string(path).unwrap_or_default()
+            "runtime diagnostic timed out; stderr={:?}; stdout={:?}",
+            std::fs::read_to_string(path).unwrap_or_default(),
+            std::fs::read_to_string(path.with_extension("stdout")).unwrap_or_default()
         );
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
     }
@@ -920,6 +926,7 @@ async fn child_process_restart_replaces_9292_pid_and_listener_inode() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
+        .map(RuntimeChild)
         .unwrap();
     let first_pid = first.id();
     let first_inode = wait_for_child_listener(&mut first).await;
@@ -945,6 +952,7 @@ async fn child_process_restart_replaces_9292_pid_and_listener_inode() {
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
         .spawn()
+        .map(RuntimeChild)
         .unwrap();
     let second_pid = second.id();
     let second_inode = wait_for_child_listener(&mut second).await;
@@ -975,9 +983,10 @@ async fn concurrent_second_start_rejects_live_owner_without_takeover() {
     let first_stderr = temp.0.join("first.stderr");
     let mut first = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
         .arg(&config_path)
-        .stdout(std::process::Stdio::null())
+        .stdout(std::fs::File::create(first_stderr.with_extension("stdout")).unwrap())
         .stderr(std::fs::File::create(&first_stderr).unwrap())
         .spawn()
+        .map(RuntimeChild)
         .unwrap();
     let first_pid = first.id();
     wait_for_child_diagnostic(
@@ -1013,9 +1022,10 @@ async fn concurrent_second_start_rejects_live_owner_without_takeover() {
     let second_stderr = temp.0.join("second.stderr");
     let mut second = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
         .arg(&config_path)
-        .stdout(std::process::Stdio::null())
+        .stdout(std::fs::File::create(second_stderr.with_extension("stdout")).unwrap())
         .stderr(std::fs::File::create(&second_stderr).unwrap())
         .spawn()
+        .map(RuntimeChild)
         .unwrap();
     assert!(first_pid != second.id());
     let status = tokio::time::timeout(std::time::Duration::from_secs(60), async {
@@ -1066,9 +1076,10 @@ async fn stale_owner_startup_recovers_then_acquires_durable_generation() {
     let first_stderr = temp.0.join("first.stderr");
     let mut first = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
         .arg(&config_path)
-        .stdout(std::process::Stdio::null())
+        .stdout(std::fs::File::create(first_stderr.with_extension("stdout")).unwrap())
         .stderr(std::fs::File::create(&first_stderr).unwrap())
         .spawn()
+        .map(RuntimeChild)
         .unwrap();
     let first_pid = first.id();
     wait_for_child_diagnostic(
@@ -1095,9 +1106,10 @@ async fn stale_owner_startup_recovers_then_acquires_durable_generation() {
     let second_stderr = temp.0.join("second.stderr");
     let mut second = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
         .arg(&config_path)
-        .stdout(std::process::Stdio::null())
+        .stdout(std::fs::File::create(second_stderr.with_extension("stdout")).unwrap())
         .stderr(std::fs::File::create(&second_stderr).unwrap())
         .spawn()
+        .map(RuntimeChild)
         .unwrap();
     wait_for_child_diagnostic(
         &mut second,
