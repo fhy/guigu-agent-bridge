@@ -34,7 +34,7 @@ fn main() {
     build.update([0]);
     build.update(features.join(",").as_bytes());
     let build: [u8; 32] = build.finalize().into();
-    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR")).join("t050_build.rs");
+    let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("t050_build.rs");
     fs::write(
         out,
         format!(
@@ -42,6 +42,55 @@ fn main() {
         ),
     )
     .expect("write T050 build identity");
+}
+
+pub(crate) fn git_watch_paths(root: &Path) -> Vec<String> {
+    let git_head = Command::new("git")
+        .current_dir(root)
+        .args(["rev-parse", "--git-path", "HEAD"])
+        .output()
+        .expect("git path is required for T050 artifact identity");
+    assert!(git_head.status.success(), "cannot resolve git HEAD path");
+    let head_path = String::from_utf8(git_head.stdout)
+        .unwrap()
+        .trim()
+        .to_owned();
+    let mut paths = vec![head_path.clone()];
+
+    let head_file = if Path::new(&head_path).is_absolute() {
+        PathBuf::from(&head_path)
+    } else {
+        root.join(&head_path)
+    };
+    if let Ok(content) = fs::read_to_string(&head_file)
+        && let Some(ref_name) = content.trim().strip_prefix("ref: ")
+    {
+        let ref_out = Command::new("git")
+            .current_dir(root)
+            .args(["rev-parse", "--git-path", ref_name])
+            .output()
+            .expect("git path is required for T050 artifact identity");
+        assert!(ref_out.status.success(), "cannot resolve ref path");
+        paths.push(String::from_utf8(ref_out.stdout).unwrap().trim().to_owned());
+
+        let packed_out = Command::new("git")
+            .current_dir(root)
+            .args(["rev-parse", "--git-path", "packed-refs"])
+            .output()
+            .expect("git path is required for T050 artifact identity");
+        assert!(
+            packed_out.status.success(),
+            "cannot resolve packed-refs path"
+        );
+        paths.push(
+            String::from_utf8(packed_out.stdout)
+                .unwrap()
+                .trim()
+                .to_owned(),
+        );
+    }
+
+    paths
 }
 
 pub(crate) fn source_identity(root: &Path) -> ([u8; 20], bool) {
@@ -53,16 +102,9 @@ pub(crate) fn source_identity(root: &Path) -> ([u8; 20], bool) {
         );
         return ([0; 20], true);
     }
-    let git_head = Command::new("git")
-        .current_dir(root)
-        .args(["rev-parse", "--git-path", "HEAD"])
-        .output()
-        .expect("git path is required for T050 artifact identity");
-    assert!(git_head.status.success(), "cannot resolve git HEAD path");
-    println!(
-        "cargo:rerun-if-changed={}",
-        String::from_utf8(git_head.stdout).unwrap().trim()
-    );
+    for path in git_watch_paths(root) {
+        println!("cargo:rerun-if-changed={path}");
+    }
     let head = Command::new("git")
         .current_dir(root)
         .args(["rev-parse", "--verify", "HEAD"])
