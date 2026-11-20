@@ -151,10 +151,7 @@ async fn prepare_initialized_client(
     let prep =
         MatrixSync::new(client.clone(), Arc::new(MemorySyncTokenStore::default()), 4).unwrap();
     let (tx, mut rx) = mpsc::channel(4);
-    tokio::time::timeout(Duration::from_secs(60), prep.sync_once(&tx))
-        .await
-        .expect("preparation sync exceeded 60 s watchdog")
-        .unwrap();
+    prep.sync_once(&tx).await.unwrap();
     assert!(
         rx.try_recv().is_err(),
         "preparation must deliver no business event"
@@ -423,7 +420,11 @@ async fn durable_disposition_precedes_checkpoint_and_failure_keeps_cursor() {
 async fn initial_response_checkpoint_is_owned_before_the_second_sync() {
     let server = MockServer::start().await;
     let config = config(&server.uri());
-    let client = prepare_initialized_client(&server, &config).await;
+    let client = tokio::time::timeout(Duration::from_secs(60), {
+        prepare_initialized_client(&server, &config)
+    })
+    .await
+    .expect("preparation exceeded 60 s watchdog");
 
     server.reset().await;
     mount_versions(&server).await;
@@ -794,7 +795,11 @@ async fn unknown_token_is_authentication_and_the_owner_shuts_down_cleanly() {
 async fn sync_owner_reconnects_after_a_transient_failure() {
     let server = MockServer::start().await;
     let config = config(&server.uri());
-    let client = prepare_initialized_client(&server, &config).await;
+    let client = tokio::time::timeout(Duration::from_secs(60), {
+        prepare_initialized_client(&server, &config)
+    })
+    .await
+    .expect("preparation exceeded 60 s watchdog");
 
     server.reset().await;
     mount_versions(&server).await;
