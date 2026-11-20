@@ -980,6 +980,11 @@ async fn concurrent_second_start_rejects_live_owner_without_takeover() {
         ),
     )
     .unwrap();
+    // Schema installation belongs to fixture preparation. The timed scenario
+    // below exercises two real owner generations and the maintenance lock.
+    let pool = connect(&database).await.unwrap();
+    migrate(&pool).await.unwrap();
+    pool.close().await;
     let first_stderr = temp.0.join("first.stderr");
     let mut first = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
         .arg(&config_path)
@@ -1073,6 +1078,11 @@ async fn stale_owner_startup_recovers_then_acquires_durable_generation() {
         ),
     )
     .unwrap();
+    // Schema installation belongs to fixture preparation. The timed scenario
+    // below exercises two real owner generations and the maintenance lock.
+    let pool = connect(&database).await.unwrap();
+    migrate(&pool).await.unwrap();
+    pool.close().await;
     let first_stderr = temp.0.join("first.stderr");
     let mut first = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
         .arg(&config_path)
