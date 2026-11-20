@@ -151,7 +151,10 @@ async fn prepare_initialized_client(
     let prep =
         MatrixSync::new(client.clone(), Arc::new(MemorySyncTokenStore::default()), 4).unwrap();
     let (tx, mut rx) = mpsc::channel(4);
-    prep.sync_once(&tx).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(60), prep.sync_once(&tx))
+        .await
+        .expect("preparation sync exceeded 60 s watchdog")
+        .unwrap();
     assert!(
         rx.try_recv().is_err(),
         "preparation must deliver no business event"
