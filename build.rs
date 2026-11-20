@@ -34,7 +34,7 @@ fn main() {
     build.update([0]);
     build.update(features.join(",").as_bytes());
     let build: [u8; 32] = build.finalize().into();
-    let out = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR")).join("t050_build.rs");
+    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR")).join("t050_build.rs");
     fs::write(
         out,
         format!(
@@ -71,7 +71,15 @@ pub(crate) fn git_watch_paths(root: &Path) -> Vec<String> {
             .output()
             .expect("git path is required for T050 artifact identity");
         assert!(ref_out.status.success(), "cannot resolve ref path");
-        paths.push(String::from_utf8(ref_out.stdout).unwrap().trim().to_owned());
+        let ref_path = String::from_utf8(ref_out.stdout).unwrap().trim().to_owned();
+        let ref_resolved = if Path::new(&ref_path).is_absolute() {
+            PathBuf::from(&ref_path)
+        } else {
+            root.join(&ref_path)
+        };
+        if ref_resolved.exists() {
+            paths.push(ref_path);
+        }
 
         let packed_out = Command::new("git")
             .current_dir(root)
@@ -82,12 +90,18 @@ pub(crate) fn git_watch_paths(root: &Path) -> Vec<String> {
             packed_out.status.success(),
             "cannot resolve packed-refs path"
         );
-        paths.push(
-            String::from_utf8(packed_out.stdout)
-                .unwrap()
-                .trim()
-                .to_owned(),
-        );
+        let packed_path = String::from_utf8(packed_out.stdout)
+            .unwrap()
+            .trim()
+            .to_owned();
+        let packed_resolved = if Path::new(&packed_path).is_absolute() {
+            PathBuf::from(&packed_path)
+        } else {
+            root.join(&packed_path)
+        };
+        if packed_resolved.exists() {
+            paths.push(packed_path);
+        }
     }
 
     paths
