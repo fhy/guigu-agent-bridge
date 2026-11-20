@@ -9,7 +9,6 @@ use sha2::{Digest, Sha256};
 fn main() {
     println!("cargo:rerun-if-changed=Cargo.lock");
     println!("cargo:rerun-if-changed=src");
-    println!("cargo:rerun-if-changed=.git");
     println!("cargo:rerun-if-env-changed=RUSTC");
     let (source, source_dirty) = source_identity(Path::new("."));
     let lock_hash = Sha256::digest(fs::read("Cargo.lock").expect("Cargo.lock"));

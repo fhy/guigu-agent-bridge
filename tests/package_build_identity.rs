@@ -360,6 +360,14 @@ fn cargo_auto_invalidates_on_worktree_commit_without_touch() {
         commit1, commit3,
         "embedded commit must advance after worktree commit: {commit1} -> {commit3}"
     );
+    let mtime3 = fs::metadata(&out_file).unwrap().modified().unwrap();
+
+    cargo_build(&wt);
+    let mtime4 = fs::metadata(&out_file).unwrap().modified().unwrap();
+    assert_eq!(
+        mtime3, mtime4,
+        "post-commit no-change rebuild must not re-run the build script"
+    );
 }
 
 #[test]
@@ -432,5 +440,87 @@ fn cargo_auto_invalidates_on_packed_to_loose_transition() {
     assert_ne!(
         commit1, commit3,
         "commit must advance: {commit1} -> {commit3}"
+    );
+    let mtime3 = fs::metadata(&out_file).unwrap().modified().unwrap();
+
+    cargo_build(&wt);
+    let mtime4 = fs::metadata(&out_file).unwrap().modified().unwrap();
+    assert_eq!(
+        mtime3, mtime4,
+        "post-commit no-change rebuild must not re-run the build script"
+    );
+}
+
+#[test]
+fn cargo_auto_invalidates_on_normal_checkout_commit() {
+    let root = tempfile::tempdir().unwrap();
+    let project = create_micro_project(root.path());
+
+    git(&project, &["init", "-q"]);
+    git(&project, &["add", "."]);
+    git_commit(&project, "initial");
+
+    cargo_build(&project);
+    let out_file = find_out_file(&project, "t050_build.rs");
+    let content1 = fs::read_to_string(&out_file).unwrap();
+    let commit1 = extract_commit(&content1);
+    let head1 = commit_hex(&project);
+    assert_eq!(commit1, head1, "initial identity must match HEAD");
+    let mtime1 = fs::metadata(&out_file).unwrap().modified().unwrap();
+
+    cargo_build(&project);
+    let mtime2 = fs::metadata(&out_file).unwrap().modified().unwrap();
+    assert_eq!(
+        mtime1, mtime2,
+        "no-change rebuild must not re-run the build script"
+    );
+
+    fs::write(project.join("new-file"), "data").unwrap();
+    git(&project, &["add", "new-file"]);
+    git_commit(&project, "normal commit");
+
+    cargo_build(&project);
+    let content3 = fs::read_to_string(&out_file).unwrap();
+    let commit3 = extract_commit(&content3);
+    let head3 = commit_hex(&project);
+    assert_eq!(commit3, head3, "identity must advance to new HEAD");
+    assert_ne!(
+        commit1, commit3,
+        "embedded commit must advance after normal commit: {commit1} -> {commit3}"
+    );
+    let mtime3 = fs::metadata(&out_file).unwrap().modified().unwrap();
+
+    cargo_build(&project);
+    let mtime4 = fs::metadata(&out_file).unwrap().modified().unwrap();
+    assert_eq!(
+        mtime3, mtime4,
+        "post-commit no-change rebuild must not re-run the build script"
+    );
+}
+
+#[test]
+fn cargo_auto_invalidates_on_detached_head() {
+    let root = tempfile::tempdir().unwrap();
+    let project = create_micro_project(root.path());
+
+    git(&project, &["init", "-q"]);
+    git(&project, &["add", "."]);
+    git_commit(&project, "initial");
+    let sha1 = commit_hex(&project);
+
+    git(&project, &["checkout", "-q", "--detach", &sha1]);
+
+    cargo_build(&project);
+    let out_file = find_out_file(&project, "t050_build.rs");
+    let content1 = fs::read_to_string(&out_file).unwrap();
+    let commit1 = extract_commit(&content1);
+    assert_eq!(commit1, sha1, "detached identity must match detached SHA");
+    let mtime1 = fs::metadata(&out_file).unwrap().modified().unwrap();
+
+    cargo_build(&project);
+    let mtime2 = fs::metadata(&out_file).unwrap().modified().unwrap();
+    assert_eq!(
+        mtime1, mtime2,
+        "detached no-change rebuild must not re-run the build script"
     );
 }
