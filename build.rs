@@ -72,13 +72,33 @@ pub(crate) fn git_watch_paths(root: &Path) -> Vec<String> {
             .expect("git path is required for T050 artifact identity");
         assert!(ref_out.status.success(), "cannot resolve ref path");
         let ref_path = String::from_utf8(ref_out.stdout).unwrap().trim().to_owned();
-        let ref_resolved = if Path::new(&ref_path).is_absolute() {
-            PathBuf::from(&ref_path)
+        let ref_rel = Path::new(&ref_path);
+        let ref_resolved = if ref_rel.is_absolute() {
+            ref_rel.to_path_buf()
         } else {
-            root.join(&ref_path)
+            root.join(ref_rel)
         };
         if ref_resolved.exists() {
             paths.push(ref_path);
+        } else {
+            // The loose ref is absent (e.g. packed). Watch the nearest
+            // existing ancestor so that creating the file triggers a rebuild.
+            let mut ancestor = ref_rel.parent().map(Path::to_path_buf);
+            while let Some(a) = &ancestor {
+                if a.as_os_str().is_empty() {
+                    break;
+                }
+                let a_resolved = if a.is_absolute() {
+                    a.clone()
+                } else {
+                    root.join(a)
+                };
+                if a_resolved.exists() {
+                    paths.push(a.to_string_lossy().into_owned());
+                    break;
+                }
+                ancestor = a.parent().map(Path::to_path_buf);
+            }
         }
 
         let packed_out = Command::new("git")
@@ -94,16 +114,19 @@ pub(crate) fn git_watch_paths(root: &Path) -> Vec<String> {
             .unwrap()
             .trim()
             .to_owned();
-        let packed_resolved = if Path::new(&packed_path).is_absolute() {
-            PathBuf::from(&packed_path)
+        let packed_rel = Path::new(&packed_path);
+        let packed_resolved = if packed_rel.is_absolute() {
+            packed_rel.to_path_buf()
         } else {
-            root.join(&packed_path)
+            root.join(packed_rel)
         };
         if packed_resolved.exists() {
             paths.push(packed_path);
         }
     }
 
+    let mut seen = std::collections::HashSet::new();
+    paths.retain(|p| seen.insert(p.clone()));
     paths
 }
 

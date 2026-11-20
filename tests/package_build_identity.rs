@@ -150,6 +150,33 @@ fn packed_refs_watched_when_present() {
 }
 
 #[test]
+fn packed_branch_watches_parent_dir_when_loose_ref_missing() {
+    let root = checkout();
+    git(root.path(), &["pack-refs", "--all"]);
+    let head_content = fs::read_to_string(root.path().join(".git/HEAD")).unwrap();
+    let branch = head_content
+        .trim()
+        .strip_prefix("ref: refs/heads/")
+        .expect("branch ref");
+    let loose_ref = root.path().join(".git/refs/heads").join(branch);
+    assert!(
+        !loose_ref.exists(),
+        "loose ref must not exist after pack-refs: {}",
+        loose_ref.display()
+    );
+    let paths = build_script::git_watch_paths(root.path());
+    assert!(
+        paths.iter().any(|p| p.ends_with("packed-refs")),
+        "packed-refs must be watched: {paths:?}"
+    );
+    assert!(
+        paths.iter().any(|p| p.ends_with("refs/heads")),
+        "parent dir of missing loose ref must be watched: {paths:?}"
+    );
+    assert_paths_exist(root.path(), &paths);
+}
+
+#[test]
 fn packed_to_loose_transition_watches_new_loose_ref() {
     let root = checkout();
     let sha = commit_hex(root.path());
@@ -207,90 +234,36 @@ fn no_change_rebuild_is_stable() {
 }
 
 // ---------------------------------------------------------------------------
-// Real Cargo regression: proves build-script auto-invalidation
+// Real Cargo regression: proves build-script auto-invalidation using the
+// actual project build.rs
 // ---------------------------------------------------------------------------
 
-const MICRO_BUILD_RS: &str = r#"
-use std::{env, fs, path::{Path, PathBuf}, process::Command};
+fn create_micro_project(root: &Path) -> std::path::PathBuf {
+    let project = root.join("proj");
+    fs::create_dir_all(project.join("src")).unwrap();
 
-fn git_watch_paths(root: &Path) -> Vec<String> {
-    let git_head = Command::new("git")
-        .current_dir(root)
-        .args(["rev-parse", "--git-path", "HEAD"])
-        .output()
-        .expect("git path required");
-    assert!(git_head.status.success());
-    let head_path = String::from_utf8(git_head.stdout).unwrap().trim().to_owned();
-    let mut paths = vec![head_path.clone()];
+    let build_rs = fs::read_to_string(Path::new(env!("CARGO_MANIFEST_DIR")).join("build.rs"))
+        .expect("read actual build.rs");
+    fs::write(project.join("build.rs"), build_rs).unwrap();
 
-    let head_file = if Path::new(&head_path).is_absolute() {
-        PathBuf::from(&head_path)
-    } else {
-        root.join(&head_path)
-    };
-    if let Ok(content) = fs::read_to_string(&head_file) {
-        if let Some(ref_name) = content.trim().strip_prefix("ref: ") {
-            let ref_out = Command::new("git")
-                .current_dir(root)
-                .args(["rev-parse", "--git-path", ref_name])
-                .output()
-                .expect("git path required");
-            assert!(ref_out.status.success());
-            let ref_path = String::from_utf8(ref_out.stdout).unwrap().trim().to_owned();
-            let ref_resolved = if Path::new(&ref_path).is_absolute() {
-                PathBuf::from(&ref_path)
-            } else {
-                root.join(&ref_path)
-            };
-            if ref_resolved.exists() {
-                paths.push(ref_path);
-            }
-
-            let packed_out = Command::new("git")
-                .current_dir(root)
-                .args(["rev-parse", "--git-path", "packed-refs"])
-                .output()
-                .expect("git path required");
-            assert!(packed_out.status.success());
-            let packed_path = String::from_utf8(packed_out.stdout).unwrap().trim().to_owned();
-            let packed_resolved = if Path::new(&packed_path).is_absolute() {
-                PathBuf::from(&packed_path)
-            } else {
-                root.join(&packed_path)
-            };
-            if packed_resolved.exists() {
-                paths.push(packed_path);
-            }
-        }
-    }
-
-    paths
+    fs::write(
+        project.join("Cargo.toml"),
+        "[package]\nname = \"identity-test\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[build-dependencies]\nsha2 = \"0.10.9\"\n",
+    )
+    .unwrap();
+    fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
+    project
 }
 
-fn main() {
-    for path in git_watch_paths(Path::new(".")) {
-        println!("cargo:rerun-if-changed={path}");
-    }
-
-    let head = Command::new("git")
-        .current_dir(".")
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .expect("git required");
-    assert!(head.status.success());
-    let commit = String::from_utf8(head.stdout).unwrap().trim().to_owned();
-
-    let out = PathBuf::from(env::var_os("OUT_DIR").expect("OUT_DIR"));
-    fs::write(out.join("commit.txt"), &commit).expect("write commit");
-
-    let counter_file = out.join("run_count.txt");
-    let count: u32 = fs::read_to_string(&counter_file)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
-    fs::write(&counter_file, (count + 1).to_string()).expect("write counter");
+fn extract_commit(content: &str) -> String {
+    let marker = "SOURCE_COMMIT: [u8; 20] = [";
+    let start = content.find(marker).expect("SOURCE_COMMIT not found") + marker.len();
+    let end = content[start..].find(']').expect("closing bracket") + start;
+    content[start..end]
+        .split(',')
+        .map(|s| format!("{:02x}", s.trim().parse::<u8>().unwrap()))
+        .collect()
 }
-"#;
 
 fn find_out_file(wt: &Path, name: &str) -> std::path::PathBuf {
     let build_dir = wt.join("target/debug/build");
@@ -323,24 +296,9 @@ fn cargo_build(wt: &Path) {
     );
 }
 
-#[test]
-fn cargo_auto_invalidates_on_worktree_commit_without_touch() {
-    let root = tempfile::tempdir().unwrap();
-    let project = root.path().join("proj");
-    fs::create_dir_all(project.join("src")).unwrap();
-
-    fs::write(
-        project.join("Cargo.toml"),
-        "[package]\nname = \"identity-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )
-    .unwrap();
-    fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
-    fs::write(project.join("build.rs"), MICRO_BUILD_RS).unwrap();
-
-    git(&project, &["init", "-q"]);
-    git(&project, &["add", "."]);
+fn git_commit(root: &Path, message: &str) {
     git(
-        &project,
+        root,
         &[
             "-c",
             "user.name=fixture",
@@ -348,101 +306,19 @@ fn cargo_auto_invalidates_on_worktree_commit_without_touch() {
             "user.email=fixture@example.invalid",
             "commit",
             "-qm",
-            "initial",
+            message,
         ],
-    );
-
-    git(&project, &["branch", "wt-branch"]);
-    let wt = root.path().join("wt");
-    git(
-        &project,
-        &["worktree", "add", "-q", wt.to_str().unwrap(), "wt-branch"],
-    );
-
-    cargo_build(&wt);
-    let commit_file = find_out_file(&wt, "commit.txt");
-    let count_file = find_out_file(&wt, "run_count.txt");
-    let commit1 = fs::read_to_string(&commit_file).unwrap().trim().to_owned();
-    let count1: u32 = fs::read_to_string(&count_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert_eq!(count1, 1, "first build must run script once");
-
-    cargo_build(&wt);
-    let count2: u32 = fs::read_to_string(&count_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert_eq!(
-        count2, 1,
-        "no-change build must not re-run the build script (count={count2})"
-    );
-
-    fs::write(wt.join("new-file"), "data").unwrap();
-    git(&wt, &["add", "new-file"]);
-    git(
-        &wt,
-        &[
-            "-c",
-            "user.name=fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "commit",
-            "-qm",
-            "worktree commit",
-        ],
-    );
-
-    cargo_build(&wt);
-    let commit2 = fs::read_to_string(&commit_file).unwrap().trim().to_owned();
-    let count3: u32 = fs::read_to_string(&count_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert_eq!(
-        count3, 2,
-        "build script must re-run after worktree commit (count={count3})"
-    );
-    assert_ne!(
-        commit1, commit2,
-        "embedded commit must advance after worktree commit: {commit1} -> {commit2}"
     );
 }
 
 #[test]
-fn cargo_auto_invalidates_on_packed_ref_commit() {
+fn cargo_auto_invalidates_on_worktree_commit_without_touch() {
     let root = tempfile::tempdir().unwrap();
-    let project = root.path().join("proj");
-    fs::create_dir_all(project.join("src")).unwrap();
-
-    fs::write(
-        project.join("Cargo.toml"),
-        "[package]\nname = \"identity-test\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
-    )
-    .unwrap();
-    fs::write(project.join("src/main.rs"), "fn main() {}\n").unwrap();
-    fs::write(project.join("build.rs"), MICRO_BUILD_RS).unwrap();
+    let project = create_micro_project(root.path());
 
     git(&project, &["init", "-q"]);
     git(&project, &["add", "."]);
-    git(
-        &project,
-        &[
-            "-c",
-            "user.name=fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "commit",
-            "-qm",
-            "initial",
-        ],
-    );
-
-    git(&project, &["pack-refs", "--all"]);
+    git_commit(&project, "initial");
 
     git(&project, &["branch", "wt-branch"]);
     let wt = root.path().join("wt");
@@ -452,49 +328,109 @@ fn cargo_auto_invalidates_on_packed_ref_commit() {
     );
 
     cargo_build(&wt);
-    let commit_file = find_out_file(&wt, "commit.txt");
-    let count_file = find_out_file(&wt, "run_count.txt");
-    let commit1 = fs::read_to_string(&commit_file).unwrap().trim().to_owned();
-    let count1: u32 = fs::read_to_string(&count_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert_eq!(count1, 1);
+    let out_file = find_out_file(&wt, "t050_build.rs");
+    let content1 = fs::read_to_string(&out_file).unwrap();
+    let commit1 = extract_commit(&content1);
+    let head1 = commit_hex(&wt);
+    assert_eq!(commit1, head1, "initial identity must match HEAD");
+    let mtime1 = fs::metadata(&out_file).unwrap().modified().unwrap();
 
     cargo_build(&wt);
-    let count2: u32 = fs::read_to_string(&count_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
-    assert_eq!(count2, 1, "no-change build must not re-run");
+    let content2 = fs::read_to_string(&out_file).unwrap();
+    let mtime2 = fs::metadata(&out_file).unwrap().modified().unwrap();
+    assert_eq!(
+        content1, content2,
+        "no-change rebuild must not alter output"
+    );
+    assert_eq!(
+        mtime1, mtime2,
+        "no-change rebuild must not re-run the build script"
+    );
 
     fs::write(wt.join("new-file"), "data").unwrap();
     git(&wt, &["add", "new-file"]);
+    git_commit(&wt, "worktree commit");
+
+    cargo_build(&wt);
+    let content3 = fs::read_to_string(&out_file).unwrap();
+    let commit3 = extract_commit(&content3);
+    let head3 = commit_hex(&wt);
+    assert_eq!(commit3, head3, "identity must advance to new HEAD");
+    assert_ne!(
+        commit1, commit3,
+        "embedded commit must advance after worktree commit: {commit1} -> {commit3}"
+    );
+}
+
+#[test]
+fn cargo_auto_invalidates_on_packed_to_loose_transition() {
+    let root = tempfile::tempdir().unwrap();
+    let project = create_micro_project(root.path());
+
+    git(&project, &["init", "-q"]);
+    git(&project, &["add", "."]);
+    git_commit(&project, "initial");
+
+    // Create branch and worktree FIRST, then pack.
+    git(&project, &["branch", "wt-branch"]);
+    let wt = root.path().join("wt");
     git(
-        &wt,
-        &[
-            "-c",
-            "user.name=fixture",
-            "-c",
-            "user.email=fixture@example.invalid",
-            "commit",
-            "-qm",
-            "packed commit",
-        ],
+        &project,
+        &["worktree", "add", "-q", wt.to_str().unwrap(), "wt-branch"],
+    );
+
+    git(&project, &["pack-refs", "--all"]);
+
+    // Assert the target loose ref does NOT exist after packing.
+    let ref_rel = git(&wt, &["rev-parse", "--git-path", "refs/heads/wt-branch"]);
+    let ref_rel = ref_rel.trim().to_owned();
+    let loose_ref = if Path::new(&ref_rel).is_absolute() {
+        std::path::PathBuf::from(&ref_rel)
+    } else {
+        wt.join(&ref_rel)
+    };
+    assert!(
+        !loose_ref.exists(),
+        "loose ref must not exist after pack-refs: {}",
+        loose_ref.display()
     );
 
     cargo_build(&wt);
-    let commit2 = fs::read_to_string(&commit_file).unwrap().trim().to_owned();
-    let count3: u32 = fs::read_to_string(&count_file)
-        .unwrap()
-        .trim()
-        .parse()
-        .unwrap();
+    let out_file = find_out_file(&wt, "t050_build.rs");
+    let content1 = fs::read_to_string(&out_file).unwrap();
+    let commit1 = extract_commit(&content1);
+    let head1 = commit_hex(&wt);
+    assert_eq!(commit1, head1, "initial identity must match HEAD");
+    let mtime1 = fs::metadata(&out_file).unwrap().modified().unwrap();
+
+    cargo_build(&wt);
+    let mtime2 = fs::metadata(&out_file).unwrap().modified().unwrap();
     assert_eq!(
-        count3, 2,
-        "build script must re-run after packed-ref commit"
+        mtime1, mtime2,
+        "no-change rebuild must not re-run the build script"
     );
-    assert_ne!(commit1, commit2, "commit must advance");
+
+    // Commit in the worktree: git creates a new loose ref file.
+    fs::write(wt.join("new-file"), "data").unwrap();
+    git(&wt, &["add", "new-file"]);
+    git_commit(&wt, "packed commit");
+
+    assert!(
+        loose_ref.exists(),
+        "loose ref must exist after commit: {}",
+        loose_ref.display()
+    );
+
+    cargo_build(&wt);
+    let content3 = fs::read_to_string(&out_file).unwrap();
+    let commit3 = extract_commit(&content3);
+    let head3 = commit_hex(&wt);
+    assert_eq!(
+        commit3, head3,
+        "identity must match new HEAD after packed-to-loose transition"
+    );
+    assert_ne!(
+        commit1, commit3,
+        "commit must advance: {commit1} -> {commit3}"
+    );
 }
