@@ -191,6 +191,7 @@ mod tests {
     use sqlx::SqlitePool;
     use std::{collections::VecDeque, future::pending, sync::Mutex};
     use tokio::sync::Notify;
+    use tracing::instrument::WithSubscriber;
 
     enum Outcome {
         Ready(Result<(), DurableSendError>),
@@ -474,7 +475,17 @@ mod tests {
         .await
         .unwrap();
 
-        assert_eq!(drain.drain_once().await, Ok(1));
+        let captured = crate::test_diagnostics::Capture::default();
+        let result = drain
+            .drain_once()
+            .with_subscriber(captured.subscriber())
+            .await;
+        assert_eq!(result, Ok(1));
+        let output = captured.output();
+        assert!(
+            output.contains("finish-cleanup") && output.contains("cleanup deferred"),
+            "{output}"
+        );
 
         let state: String =
             sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
@@ -571,5 +582,63 @@ mod tests {
         assert!(sets.is_empty());
 
         assert_eq!(sender.calls.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn cleanup_fatal_paths_do_not_become_deferred() {
+        let (_t, drain, _sender, pool) = fixture(vec![]).await;
+
+        assert_eq!(drain.drain_once().await, Ok(1));
+
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "cleaned");
+
+        let (_t2, drain2, _sender2, pool2) = fixture(vec![]).await;
+
+        sqlx::query(
+            "CREATE TRIGGER fail_final_cleanup BEFORE UPDATE ON acp_output_sets \
+             WHEN NEW.state='cleaned' AND OLD.state='cleaning' AND OLD.set_id='set' \
+             BEGIN SELECT RAISE(ABORT,'injected cleanup failure'); END",
+        )
+        .execute(&pool2)
+        .await
+        .unwrap();
+
+        assert_eq!(drain2.drain_once().await, Ok(1));
+
+        let state2: String =
+            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                .fetch_one(&pool2)
+                .await
+                .unwrap();
+        assert_eq!(state2, "cleaning");
+
+        sqlx::query("DROP TRIGGER fail_final_cleanup")
+            .execute(&pool2)
+            .await
+            .unwrap();
+
+        sqlx::query("UPDATE acp_output_quota SET landed_bytes=0 WHERE singleton=1")
+            .execute(&pool2)
+            .await
+            .unwrap();
+
+        let now = Utc::now().to_rfc3339();
+        let result = drain2.store.finish_cleanup("set", &now).await;
+        assert!(
+            matches!(result, Err(OutputStoreError::Conflict)),
+            "expected Conflict, got {result:?}"
+        );
+
+        let state3: String =
+            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                .fetch_one(&pool2)
+                .await
+                .unwrap();
+        assert_eq!(state3, "cleaning");
     }
 }
