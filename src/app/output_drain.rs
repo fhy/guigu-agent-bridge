@@ -460,4 +460,116 @@ mod tests {
         assert_eq!(drain.drain_once().await, Ok(0));
         assert_eq!(sender.calls.lock().unwrap().len(), 1);
     }
+
+    #[tokio::test]
+    async fn cleanup_deferred_preserves_ack_and_recovers_exactly_once() {
+        let (_t, drain, sender, pool) = fixture(vec![]).await;
+
+        sqlx::query(
+            "CREATE TRIGGER fail_final_cleanup BEFORE UPDATE ON acp_output_sets \
+             WHEN NEW.state='cleaned' AND OLD.state='cleaning' AND OLD.set_id='set' \
+             BEGIN SELECT RAISE(ABORT,'injected cleanup failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        assert_eq!(drain.drain_once().await, Ok(1));
+
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "cleaning");
+
+        let quota: (i64, i64) = sqlx::query_as(
+            "SELECT reserved_bytes, landed_bytes FROM acp_output_quota WHERE singleton=1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(quota, (0, 10));
+
+        let seg_states: Vec<String> = sqlx::query_scalar(
+            "SELECT state FROM acp_output_segments WHERE set_id='set' ORDER BY segment_index",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(seg_states, vec!["landed", "landed"]);
+
+        assert_eq!(sender.calls.lock().unwrap().len(), 3);
+
+        drain
+            .store
+            .create_set(&OutputSetInput {
+                set_id: "set2",
+                task_id: "task",
+                attempt: 1,
+                turn: 2,
+                runtime_fence: "f",
+                room_id: "!r:x",
+                thread_root: Some("$t"),
+                reply_event_id: Some("$e"),
+                now: "n",
+            })
+            .await
+            .unwrap();
+        drain
+            .spool
+            .publish("set2", "o2", b"xyz", "n")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE acp_output_sets SET state='sealed' WHERE set_id='set2'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(drain.drain_once().await, Ok(1));
+
+        let state2: String =
+            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set2'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state2, "cleaned");
+
+        let state1: String =
+            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state1, "cleaning");
+
+        sqlx::query("DROP TRIGGER fail_final_cleanup")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let now = Utc::now().to_rfc3339();
+        let segments = drain.store.begin_cleanup("set", &now).await.unwrap();
+        drain.spool.cleanup_files("set", &segments).unwrap();
+        drain.store.finish_cleanup("set", &now).await.unwrap();
+
+        let state1: String =
+            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state1, "cleaned");
+
+        let quota: (i64, i64) = sqlx::query_as(
+            "SELECT reserved_bytes, landed_bytes FROM acp_output_quota WHERE singleton=1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(quota, (0, 0));
+
+        let sets = drain.store.cleanup_sets().await.unwrap();
+        assert!(sets.is_empty());
+
+        assert_eq!(sender.calls.lock().unwrap().len(), 4);
+    }
 }
