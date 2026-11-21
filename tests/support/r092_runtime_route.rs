@@ -129,9 +129,13 @@ fn config(fixture: &support::Fixture, server: &MockServer) -> Config {
         .routes
         .rooms
         .insert("!room:example.test".into(), "worker".into());
-    let backend =
-        std::path::PathBuf::from(std::env::var_os("CARGO_TARGET_DIR").expect("shared target"))
-            .join("debug/examples/acp-mock-backend");
+    let executable = std::env::current_exe().unwrap();
+    let backend = executable
+        .parent()
+        .unwrap()
+        .parent()
+        .unwrap()
+        .join("examples/acp-mock-backend");
     assert!(
         backend.is_file(),
         "build the existing ACP mock before this target"

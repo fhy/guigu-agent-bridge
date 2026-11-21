@@ -11,6 +11,8 @@ pub(crate) enum OutputStoreError {
     Conflict,
     #[error("durable output row is malformed")]
     Malformed,
+    #[error("durable output cleanup deferred after successful ACK")]
+    CleanupDeferred,
 }
 #[cfg(test)]
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -7,7 +7,7 @@ const SHUTDOWN_SETTLE: Duration = Duration::from_secs(1);
 use crate::{
     acp::output::DurableOutputSpool,
     matrix::{DurableMatrixSender, DurableSendError},
-    storage::OutputSpoolStore,
+    storage::{OutputSpoolStore, OutputStoreError},
 };
 
 #[derive(Clone)]
@@ -86,11 +86,18 @@ impl OutputSetDrain {
                         self.spool
                             .cleanup_files(&set.set_id, &segments)
                             .map_err(|_| ())?;
-                        self.store
-                            .finish_cleanup(&set.set_id, &now)
-                            .await
-                            .map_err(|_| ())?;
-                        return Ok(1);
+                        match self.store.finish_cleanup(&set.set_id, &now).await {
+                            Ok(()) => return Ok(1),
+                            Err(OutputStoreError::CleanupDeferred) => {
+                                tracing::warn!(
+                                    component = "output-drain",
+                                    stage = "finish-cleanup",
+                                    "cleanup deferred after successful ACK; will recover on restart"
+                                );
+                                return Ok(1);
+                            }
+                            Err(_) => return Err(()),
+                        }
                     }
                 }
                 Err(error) => {

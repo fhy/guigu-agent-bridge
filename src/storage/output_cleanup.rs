@@ -1,4 +1,7 @@
-use super::output_spool::{OutputSegment, OutputSpoolStore, OutputStoreError, decode_segment};
+use super::{
+    output_spool::{OutputSegment, OutputSpoolStore, OutputStoreError, decode_segment},
+    recovery_eligibility::writer,
+};
 
 impl OutputSpoolStore {
     pub(crate) async fn abandon(
@@ -123,19 +126,37 @@ impl OutputSpoolStore {
             .await?;
         let segment_changes = self.prepare_segments(&mut tx, set_id).await?;
         let bytes: i64=sqlx::query_scalar("SELECT COALESCE(SUM(byte_length),0) FROM acp_output_segments WHERE set_id=? AND state='landed'").bind(set_id).fetch_one(&mut *tx).await?;
-        sqlx::query("UPDATE acp_output_segments SET state='cleaned',revision=revision+1,updated_at=? WHERE set_id=? AND state='landed'").bind(now).bind(set_id).execute(&mut *tx).await?;
-        let quota=sqlx::query("UPDATE acp_output_quota SET landed_bytes=landed_bytes-?,revision=revision+1 WHERE singleton=1 AND landed_bytes>=?").bind(bytes).bind(bytes).execute(&mut *tx).await?;
+        if let Err(e) = sqlx::query("UPDATE acp_output_segments SET state='cleaned',revision=revision+1,updated_at=? WHERE set_id=? AND state='landed'").bind(now).bind(set_id).execute(&mut *tx).await {
+            return Self::deferred_or_fatal(tx, e).await;
+        }
+        let quota=match sqlx::query("UPDATE acp_output_quota SET landed_bytes=landed_bytes-?,revision=revision+1 WHERE singleton=1 AND landed_bytes>=?").bind(bytes).bind(bytes).execute(&mut *tx).await {
+            Ok(q) => q,
+            Err(e) => return Self::deferred_or_fatal(tx, e).await,
+        };
         if quota.rows_affected() != 1 {
             tx.rollback().await?;
             return Err(OutputStoreError::Conflict);
         }
         self.finish_segments(&mut tx, segment_changes).await?;
-        let set=sqlx::query("UPDATE acp_output_sets SET state='cleaned',claim_owner=NULL,updated_at=? WHERE set_id=? AND state='cleaning'").bind(now).bind(set_id).execute(&mut *tx).await?;
+        let set=match sqlx::query("UPDATE acp_output_sets SET state='cleaned',claim_owner=NULL,updated_at=? WHERE set_id=? AND state='cleaning'").bind(now).bind(set_id).execute(&mut *tx).await {
+            Ok(s) => s,
+            Err(e) => return Self::deferred_or_fatal(tx, e).await,
+        };
         if set.rows_affected() != 1 {
             return Err(OutputStoreError::Conflict);
         }
         self.finish_row(&mut tx, set_change).await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn deferred_or_fatal(
+        tx: writer::ScopedTransaction<'_>,
+        error: sqlx::Error,
+    ) -> Result<(), OutputStoreError> {
+        match tx.rollback().await {
+            Ok(()) => Err(OutputStoreError::CleanupDeferred),
+            Err(_) => Err(OutputStoreError::Sql(error)),
+        }
     }
 }
