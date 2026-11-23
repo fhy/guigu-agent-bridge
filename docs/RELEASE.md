@@ -1,12 +1,12 @@
 # Release Checklist
 
-## Current local candidate: v0.2.28
+## Current local candidate: v0.2.29
 
-Version `0.2.28` is prepared locally, not published or deployed. See
-[candidate notes](RELEASE-0.2.28.md) for the bounded post-send completion repair
-and deployment limits. Schema remains 26, identical to v0.2.27; this candidate
-adds no migration or dependency change. An unresolved `sending` row is not made
-complete by installing or restarting this version.
+Version `0.2.29` is prepared locally, not published or deployed. See
+[candidate notes](RELEASE-0.2.29.md) for the public-mainline lifecycle
+repairs and validation limits. Schema remains 26, identical to v0.2.28; this
+candidate adds no migration or dependency change. An unresolved `sending` row
+is not made complete by installing or restarting this version.
 
 Publication and deployment require exact reviewed artifacts and separate execution.
 The checklist below is historical guidance; its schema/rollback details do not apply
