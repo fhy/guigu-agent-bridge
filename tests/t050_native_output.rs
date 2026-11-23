@@ -42,6 +42,10 @@ impl Fixture {
             .parent()
             .unwrap()
             .join("examples/acp-mock-backend");
+        assert!(
+            mock.is_file(),
+            "build the existing ACP mock before this target"
+        );
         let source = format!(
             r#"
 [bridge]

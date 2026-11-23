@@ -97,6 +97,10 @@ impl Fixture {
             .unwrap()
             .join("examples")
             .join(format!("acp-mock-backend{}", std::env::consts::EXE_SUFFIX));
+        assert!(
+            mock.is_file(),
+            "build the existing ACP mock before this target"
+        );
         std::fs::write(&config_path, "# test-support assembly source\n").unwrap();
         let source = format!(
             r#"
