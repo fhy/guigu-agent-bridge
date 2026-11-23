@@ -148,6 +148,10 @@
 //!   future is raced against [`Timer::sleep_until`], so a `deliver` or `execute`
 //!   that never resolves cannot block the worker forever. The losing future is
 //!   dropped — the worker spawns no task and calls no `abort()`.
+//!   The crate-owned prepared delivery is the exception: its independently
+//!   bounded ACP/SQLite startup must settle before CP-2 reap/finalization, because
+//!   dropping it between durable lease acquisition and owner installation would
+//!   orphan side effects. Execution is still raced and reaped before terminal.
 //! - The `select!` is `biased`: **stage result > cancellation > deadline**. A
 //!   stage result that is already available is the authoritative fact and is
 //!   never overwritten by a signal that arrived in the same poll; cancellation is
@@ -332,6 +336,8 @@ pub struct DispatchRequest<'a> {
     pub delivery_id: DeliveryId,
     /// Attempt number. T005 always uses `1`; retries (`> 1`) belong to T006.
     pub attempt: u32,
+    /// Producer-owned lease facts captured before dispatch.
+    pub queue_lease: Option<&'a QueueLeaseContext>,
 }
 
 /// The terminal outcome produced by [`TaskDispatcher::execute`].
@@ -378,6 +384,18 @@ pub enum DispatchError {
     AcceptanceUnknown,
     #[error("execution requires recovery")]
     RecoveryNeeded,
+}
+
+impl DispatchError {
+    pub(crate) fn category(&self) -> &'static str {
+        match self {
+            Self::NotAccepted { .. } => "not-accepted",
+            Self::ExecutionFailed { .. } => "execution-failed",
+            Self::UnsupportedPrepared => "unsupported-prepared",
+            Self::AcceptanceUnknown => "acceptance-unknown",
+            Self::RecoveryNeeded => "recovery-needed",
+        }
+    }
 }
 
 /// Result of the crate-owned reliable finalization protocol.
@@ -712,6 +730,15 @@ fn admit_ready(
 /// [`TaskId`] and a sequence number — never an address, command or credential.
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum WorkerError {
+    #[error(
+        "delivery finalization failed for task {task_id} at seq {seq}: {delivery_class}/{finalization_class}"
+    )]
+    DeliveryFinalization {
+        task_id: TaskId,
+        seq: u64,
+        delivery_class: &'static str,
+        finalization_class: &'static str,
+    },
     /// The event stream is closed; no further transition can be recorded.
     ///
     /// The worker stops, drops the task receiver, and later submissions report
@@ -828,6 +855,31 @@ impl LoopLimits {
             task.hops,
             self.max_hops,
         ))
+    }
+}
+
+impl WorkerError {
+    pub(crate) fn category(&self) -> &'static str {
+        match self {
+            Self::DeliveryFinalization { .. } => "delivery-finalization",
+            Self::EventStreamClosed { .. } => "event-stream-closed",
+            Self::EventBackpressure { .. } => "event-backpressure",
+            Self::EventWrite { .. } if self.is_recovery_needed() => "recovery-needed",
+            Self::EventWrite { .. } => "event-write",
+        }
+    }
+    const RECOVERY_SEQ: u64 = u64::MAX;
+
+    fn recovery_needed(task_id: TaskId) -> Self {
+        Self::EventWrite {
+            task_id,
+            seq: Self::RECOVERY_SEQ,
+            error: BusError::TaskChannelClosed,
+        }
+    }
+
+    fn is_recovery_needed(&self) -> bool {
+        matches!(self, Self::EventWrite { seq, error: BusError::TaskChannelClosed, .. } if *seq == Self::RECOVERY_SEQ)
     }
 }
 
@@ -1125,7 +1177,11 @@ impl Worker {
             // in-flight `process` call; T005 is serial by design and has no
             // limiter, semaphore or rejection path.
             match self.queue.pop() {
-                Some(task) => self.process(task).await?,
+                Some(task) => match self.process(task).await {
+                    Ok(()) => {}
+                    Err(error) if error.is_recovery_needed() => continue,
+                    Err(error) => return Err(error),
+                },
                 None if closed => return Ok(()),
                 // 3. Nothing to do: wait for either a task or a close.
                 None => match self.tasks.recv().await {
@@ -1254,6 +1310,7 @@ impl Worker {
                 target,
                 delivery_id,
                 attempt,
+                queue_lease: queue_lease.as_ref(),
             };
 
             // Paths B/C: the delivery attempt is recorded before it is made.
@@ -1277,44 +1334,66 @@ impl Worker {
                 return self.fail_task(task_id, seq, error.to_string()).await;
             }
 
-            // Stage one, raced: a `deliver` that never resolves is abandoned by
-            // the timeout/cancellation boundary instead of blocking the worker.
+            // Legacy delivery is raced. Prepared delivery owns durable side
+            // effects, so retain it through its bounded startup before CP2 can
+            // reap/finalize; dropping it would orphan a lease before its owner
+            // and cancellation channel have been installed.
             if let (Some(lifecycle), Some(lease)) = (&self.lifecycle, &queue_lease)
                 && let Err(error) = lifecycle.renew_queue_lease(&task, lease).await
             {
                 return self.fail_task(task_id, seq, error.to_string()).await;
             }
-            match self
-                .race(
-                    task_id,
-                    deadline,
-                    &mut cancel_rx,
-                    dispatcher.deliver(request.clone()),
-                )
-                .await
-            {
+            let delivery = dispatcher.deliver(request.clone());
+            let delivered = if dispatcher.supports_prepared() {
+                Raced::Done(delivery.await)
+            } else {
+                self.race(task_id, deadline, &mut cancel_rx, delivery).await
+            };
+            match delivered {
                 Raced::Done(Ok(())) => {}
                 Raced::Done(Err(err)) => {
+                    tracing::warn!(%task_id, %delivery_id, attempt, seq, category = err.category(), stage = "delivery", "delivery failed");
                     if dispatcher.supports_prepared() {
+                        let (status, payload) = if let Some(reason) = self.cancel_reason(task_id) {
+                            (
+                                TaskStatus::Cancelled,
+                                TaskEventPayload::Cancelled { reason },
+                            )
+                        } else if let Some(deadline) = self.expired(deadline) {
+                            (
+                                TaskStatus::TimedOut,
+                                TaskEventPayload::TimedOut { deadline },
+                            )
+                        } else {
+                            (
+                                TaskStatus::Failed,
+                                TaskEventPayload::Failed {
+                                    error: err.to_string(),
+                                },
+                            )
+                        };
                         let event = TaskEvent {
                             id: EventId::generate(),
                             task_id,
                             seq,
-                            status: TaskStatus::Failed,
+                            status,
                             timestamp: self.clock.now(),
-                            payload: TaskEventPayload::Failed {
-                                error: err.to_string(),
-                            },
+                            payload,
                         };
                         dispatcher
-                            .finalize_delivery_failure(request.clone(), event)
+                            .finalize_delivery_failure(request.clone(), event.clone())
                             .await
-                            .map_err(|_| WorkerError::EventWrite {
+                            .map_err(|error| WorkerError::DeliveryFinalization {
                                 task_id,
                                 seq,
-                                error: BusError::TaskChannelClosed,
+                                delivery_class: err.category(),
+                                finalization_class: error.category(),
                             })?;
-                        return Ok(());
+                        let result = self.emit(event, task_id, seq).await;
+                        if let Some(cancellation) = &self.config.cancellation {
+                            cancellation.retire(task_id);
+                        }
+                        return result;
                     }
                     match self
                         .refused(task_id, attempt, &err, deadline, &mut cancel_rx)
@@ -1419,6 +1498,9 @@ impl Worker {
                         return self.finalize_prepared(task_id, seq, prepared).await;
                     }
                     Raced::Done(Err(error)) => {
+                        if matches!(error, DispatchError::RecoveryNeeded) {
+                            return Err(WorkerError::recovery_needed(task_id));
+                        }
                         return self.fail_task(task_id, seq, error.to_string()).await;
                     }
                     Raced::Cancelled(reason) => {
@@ -2321,6 +2403,7 @@ enabled = true
             target,
             delivery_id,
             attempt: 1,
+            queue_lease: None,
         };
         let clone = request.clone();
         assert_eq!(clone.delivery_id, delivery_id);

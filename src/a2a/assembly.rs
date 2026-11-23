@@ -80,15 +80,29 @@ fn warn_insecure_peer(peer_key: &str) {
     );
 }
 
+pub(crate) struct ServerDependencies {
+    pub pool: SqlitePool,
+    pub repository: Arc<dyn Repository>,
+    pub concrete: SqliteRepository,
+    pub bus: Arc<PersistingBus>,
+    pub cancellation: Cancellation,
+    pub registry: Arc<EndpointRegistry>,
+    pub faults: Arc<dyn super::IngressFaultInjector>,
+}
+
 pub(crate) async fn server(
     config: &Config,
-    pool: SqlitePool,
-    repository: Arc<dyn Repository>,
-    concrete: SqliteRepository,
-    bus: Arc<PersistingBus>,
-    cancellation: Cancellation,
-    registry: Arc<EndpointRegistry>,
+    dependencies: ServerDependencies,
 ) -> Result<A2aServerHandle, A2aError> {
+    let ServerDependencies {
+        pool,
+        repository,
+        concrete,
+        bus,
+        cancellation,
+        registry,
+        faults,
+    } = dependencies;
     let unix_path = config.transports.a2a.listen.strip_prefix("unix:");
     let bind = if unix_path.is_some() {
         "127.0.0.1:0".parse().unwrap()
@@ -148,14 +162,17 @@ pub(crate) async fn server(
             })
             .collect(),
     };
-    let ingress = Arc::new(A2aIngress::new(
-        A2aStore::new(pool),
-        repository,
-        concrete,
-        bus,
-        cancellation,
-        endpoints,
-    ));
+    let ingress = Arc::new(
+        A2aIngress::new(
+            A2aStore::new(pool),
+            repository,
+            concrete,
+            bus,
+            cancellation,
+            endpoints,
+        )
+        .with_faults(faults),
+    );
     let server_config = A2aServerConfig {
         bind,
         allow_private_plaintext: config.transports.a2a.allow_private_plaintext,

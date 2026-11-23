@@ -1,0 +1,222 @@
+use super::*;
+
+impl MatrixSync {
+    pub(super) fn spawn(
+        self,
+        acknowledged: bool,
+    ) -> (
+        MatrixSyncHandle,
+        mpsc::Receiver<InboundMatrixEvent>,
+        mpsc::Sender<Disposition>,
+    ) {
+        let (events_tx, events_rx) = mpsc::channel(self.capacity);
+        let (dispositions_tx, dispositions_rx) = mpsc::channel(1);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let alive = Arc::new(AtomicBool::new(true));
+        let observer = self.failure_observer.clone();
+        let owner =
+            crate::app::required_owner::RequiredOwner::observed(Arc::clone(&alive), move |_| {
+                if let Some(observer) = observer {
+                    observer(&MatrixError::Join);
+                }
+            });
+        let failure_observer = self.failure_observer.clone();
+        let recovery_lease = self.recovery.clone().map(MatrixSyncLease::new);
+        let join = tokio::spawn(async move {
+            let _owner = owner;
+            let result = self
+                .run(
+                    events_tx,
+                    shutdown_rx,
+                    acknowledged.then_some(dispositions_rx),
+                )
+                .await;
+            if let (Err(error), Some(observer)) = (&result, failure_observer) {
+                observer(error);
+            }
+            result
+        });
+        (
+            MatrixSyncHandle {
+                shutdown_tx,
+                join,
+                alive,
+                recovery_lease,
+            },
+            events_rx,
+            dispositions_tx,
+        )
+    }
+
+    async fn run(
+        self,
+        events: mpsc::Sender<InboundMatrixEvent>,
+        mut shutdown: watch::Receiver<bool>,
+        mut dispositions: Option<mpsc::Receiver<Disposition>>,
+    ) -> Result<(), MatrixError> {
+        if let Some(recovery) = &self.recovery {
+            recovery
+                .store
+                .reconcile_restart()
+                .await
+                .map_err(|_| MatrixError::Storage)?;
+        }
+        let mut failures = 0_u8;
+        loop {
+            let request = self.sync_with_dispositions(&events, &mut dispositions);
+            tokio::pin!(request);
+            let response = tokio::select! {
+                biased;
+                changed = shutdown.changed() => {
+                    let _ = changed;
+                    if self.recovery.is_some() && self.processing.load(Ordering::Acquire) {
+                        // Ingress stays alive until this owner joins. Finish the
+                        // response already being persisted; dropping it would
+                        // strand a batch even during an ordinary graceful stop.
+                        // shutdown_joined still enforces the caller's deadline.
+                        tracing::debug!(
+                            stage = "matrix-sync-cleanup",
+                            decision = "drain-current-response",
+                            "shutdown waits for the durable response disposition"
+                        );
+                        return request.await.map(|_| ());
+                    }
+                    return Ok(());
+                }
+                response = &mut request => response,
+            };
+            match response {
+                Ok(_) => {
+                    if failures != 0 {
+                        report_recovered(failures);
+                    }
+                    failures = 0;
+                }
+                Err(MatrixError::Transport) if failures < 2 => {
+                    failures += 1;
+                    report_retry(failures);
+                    tokio::select! {
+                        biased;
+                        changed = shutdown.changed() => {
+                            let _ = changed;
+                            return Ok(());
+                        }
+                        _ = tokio::time::sleep(Duration::from_millis(100 * u64::from(failures))) => {}
+                    }
+                    continue;
+                }
+                Err(error) => {
+                    tracing::error!(
+                        stage = "incremental-sync",
+                        category = "sync-owner-stopped",
+                        failures,
+                        "required sync owner stopped; inspect the correlated first failure"
+                    );
+                    return Err(error);
+                }
+            }
+        }
+    }
+}
+
+fn report_retry(failures: u8) {
+    if failures == 1 {
+        tracing::warn!(
+            stage = "incremental-sync",
+            category = "transport",
+            failures,
+            retry_limit = 2,
+            "sync failed; bounded retry pending"
+        );
+    } else {
+        tracing::debug!(
+            stage = "incremental-sync",
+            category = "transport",
+            failures,
+            "repeated sync failure within retry budget"
+        );
+    }
+}
+
+fn report_recovered(failures: u8) {
+    tracing::info!(
+        stage = "incremental-sync",
+        category = "transport-recovered",
+        failures,
+        "sync recovered within retry budget"
+    );
+}
+
+#[cfg(test)]
+mod diagnostic_tests {
+    use super::*;
+
+    #[test]
+    fn retries_preserve_first_warning_count_repeats_and_report_recovery() {
+        let captured = crate::test_diagnostics::Capture::default();
+        tracing::subscriber::with_default(captured.subscriber(), || {
+            report_retry(1);
+            report_retry(2);
+            report_recovered(2);
+        });
+        let output = captured.output();
+        assert_eq!(output.matches("WARN").count(), 1);
+        assert_eq!(output.matches("DEBUG").count(), 1);
+        assert_eq!(output.matches("INFO").count(), 1);
+        assert!(output.contains("failures=2"));
+        assert!(output.find("WARN").unwrap() < output.find("transport-recovered").unwrap());
+    }
+}
+
+pub(super) fn classify_sdk_error(error: matrix_sdk::Error) -> MatrixError {
+    match error.client_api_error_kind() {
+        Some(
+            ErrorKind::UnknownToken { .. } | ErrorKind::MissingToken | ErrorKind::Forbidden { .. },
+        ) => MatrixError::DeviceKicked,
+        Some(_) => MatrixError::CutoverRefused,
+        None => MatrixError::Transport,
+    }
+}
+
+#[cfg(test)]
+mod liveness_tests {
+    use super::*;
+    struct PanickingTokens;
+    impl SyncTokenStore for PanickingTokens {
+        fn load<'a>(&'a self) -> SyncTokenFuture<'a, Result<Option<String>, MatrixError>> {
+            Box::pin(async { panic!("injected sync owner panic") })
+        }
+        fn save<'a>(&'a self, _: &'a str) -> SyncTokenFuture<'a, Result<(), MatrixError>> {
+            Box::pin(async { Ok(()) })
+        }
+    }
+    #[tokio::test]
+    async fn sync_panic_and_unpolled_abort_publish_owner_loss() {
+        for abort in [false, true] {
+            let observed = Arc::new(AtomicBool::new(false));
+            let result = observed.clone();
+            let sync =
+                MatrixSync::new(MatrixClient::for_test().await, Arc::new(PanickingTokens), 1)
+                    .unwrap()
+                    .with_failure_observer(Arc::new(move |_| {
+                        result.store(true, Ordering::Release);
+                    }));
+            let (handle, _events, _dispositions) = sync.start_with_dispositions();
+            let alive = handle.alive();
+            if abort {
+                handle.join.abort();
+            }
+            let error = tokio::time::timeout(Duration::from_secs(3), handle.join)
+                .await
+                .unwrap()
+                .unwrap_err();
+            assert!(if abort {
+                error.is_cancelled()
+            } else {
+                error.is_panic()
+            });
+            assert!(!alive.load(Ordering::Acquire));
+            assert!(observed.load(Ordering::Acquire));
+        }
+    }
+}

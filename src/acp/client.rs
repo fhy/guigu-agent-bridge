@@ -35,7 +35,7 @@ use crate::acp::schema::{
     self, AuthenticateParams, AuthenticateResult, InitializeParams, InitializeResult,
     NewSessionParams, PromptResult, ResumeSessionParams, SessionResult, StopReason,
 };
-use crate::acp::transport::{AcpTransport, TransportLimits};
+use crate::acp::transport::{AcpSpawnGate, AcpTransport, TransportLimits};
 use crate::acp::{MAX_SESSION_ID_BYTES, bounded};
 use crate::models::EndpointAddress;
 
@@ -102,69 +102,122 @@ impl AcpClient {
         cwd: Option<&Path>,
         limits: AcpLimits,
     ) -> Result<Self, AcpError> {
-        let transport = Arc::new(AcpTransport::spawn(address, cwd, limits.transport)?);
-        let params = encode(schema::METHOD_INITIALIZE, &InitializeParams::new())?;
-        let completed = transport
-            .request(
-                Phase::Initialize,
-                schema::METHOD_INITIALIZE,
-                params,
-                limits.initialize_deadline,
-            )
-            .await?;
-        let result: InitializeResult = decode(schema::METHOD_INITIALIZE, completed.result)?;
+        Self::connect_with_gate(address, agent_id, cwd, limits, None).await
+    }
 
-        if result.protocol_version != schema::PROTOCOL_VERSION {
-            // The ACP schema tells a client that does not support the negotiated
-            // version to disconnect. We do exactly that: no heuristic fallback.
-            let _ = transport.shutdown().await;
-            return Err(AcpError::UnsupportedProtocol {
-                got: result.protocol_version,
-                supported: schema::PROTOCOL_VERSION,
-            });
+    pub(crate) async fn connect_with_gate(
+        address: &EndpointAddress,
+        agent_id: &str,
+        cwd: Option<&Path>,
+        limits: AcpLimits,
+        gate: Option<&AcpSpawnGate>,
+    ) -> Result<Self, AcpError> {
+        Self::connect_retaining_transport(address, agent_id, cwd, limits, gate, |_| {}).await
+    }
+
+    pub(crate) async fn connect_retaining_transport(
+        address: &EndpointAddress,
+        agent_id: &str,
+        cwd: Option<&Path>,
+        limits: AcpLimits,
+        gate: Option<&AcpSpawnGate>,
+        retain: impl FnOnce(Arc<AcpTransport>) + Send,
+    ) -> Result<Self, AcpError> {
+        let mut reservation = gate.and_then(AcpSpawnGate::reserve);
+        if gate.is_some() && reservation.is_none() {
+            return Err(AcpError::TransportClosed);
         }
-        let api_methods: Vec<_> = result
-            .auth_methods
-            .iter()
-            .filter(|method| method.is_supported_api_key())
-            .collect();
-        if api_methods.len() > 1 {
-            let _ = transport.shutdown().await;
-            return Err(AcpError::Authentication {
-                advertised: result.auth_methods.len(),
-            });
-        }
-        if !result.auth_methods.is_empty() {
-            let Some(method) = api_methods.first() else {
+        let transport = Arc::new(AcpTransport::spawn(address, cwd, limits.transport)?);
+        // Publish ownership before any await or fallible registration. The
+        // caller can still join this exact transport if initialization fails
+        // or its future is cancelled before a client is returned.
+        retain(Arc::clone(&transport));
+        if let Some(ref mut reservation) = reservation {
+            if !AcpSpawnGate::retain_transport(reservation, Arc::clone(&transport)) {
                 let _ = transport.shutdown().await;
-                return Err(AcpError::Authentication {
-                    advertised: result.auth_methods.len(),
-                });
-            };
-            let params = encode(
-                schema::METHOD_AUTHENTICATE,
-                &AuthenticateParams {
-                    method_id: method.id.clone(),
-                },
-            )?;
+                return Err(AcpError::TransportClosed);
+            }
+            // The transport has spawned exactly one owned child. Registration is
+            // mandatory for the runtime-owned path; an absent PID is fail-closed.
+            let pid = transport.child_pid();
+            if !AcpSpawnGate::register_child(reservation, pid) {
+                let _ = transport.shutdown().await;
+                return Err(AcpError::TransportClosed);
+            }
+            if reservation.identity.is_none() {
+                let _ = transport.shutdown().await;
+                return Err(AcpError::TransportClosed);
+            }
+        }
+        let connected = async {
+            let params = encode(schema::METHOD_INITIALIZE, &InitializeParams::new())?;
             let completed = transport
                 .request(
-                    Phase::Authenticate,
-                    schema::METHOD_AUTHENTICATE,
+                    Phase::Initialize,
+                    schema::METHOD_INITIALIZE,
                     params,
                     limits.initialize_deadline,
                 )
                 .await?;
-            let _: AuthenticateResult = decode(schema::METHOD_AUTHENTICATE, completed.result)?;
-        }
+            let result: InitializeResult = decode(schema::METHOD_INITIALIZE, completed.result)?;
 
-        let backend_id = backend_id(agent_id, result.agent_info.as_ref());
-        tracing::debug!(%backend_id, "acp backend negotiated");
-        Ok(Self {
-            transport,
-            limits,
-            backend_id,
-        })
+            if result.protocol_version != schema::PROTOCOL_VERSION {
+                // The ACP schema tells a client that does not support the negotiated
+                // version to disconnect. We do exactly that: no heuristic fallback.
+                let _ = transport.shutdown().await;
+                return Err(AcpError::UnsupportedProtocol {
+                    got: result.protocol_version,
+                    supported: schema::PROTOCOL_VERSION,
+                });
+            }
+            let api_methods: Vec<_> = result
+                .auth_methods
+                .iter()
+                .filter(|method| method.is_supported_api_key())
+                .collect();
+            if api_methods.len() > 1 {
+                let _ = transport.shutdown().await;
+                return Err(AcpError::Authentication {
+                    advertised: result.auth_methods.len(),
+                });
+            }
+            if !result.auth_methods.is_empty() {
+                let Some(method) = api_methods.first() else {
+                    let _ = transport.shutdown().await;
+                    return Err(AcpError::Authentication {
+                        advertised: result.auth_methods.len(),
+                    });
+                };
+                let params = encode(
+                    schema::METHOD_AUTHENTICATE,
+                    &AuthenticateParams {
+                        method_id: method.id.clone(),
+                    },
+                )?;
+                let completed = transport
+                    .request(
+                        Phase::Authenticate,
+                        schema::METHOD_AUTHENTICATE,
+                        params,
+                        limits.initialize_deadline,
+                    )
+                    .await?;
+                let _: AuthenticateResult = decode(schema::METHOD_AUTHENTICATE, completed.result)?;
+            }
+
+            let backend_id = backend_id(agent_id, result.agent_info.as_ref());
+            tracing::debug!(%backend_id, "acp backend negotiated");
+            Ok(Self {
+                transport: Arc::clone(&transport),
+                limits,
+                backend_id,
+            })
+        }
+        .await;
+        if connected.is_err() {
+            let _ = transport.shutdown().await;
+        }
+        connected
     }
 
     /// The negotiated backend identity, `agent/name@version` (ADR-001).
@@ -211,10 +264,9 @@ impl AcpClient {
 
     /// Re-bind an existing session.
     ///
-    /// The agent must answer with the session id that was asked for: a resume that
-    /// silently moves to another session would make the stored row and the live
-    /// conversation disagree, so it is reported as
-    /// [`AcpError::SessionId`] instead.
+    /// Resume is bound to the requested session by the correlated JSON-RPC reply.
+    /// Native ACP resume results may omit the new-session `sessionId` field. If
+    /// a peer additionally echoes it, a different or malformed identity is refused.
     ///
     /// # Errors
     ///
@@ -250,14 +302,22 @@ impl AcpClient {
                 self.limits.request_deadline,
             )
             .await?;
-        let result: SessionResult = decode(schema::METHOD_SESSION_RESUME, completed.result)?;
-        let returned = validate_session_id(result.session_id)?;
-        if returned != requested {
-            return Err(AcpError::SessionId {
-                detail: "resume answered with a different session id".to_owned(),
+        if !completed.result.is_object() {
+            return Err(AcpError::Schema {
+                method: schema::METHOD_SESSION_RESUME.to_owned(),
+                detail: "resume result must be an object".to_owned(),
             });
         }
-        Ok(returned)
+        if completed.result.get("sessionId").is_some() {
+            let result: SessionResult = decode(schema::METHOD_SESSION_RESUME, completed.result)?;
+            let returned = validate_session_id(result.session_id)?;
+            if returned != requested {
+                return Err(AcpError::SessionId {
+                    detail: "resume answered with a different session id".to_owned(),
+                });
+            }
+        }
+        Ok(requested)
     }
 
     /// Run one prompt turn to its terminal answer.
@@ -338,6 +398,26 @@ impl AcpClient {
                 schema::text_prompt(&session_id, text),
                 self.limits.request_deadline,
                 capacity,
+            )
+            .await
+    }
+
+    pub(crate) async fn prompt_stream_durable(
+        &self,
+        session_id: &str,
+        text: &str,
+        capacity: usize,
+        durable: tokio::sync::mpsc::Sender<String>,
+    ) -> Result<AcpTurnHandle, AcpError> {
+        let session_id = validate_session_id(session_id.to_owned())?;
+        self.transport
+            .request_stream_with_durable(
+                Phase::Prompt,
+                schema::METHOD_SESSION_PROMPT,
+                schema::text_prompt(&session_id, text),
+                self.limits.request_deadline,
+                capacity,
+                Some(durable),
             )
             .await
     }
@@ -426,6 +506,8 @@ fn validate_session_id(session_id: String) -> Result<String, AcpError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::acp::transport::AcpSpawnGate;
+    use crate::models::EndpointAddress;
 
     #[test]
     fn a_backend_id_carries_the_agents_own_name_and_version() {
@@ -470,5 +552,30 @@ mod tests {
             validate_session_id("x".repeat(MAX_SESSION_ID_BYTES + 1)),
             Err(AcpError::SessionId { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn gated_client_handshake_uses_real_local_child() {
+        let script = r#"while IFS= read -r line; do case "$line" in *initialize*) printf '%s\n' '{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":1,"agentInfo":{"name":"fixture","version":"1"}}}';; esac; done"#;
+        let gate = AcpSpawnGate::new();
+        let address = EndpointAddress::Acp {
+            command: "sh".into(),
+            args: vec!["-c".into(), script.into()],
+        };
+        let client = AcpClient::connect_with_gate(
+            &address,
+            "fixture",
+            None,
+            AcpLimits::default(),
+            Some(&gate),
+        )
+        .await
+        .expect("handshake");
+        assert!(client.is_alive());
+        assert!(!gate.is_closed_joined());
+        gate.close_and_join().await;
+        assert!(gate.is_closed_joined());
+        assert!(gate.reserve().is_none());
+        let _ = client.shutdown().await;
     }
 }

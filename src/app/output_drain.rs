@@ -1,0 +1,804 @@
+use chrono::{SecondsFormat, Utc};
+use std::{sync::Arc, time::Duration};
+use tokio::sync::watch;
+
+const SHUTDOWN_SETTLE: Duration = Duration::from_secs(1);
+
+use crate::{
+    acp::output::DurableOutputSpool,
+    matrix::{DurableMatrixSender, DurableSendError},
+    storage::{OutputSpoolStore, OutputStoreError},
+};
+
+#[derive(Clone)]
+pub(crate) struct OutputSetDrain {
+    store: OutputSpoolStore,
+    spool: DurableOutputSpool,
+    sender: Arc<dyn DurableMatrixSender>,
+}
+
+impl OutputSetDrain {
+    pub(crate) fn new(
+        store: OutputSpoolStore,
+        spool: DurableOutputSpool,
+        sender: Arc<dyn DurableMatrixSender>,
+    ) -> Self {
+        Self {
+            store,
+            spool,
+            sender,
+        }
+    }
+
+    pub(crate) async fn drain_once(&self) -> Result<usize, ()> {
+        let now = Utc::now();
+        let stale = now
+            - chrono::Duration::from_std(self.spool.policy().stale_claim_after).map_err(|_| ())?;
+        let now = now.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let stale = stale.to_rfc3339_opts(SecondsFormat::Nanos, true);
+        let owner = uuid::Uuid::now_v7().to_string();
+        let Some(mut set) = self
+            .store
+            .claim_next(&owner, &now, &stale)
+            .await
+            .map_err(|_| ())?
+        else {
+            return Ok(0);
+        };
+        loop {
+            let Some(segment) = self.store.next_segment(&set).await.map_err(|_| ())? else {
+                return Err(());
+            };
+            let bytes = self.spool.read_delivery(&segment).map_err(|_| ())?;
+            let body = std::str::from_utf8(&bytes).map_err(|_| ())?;
+            self.store
+                .authorize_delivery(&set.set_id, segment.part.index)
+                .await
+                .map_err(|_| ())?;
+            let txn = segment.part.stable_txn_id.as_str();
+            let send = self.sender.send_durable(
+                &set.room_id,
+                set.thread_root.as_deref(),
+                set.reply_event_id.as_deref(),
+                body,
+                txn,
+            );
+            let outcome = tokio::time::timeout(self.spool.policy().matrix_send_timeout, send)
+                .await
+                .unwrap_or(Err(DurableSendError::UnknownCommit));
+            match outcome {
+                Ok(()) => {
+                    if !self
+                        .store
+                        .acknowledge(&set, segment.part.index, &now)
+                        .await
+                        .map_err(|_| ())?
+                    {
+                        return Err(());
+                    }
+                    set.acknowledged_cursor = segment.part.index;
+                    if set.acknowledged_cursor + 1 == set.segment_count {
+                        let segments = self
+                            .store
+                            .begin_cleanup(&set.set_id, &now)
+                            .await
+                            .map_err(|_| ())?;
+                        self.spool
+                            .cleanup_files(&set.set_id, &segments)
+                            .map_err(|_| ())?;
+                        match self.store.finish_cleanup(&set.set_id, &now).await {
+                            Ok(()) => return Ok(1),
+                            Err(OutputStoreError::CleanupDeferred) => {
+                                tracing::warn!(
+                                    component = "output-drain",
+                                    stage = "finish-cleanup",
+                                    "cleanup deferred after successful ACK; will recover on restart"
+                                );
+                                return Ok(1);
+                            }
+                            Err(_) => return Err(()),
+                        }
+                    }
+                }
+                Err(error) => {
+                    let class = matches!(error, DurableSendError::Permanent).then_some("permanent");
+                    self.store
+                        .record_failure(
+                            &set,
+                            class,
+                            self.spool.policy().delivery_attempt_limit,
+                            &now,
+                        )
+                        .await
+                        .map_err(|_| ())?;
+                    return Ok(0);
+                }
+            }
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn start(self, interval: Duration) -> OutputSetDrainHandle {
+        self.start_supervised(interval, None)
+    }
+
+    pub(crate) fn start_supervised(
+        self,
+        interval: Duration,
+        owner: Option<super::required_owner::RequiredOwner>,
+    ) -> OutputSetDrainHandle {
+        let shutdown_timeout = self
+            .spool
+            .policy()
+            .matrix_send_timeout
+            .saturating_add(SHUTDOWN_SETTLE);
+        let (shutdown, mut receiver) = watch::channel(false);
+        let join = tokio::spawn(async move {
+            let mut owner = owner;
+            loop {
+                if *receiver.borrow() {
+                    break;
+                }
+                if self.drain_once().await.is_err() {
+                    if let Some(owner) = owner.as_mut() {
+                        owner.fail("persistence-or-fence-refused");
+                    }
+                    tracing::error!(
+                        component = "output-drain",
+                        class = "persistence-or-fence-refused"
+                    );
+                    return Err(());
+                }
+                tokio::select! { biased; _=receiver.changed()=>break, _=tokio::time::sleep(interval)=>{} }
+            }
+            Ok(())
+        });
+        OutputSetDrainHandle {
+            shutdown,
+            join,
+            shutdown_timeout,
+        }
+    }
+}
+
+pub(crate) struct OutputSetDrainHandle {
+    shutdown: watch::Sender<bool>,
+    join: tokio::task::JoinHandle<Result<(), ()>>,
+    shutdown_timeout: Duration,
+}
+impl OutputSetDrainHandle {
+    pub(crate) async fn shutdown(self) -> Result<Result<(), ()>, tokio::task::JoinError> {
+        let _ = self.shutdown.send(true);
+        let mut join = self.join;
+        match tokio::time::timeout(self.shutdown_timeout, &mut join).await {
+            Ok(result) => result,
+            Err(_) => {
+                join.abort();
+                join.await
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        acp::output_policy::DurableOutputPolicy,
+        matrix::{DurableSendError, outbound::DurableSendFuture},
+        storage::OutputSetInput,
+    };
+    use sqlx::{
+        Connection, SqlitePool,
+        sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    };
+    use std::{collections::VecDeque, future::pending, sync::Mutex};
+    use tokio::sync::Notify;
+    use tracing::instrument::WithSubscriber;
+
+    enum Outcome {
+        Ready(Result<(), DurableSendError>),
+        Pending,
+    }
+
+    struct Temp(std::path::PathBuf);
+    impl Drop for Temp {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+    #[derive(Default)]
+    struct Sender {
+        outcomes: Mutex<VecDeque<Outcome>>,
+        calls: Mutex<Vec<(String, String)>>,
+        pending_entered: Notify,
+    }
+    impl DurableMatrixSender for Sender {
+        fn send_durable<'a>(
+            &'a self,
+            _: &'a str,
+            _: Option<&'a str>,
+            _: Option<&'a str>,
+            body: &'a str,
+            txn: &'a str,
+        ) -> DurableSendFuture<'a> {
+            Box::pin(async move {
+                self.calls.lock().unwrap().push((body.into(), txn.into()));
+                let outcome = self
+                    .outcomes
+                    .lock()
+                    .unwrap()
+                    .pop_front()
+                    .unwrap_or(Outcome::Ready(Ok(())));
+                match outcome {
+                    Outcome::Ready(result) => result,
+                    Outcome::Pending => {
+                        self.pending_entered.notify_one();
+                        pending().await
+                    }
+                }
+            })
+        }
+    }
+
+    async fn fixture(outcomes: Vec<Outcome>) -> (Temp, OutputSetDrain, Arc<Sender>, SqlitePool) {
+        fixture_with_timeout(outcomes, None).await
+    }
+
+    async fn fixture_with_timeout(
+        outcomes: Vec<Outcome>,
+        send_timeout: Option<Duration>,
+    ) -> (Temp, OutputSetDrain, Arc<Sender>, SqlitePool) {
+        let root = std::env::temp_dir().join(format!("t051-drain-{}", uuid::Uuid::now_v7()));
+        std::fs::create_dir(&root).unwrap();
+        let temp = Temp(root.clone());
+        let pool = SqlitePool::connect("sqlite::memory:").await.unwrap();
+        crate::storage::migrate(&pool).await.unwrap();
+        sqlx::query("INSERT INTO conversations(conversation_id,participants_json) VALUES('conversation','[]')")
+            .execute(&pool)
+            .await
+            .unwrap();
+        sqlx::query("INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,text,priority,depth,hops,version) VALUES('task','task','from','to','conversation','text',1,0,0,0)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let mut policy = DurableOutputPolicy::derive(&root.join("state.db"), 64).unwrap();
+        policy.spool_segment_bytes = 8;
+        policy.matrix_segment_bytes = 4;
+        if let Some(timeout) = send_timeout {
+            policy.matrix_send_timeout = timeout;
+        }
+        let store = OutputSpoolStore::new(pool.clone(), policy.process_quota_bytes).unwrap();
+        store
+            .create_set(&OutputSetInput {
+                set_id: "set",
+                task_id: "task",
+                attempt: 1,
+                turn: 1,
+                runtime_fence: "f",
+                room_id: "!r:x",
+                thread_root: Some("$t"),
+                reply_event_id: Some("$e"),
+                now: "n",
+            })
+            .await
+            .unwrap();
+        let spool = DurableOutputSpool::new(policy, store.clone());
+        spool.publish("set", "o", b"abcdefghij", "n").await.unwrap();
+        sqlx::query("UPDATE acp_output_sets SET state='sealed' WHERE set_id='set'")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let sender = Arc::new(Sender {
+            outcomes: Mutex::new(outcomes.into()),
+            calls: Mutex::new(Vec::new()),
+            pending_entered: Notify::new(),
+        });
+        let drain = OutputSetDrain::new(store, spool, sender.clone());
+        (temp, drain, sender, pool)
+    }
+
+    #[tokio::test]
+    async fn complete_set_is_ordered_stable_and_cleaned() {
+        let (_t, drain, sender, pool) = fixture(vec![]).await;
+        assert_eq!(drain.drain_once().await, Ok(1));
+        {
+            let calls = sender.calls.lock().unwrap();
+            assert_eq!(
+                calls.iter().map(|v| v.0.as_str()).collect::<Vec<_>>(),
+                vec!["abcd", "efgh", "ij"]
+            );
+            assert!(calls.windows(2).all(|v| v[0].1 != v[1].1));
+        }
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "cleaned");
+    }
+
+    #[tokio::test]
+    async fn unknown_commit_reuses_transaction_and_permanent_stops() {
+        let (_t, drain, sender, pool) = fixture(vec![
+            Outcome::Ready(Err(DurableSendError::UnknownCommit)),
+            Outcome::Ready(Ok(())),
+            Outcome::Ready(Ok(())),
+            Outcome::Ready(Ok(())),
+        ])
+        .await;
+        assert_eq!(drain.drain_once().await, Ok(0));
+        assert_eq!(drain.drain_once().await, Ok(1));
+        {
+            let calls = sender.calls.lock().unwrap();
+            assert_eq!(calls[0].1, calls[1].1);
+        }
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "cleaned");
+        let (_t, drain, sender, pool) =
+            fixture(vec![Outcome::Ready(Err(DurableSendError::Permanent))]).await;
+        assert_eq!(drain.drain_once().await, Ok(0));
+        assert_eq!(sender.calls.lock().unwrap().len(), 1);
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "partial");
+    }
+
+    #[tokio::test]
+    async fn pending_send_times_out_and_retries_the_same_transaction() {
+        let (_t, drain, sender, pool) = fixture_with_timeout(
+            vec![
+                Outcome::Pending,
+                Outcome::Ready(Ok(())),
+                Outcome::Ready(Ok(())),
+                Outcome::Ready(Ok(())),
+            ],
+            Some(Duration::from_millis(20)),
+        )
+        .await;
+        assert_eq!(drain.drain_once().await, Ok(0));
+        let first: (String, i64) = sqlx::query_as(
+            "SELECT state,acknowledged_cursor FROM acp_output_sets WHERE set_id='set'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(first, ("sealed".into(), -1));
+        assert_eq!(drain.drain_once().await, Ok(1));
+        let calls = sender.calls.lock().unwrap();
+        assert_eq!(calls[0].1, calls[1].1);
+        assert_eq!(calls[0].0, "abcd");
+        assert_eq!(calls[1].0, "abcd");
+    }
+
+    #[tokio::test]
+    async fn pending_and_healthy_shutdown_are_bounded_and_clean() {
+        let (_t, drain, sender, pool) =
+            fixture_with_timeout(vec![Outcome::Pending], Some(Duration::from_millis(20))).await;
+        let handle = drain.start(Duration::from_secs(60));
+        tokio::time::timeout(
+            Duration::from_millis(200),
+            sender.pending_entered.notified(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(sender.calls.lock().unwrap().len(), 1);
+        tokio::time::timeout(Duration::from_millis(200), handle.shutdown())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        {
+            let calls = sender.calls.lock().unwrap();
+            assert_eq!(calls.len(), 1);
+            assert!(!calls[0].1.is_empty());
+        }
+        let state: (String, i64) = sqlx::query_as(
+            "SELECT state,acknowledged_cursor FROM acp_output_sets WHERE set_id='set'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state, ("sealed".into(), -1));
+
+        let (_t, drain, sender, pool) = fixture(vec![]).await;
+        assert_eq!(drain.drain_once().await, Ok(1));
+        drain
+            .start(Duration::from_secs(60))
+            .shutdown()
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(sender.calls.lock().unwrap().len(), 3);
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "cleaned");
+    }
+    #[tokio::test]
+    async fn output_completion_storage_failure_is_unhealthy_before_shutdown() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let (_t, drain, sender, pool) = fixture(vec![]).await;
+        sqlx::query("CREATE TRIGGER fail_output_ack BEFORE UPDATE ON acp_output_sets WHEN NEW.acknowledged_cursor>OLD.acknowledged_cursor BEGIN SELECT RAISE(ABORT,'ack storage failure'); END").execute(&pool).await.unwrap();
+        let health = crate::app::HealthState::new(
+            crate::runtime::SqliteRuntimeStore::new(pool.clone()),
+            Arc::new(crate::runtime::RuntimeMetrics::default()),
+            Arc::new(crate::app::ProjectionMetrics::default()),
+        );
+        health.set_owner(crate::app::OwnerState::Running);
+        health.set_adapter_ready(true);
+        let alive = Arc::new(AtomicBool::new(true));
+        health.register_required(alive.clone());
+        let cause = Arc::new(Mutex::new(None));
+        let observed = cause.clone();
+        let guard =
+            crate::app::required_owner::RequiredOwner::observed(alive.clone(), move |class| {
+                *observed.lock().unwrap() = Some(class);
+            });
+        let handle = drain
+            .clone()
+            .start_supervised(Duration::from_millis(1), Some(guard));
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while alive.load(Ordering::Acquire) {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert_ne!(
+            health.snapshot().await.readiness,
+            crate::runtime::Readiness::Ready
+        );
+        assert_eq!(*cause.lock().unwrap(), Some("persistence-or-fence-refused"));
+        assert!(handle.shutdown().await.unwrap().is_err());
+        assert_eq!(sender.calls.lock().unwrap().len(), 1);
+        assert_eq!(drain.drain_once().await, Ok(0));
+        assert_eq!(sender.calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn cleanup_deferred_preserves_ack_and_recovers_exactly_once() {
+        let (_t, drain, sender, pool) = fixture(vec![]).await;
+
+        sqlx::query(
+            "CREATE TRIGGER fail_final_cleanup BEFORE UPDATE ON acp_output_sets \
+             WHEN NEW.state='cleaned' AND OLD.state='cleaning' AND OLD.set_id='set' \
+             BEGIN SELECT RAISE(ABORT,'injected cleanup failure'); END",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let captured = crate::test_diagnostics::Capture::default();
+        let result = drain
+            .drain_once()
+            .with_subscriber(captured.subscriber())
+            .await;
+        assert_eq!(result, Ok(1));
+        let output = captured.output();
+        assert!(
+            output.contains("finish-cleanup") && output.contains("cleanup deferred"),
+            "{output}"
+        );
+
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "cleaning");
+
+        let quota: (i64, i64) = sqlx::query_as(
+            "SELECT reserved_bytes, landed_bytes FROM acp_output_quota WHERE singleton=1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(quota, (0, 10));
+
+        let seg_states: Vec<String> = sqlx::query_scalar(
+            "SELECT state FROM acp_output_segments WHERE set_id='set' ORDER BY segment_index",
+        )
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        assert_eq!(seg_states, vec!["landed", "landed"]);
+
+        assert_eq!(sender.calls.lock().unwrap().len(), 3);
+
+        drain
+            .store
+            .create_set(&OutputSetInput {
+                set_id: "set2",
+                task_id: "task",
+                attempt: 1,
+                turn: 2,
+                runtime_fence: "f",
+                room_id: "!r:x",
+                thread_root: Some("$t"),
+                reply_event_id: Some("$e"),
+                now: "n",
+            })
+            .await
+            .unwrap();
+        drain
+            .spool
+            .publish("set2", "o2", b"xyz", "n")
+            .await
+            .unwrap();
+        sqlx::query("UPDATE acp_output_sets SET state='sealed' WHERE set_id='set2'")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        assert_eq!(drain.drain_once().await, Ok(1));
+
+        let state2: String =
+            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set2'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state2, "cleaned");
+
+        let state1: String =
+            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state1, "cleaning");
+
+        sqlx::query("DROP TRIGGER fail_final_cleanup")
+            .execute(&pool)
+            .await
+            .unwrap();
+
+        let now = Utc::now().to_rfc3339();
+        let segments = drain.store.begin_cleanup("set", &now).await.unwrap();
+        drain.spool.cleanup_files("set", &segments).unwrap();
+        drain.store.finish_cleanup("set", &now).await.unwrap();
+
+        let state1: String =
+            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state1, "cleaned");
+
+        let quota: (i64, i64) = sqlx::query_as(
+            "SELECT reserved_bytes, landed_bytes FROM acp_output_quota WHERE singleton=1",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(quota, (0, 0));
+
+        let sets = drain.store.cleanup_sets().await.unwrap();
+        assert!(sets.is_empty());
+
+        assert_eq!(sender.calls.lock().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn cleanup_fatal_paths_do_not_become_deferred() {
+        // Part 1: fence drift — set is no longer in 'cleaning', so the final
+        // UPDATE matches 0 rows and returns Conflict (not CleanupDeferred).
+        {
+            let (_t, drain, _sender, pool) = fixture(vec![]).await;
+            assert_eq!(drain.drain_once().await, Ok(1));
+            sqlx::query("UPDATE acp_output_sets SET state='delivered' WHERE set_id='set'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let now = Utc::now().to_rfc3339();
+            let result = drain.store.finish_cleanup("set", &now).await;
+            assert!(
+                matches!(result, Err(OutputStoreError::Conflict)),
+                "expected Conflict for fence drift, got {result:?}"
+            );
+            let state: String =
+                sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(state, "delivered");
+        }
+
+        // Part 2: commit failure — a separate connection holds a SHARED lock so
+        // BEGIN IMMEDIATE (RESERVED) succeeds but COMMIT (EXCLUSIVE) fails with
+        // SQLITE_BUSY, returning Sql (not CleanupDeferred).
+        {
+            let root =
+                std::env::temp_dir().join(format!("t051-fatal-commit-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir(&root).unwrap();
+            let _temp = Temp(root.clone());
+            let db_path = root.join("state.db");
+            let pool = SqlitePoolOptions::new()
+                .connect_with(
+                    SqliteConnectOptions::new()
+                        .filename(&db_path)
+                        .create_if_missing(true)
+                        .journal_mode(SqliteJournalMode::Delete)
+                        .foreign_keys(true),
+                )
+                .await
+                .unwrap();
+            crate::storage::migrate(&pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO conversations(conversation_id,participants_json) \
+                 VALUES('conversation','[]')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,\
+                 text,priority,depth,hops,version) \
+                 VALUES('task','task','from','to','conversation','text',1,0,0,0)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let policy = DurableOutputPolicy::derive(&db_path, 64).unwrap();
+            let store = OutputSpoolStore::new(pool.clone(), policy.process_quota_bytes).unwrap();
+            store
+                .create_set(&OutputSetInput {
+                    set_id: "set",
+                    task_id: "task",
+                    attempt: 1,
+                    turn: 1,
+                    runtime_fence: "f",
+                    room_id: "!r:x",
+                    thread_root: Some("$t"),
+                    reply_event_id: Some("$e"),
+                    now: "n",
+                })
+                .await
+                .unwrap();
+            let spool = DurableOutputSpool::new(policy, store.clone());
+            spool.publish("set", "o", b"abcdefghij", "n").await.unwrap();
+            sqlx::query("UPDATE acp_output_sets SET state='cleaning' WHERE set_id='set'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let bytes: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(byte_length),0) FROM acp_output_segments \
+                 WHERE set_id='set' AND state='landed'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE acp_output_quota SET landed_bytes=? WHERE singleton=1")
+                .bind(bytes)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            let mut lock = sqlx::SqliteConnection::connect_with(
+                &SqliteConnectOptions::new().filename(&db_path),
+            )
+            .await
+            .unwrap();
+            sqlx::query("BEGIN").execute(&mut lock).await.unwrap();
+            sqlx::query("SELECT count(*) FROM acp_output_sets")
+                .execute(&mut lock)
+                .await
+                .unwrap();
+
+            let now = Utc::now().to_rfc3339();
+            let result = store.finish_cleanup("set", &now).await;
+            assert!(
+                matches!(result, Err(OutputStoreError::Sql(_))),
+                "expected Sql for commit failure, got {result:?}"
+            );
+            let state: String =
+                sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(state, "cleaning");
+        }
+
+        // Part 3: transaction-start failure — a separate connection holds a
+        // RESERVED lock (via BEGIN IMMEDIATE) so the pool's BEGIN IMMEDIATE
+        // fails with SQLITE_BUSY, returning Sql (not CleanupDeferred).
+        {
+            let root =
+                std::env::temp_dir().join(format!("t051-fatal-begin-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir(&root).unwrap();
+            let _temp = Temp(root.clone());
+            let db_path = root.join("state.db");
+            let pool = SqlitePoolOptions::new()
+                .connect_with(
+                    SqliteConnectOptions::new()
+                        .filename(&db_path)
+                        .create_if_missing(true)
+                        .journal_mode(SqliteJournalMode::Delete)
+                        .foreign_keys(true),
+                )
+                .await
+                .unwrap();
+            crate::storage::migrate(&pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO conversations(conversation_id,participants_json) \
+                 VALUES('conversation','[]')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,\
+                 text,priority,depth,hops,version) \
+                 VALUES('task','task','from','to','conversation','text',1,0,0,0)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let policy = DurableOutputPolicy::derive(&db_path, 64).unwrap();
+            let store = OutputSpoolStore::new(pool.clone(), policy.process_quota_bytes).unwrap();
+            store
+                .create_set(&OutputSetInput {
+                    set_id: "set",
+                    task_id: "task",
+                    attempt: 1,
+                    turn: 1,
+                    runtime_fence: "f",
+                    room_id: "!r:x",
+                    thread_root: Some("$t"),
+                    reply_event_id: Some("$e"),
+                    now: "n",
+                })
+                .await
+                .unwrap();
+            let spool = DurableOutputSpool::new(policy, store.clone());
+            spool.publish("set", "o", b"abcdefghij", "n").await.unwrap();
+            sqlx::query("UPDATE acp_output_sets SET state='cleaning' WHERE set_id='set'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let bytes: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(byte_length),0) FROM acp_output_segments \
+                 WHERE set_id='set' AND state='landed'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE acp_output_quota SET landed_bytes=? WHERE singleton=1")
+                .bind(bytes)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            let mut lock = sqlx::SqliteConnection::connect_with(
+                &SqliteConnectOptions::new().filename(&db_path),
+            )
+            .await
+            .unwrap();
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut lock)
+                .await
+                .unwrap();
+
+            let now = Utc::now().to_rfc3339();
+            let result = store.finish_cleanup("set", &now).await;
+            assert!(
+                matches!(result, Err(OutputStoreError::Sql(_))),
+                "expected Sql for begin failure, got {result:?}"
+            );
+            let state: String =
+                sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(state, "cleaning");
+        }
+    }
+}

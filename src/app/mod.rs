@@ -5,9 +5,13 @@ mod dispatcher;
 pub mod gateway_handoff;
 mod health;
 mod ingress;
+mod matrix_recovery;
 mod outbox;
+pub(crate) mod output_drain;
+pub(crate) mod output_projection;
 mod projection;
 mod reload;
+pub(crate) mod required_owner;
 mod retry;
 mod runtime;
 
@@ -29,3 +33,6 @@ pub use reload::{
 };
 pub use retry::DurableRetryAdmission;
 pub use runtime::{AppError, AppRuntime, run_config_with_shutdown};
+
+#[cfg(test)]
+pub(crate) use outbox::completion::finish as test_finish_projection;

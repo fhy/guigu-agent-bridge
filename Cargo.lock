@@ -1160,16 +1160,20 @@ dependencies = [
 
 [[package]]
 name = "guigu-agent-bridge"
-version = "0.2.24"
+version = "0.2.28"
 dependencies = [
  "axum",
  "chrono",
+ "libc",
+ "libsqlite3-sys",
  "matrix-sdk",
+ "matrix-sdk-crypto",
  "reqwest",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "sqlx",
+ "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "toml 1.1.6+spec-1.1.0",

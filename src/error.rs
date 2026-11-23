@@ -15,6 +15,8 @@ pub enum Error {
     /// A bounded command-line result rendered by the binary entry point.
     #[error("cli failure")]
     Cli(CliFailure),
+    #[error("owner binding remediation refusal")]
+    OwnerBinding(crate::owner_binding_remediation::Failure),
     /// The shutdown signal (Ctrl-C) could not be awaited.
     #[error("failed to await shutdown signal: {0}")]
     Shutdown(#[source] std::io::Error),

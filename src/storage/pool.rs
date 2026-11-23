@@ -13,7 +13,7 @@
 //! |--------|-------|-----|
 //! | `journal_mode` | `WAL` | one writer with concurrent readers |
 //! | `foreign_keys` | `ON` | referential integrity is enforced by the database |
-//! | `busy_timeout` | 5 s | writer contention is queued, not failed |
+//! | `busy_timeout` | 15 s | writer contention is queued, not failed |
 //! | `synchronous` | `FULL` | the event store is the source of truth: fsync per commit |
 //! | `create_if_missing` | `true` | a fresh deployment creates the file |
 //! | pool `max_connections` | 5 | WAL serves read concurrency; SQLite has one writer |
@@ -36,11 +36,10 @@ use crate::storage::StorageError;
 
 /// How long a writer waits for the SQLite write lock before failing.
 ///
-/// Every write in this project is a single statement or a short transaction, so
-/// a held lock is measured in microseconds to milliseconds and this value is an
-/// abnormal-path backstop rather than a normal waiting path. It matches the sqlx
-/// default, so no new semantics are introduced.
-pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(5);
+/// FULL durability can hold the writer during a slow fsync: measured commits
+/// exceeded five seconds. Allow bounded transient contention while retaining a
+/// refusal for a continuously held writer; this does not retry transactions.
+pub const DEFAULT_BUSY_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Maximum number of pooled connections.
 ///
@@ -51,6 +50,20 @@ pub const MAX_CONNECTIONS: u32 = 5;
 
 /// The migrations embedded from `migrations/` at compile time.
 static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
+
+pub(crate) fn migration_contract() -> Vec<(i64, String, Vec<u8>)> {
+    MIGRATOR
+        .migrations
+        .iter()
+        .map(|migration| {
+            (
+                migration.version,
+                migration.description.to_string(),
+                migration.checksum.to_vec(),
+            )
+        })
+        .collect()
+}
 
 /// Open (creating if needed) a SQLite pool for `path` with the frozen options.
 ///
@@ -63,7 +76,20 @@ static MIGRATOR: Migrator = sqlx::migrate!("./migrations");
 /// [`StorageError::Open`] when the database file cannot be opened or created,
 /// including when its parent directory does not exist.
 pub async fn connect(path: impl AsRef<Path>) -> Result<SqlitePool, StorageError> {
-    let path = path.as_ref();
+    connect_inner(path.as_ref(), None).await
+}
+
+pub(crate) async fn connect_for_runtime(
+    path: &Path,
+    guard: std::sync::Arc<crate::maintenance_lock::MaintenanceLock>,
+) -> Result<SqlitePool, StorageError> {
+    connect_inner(path, Some(guard)).await
+}
+
+async fn connect_inner(
+    path: &Path,
+    guard: Option<std::sync::Arc<crate::maintenance_lock::MaintenanceLock>>,
+) -> Result<SqlitePool, StorageError> {
     let options = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(true)
@@ -74,6 +100,13 @@ pub async fn connect(path: impl AsRef<Path>) -> Result<SqlitePool, StorageError>
 
     SqlitePoolOptions::new()
         .max_connections(MAX_CONNECTIONS)
+        .after_connect(move |_, _| {
+            let retained = guard.clone();
+            Box::pin(async move {
+                let _retained = retained;
+                Ok(())
+            })
+        })
         .connect_with(options)
         .await
         .map_err(|source| StorageError::Open {
@@ -107,7 +140,7 @@ mod tests {
     fn connection_options_are_frozen() {
         // Pins the values declared in the design gate (D8): a change here is a
         // durability/locking change and must be re-confirmed by Coordinator.
-        assert_eq!(DEFAULT_BUSY_TIMEOUT, Duration::from_secs(5));
+        assert_eq!(DEFAULT_BUSY_TIMEOUT, Duration::from_secs(15));
         assert_eq!(MAX_CONNECTIONS, 5);
     }
 

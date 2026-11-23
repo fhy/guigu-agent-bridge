@@ -1,8 +1,11 @@
 use std::collections::BTreeMap;
 use std::net::SocketAddr;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 use std::sync::Arc;
 
-use axum::extract::{DefaultBodyLimit, Path, State};
+use axum::body::{Body, to_bytes};
+use axum::extract::{Path, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::IntoResponse;
 use axum::routing::{get, post};
@@ -10,7 +13,8 @@ use axum::{Json, Router};
 use serde_json::Value;
 use tokio::net::TcpListener;
 
-use super::wire::{AgentCard, JsonRpcError, JsonRpcRequest, JsonRpcResponse};
+use super::server_response::{classify, failure_response, method_class, terminal_event};
+use super::wire::{AgentCard, JsonRpcRequest, JsonRpcResponse};
 use super::{A2aError, ListenPolicy, validate_listener};
 
 pub type HandlerFuture<'a> =
@@ -56,6 +60,8 @@ pub struct A2aServerHandle {
     stop: Option<tokio::sync::oneshot::Sender<()>>,
     owner: tokio::task::JoinHandle<std::io::Result<()>>,
     unix_path: Option<(std::path::PathBuf, u64)>,
+    local_addr: Option<SocketAddr>,
+    listener_inode: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -63,6 +69,7 @@ struct ServerState {
     card: AgentCard,
     peers: BTreeMap<String, PeerAccess>,
     handler: Arc<dyn A2aHandler>,
+    max_body_bytes: usize,
 }
 
 impl A2aServer {
@@ -83,11 +90,11 @@ impl A2aServer {
             card: config.card,
             peers: config.peers,
             handler,
+            max_body_bytes: config.max_body_bytes,
         };
         let router = Router::new()
             .route("/.well-known/agent-card.json", get(card))
             .route("/a2a/{endpoint}/rpc", post(rpc))
-            .layer(DefaultBodyLimit::max(config.max_body_bytes))
             .with_state(state);
         Ok(Self {
             listener: ServerListener::Tcp(listener),
@@ -122,11 +129,11 @@ impl A2aServer {
             card: config.card,
             peers: config.peers,
             handler,
+            max_body_bytes: config.max_body_bytes,
         };
         let router = Router::new()
             .route("/.well-known/agent-card.json", get(card))
             .route("/a2a/{endpoint}/rpc", post(rpc))
-            .layer(DefaultBodyLimit::max(config.max_body_bytes))
             .with_state(state);
         Ok(Self {
             listener: ServerListener::Unix(listener),
@@ -155,6 +162,12 @@ impl A2aServer {
 
     pub fn start(self) -> A2aServerHandle {
         let (stop, stopped) = tokio::sync::oneshot::channel();
+        let local_addr = self.local_addr().ok();
+        let listener_inode = match &self.listener {
+            ServerListener::Tcp(listener) => socket_inode(listener),
+            #[cfg(unix)]
+            ServerListener::Unix(_) => None,
+        };
         let unix_path = self.unix_path;
         let owner = tokio::spawn(async move {
             match self.listener {
@@ -179,11 +192,21 @@ impl A2aServer {
             stop: Some(stop),
             owner,
             unix_path,
+            local_addr,
+            listener_inode,
         }
     }
 }
 
 impl A2aServerHandle {
+    pub fn local_addr(&self) -> Option<SocketAddr> {
+        self.local_addr
+    }
+
+    pub fn listener_inode(&self) -> Option<u64> {
+        self.listener_inode
+    }
+
     pub async fn shutdown(mut self) -> Result<(), A2aError> {
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
@@ -207,80 +230,131 @@ impl A2aServerHandle {
     }
 }
 
+#[cfg(unix)]
+fn socket_inode(listener: &TcpListener) -> Option<u64> {
+    let link = std::fs::read_link(format!("/proc/self/fd/{}", listener.as_raw_fd())).ok()?;
+    let text = link.to_string_lossy();
+    text.strip_prefix("socket:[")?
+        .strip_suffix(']')?
+        .parse()
+        .ok()
+}
+
+#[cfg(not(unix))]
+fn socket_inode(_listener: &TcpListener) -> Option<u64> {
+    None
+}
+
 async fn card(State(state): State<ServerState>) -> Json<AgentCard> {
     Json(state.card)
+}
+
+fn authorized_request(
+    state: &ServerState,
+    endpoint: &str,
+    headers: &HeaderMap,
+    bytes: &[u8],
+    correlation: uuid::Uuid,
+) -> Result<(String, JsonRpcRequest), Box<axum::response::Response>> {
+    let Some((peer, access)) = state.peers.iter().find(|(_, access)| {
+        headers
+            .get(axum::http::header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            == Some(&format!("Bearer {}", access.token.expose()))
+    }) else {
+        return Err(Box::new(failure_response(
+            correlation,
+            Value::Null,
+            "other",
+            crate::a2a::IngressFailure::new(
+                crate::a2a::IngressStage::Authentication,
+                crate::a2a::IngressCause::AuthenticationFailed,
+                crate::a2a::Retryability::CredentialsChange,
+            ),
+        )));
+    };
+    if !access.allowed_endpoints.contains(endpoint) {
+        return Err(Box::new(failure_response(
+            correlation,
+            Value::Null,
+            "other",
+            crate::a2a::IngressFailure::new(
+                crate::a2a::IngressStage::Authorization,
+                crate::a2a::IngressCause::TargetUnavailable,
+                crate::a2a::Retryability::PolicyChange,
+            ),
+        )));
+    }
+    let request = serde_json::from_slice(bytes).map_err(|_| {
+        Box::new(failure_response(
+            correlation,
+            Value::Null,
+            "other",
+            crate::a2a::IngressFailure::new(
+                crate::a2a::IngressStage::RpcEnvelope,
+                crate::a2a::IngressCause::MalformedJson,
+                crate::a2a::Retryability::Never,
+            ),
+        ))
+    })?;
+    Ok((peer.clone(), request))
 }
 
 async fn rpc(
     State(state): State<ServerState>,
     Path(endpoint): Path<String>,
     headers: HeaderMap,
-    Json(request): Json<JsonRpcRequest>,
+    body: Body,
 ) -> impl IntoResponse {
-    let Some((peer, access)) = state.peers.iter().find(|(_, access)| {
-        headers
-            .get(axum::http::header::AUTHORIZATION)
-            .and_then(|v| v.to_str().ok())
-            == Some(&format!("Bearer {}", access.token.expose()))
-    }) else {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(error(request.id, -32001, "unauthorized")),
-        )
-            .into_response();
+    let correlation = uuid::Uuid::now_v7();
+    let bytes = match to_bytes(body, state.max_body_bytes).await {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return failure_response(
+                correlation,
+                Value::Null,
+                "other",
+                crate::a2a::IngressFailure::new(
+                    crate::a2a::IngressStage::HttpBody,
+                    crate::a2a::IngressCause::BodyTooLarge,
+                    crate::a2a::Retryability::Never,
+                ),
+            );
+        }
     };
-    if !access.allowed_endpoints.contains(&endpoint) {
-        return (
-            StatusCode::UNAUTHORIZED,
-            Json(error(request.id, -32001, "unauthorized")),
-        )
-            .into_response();
-    }
+    let (peer, request) = match authorized_request(&state, &endpoint, &headers, &bytes, correlation)
+    {
+        Ok(value) => value,
+        Err(response) => return *response,
+    };
+    let method_class = method_class(&request.method);
     if request.jsonrpc != "2.0" {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(error(request.id, -32600, "invalid request")),
-        )
-            .into_response();
+        return failure_response(
+            correlation,
+            request.id,
+            method_class,
+            crate::a2a::IngressFailure::new(
+                crate::a2a::IngressStage::RpcEnvelope,
+                crate::a2a::IngressCause::InvalidParams,
+                crate::a2a::Retryability::Never,
+            ),
+        );
     }
     let id = request.id.clone();
-    match state.handler.handle(peer, &endpoint, request).await {
-        Ok(value) => (
-            StatusCode::OK,
-            Json(JsonRpcResponse {
-                jsonrpc: "2.0".into(),
-                id,
-                result: Some(value),
-                error: None,
-            }),
-        )
-            .into_response(),
-        Err(A2aError::Unsupported) => (
-            StatusCode::OK,
-            Json(error(id, -32601, "method not supported")),
-        )
-            .into_response(),
-        Err(A2aError::TooLarge) => (
-            StatusCode::PAYLOAD_TOO_LARGE,
-            Json(error(id, -32002, "request too large")),
-        )
-            .into_response(),
-        Err(_) => (
-            StatusCode::BAD_REQUEST,
-            Json(error(id, -32602, "invalid params")),
-        )
-            .into_response(),
-    }
-}
-
-fn error(id: Value, code: i32, message: &'static str) -> JsonRpcResponse {
-    JsonRpcResponse {
-        jsonrpc: "2.0".into(),
-        id,
-        result: None,
-        error: Some(JsonRpcError {
-            code,
-            message: message.into(),
-        }),
+    match state.handler.handle(&peer, &endpoint, request).await {
+        Ok(value) => {
+            terminal_event(correlation, method_class, None, StatusCode::OK, 0);
+            (
+                StatusCode::OK,
+                Json(JsonRpcResponse {
+                    jsonrpc: "2.0".into(),
+                    id,
+                    result: Some(value),
+                    error: None,
+                }),
+            )
+                .into_response()
+        }
+        Err(error) => failure_response(correlation, id, method_class, classify(error)),
     }
 }

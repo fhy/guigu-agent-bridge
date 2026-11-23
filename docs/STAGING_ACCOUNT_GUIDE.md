@@ -1,76 +1,50 @@
 # Staging Matrix Account Guide
 
-Staging accounts are isolated test identities for development and recovery
-rehearsals. They must never share a production access token, device, room,
-database, crypto store, session directory, or ACP credential.
+Staging identities must not share production tokens, devices, rooms, databases,
+crypto stores, session directories or ACP credentials. Roles are selected by
+the task, not inferred from service names.
 
-## Account Roles
+## Account roles
 
-Create roles only when a test requires them:
+| Role | Intended use | Example identity |
+|---|---|---|
+| primary | Normal sync, routing, restart and readiness | `@bridge-staging:example.test` |
+| failure | Authentication, timeout and recovery fixtures | `@bridge-staging-failure:example.test` |
+| reviewer | Multi-user permissions and review routing | `@bridge-staging-reviewer:example.test` |
+| observer | Test-only monitoring and alerts | `@bridge-staging-observer:example.test` |
 
-| Role | Intended use |
-|---|---|
-| `primary` | Normal sync, E2EE, restart, readiness, and smoke tests |
-| `failure` | Authentication, timeout, retry, and recovery injection |
-| `reviewer` | Multi-user permissions and review routing |
-| `observer` | Observer-only monitoring and alert tests |
+These are examples, not actual account assignments. Private task records select
+the homeserver, participating identities, room/state roots and budgets. A role
+named observer is not permission to access an existing production Observer.
 
-The standard account set is:
+## Isolation and secrets
 
-| Role | Standard user ID |
-|---|---|
-| `primary` | `@bridge-staging:example.test` |
-| `failure` | `@bridge-staging-failure:example.test` |
-| `reviewer` | `@bridge-staging-reviewer:example.test` |
-| `observer` | `@bridge-staging-observer:example.test` |
+Use separate devices/stores and assigned test state for each participant. Store
+secrets in a restricted local provider or mode0600 environment file. A fixed
+test process may consume assigned material privately; do not print, copy into
+handoffs or commit passwords, tokens, signing keys or crypto-store contents.
+Record only necessary non-secret references, role, categories and counts.
 
-Deployments replace `example.test` with the approved staging homeserver. The
-identifiers are documentation examples; the private registry holds actual IDs.
+Preserve existing device keys. A fresh local store does not by itself authorize
+overwriting a remote device's crypto keys. Session/device setup must follow the
+task's contract. Historical unknown-retained tuples are not reusable test inputs.
 
-Every task must select roles explicitly. A bounded scenario may use multiple assigned
-roles to exchange messages automatically; Agents must not select unassigned accounts
-or infer a production identity.
+## Bounded lifecycle
 
-## Isolation And Credentials
+The Project Controller records the environment, assigned accounts/room, message
+and timeout budgets, retry policy, cleanup/retention and production exclusions.
+Reversible setup within that continuing authorization does not require a new
+approval for each action. Account deletion, unrelated history/membership changes
+and production authentication changes are not implied by staging testing.
 
-Each role has its own Matrix user, device, room membership, access token, crypto
-store, SQLite database, session root, and logs. Store credentials in a local
-secret manager or a mode `0600` environment file. Record only the user ID, role,
-non-secret storage references, and lifecycle status in documentation.
+Prefer automated account-to-account tests. Private test rooms may include only
+the assigned participants. Record whether the room is encrypted: basic routing
+in an unencrypted room does not establish E2EE acceptance. A failed or ambiguous
+send closes the attempt; diagnose before any explicitly permitted new attempt,
+and never silently reset issuance/send budgets or retry an ambiguous operation.
 
-Never document passwords, access tokens, signing keys, crypto-store contents,
-database contents, or production room identifiers.
-
-## Lifecycle
-
-The Coordinator assigns the role and test room in the task specification. The
-Operator creates or disables the account using the homeserver administration
-interface. The Developer uses only the assigned role and its isolated paths. A
-reset may stop the staging service and recreate staging state, but must reject
-production paths. The Reviewer verifies account, room, database, and crypto-store
-separation before accepting evidence.
-
-## Multi-Account Scenarios
-
-Prefer automated account-to-account testing over using an Operator as the message
-transport. A scenario may create private test rooms, invite its assigned identities and
-send a bounded sequence through sender, bridge, observer and reviewer roles. The task
-records maximum accounts, rooms, messages, duration and retry count before execution.
-
-The default retry count is zero. A failed or ambiguous message stops the scenario unless
-the specification explicitly permits another uniquely marked attempt. Tests verify
-only redacted event counts, lifecycle states and delivery outcomes; they do not record
-message bodies or Matrix identifiers.
-
-## User-Assisted Fallback
-
-If automated identities cannot cover Element behavior, device verification,
-cross-signing, notifications or another real-client property, the Operator may invite
-the user into a named test room. The user is asked for a bounded action such as sending
-one marked message or confirming a displayed result. This does not make the test room
-production.
-
-Do not inspect unrelated room history, invite unrelated real users, alter unrelated
-room permissions or automatically repeat a user-assisted message. See
-[Environment And Matrix Testing](ENVIRONMENT_AND_MATRIX_TESTING.md) for the environment
-classification and escalation rules.
+Report owned-process cleanup separately from file/session/room history residue.
+Do not delete unrelated accounts or rooms to claim zero residue. User-assisted
+Element/device-verification checks are optional when automation cannot cover
+that client property; ask for a bounded action in the assigned test room only.
+See [Environment and Matrix Testing](ENVIRONMENT_AND_MATRIX_TESTING.md).

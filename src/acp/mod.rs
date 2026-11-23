@@ -60,9 +60,19 @@ pub mod client;
 pub mod error;
 pub mod framing;
 pub mod jsonrpc;
+pub(crate) mod output;
+mod output_files;
+pub(crate) mod output_policy;
+#[cfg(test)]
+mod output_process_rows;
+mod output_stream;
+#[cfg(test)]
+mod output_tests;
 pub mod result;
 pub mod schema;
 pub mod session;
+mod spawn_gate;
+pub(crate) use spawn_gate::JoinedChildren;
 pub mod transport;
 
 mod dispatcher;
@@ -75,6 +85,7 @@ pub use jsonrpc::{JsonRpcErrorObject, JsonRpcMessage, ProtocolError, RequestId};
 pub use result::{TurnResult, WireTurnResult};
 pub use schema::PROTOCOL_VERSION;
 pub use session::{MAX_SESSION_ID_BYTES, SessionState, SqliteSessionStore, StoredSession};
+pub(crate) use transport::AcpSpawnGate;
 pub use transport::{AcpTransport, AcpTurnHandle, CompletedRequest, TransportLimits, TurnUpdate};
 
 /// How much of any single self-authored detail string is retained.

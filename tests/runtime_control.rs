@@ -4,12 +4,13 @@ use chrono::{DateTime, Utc};
 use guigu_agent_bridge::{
     bus::derive_endpoint_id,
     models::{DeliveryId, TaskId},
+    offline_recovery::{RecoveryError, RecoveryOutcome, recover_stale_runtime},
     runtime::{
         AcquireOutcome, ContinuationPolicy, ContinuationState, Degradation, ExecutionResourceKey,
         Lease, Metric, PolicyLimit, Readiness, ReleaseDisposition, RuntimeError, RuntimeMetrics,
         SqliteRuntimeStore, WorkspaceId, health_snapshot,
     },
-    storage::{connect, migrate},
+    storage::{RecoveryDiagnostic, RecoveryFixture, RecoveryPlan, connect, migrate},
 };
 
 fn at() -> DateTime<Utc> {
@@ -716,6 +717,99 @@ async fn restart_snapshot_separates_ready_from_ambiguous_without_replay() {
     let snapshot = store.recovery_snapshot(at(), 8).await.unwrap();
     assert!(snapshot.ready.is_empty());
     assert_eq!(snapshot.ambiguous, vec![db.task]);
+    db.close().await;
+}
+
+#[tokio::test]
+async fn sqlite_cas_facts_drive_ambiguous_recovery_block() {
+    let db = Db::new().await;
+    let store = SqliteRuntimeStore::new(db.pool.clone());
+    let lease = match store
+        .acquire(key(), db.task, at(), Duration::from_secs(30))
+        .await
+        .unwrap()
+    {
+        AcquireOutcome::Acquired(value) => value,
+        _ => panic!("acquire"),
+    };
+    store
+        .begin_continuation(&lease, db.delivery, "durable", at())
+        .await
+        .unwrap();
+    let continuation = store.continuation(db.task).await.unwrap().unwrap();
+    store
+        .claim_turn(&lease, continuation.revision, at())
+        .await
+        .unwrap();
+    let owner_token = "t050-owner-proof-v1";
+    let process_fingerprint = "t050-process-proof-v1";
+    sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES(?,?,?,?,?)")
+        .bind(owner_token)
+        .bind(at().to_rfc3339())
+        .bind(at().to_rfc3339())
+        .bind("active")
+        .bind(process_fingerprint)
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let recovery = recover_stale_runtime(
+        &db.path,
+        owner_token,
+        process_fingerprint,
+        "2026-09-17T12:01:00Z",
+    )
+    .await;
+    assert!(matches!(recovery, Err(RecoveryError::WorkPresent)));
+    assert!(!matches!(recovery, Ok(RecoveryOutcome::Recovered)));
+    let snapshot = store.recovery_snapshot(at(), 8).await.unwrap();
+    let counts = store.counts_at(at()).await.unwrap();
+    assert_eq!(snapshot.ambiguous, vec![db.task]);
+    let signals = RecoveryFixture::from_runtime_facts(
+        true,
+        false,
+        &RecoveryPlan::default(),
+        &snapshot,
+        &counts,
+    );
+    let diagnostic = RecoveryDiagnostic::classify(signals);
+    assert_eq!(diagnostic.status, 3);
+    assert_eq!(
+        diagnostic.blocker.map(|b| b.name()),
+        Some("runtime-ambiguous")
+    );
+    db.close().await;
+}
+
+#[tokio::test]
+async fn recovery_cas_fingerprint_mismatch_stays_blocked_without_takeover() {
+    let db = Db::new().await;
+    let owner = "pid:4294967295";
+    sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES(?,?,?,?,?)")
+        .bind(owner)
+        .bind(at().to_rfc3339())
+        .bind(at().to_rfc3339())
+        .bind("active")
+        .bind("pid:4294967295")
+        .execute(&db.pool)
+        .await
+        .unwrap();
+    let result = guigu_agent_bridge::offline_recovery::recover_stale_runtime(
+        &db.path,
+        owner,
+        "pid:wrong-fingerprint",
+        "2026-09-17T12:01:00Z",
+    )
+    .await;
+    assert!(matches!(result, Err(RecoveryError::OwnerIdentity)));
+    let (state, fingerprint): (String, String) = sqlx::query_as(
+        "SELECT state,process_fingerprint FROM runtime_instances WHERE instance_token=?",
+    )
+    .bind(owner)
+    .fetch_one(&db.pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "active");
+    assert_eq!(fingerprint, "pid:4294967295");
     db.close().await;
 }
 

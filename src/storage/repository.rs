@@ -80,6 +80,7 @@ use crate::storage::codec::{
     encode_json, encode_optional_timestamp, encode_priority, encode_status, encode_timestamp,
     encode_transport, encode_u32, encode_u64,
 };
+use crate::storage::recovery_eligibility::{RecoveryScope, writer as eligibility};
 
 /// A boxed, `Send` future returned by [`Repository`] methods.
 ///
@@ -383,12 +384,23 @@ pub enum AckOutcome {
 #[derive(Debug, Clone)]
 pub struct SqliteRepository {
     pool: SqlitePool,
+    recovery: Option<RecoveryScope>,
 }
 
 impl SqliteRepository {
     /// Wrap an opened, migrated pool.
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            recovery: None,
+        }
+    }
+
+    pub fn with_recovery(pool: SqlitePool, recovery: RecoveryScope) -> Self {
+        Self {
+            pool,
+            recovery: Some(recovery),
+        }
     }
 
     /// Insert a task row and its first event **atomically**.
@@ -435,7 +447,7 @@ impl SqliteRepository {
             });
         }
 
-        let mut transaction = self.pool.begin().await.map_err(StorageError::from)?;
+        let mut transaction = eligibility::begin(&self.pool, self.recovery.as_ref()).await?;
 
         if let Err(error) = insert_task_row(&mut *transaction, task).await {
             match classify_task_duplicate(&mut *transaction, task, error).await? {
@@ -443,12 +455,24 @@ impl SqliteRepository {
                 DuplicateVerdict::Propagate(error) => return Err(error),
             }
         }
+        eligibility::inserted(
+            &mut transaction,
+            self.recovery.as_ref(),
+            &eligibility::text_identity("tasks", &encode_id(task.task_id))?,
+        )
+        .await?;
         if let Err(error) = insert_event_row(&mut *transaction, event).await {
             match classify_event_duplicate(&mut *transaction, event, error).await? {
                 DuplicateVerdict::Replay => {}
                 DuplicateVerdict::Propagate(error) => return Err(error),
             }
         }
+        eligibility::inserted(
+            &mut transaction,
+            self.recovery.as_ref(),
+            &eligibility::text_identity("task_events", &encode_id(event.id))?,
+        )
+        .await?;
 
         transaction.commit().await.map_err(StorageError::from)
     }
@@ -529,6 +553,24 @@ impl Repository for SqliteRepository {
         Box::pin(async move {
             let address = encode_json(&endpoint.address, "agents.address_json")?;
             let capabilities = encode_json(&endpoint.capabilities, "agents.capabilities_json")?;
+            let mut transaction = eligibility::begin(&self.pool, self.recovery.as_ref()).await?;
+            let identity = eligibility::text_identity("agents", &encode_id(endpoint.id))?;
+            let existing = sqlx::query("SELECT endpoint_id,agent_id,transport,enabled,address_json,capabilities_json FROM agents WHERE endpoint_id=?")
+                .bind(encode_id(endpoint.id)).fetch_optional(&mut *transaction).await?;
+            let mutation = if let Some(row) = existing {
+                if row.try_get::<&str, _>("agent_id")? == agent_id
+                    && row.try_get::<Option<&str>, _>("address_json")?.is_some()
+                    && agent_from_row(&row)? == *endpoint
+                {
+                    eligibility::route(&mut transaction, self.recovery.as_ref(), &identity).await?;
+                    transaction.commit().await?;
+                    return Ok(());
+                }
+                eligibility::prepare_mutation(&mut transaction, self.recovery.as_ref(), &identity)
+                    .await?
+            } else {
+                None
+            };
             let result = sqlx::query(UPSERT_AGENT)
                 .bind(encode_id(endpoint.id))
                 .bind(agent_id)
@@ -536,10 +578,22 @@ impl Repository for SqliteRepository {
                 .bind(encode_bool(endpoint.enabled))
                 .bind(address)
                 .bind(capabilities)
-                .execute(&self.pool)
+                .execute(&mut *transaction)
                 .await
                 .map_err(StorageError::from)?;
             if result.rows_affected() == 1 {
+                if mutation.is_some() {
+                    eligibility::complete_mutation(
+                        &mut transaction,
+                        self.recovery.as_ref(),
+                        mutation,
+                    )
+                    .await?;
+                } else {
+                    eligibility::inserted(&mut transaction, self.recovery.as_ref(), &identity)
+                        .await?;
+                }
+                transaction.commit().await?;
                 return Ok(());
             }
             // The `agent_id` is already mapped to a different endpoint identity.
@@ -592,16 +646,25 @@ impl Repository for SqliteRepository {
                 &conversation.participants,
                 "conversations.participants_json",
             )?;
+            let mut transaction = eligibility::begin(&self.pool, self.recovery.as_ref()).await?;
             let error = match sqlx::query(INSERT_CONVERSATION)
                 .bind(encode_id(conversation.id))
                 .bind(transport)
                 .bind(external_id)
                 .bind(thread_ref)
                 .bind(participants)
-                .execute(&self.pool)
+                .execute(&mut *transaction)
                 .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    eligibility::inserted(
+                        &mut transaction,
+                        self.recovery.as_ref(),
+                        &eligibility::text_identity("conversations", &encode_id(conversation.id))?,
+                    )
+                    .await?;
+                    return transaction.commit().await.map_err(StorageError::from);
+                }
                 Err(error) => StorageError::from(error),
             };
             if !matches!(error, StorageError::Duplicate { .. }) {
@@ -611,8 +674,21 @@ impl Repository for SqliteRepository {
             // merely *shares* the external reference with the requested one is
             // deliberately not a replay: the caller's id was not persisted, so it
             // must read the winner back and reconcile (`conversation_by_external_ref`).
-            match self.select_conversation_row(conversation.id).await? {
-                Some(stored) if stored == *conversation => Ok(()),
+            let row = sqlx::query(SELECT_CONVERSATION)
+                .bind(encode_id(conversation.id))
+                .fetch_optional(&mut *transaction)
+                .await?;
+            let stored = row.as_ref().map(conversation_from_row).transpose()?;
+            match stored {
+                Some(stored) if stored == *conversation => {
+                    eligibility::inserted(
+                        &mut transaction,
+                        self.recovery.as_ref(),
+                        &eligibility::text_identity("conversations", &encode_id(conversation.id))?,
+                    )
+                    .await?;
+                    transaction.commit().await.map_err(StorageError::from)
+                }
                 _ => Err(StorageError::Duplicate {
                     detail: "conversations external reference".to_owned(),
                 }),
@@ -660,6 +736,7 @@ impl Repository for SqliteRepository {
     ) -> StorageFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
             let metadata = encode_json(&message.metadata, "messages.metadata_json")?;
+            let mut transaction = eligibility::begin(&self.pool, self.recovery.as_ref()).await?;
             let error = match sqlx::query(INSERT_MESSAGE)
                 .bind(encode_id(message.id))
                 .bind(encode_id(message.conversation))
@@ -668,17 +745,38 @@ impl Repository for SqliteRepository {
                 .bind(message.body.as_str())
                 .bind(message.reply_to.map(encode_id))
                 .bind(metadata)
-                .execute(&self.pool)
+                .execute(&mut *transaction)
                 .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    eligibility::inserted(
+                        &mut transaction,
+                        self.recovery.as_ref(),
+                        &eligibility::text_identity("messages", &encode_id(message.id))?,
+                    )
+                    .await?;
+                    return transaction.commit().await.map_err(StorageError::from);
+                }
                 Err(error) => StorageError::from(error),
             };
             if !matches!(error, StorageError::Duplicate { .. }) {
                 return Err(error);
             }
-            match select_message_row(&self.pool, message.id).await? {
-                Some(stored) if stored == *message => Ok(()),
+            let row = sqlx::query(SELECT_MESSAGE)
+                .bind(encode_id(message.id))
+                .fetch_optional(&mut *transaction)
+                .await?;
+            let stored = row.as_ref().map(message_from_row).transpose()?;
+            match stored {
+                Some(stored) if stored == *message => {
+                    eligibility::inserted(
+                        &mut transaction,
+                        self.recovery.as_ref(),
+                        &eligibility::text_identity("messages", &encode_id(message.id))?,
+                    )
+                    .await?;
+                    transaction.commit().await.map_err(StorageError::from)
+                }
                 _ => Err(StorageError::Duplicate {
                     detail: "messages.message_id".to_owned(),
                 }),
@@ -712,13 +810,20 @@ impl Repository for SqliteRepository {
         task: &'a AgentTask,
     ) -> StorageFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
-            match insert_task_row(&self.pool, task).await {
-                Ok(()) => Ok(()),
-                Err(error) => match classify_task_duplicate(&self.pool, task, error).await? {
-                    DuplicateVerdict::Replay => Ok(()),
-                    DuplicateVerdict::Propagate(error) => Err(error),
-                },
+            let mut transaction = eligibility::begin(&self.pool, self.recovery.as_ref()).await?;
+            if let Err(error) = insert_task_row(&mut *transaction, task).await {
+                match classify_task_duplicate(&mut *transaction, task, error).await? {
+                    DuplicateVerdict::Replay => {}
+                    DuplicateVerdict::Propagate(error) => return Err(error),
+                }
             }
+            eligibility::inserted(
+                &mut transaction,
+                self.recovery.as_ref(),
+                &eligibility::text_identity("tasks", &encode_id(task.task_id))?,
+            )
+            .await?;
+            transaction.commit().await.map_err(StorageError::from)
         })
     }
 
@@ -758,13 +863,26 @@ impl Repository for SqliteRepository {
         event: &'a TaskEvent,
     ) -> StorageFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
-            match insert_event_row(&self.pool, event).await {
-                Ok(()) => Ok(()),
-                Err(error) => match classify_event_duplicate(&self.pool, event, error).await? {
-                    DuplicateVerdict::Replay => Ok(()),
-                    DuplicateVerdict::Propagate(error) => Err(error),
-                },
+            let mut transaction = eligibility::begin(&self.pool, self.recovery.as_ref()).await?;
+            eligibility::require(
+                &mut transaction,
+                self.recovery.as_ref(),
+                &eligibility::text_identity("tasks", &encode_id(event.task_id))?,
+            )
+            .await?;
+            if let Err(error) = insert_event_row(&mut *transaction, event).await {
+                match classify_event_duplicate(&mut *transaction, event, error).await? {
+                    DuplicateVerdict::Replay => {}
+                    DuplicateVerdict::Propagate(error) => return Err(error),
+                }
             }
+            eligibility::inserted(
+                &mut transaction,
+                self.recovery.as_ref(),
+                &eligibility::text_identity("task_events", &encode_id(event.id))?,
+            )
+            .await?;
+            transaction.commit().await.map_err(StorageError::from)
         })
     }
 
@@ -814,20 +932,29 @@ impl Repository for SqliteRepository {
                 })?;
             debug_assert!(next > expected_version);
 
+            let mut transaction = eligibility::begin(&self.pool, self.recovery.as_ref()).await?;
+            let identity = eligibility::text_identity("tasks", &encode_id(task_id))?;
+            let mutation =
+                eligibility::prepare_mutation(&mut transaction, self.recovery.as_ref(), &identity)
+                    .await?;
             let row = sqlx::query(UPDATE_VERSION_IF_CURRENT)
                 .bind(encode_id(task_id))
                 .bind(encode_u64(expected_version, "tasks.version")?)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *transaction)
                 .await
                 .map_err(StorageError::from)?;
             if let Some(row) = row {
-                return decode_u64(integer(&row, "version")?, "tasks.version");
+                let version = decode_u64(integer(&row, "version")?, "tasks.version")?;
+                eligibility::complete_mutation(&mut transaction, self.recovery.as_ref(), mutation)
+                    .await?;
+                transaction.commit().await?;
+                return Ok(version);
             }
             // No row updated: either the task is unknown or the version moved. The
             // conditional `WHERE` is what makes this a lost-update-free compare.
             let stored = sqlx::query_scalar::<_, i64>(SELECT_TASK_VERSION)
                 .bind(encode_id(task_id))
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *transaction)
                 .await
                 .map_err(StorageError::from)?;
             match stored {
@@ -848,6 +975,15 @@ impl Repository for SqliteRepository {
     ) -> StorageFuture<'a, Result<(), StorageError>> {
         Box::pin(async move {
             let acknowledged = encode_optional_timestamp(delivery.acknowledged_at().as_ref());
+            let mut transaction = eligibility::begin(&self.pool, self.recovery.as_ref()).await?;
+            let identity =
+                eligibility::text_identity("deliveries", &encode_id(delivery.delivery_id()))?;
+            eligibility::require(
+                &mut transaction,
+                self.recovery.as_ref(),
+                &eligibility::text_identity("tasks", &encode_id(delivery.task_id()))?,
+            )
+            .await?;
             let error = match sqlx::query(INSERT_DELIVERY)
                 .bind(encode_id(delivery.delivery_id()))
                 .bind(encode_id(delivery.task_id()))
@@ -855,27 +991,40 @@ impl Repository for SqliteRepository {
                 .bind(encode_id(delivery.target()))
                 .bind(encode_timestamp(&delivery.dispatched_at()))
                 .bind(acknowledged)
-                .execute(&self.pool)
+                .execute(&mut *transaction)
                 .await
             {
-                Ok(_) => return Ok(()),
+                Ok(_) => {
+                    eligibility::inserted(&mut transaction, self.recovery.as_ref(), &identity)
+                        .await?;
+                    transaction.commit().await?;
+                    return Ok(());
+                }
                 Err(error) => StorageError::from(error),
             };
             if !matches!(error, StorageError::Duplicate { .. }) {
                 return Err(error);
             }
-            let by_delivery = select_delivery_row(&self.pool, delivery.delivery_id()).await?;
+            let by_delivery =
+                select_delivery_row(&mut *transaction, delivery.delivery_id()).await?;
             if let Some(stored) = &by_delivery
                 && same_dispatch(stored, delivery)
             {
+                eligibility::inserted(&mut transaction, self.recovery.as_ref(), &identity).await?;
+                transaction.commit().await?;
                 return Ok(());
             }
-            let by_attempt =
-                select_delivery_attempt_row(&self.pool, delivery.task_id(), delivery.attempt())
-                    .await?;
+            let by_attempt = select_delivery_attempt_row(
+                &mut *transaction,
+                delivery.task_id(),
+                delivery.attempt(),
+            )
+            .await?;
             if let Some(stored) = &by_attempt
                 && same_dispatch(stored, delivery)
             {
+                eligibility::inserted(&mut transaction, self.recovery.as_ref(), &identity).await?;
+                transaction.commit().await?;
                 return Ok(());
             }
             Err(StorageError::Duplicate {
@@ -891,13 +1040,21 @@ impl Repository for SqliteRepository {
     ) -> StorageFuture<'a, Result<AckOutcome, StorageError>> {
         Box::pin(async move {
             let id = encode_id(delivery_id);
+            let mut transaction = eligibility::begin(&self.pool, self.recovery.as_ref()).await?;
+            let identity = eligibility::text_identity("deliveries", &id)?;
+            let mutation =
+                eligibility::prepare_mutation(&mut transaction, self.recovery.as_ref(), &identity)
+                    .await?;
             let result = sqlx::query(ACKNOWLEDGE_DELIVERY)
                 .bind(encode_timestamp(&at))
                 .bind(&id)
-                .execute(&self.pool)
+                .execute(&mut *transaction)
                 .await
                 .map_err(StorageError::from)?;
             if result.rows_affected() == 1 {
+                eligibility::complete_mutation(&mut transaction, self.recovery.as_ref(), mutation)
+                    .await?;
+                transaction.commit().await?;
                 return Ok(AckOutcome::Recorded);
             }
             // Zero rows: either already acknowledged (the first timestamp stands)
@@ -905,7 +1062,7 @@ impl Repository for SqliteRepository {
             // read settles it.
             let stored = sqlx::query_scalar::<_, Option<String>>(SELECT_DELIVERY_ACKNOWLEDGEMENT)
                 .bind(&id)
-                .fetch_optional(&self.pool)
+                .fetch_optional(&mut *transaction)
                 .await
                 .map_err(StorageError::from)?;
             match stored {
@@ -1198,27 +1355,33 @@ async fn select_message_row(
     row.as_ref().map(message_from_row).transpose()
 }
 
-async fn select_delivery_row(
-    pool: &SqlitePool,
+async fn select_delivery_row<'executor, Executor>(
+    executor: Executor,
     id: DeliveryId,
-) -> Result<Option<Delivery>, StorageError> {
+) -> Result<Option<Delivery>, StorageError>
+where
+    Executor: sqlx::Executor<'executor, Database = sqlx::Sqlite>,
+{
     let row = sqlx::query(SELECT_DELIVERY)
         .bind(encode_id(id))
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
         .map_err(StorageError::from)?;
     row.as_ref().map(delivery_from_row).transpose()
 }
 
-async fn select_delivery_attempt_row(
-    pool: &SqlitePool,
+async fn select_delivery_attempt_row<'executor, Executor>(
+    executor: Executor,
     task_id: TaskId,
     attempt: u32,
-) -> Result<Option<Delivery>, StorageError> {
+) -> Result<Option<Delivery>, StorageError>
+where
+    Executor: sqlx::Executor<'executor, Database = sqlx::Sqlite>,
+{
     let row = sqlx::query(SELECT_DELIVERY_BY_ATTEMPT)
         .bind(encode_id(task_id))
         .bind(encode_u32(attempt))
-        .fetch_optional(pool)
+        .fetch_optional(executor)
         .await
         .map_err(StorageError::from)?;
     row.as_ref().map(delivery_from_row).transpose()

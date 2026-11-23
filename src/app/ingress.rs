@@ -1,9 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::{
-        Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
-    },
+    sync::{Arc, Mutex, atomic::AtomicBool},
 };
 
 use tokio::sync::{mpsc, watch};
@@ -153,6 +150,7 @@ pub struct MatrixIngress {
     retry: Option<Arc<dyn RetryAdmission>>,
     queue: Option<Arc<crate::storage::ReliabilityStore>>,
     reap: Option<Arc<dyn crate::matrix::ReapControl>>,
+    dispositions: Option<mpsc::Sender<Result<(), crate::matrix::MatrixError>>>,
     #[cfg(test)]
     test_inject: Option<mpsc::Sender<InboundMatrixEvent>>,
 }
@@ -186,6 +184,7 @@ impl MatrixIngress {
             retry: None,
             queue: None,
             reap: None,
+            dispositions: None,
             #[cfg(test)]
             test_inject: None,
         }
@@ -209,15 +208,31 @@ impl MatrixIngress {
         self
     }
 
+    pub(crate) fn with_dispositions(
+        mut self,
+        dispositions: mpsc::Sender<Result<(), crate::matrix::MatrixError>>,
+    ) -> Self {
+        self.dispositions = Some(dispositions);
+        self
+    }
+
     pub fn start(self) -> MatrixIngressHandle {
+        self.start_supervised(|_| {})
+    }
+
+    pub(crate) fn start_supervised(
+        self,
+        on_exit: impl FnOnce(&'static str) + Send + 'static,
+    ) -> MatrixIngressHandle {
         #[cfg(test)]
         let test_inject = self.test_inject.clone();
         let (shutdown, receiver) = watch::channel(false);
         let alive = Arc::new(AtomicBool::new(true));
-        let task_alive = Arc::clone(&alive);
+        let owner =
+            crate::app::required_owner::RequiredOwner::observed(Arc::clone(&alive), on_exit);
         let join = tokio::spawn(async move {
+            let _owner = owner;
             self.run(receiver).await;
-            task_alive.store(false, Ordering::Release);
         });
         MatrixIngressHandle {
             shutdown,
@@ -239,62 +254,91 @@ impl MatrixIngress {
                 event = self.receiver.recv() => event,
             };
             let Some(event) = event else { return };
-            let snapshot = self.reload.snapshot();
-            let mut admin = AdminHandler::new(
-                Arc::clone(&self.repository),
-                self.cancellation.clone(),
-                Arc::clone(&self.sender),
-                snapshot.hot.admin.clone(),
-                Arc::clone(&self.ledger),
-            );
-            if let Some(retry) = &self.retry {
-                admin = admin.with_retry_admission(Arc::clone(retry));
-            }
-            if let Some(queue) = &self.queue {
-                admin = admin.with_queue_control(Arc::clone(queue));
-            }
-            if let Some(reap) = &self.reap {
-                admin = admin.with_reap_control(Arc::clone(reap));
-            }
-            match admin.handle(&event).await {
-                Ok(AdminResult::Replied) => continue,
-                Err(_) => continue,
-                Ok(AdminResult::Ordinary) => {}
-            }
-            let Ok(conversation) = resolve_conversation(
-                self.repository.as_ref(),
-                &event.room_id,
-                event.thread_root.as_deref(),
-            )
-            .await
-            else {
-                continue;
-            };
-            let context = ReplyContext {
-                room_id: event.room_id.clone(),
-                thread_root: event.thread_root.clone(),
-                event_id: event.event_id.clone(),
-            };
-            match route_event_durable(
-                &event,
-                conversation.id,
-                &snapshot.hot.route,
-                &snapshot.hot.permissions,
-                &self.registry,
-                self.admission.as_ref(),
-                &mut self.dedup,
-                snapshot.hot.monitor_room.clone(),
-                snapshot.generation,
-            )
-            .await
+            let disposition = self.process_event(event).await;
+            if let Some(dispositions) = &self.dispositions
+                && dispositions.send(disposition).await.is_err()
             {
-                Ok(task) => self.replies.insert(task.task_id, context),
-                Err(RouteError::Forbidden) => {
-                    let _ = send_permission_denied(self.sender.as_ref(), &context).await;
-                }
-                Err(_) => {}
+                return;
             }
         }
+    }
+
+    async fn process_event(
+        &mut self,
+        event: InboundMatrixEvent,
+    ) -> Result<(), crate::matrix::MatrixError> {
+        let snapshot = self.reload.snapshot();
+        let mut admin = AdminHandler::new(
+            Arc::clone(&self.repository),
+            self.cancellation.clone(),
+            Arc::clone(&self.sender),
+            snapshot.hot.admin.clone(),
+            Arc::clone(&self.ledger),
+        );
+        if let Some(retry) = &self.retry {
+            admin = admin.with_retry_admission(Arc::clone(retry));
+        }
+        if let Some(queue) = &self.queue {
+            admin = admin.with_queue_control(Arc::clone(queue));
+        }
+        if let Some(reap) = &self.reap {
+            admin = admin.with_reap_control(Arc::clone(reap));
+        }
+        match admin.handle(&event).await {
+            Ok(AdminResult::Replied) | Err(_) => return Ok(()),
+            Ok(AdminResult::Ordinary) => {}
+        }
+        let conversation = resolve_conversation(
+            self.repository.as_ref(),
+            &event.room_id,
+            event.thread_root.as_deref(),
+        )
+        .await
+        .map_err(|_| crate::matrix::MatrixError::Storage)?;
+        let context = ReplyContext {
+            room_id: event.room_id.clone(),
+            thread_root: event.thread_root.clone(),
+            event_id: event.event_id.clone(),
+        };
+        match route_event_durable(
+            &event,
+            conversation.id,
+            &snapshot.hot.route,
+            &snapshot.hot.permissions,
+            &self.registry,
+            self.admission.as_ref(),
+            &mut self.dedup,
+            snapshot.hot.monitor_room.clone(),
+            snapshot.generation,
+        )
+        .await
+        {
+            Ok(task) => self.replies.insert(task.task_id, context),
+            Err(RouteError::Forbidden) => {
+                let _ = send_permission_denied(self.sender.as_ref(), &context).await;
+            }
+            Err(RouteError::Bus) => return Err(crate::matrix::MatrixError::Storage),
+            Err(RouteError::NoRoute | RouteError::Target | RouteError::Ambiguous)
+                if crate::matrix::ingress_decision::unavailable_reply(
+                    &event,
+                    &snapshot.hot.route,
+                    &snapshot.hot.permissions,
+                    snapshot.hot.monitor_room.as_deref(),
+                ) && self.dedup.mark(&event.room_id, &event.event_id) =>
+            {
+                tracing::warn!(event_id = %event.event_id, category = "route-unavailable", "authorized request has no usable Agent route");
+                let _ = tokio::time::timeout(
+                    std::time::Duration::from_secs(10),
+                    self.sender.send_reply(
+                        &context,
+                        "No enabled Agent route is available for this request.",
+                    ),
+                )
+                .await;
+            }
+            Err(_) => {}
+        }
+        Ok(())
     }
 }
 
@@ -323,3 +367,7 @@ impl MatrixIngressHandle {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "ingress_liveness_tests.rs"]
+mod liveness_tests;

@@ -1,3 +1,16 @@
+#[path = "recovery_receipts.rs"]
+mod receipts;
+
+#[path = "recovery_runtime.rs"]
+mod runtime_impl;
+
+#[path = "recovery_administrative.rs"]
+mod administrative;
+
+#[cfg(test)]
+#[path = "recovery_administrative_tests.rs"]
+mod administrative_tests;
+
 use serde_json::Value;
 use sqlx::{Row, SqlitePool};
 
@@ -29,11 +42,25 @@ pub struct RecoveryControl {
 #[derive(Clone)]
 pub struct MatrixRecoveryStore {
     pool: SqlitePool,
+    recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
 }
 
 impl MatrixRecoveryStore {
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            recovery: None,
+        }
+    }
+
+    pub fn new_scoped(
+        pool: SqlitePool,
+        recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
+    ) -> Self {
+        Self { pool, recovery }
     }
 
     pub async fn initialize_cutover(
@@ -80,39 +107,44 @@ impl MatrixRecoveryStore {
     }
 
     pub async fn reconcile_restart(&self) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        let existing: Option<(String, Option<String>, Option<String>)> = sqlx::query_as(
+        use crate::storage::recovery_eligibility::writer;
+        let mut tx = writer::begin(&self.pool, self.recovery.as_ref()).await?;
+        let existing: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(
             "SELECT restart_hold_state,restart_hold_event_id,restart_hold_reason FROM matrix_recovery_control WHERE control_id=1",
         )
         .fetch_optional(&mut *tx)
         .await?;
-        if let Some((state, event_id, reason)) = existing.filter(|(state, _, _)| !state.is_empty())
+        if let Some((state, event_id, reason)) =
+            existing.filter(|(state, _, _)| state.as_deref().is_some_and(|state| !state.is_empty()))
         {
             return Err(sqlx::Error::Protocol(format!(
-                "durable restart hold {state} {} {}",
+                "durable restart hold {:?} {} {}",
+                state,
                 event_id.unwrap_or_default(),
                 reason.unwrap_or_default()
             )));
         }
-        let unresolved: Vec<(String, String)> = sqlx::query_as(
-            "SELECT event_id,state FROM matrix_recovery_receipts WHERE state <> 'dispositioned' ORDER BY created_at,event_id",
-        )
-        .fetch_all(&mut *tx)
-        .await?;
+        let unresolved = Self::unresolved_work(&mut tx).await?;
         if let Some((event_id, state)) = unresolved.first() {
-            let reason = match state.as_str() {
-                "pending" => "pending admission requires replay decision",
-                "processing" => "processing admission requires effect reconciliation",
-                "unknown" => "unknown admission requires explicit disposition",
-                "refused" => "refused admission requires explicit recovery disposition",
-                _ => "invalid recovery receipt state",
+            let reason = if event_id.starts_with("batch:") {
+                "incomplete response coverage requires reconciliation"
+            } else {
+                match state.as_str() {
+                    "pending" => "pending admission requires replay decision",
+                    "processing" => "processing admission requires effect reconciliation",
+                    "unknown" => "unknown admission requires explicit disposition",
+                    "refused" => "refused admission requires explicit recovery disposition",
+                    _ => "invalid recovery receipt state",
+                }
             };
+            let mutation = writer::prepare_control(&mut tx, self.recovery.as_ref()).await?;
             sqlx::query("UPDATE matrix_recovery_control SET restart_hold_state=?,restart_hold_event_id=?,restart_hold_reason=?,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE control_id=1 AND restart_hold_state IS NULL")
                 .bind(state)
                 .bind(event_id)
                 .bind(reason)
                 .execute(&mut *tx)
                 .await?;
+            writer::complete_hold(&mut tx, self.recovery.as_ref(), mutation).await?;
             tx.commit().await?;
             return Err(sqlx::Error::Protocol(format!(
                 "restart hold for {event_id}: {reason}"
@@ -128,20 +160,35 @@ impl MatrixRecoveryStore {
         watermark: &str,
         now: &str,
     ) -> Result<(), sqlx::Error> {
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
+        let mutation = crate::storage::recovery_eligibility::writer::prepare_control(
+            &mut tx,
+            self.recovery.as_ref(),
+        )
+        .await?;
         let result = sqlx::query("UPDATE matrix_recovery_control SET phase='active',watermark=?,updated_at=? WHERE control_id=1 AND cutover_operation_id=? AND phase='baseline'")
-            .bind(watermark).bind(now).bind(operation_id).execute(&self.pool).await?;
+            .bind(watermark).bind(now).bind(operation_id).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Err(sqlx::Error::RowNotFound);
         }
         let (phase, stored_operation, stored_watermark): (String, String, String) =
             sqlx::query_as("SELECT phase,cutover_operation_id,watermark FROM matrix_recovery_control WHERE control_id=1")
-                .fetch_one(&self.pool)
+                .fetch_one(&mut *tx)
                 .await?;
         if phase != "active" || stored_operation != operation_id || stored_watermark != watermark {
             return Err(sqlx::Error::Protocol(
                 "cutover activation read-back mismatch".into(),
             ));
         }
+        crate::storage::recovery_eligibility::writer::complete_control(
+            &mut tx,
+            self.recovery.as_ref(),
+            mutation,
+        )
+        .await?;
+        tx.commit().await?;
         Ok(())
     }
 
@@ -168,6 +215,81 @@ impl MatrixRecoveryStore {
         Ok(())
     }
 
+    pub async fn renew_component_lease(
+        &self,
+        component: &str,
+        owner: &str,
+        epoch: i64,
+        now: &str,
+    ) -> Result<(), sqlx::Error> {
+        let expires = chrono::DateTime::parse_from_rfc3339(now)
+            .map_err(|_| sqlx::Error::Protocol("invalid lease clock".into()))?
+            + chrono::Duration::seconds(60);
+        let renewal = self
+            .recovery
+            .as_ref()
+            .map(|scope| scope.for_lease_renewal(component, owner, epoch))
+            .transpose()?;
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, renewal.as_ref())
+                .await?;
+        let mutation = crate::storage::recovery_eligibility::writer::prepare_lease(
+            &mut tx,
+            renewal.as_ref(),
+            component,
+        )
+        .await?;
+        let result = sqlx::query("UPDATE matrix_component_leases SET expires_at=?,updated_at=? WHERE component=? AND owner_token=? AND epoch=? AND state='active' AND expires_at>=?")
+            .bind(expires.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)).bind(now).bind(component).bind(owner).bind(epoch).bind(now).execute(&mut *tx).await?;
+        if result.rows_affected() != 1 {
+            return Err(sqlx::Error::Protocol("component lease expired".into()));
+        }
+        crate::storage::recovery_eligibility::writer::complete_lease(
+            &mut tx,
+            renewal.as_ref(),
+            component,
+            mutation,
+        )
+        .await?;
+        tx.commit().await?;
+        Ok(())
+    }
+
+    pub(crate) async fn release_component_lease(
+        &self,
+        component: &str,
+        owner: &str,
+        epoch: i64,
+        now: &str,
+    ) -> Result<(), sqlx::Error> {
+        use crate::storage::recovery_eligibility::writer;
+        if writer::is_refused(&self.pool).await? {
+            return writer::release_component_lease(
+                &self.pool,
+                self.recovery
+                    .as_ref()
+                    .ok_or_else(|| sqlx::Error::Protocol("teardown scope missing".into()))?,
+                component,
+                owner,
+                epoch,
+                now,
+            )
+            .await;
+        }
+        let mut tx = writer::begin(&self.pool, self.recovery.as_ref()).await?;
+        let mutation = writer::prepare_lease(&mut tx, self.recovery.as_ref(), component).await?;
+        let changed = sqlx::query("UPDATE matrix_component_leases SET state='expired',expires_at=?,updated_at=? WHERE component=? AND owner_token=? AND epoch=? AND state='active'")
+            .bind(now).bind(now).bind(component).bind(owner).bind(epoch).execute(&mut *tx).await?;
+        if changed.rows_affected() != 1 {
+            return Err(sqlx::Error::Protocol(
+                "component lease release fenced".into(),
+            ));
+        }
+        writer::complete_expired_lease(&mut tx, self.recovery.as_ref(), component, mutation)
+            .await?;
+        tx.commit().await
+    }
+
     pub async fn acquire_component_lease(
         &self,
         component: &str,
@@ -175,12 +297,20 @@ impl MatrixRecoveryStore {
         now: &str,
         expires_at: &str,
     ) -> Result<i64, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         let existing = sqlx::query(
             "SELECT owner_token,epoch,state,expires_at FROM matrix_component_leases WHERE component=?",
         )
         .bind(component)
         .fetch_optional(&mut *tx)
+        .await?;
+        let mutation = crate::storage::recovery_eligibility::writer::prepare_lease(
+            &mut tx,
+            self.recovery.as_ref(),
+            component,
+        )
         .await?;
         let epoch = match existing {
             None => 1,
@@ -191,12 +321,30 @@ impl MatrixRecoveryStore {
                 if state == "active" && current != owner_token && expires.as_str() > now {
                     return Err(sqlx::Error::Protocol("component lease is owned".into()));
                 }
-                row.try_get::<i64, _>("epoch")? + 1
+                row.try_get::<i64, _>("epoch")?
+                    .checked_add(1)
+                    .ok_or_else(|| sqlx::Error::Protocol("component epoch overflow".into()))?
             }
         };
         sqlx::query("INSERT INTO matrix_component_leases(component,owner_token,epoch,state,expires_at,updated_at) VALUES(?,?,?,'active',?,?) ON CONFLICT(component) DO UPDATE SET owner_token=excluded.owner_token,epoch=excluded.epoch,state='active',expires_at=excluded.expires_at,updated_at=excluded.updated_at")
             .bind(component).bind(owner_token).bind(epoch).bind(expires_at).bind(now).execute(&mut *tx).await?;
+        crate::storage::recovery_eligibility::writer::complete_lease(
+            &mut tx,
+            self.recovery.as_ref(),
+            component,
+            mutation,
+        )
+        .await?;
         tx.commit().await?;
+        if component == "MatrixSync"
+            && let Some(scope) = self.recovery.as_ref()
+        {
+            scope.install_matrix_fence(crate::storage::recovery_eligibility::LiveFence {
+                component: component.into(),
+                owner: owner_token.into(),
+                epoch,
+            })?;
+        }
         Ok(epoch)
     }
 
@@ -213,10 +361,13 @@ impl MatrixRecoveryStore {
         expected_events: &[String],
         now: &str,
     ) -> Result<(), sqlx::Error> {
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         let active: Option<String> = sqlx::query_scalar(
             "SELECT watermark FROM matrix_recovery_control WHERE control_id=1 AND phase='active'",
         )
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?;
         if active.as_deref() != Some(previous_watermark)
             || (request_token != Some(previous_watermark)
@@ -227,7 +378,7 @@ impl MatrixRecoveryStore {
             ));
         }
         let lease: Option<(String, i64)> = sqlx::query_as("SELECT owner_token,epoch FROM matrix_component_leases WHERE component='MatrixSync' AND state='active' AND expires_at>=?")
-            .bind(now).fetch_optional(&self.pool).await?;
+            .bind(now).fetch_optional(&mut *tx).await?;
         if lease.as_ref() != Some(&(owner_token.to_owned(), owner_epoch)) {
             return Err(sqlx::Error::Protocol("stale component lease".into()));
         }
@@ -236,149 +387,25 @@ impl MatrixRecoveryStore {
         )
         .bind(response_token)
         .bind(previous_watermark)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *tx)
         .await?) && existing_digest != response_digest {
             return Err(sqlx::Error::Protocol("response digest mismatch".into()));
         }
-        sqlx::query("INSERT INTO matrix_recovery_batches(batch_id,request_token,previous_watermark,response_token,response_digest,component,owner_token,owner_epoch,expected_events_json,covered_events_json,state,created_at,updated_at) VALUES(?,?,?,?,?,'MatrixSync',?,?,?,'[]','pending',?,?)")
+        sqlx::query("INSERT INTO matrix_recovery_batches(batch_id,request_token,previous_watermark,response_token,response_digest,component,owner_token,owner_epoch,expected_events_json,covered_events_json,state,created_at,updated_at) VALUES(?,?,?,?,?,'MatrixSync',?,?,?,'[]','processing',?,?)")
             .bind(batch_id).bind(request_token).bind(previous_watermark).bind(response_token).bind(response_digest).bind(owner_token).bind(owner_epoch)
             .bind(serde_json::to_string(expected_events).map_err(|error| sqlx::Error::Protocol(error.to_string()))?)
-            .bind(now).bind(now).execute(&self.pool).await?;
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn admit_event(
-        &self,
-        account_id: &str,
-        room_id: &str,
-        event_id: &str,
-        operation_id: &str,
-        payload_digest: &str,
-        batch_id: &str,
-        now: &str,
-    ) -> Result<BatchAdmission, sqlx::Error> {
-        let admission = self
-            .reserve_event(
-                account_id,
-                room_id,
-                event_id,
-                operation_id,
-                payload_digest,
-                batch_id,
-                now,
-            )
-            .await?;
-        if admission == BatchAdmission::New {
-            self.finish_event(
-                account_id,
-                room_id,
-                event_id,
-                operation_id,
-                batch_id,
-                operation_id,
-                1,
-                now,
-            )
-            .await?;
-        }
-        Ok(admission)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn reserve_event(
-        &self,
-        account_id: &str,
-        room_id: &str,
-        event_id: &str,
-        operation_id: &str,
-        payload_digest: &str,
-        batch_id: &str,
-        now: &str,
-    ) -> Result<BatchAdmission, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
-        let existing = sqlx::query("SELECT payload_digest,state FROM matrix_recovery_receipts WHERE account_id=? AND room_id=? AND event_id=? AND cutover_operation_id=?")
-            .bind(account_id).bind(room_id).bind(event_id).bind(operation_id).fetch_optional(&mut *tx).await?;
-        if let Some(row) = existing {
-            let digest: String = row.try_get("payload_digest")?;
-            if digest != payload_digest {
-                return Err(sqlx::Error::Protocol("receipt digest mismatch".into()));
-            }
-            let state: String = row.try_get("state")?;
-            tx.commit().await?;
-            if state == "dispositioned" {
-                return Ok(BatchAdmission::Duplicate);
-            }
-            return Err(sqlx::Error::Protocol(
-                "receipt requires recovery reconciliation".into(),
-            ));
-        }
-        let expected: String = sqlx::query_scalar("SELECT expected_events_json FROM matrix_recovery_batches WHERE batch_id=? AND state IN ('pending','processing')")
-            .bind(batch_id).fetch_one(&mut *tx).await?;
-        let expected: Vec<String> = serde_json::from_str(&expected)
-            .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-        if !expected.iter().any(|value| value == event_id) {
-            return Err(sqlx::Error::Protocol("event outside batch coverage".into()));
-        }
-        sqlx::query("INSERT INTO matrix_recovery_receipts(account_id,room_id,event_id,cutover_operation_id,payload_digest,state,batch_id,created_at,updated_at) VALUES(?,?,?,?,?,'pending',?,?,?)")
-            .bind(account_id).bind(room_id).bind(event_id).bind(operation_id).bind(payload_digest).bind(batch_id).bind(now).bind(now).execute(&mut *tx).await?;
-        let row = sqlx::query("SELECT covered_events_json FROM matrix_recovery_batches WHERE batch_id=? AND state IN ('pending','processing')")
-            .bind(batch_id).fetch_one(&mut *tx).await?;
-        let mut covered: Vec<String> =
-            serde_json::from_str(row.try_get::<String, _>("covered_events_json")?.as_str())
-                .map_err(|error| sqlx::Error::Protocol(error.to_string()))?;
-        if !covered.iter().any(|value| value == event_id) {
-            covered.push(event_id.to_owned());
-            sqlx::query("UPDATE matrix_recovery_batches SET covered_events_json=?,state='processing',updated_at=? WHERE batch_id=?")
-                .bind(serde_json::to_string(&covered).map_err(|error| sqlx::Error::Protocol(error.to_string()))?)
-                .bind(now).bind(batch_id).execute(&mut *tx).await?;
-        }
+            .bind(now).bind(now).execute(&mut *tx).await?;
+        let identity = crate::storage::recovery_eligibility::writer::text_identity(
+            "matrix_recovery_batches",
+            batch_id,
+        )?;
+        crate::storage::recovery_eligibility::writer::inserted(
+            &mut tx,
+            self.recovery.as_ref(),
+            &identity,
+        )
+        .await?;
         tx.commit().await?;
-        Ok(BatchAdmission::New)
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn finish_event(
-        &self,
-        account_id: &str,
-        room_id: &str,
-        event_id: &str,
-        operation_id: &str,
-        batch_id: &str,
-        owner_token: &str,
-        owner_epoch: i64,
-        now: &str,
-    ) -> Result<(), sqlx::Error> {
-        let result = sqlx::query("UPDATE matrix_recovery_receipts SET state='dispositioned',updated_at=? WHERE account_id=? AND room_id=? AND event_id=? AND cutover_operation_id=? AND batch_id=? AND state IN ('pending','processing') AND EXISTS (SELECT 1 FROM matrix_recovery_batches b JOIN matrix_component_leases l ON l.component=b.component AND l.owner_token=b.owner_token AND l.epoch=b.owner_epoch WHERE b.batch_id=? AND b.owner_token=? AND b.owner_epoch=? AND b.state='processing' AND l.state='active' AND l.expires_at>=?)")
-            .bind(now).bind(account_id).bind(room_id).bind(event_id).bind(operation_id).bind(batch_id).bind(batch_id).bind(owner_token).bind(owner_epoch).bind(now).execute(&self.pool).await?;
-        if result.rows_affected() != 1 {
-            return Err(sqlx::Error::Protocol(
-                "receipt disposition fence failed".into(),
-            ));
-        }
-        Ok(())
-    }
-
-    #[allow(clippy::too_many_arguments)]
-    pub async fn refuse_event(
-        &self,
-        account_id: &str,
-        room_id: &str,
-        event_id: &str,
-        operation_id: &str,
-        batch_id: &str,
-        owner_token: &str,
-        owner_epoch: i64,
-        code: &str,
-        now: &str,
-    ) -> Result<(), sqlx::Error> {
-        let result = sqlx::query("UPDATE matrix_recovery_receipts SET state='refused',refusal_code=?,updated_at=? WHERE account_id=? AND room_id=? AND event_id=? AND cutover_operation_id=? AND batch_id=? AND state IN ('pending','processing') AND EXISTS (SELECT 1 FROM matrix_recovery_batches b JOIN matrix_component_leases l ON l.component=b.component AND l.owner_token=b.owner_token AND l.epoch=b.owner_epoch WHERE b.batch_id=? AND b.owner_token=? AND b.owner_epoch=? AND b.state='processing' AND l.state='active' AND l.expires_at>=?)")
-            .bind(code).bind(now).bind(account_id).bind(room_id).bind(event_id).bind(operation_id).bind(batch_id).bind(batch_id).bind(owner_token).bind(owner_epoch).bind(now).execute(&self.pool).await?;
-        if result.rows_affected() != 1 {
-            return Err(sqlx::Error::Protocol(
-                "refusal disposition fence failed".into(),
-            ));
-        }
         Ok(())
     }
 
@@ -390,7 +417,14 @@ impl MatrixRecoveryStore {
         owner_epoch: i64,
         now: &str,
     ) -> Result<(), sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
+        let mutation = crate::storage::recovery_eligibility::writer::prepare_control(
+            &mut tx,
+            self.recovery.as_ref(),
+        )
+        .await?;
         let row = sqlx::query("SELECT b.previous_watermark,b.response_token,b.response_digest,b.expected_events_json,b.covered_events_json,b.state AS batch_state FROM matrix_recovery_batches b JOIN matrix_component_leases l ON l.component=b.component AND l.owner_token=b.owner_token AND l.epoch=b.owner_epoch WHERE b.batch_id=? AND b.component='MatrixSync' AND b.owner_token=? AND b.owner_epoch=? AND l.state='active' AND l.expires_at>=?")
             .bind(batch_id).bind(owner_token).bind(owner_epoch).bind(now).fetch_one(&mut *tx).await?;
         let expected: Vec<String> =
@@ -426,6 +460,16 @@ impl MatrixRecoveryStore {
                 "checkpoint is not batch response token".into(),
             ));
         }
+        let identity = crate::storage::recovery_eligibility::writer::text_identity(
+            "matrix_recovery_batches",
+            batch_id,
+        )?;
+        let batch_mutation = crate::storage::recovery_eligibility::writer::prepare_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            &identity,
+        )
+        .await?;
         let batch_update = sqlx::query(
             "UPDATE matrix_recovery_batches SET state='terminal',updated_at=? WHERE batch_id=? AND previous_watermark=? AND owner_token=? AND owner_epoch=? AND response_digest=? AND state='processing'",
         )
@@ -436,11 +480,23 @@ impl MatrixRecoveryStore {
                 "batch completion fence failed".into(),
             ));
         }
+        crate::storage::recovery_eligibility::writer::complete_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            batch_mutation,
+        )
+        .await?;
         let watermark_update = sqlx::query("UPDATE matrix_recovery_control SET watermark=?,updated_at=? WHERE control_id=1 AND phase='active' AND watermark=?")
             .bind(checkpoint).bind(now).bind(&previous).execute(&mut *tx).await?;
         if watermark_update.rows_affected() != 1 {
             return Err(sqlx::Error::Protocol("watermark CAS failed".into()));
         }
+        crate::storage::recovery_eligibility::writer::complete_control(
+            &mut tx,
+            self.recovery.as_ref(),
+            mutation,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }

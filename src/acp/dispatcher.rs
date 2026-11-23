@@ -43,12 +43,14 @@ use std::sync::{Arc, Mutex};
 use crate::acp::client::{AcpClient, AcpLimits};
 use crate::acp::error::{AcpError, Phase};
 use crate::acp::session::{SessionState, SqliteSessionStore, StoredSession};
+use crate::acp::transport::AcpSpawnGate;
 use crate::acp::{bounded, client};
 use crate::bus::RegisteredEndpoint;
 use crate::bus::{
     BusFuture, Clock, DispatchError, DispatchOutcome, DispatchRequest, TaskDispatcher,
 };
-use crate::storage::{Delivery, Repository};
+use crate::storage::session_owner_binding::SessionOwnerBinding;
+use crate::storage::{Delivery, Repository, RuntimeOwnerEvidence};
 
 /// Builds an [`AcpDispatcher`].
 ///
@@ -63,8 +65,10 @@ pub struct AcpDispatcherBuilder {
     store: Option<SqliteSessionStore>,
     repository: Option<Arc<dyn Repository>>,
     reliability: Option<crate::storage::ReliabilityStore>,
+    durable_output: Option<(crate::acp::output::DurableOutputSpool, String)>,
     legacy_results: bool,
     allow_nonterminal_end_turn: bool,
+    spawn_gate: Option<AcpSpawnGate>,
 }
 
 impl Default for AcpDispatcherBuilder {
@@ -84,8 +88,10 @@ impl AcpDispatcherBuilder {
             store: None,
             repository: None,
             reliability: None,
+            durable_output: None,
             legacy_results: false,
             allow_nonterminal_end_turn: false,
+            spawn_gate: None,
         }
     }
 
@@ -129,6 +135,15 @@ impl AcpDispatcherBuilder {
         self
     }
 
+    pub(crate) fn durable_output(
+        mut self,
+        spool: crate::acp::output::DurableOutputSpool,
+        owner: String,
+    ) -> Self {
+        self.durable_output = Some((spool, owner));
+        self
+    }
+
     pub fn legacy_results(mut self, enabled: bool) -> Self {
         self.legacy_results = enabled;
         self
@@ -136,6 +151,11 @@ impl AcpDispatcherBuilder {
 
     pub fn allow_nonterminal_end_turn(mut self, enabled: bool) -> Self {
         self.allow_nonterminal_end_turn = enabled;
+        self
+    }
+
+    pub(crate) fn spawn_gate(mut self, gate: AcpSpawnGate) -> Self {
+        self.spawn_gate = Some(gate);
         self
     }
 
@@ -153,8 +173,10 @@ impl AcpDispatcherBuilder {
             store,
             repository,
             reliability,
+            durable_output,
             legacy_results,
             allow_nonterminal_end_turn,
+            spawn_gate,
         } = self;
         let cwd = cwd.ok_or("a working directory is required")?;
         let cwd = cwd
@@ -172,9 +194,14 @@ impl AcpDispatcherBuilder {
                 store,
                 repository,
                 reliability,
+                durable_output,
+                session_gate: tokio::sync::Mutex::new(()),
                 client: Mutex::new(None),
+                transport: Mutex::new(None),
+                connecting: tokio::sync::Mutex::new(()),
                 legacy_results,
                 allow_nonterminal_end_turn,
+                spawn_gate,
             }),
         })
     }
@@ -198,6 +225,7 @@ pub struct AcpDispatcher {
 }
 
 struct DispatcherInner {
+    transport: Mutex<Option<Arc<super::transport::AcpTransport>>>,
     cwd: String,
     additional_directories: Vec<String>,
     limits: AcpLimits,
@@ -205,6 +233,8 @@ struct DispatcherInner {
     store: SqliteSessionStore,
     repository: Arc<dyn Repository>,
     reliability: Option<crate::storage::ReliabilityStore>,
+    durable_output: Option<(crate::acp::output::DurableOutputSpool, String)>,
+    session_gate: tokio::sync::Mutex<()>,
     /// The negotiated backend, if one is running.
     ///
     /// The lock exists only to clone or replace an `Arc`; it is never held across
@@ -212,8 +242,10 @@ struct DispatcherInner {
     /// client is simply dropped when it is replaced, which closes its outgoing
     /// channel, tears its loop down and reaps the child.
     client: Mutex<Option<Arc<AcpClient>>>,
+    connecting: tokio::sync::Mutex<()>,
     legacy_results: bool,
     allow_nonterminal_end_turn: bool,
+    spawn_gate: Option<AcpSpawnGate>,
 }
 
 pub struct AcpStructuredTurn {
@@ -222,6 +254,7 @@ pub struct AcpStructuredTurn {
     endpoint: crate::models::EndpointId,
     session_id: String,
     handle: crate::acp::AcpTurnHandle,
+    output: Option<crate::acp::output::DurableTurnOutput>,
 }
 
 impl AcpStructuredTurn {
@@ -230,7 +263,25 @@ impl AcpStructuredTurn {
     }
 
     pub async fn finish(self) -> Result<crate::acp::TurnResult, AcpError> {
-        let completed = self.handle.finish().await;
+        let completed = self.handle.finish().await.and_then(|completed| {
+            classify_stream_completion(
+                completed,
+                self.dispatcher.inner.legacy_results,
+                self.dispatcher.inner.allow_nonterminal_end_turn,
+            )
+        });
+        let output_result = match (completed.is_ok(), self.output) {
+            (true, Some(output)) => output.finish().await.map_err(|_| AcpError::Schema {
+                method: crate::acp::schema::METHOD_SESSION_PROMPT.into(),
+                detail: "durable output publication failed".into(),
+            }),
+            (false, Some(output)) => output.cancel().await.map_err(|_| AcpError::Schema {
+                method: crate::acp::schema::METHOD_SESSION_PROMPT.into(),
+                detail: "durable output cancellation failed".into(),
+            }),
+            (_, None) => Ok(()),
+        };
+        output_result?;
         if let Err(error) = self
             .dispatcher
             .inner
@@ -246,22 +297,7 @@ impl AcpStructuredTurn {
             tracing::warn!(%error,"could not mark the acp session ready after a streamed turn");
         }
         match completed {
-            Ok(completed) => {
-                let response = AcpClient::decode_prompt_completion(completed)?;
-                if self.dispatcher.inner.allow_nonterminal_end_turn
-                    && response.stop_reason.is_end_turn()
-                    && response.task_result.is_none()
-                {
-                    return Ok(crate::acp::TurnResult::Continue {
-                        reason: "compatibility end_turn".into(),
-                        next_prompt: Some("bridge.continue.v1\nContinue the current task from durable progress. Emit taskResult or bounded progress.".into()),
-                    });
-                }
-                response.task_result.ok_or_else(|| AcpError::Schema {
-                    method: crate::acp::schema::METHOD_SESSION_PROMPT.to_owned(),
-                    detail: "missing taskResult in strict mode".to_owned(),
-                })
-            }
+            Ok(result) => Ok(result),
             Err(AcpError::Exited { .. } | AcpError::TransportClosed) => {
                 let recovered = self.dispatcher.ensure_client(&self.target).await?;
                 recovered
@@ -278,6 +314,12 @@ impl AcpStructuredTurn {
     }
 
     pub async fn cancel_and_shutdown(self) -> Result<(), AcpError> {
+        if let Some(output) = self.output {
+            output.cancel().await.map_err(|_| AcpError::Schema {
+                method: crate::acp::schema::METHOD_SESSION_PROMPT.into(),
+                detail: "durable output cancellation failed".into(),
+            })?;
+        }
         let client = self
             .dispatcher
             .take_client()
@@ -306,8 +348,16 @@ impl AcpDispatcher {
 
     /// Shut the current backend down and report whether its owner loop joined.
     pub async fn shutdown_reaped(&self) -> bool {
-        match self.take_client() {
-            Some(client) => client.shutdown_reaped().await,
+        let _connecting = self.inner.connecting.lock().await;
+        self.take_client();
+        let transport = self
+            .inner
+            .transport
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        match transport {
+            Some(transport) => transport.shutdown_reaped().await,
             None => false,
         }
     }
@@ -385,13 +435,49 @@ impl AcpDispatcher {
                 self.inner.clock.now(),
             )
             .await?;
-        let handle = client.prompt_stream(&session_id, prompt, capacity).await?;
+        let mut output = if let Some((spool, owner)) = &self.inner.durable_output {
+            let now = self
+                .inner
+                .clock
+                .now()
+                .to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            spool
+                .start_turn(&request.task.task_id.to_string(), owner, &now)
+                .await
+                .map_err(|_| AcpError::Schema {
+                    method: crate::acp::schema::METHOD_SESSION_PROMPT.into(),
+                    detail: "durable output preparation failed".into(),
+                })?
+        } else {
+            None
+        };
+        let handle = match &output {
+            Some(output) => {
+                client
+                    .prompt_stream_durable(&session_id, prompt, capacity, output.sender())
+                    .await
+            }
+            None => client.prompt_stream(&session_id, prompt, capacity).await,
+        };
+        let handle = match handle {
+            Ok(handle) => handle,
+            Err(error) => {
+                if let Some(output) = output.take() {
+                    output.cancel().await.map_err(|_| AcpError::Schema {
+                        method: crate::acp::schema::METHOD_SESSION_PROMPT.into(),
+                        detail: "durable output cancellation failed".into(),
+                    })?;
+                }
+                return Err(error);
+            }
+        };
         Ok(AcpStructuredTurn {
             dispatcher: self.clone(),
             target: request.target.clone(),
             endpoint,
             session_id,
             handle,
+            output,
         })
     }
 
@@ -399,6 +485,7 @@ impl AcpDispatcher {
     async fn deliver_inner(&self, request: &DispatchRequest<'_>) -> Result<(), AcpError> {
         let endpoint = request.target.id();
         let conversation = request.task.conversation_id;
+        tracing::debug!(task_id = %request.task.task_id, delivery_id = %request.delivery_id, attempt = request.attempt, stage = "acp-delivery", legacy_acp_results = self.inner.legacy_results, allow_nonterminal_end_turn = self.inner.allow_nonterminal_end_turn, "effective ACP completion contract");
         let prepared_at = self.inner.clock.now();
         if let Some(reliability) = &self.inner.reliability {
             reliability
@@ -418,6 +505,11 @@ impl AcpDispatcher {
                 })?;
         }
         let client = self.ensure_client(request.target).await?;
+        // Matrix can deliver multiple first messages for one conversation in
+        // parallel. Serialize the session lookup/new-session/upsert boundary so
+        // two workers cannot both POST session/new and race the live-session
+        // unique index. The lock is not held during prompt or output delivery.
+        let _session_guard = self.inner.session_gate.lock().await;
 
         let existing = self
             .inner
@@ -430,8 +522,18 @@ impl AcpDispatcher {
                 client.backend_id(),
             )
             .await?;
+        let existing = match existing {
+            Some(session) => Some(session),
+            None => {
+                self.inner
+                    .store
+                    .live_session(endpoint, conversation, &self.inner.cwd)
+                    .await?
+            }
+        };
         let session_id = match existing {
             Some(stored) => {
+                tracing::debug!(task_id = %request.task.task_id, stage = "acp-session", action = "resume", "reconfirming durable session before acceptance");
                 // A live session is re-confirmed with the agent rather than assumed:
                 // `resume` is this attempt's acknowledgement, and it is what makes a
                 // second task in one conversation still have an explicit round trip.
@@ -455,6 +557,7 @@ impl AcpDispatcher {
                 session_id
             }
             None => {
+                tracing::debug!(task_id = %request.task.task_id, stage = "acp-session", action = "new", "creating session before acceptance");
                 let session_id = client
                     .new_session_with_workspaces(
                         &self.inner.cwd,
@@ -480,20 +583,92 @@ impl AcpDispatcher {
         // (T009's policy), while a conflicting attempt is reported.
         let now = self.inner.clock.now();
         if let Some(reliability) = &self.inner.reliability {
-            if !reliability
-                .acknowledge_delivery(
-                    &request.delivery_id.to_string(),
-                    &session_id,
-                    &now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true),
-                )
-                .await
-                .map_err(|_| AcpError::Storage {
-                    source: crate::storage::StorageError::Malformed {
-                        field: "delivery_dispositions",
-                        detail: "delivery acknowledgement failed".into(),
-                    },
-                })?
-            {
+            let now = now.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+            let acknowledged = (if let Some(lease) = request.queue_lease {
+                let generation = reliability
+                    .runtime_generation(&lease.runtime_owner)
+                    .await
+                    .map_err(|_| AcpError::Storage {
+                        source: crate::storage::StorageError::Malformed {
+                            field: "runtime_owner_evidence",
+                            detail: "binding generation lookup failed".into(),
+                        },
+                    })?
+                    .ok_or_else(|| AcpError::Storage {
+                        source: crate::storage::StorageError::Malformed {
+                            field: "runtime_owner_evidence",
+                            detail: "binding generation unavailable".into(),
+                        },
+                    })?;
+                let (
+                    child_pid,
+                    child_starttime,
+                    executable_fingerprint,
+                    domain_device,
+                    domain_inode,
+                ) = self
+                    .inner
+                    .spawn_gate
+                    .as_ref()
+                    .and_then(AcpSpawnGate::binding_identity)
+                    .ok_or_else(|| AcpError::Storage {
+                        source: crate::storage::StorageError::Malformed {
+                            field: "owner_binding",
+                            detail: "child or containment identity unavailable".into(),
+                        },
+                    })?;
+                let binding = SessionOwnerBinding {
+                    binding_id: uuid::Uuid::now_v7().to_string(),
+                    task_id: request.task.task_id.to_string(),
+                    delivery_id: request.delivery_id.to_string(),
+                    attempt: i64::from(request.attempt),
+                    session_id_digest: SessionOwnerBinding::digest(&session_id),
+                    endpoint_id: endpoint.to_string(),
+                    conversation_id: conversation.to_string(),
+                    cwd_digest: SessionOwnerBinding::digest(&self.inner.cwd),
+                    backend_id: client.backend_id().to_owned(),
+                    runtime_instance: lease.runtime_owner.clone(),
+                    runtime_generation: generation,
+                    resource_key: lease.resource_key.clone(),
+                    owner_fence: lease.owner_fence,
+                    child_pid,
+                    child_starttime,
+                    executable_fingerprint,
+                    boot_id: RuntimeOwnerEvidence::capture()
+                        .ok_or_else(|| AcpError::Storage {
+                            source: crate::storage::StorageError::Malformed {
+                                field: "owner_binding",
+                                detail: "boot identity unavailable".into(),
+                            },
+                        })?
+                        .boot_id,
+                    domain_device,
+                    domain_inode,
+                    binding_revision: 1,
+                    state: "bound",
+                    created_at: now.clone(),
+                    updated_at: now.clone(),
+                };
+                reliability
+                    .acknowledge_delivery_with_binding(
+                        &request.delivery_id.to_string(),
+                        &session_id,
+                        &now,
+                        &binding,
+                    )
+                    .await
+            } else {
+                reliability
+                    .acknowledge_delivery(&request.delivery_id.to_string(), &session_id, &now)
+                    .await
+            })
+            .map_err(|_| AcpError::Storage {
+                source: crate::storage::StorageError::Malformed {
+                    field: "delivery_dispositions",
+                    detail: "delivery acknowledgement failed".into(),
+                },
+            })?;
+            if !acknowledged {
                 return Err(AcpError::Storage {
                     source: crate::storage::StorageError::Malformed {
                         field: "delivery_dispositions",
@@ -640,6 +815,11 @@ impl AcpDispatcher {
 
     /// The running backend, spawning and negotiating one when needed.
     async fn ensure_client(&self, target: &RegisteredEndpoint) -> Result<Arc<AcpClient>, AcpError> {
+        let _connecting = self.inner.connecting.lock().await;
+        let _reservation = match &self.inner.spawn_gate {
+            Some(gate) => Some(gate.reserve().ok_or(AcpError::TransportClosed)?),
+            None => None,
+        };
         if let Some(client) = self.client_slot()
             && client.is_alive()
         {
@@ -648,12 +828,36 @@ impl AcpDispatcher {
         let address = target.address().ok_or(AcpError::UnsupportedAddress {
             phase: Phase::Spawn,
         })?;
+        let previous = self
+            .inner
+            .transport
+            .lock()
+            .ok()
+            .and_then(|slot| slot.clone());
+        if let Some(previous) = previous
+            && !previous.shutdown_reaped().await
+        {
+            return Err(AcpError::RecoveryNeeded);
+        }
+        self.inner
+            .transport
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
         let client = Arc::new(
-            AcpClient::connect(
+            AcpClient::connect_retaining_transport(
                 address,
                 target.agent_id(),
                 Some(std::path::Path::new(&self.inner.cwd)),
                 self.inner.limits,
+                self.inner.spawn_gate.as_ref(),
+                |transport| {
+                    *self
+                        .inner
+                        .transport
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner()) = Some(transport);
+                },
             )
             .await?,
         );
@@ -701,7 +905,7 @@ impl TaskDispatcher for AcpDispatcher {
     ) -> BusFuture<'a, Result<(), DispatchError>> {
         Box::pin(async move {
             self.deliver_inner(&request).await.map_err(|error| {
-                tracing::warn!(%error, "acp delivery was not accepted");
+                tracing::error!(task_id = %request.task.task_id, delivery_id = %request.delivery_id, attempt = request.attempt, stage = "acp-delivery", category = error.category(), "ACP delivery failed before acknowledgement");
                 DispatchError::NotAccepted {
                     reason: reason_of(&error),
                 }
@@ -716,7 +920,7 @@ impl TaskDispatcher for AcpDispatcher {
     ) -> BusFuture<'a, Result<DispatchOutcome, DispatchError>> {
         Box::pin(async move {
             self.execute_inner(&request).await.map_err(|error| {
-                tracing::warn!(%error, "acp execution failed");
+                tracing::error!(task_id = %request.task.task_id, delivery_id = %request.delivery_id, attempt = request.attempt, stage = "acp-execution", category = error.category(), legacy_acp_results = self.inner.legacy_results, "ACP turn failed; task outcome requires durable finalization");
                 DispatchError::ExecutionFailed {
                     reason: reason_of(&error),
                 }
@@ -726,6 +930,31 @@ impl TaskDispatcher for AcpDispatcher {
 }
 
 /// Map a finished turn onto the frozen outcome.
+fn classify_stream_completion(
+    completed: crate::acp::CompletedRequest,
+    legacy_results: bool,
+    allow_nonterminal_end_turn: bool,
+) -> Result<crate::acp::TurnResult, AcpError> {
+    let response = AcpClient::decode_prompt_completion(completed)?;
+    if let Some(result) = response.task_result {
+        return Ok(result);
+    }
+    if response.stop_reason.is_end_turn() {
+        if legacy_results {
+            return Ok(crate::acp::TurnResult::Completed {
+                output: response.text,
+            });
+        }
+        if allow_nonterminal_end_turn {
+            return Ok(crate::acp::TurnResult::Continue {
+                reason: "compatibility end_turn".into(),
+                next_prompt: Some("bridge.continue.v1\nContinue the current task from durable progress. Emit taskResult or bounded progress.".into()),
+            });
+        }
+    }
+    Err(AcpError::MissingTaskResult)
+}
+
 fn map_turn(turn: client::PromptTurn, legacy_results: bool) -> DispatchOutcome {
     match turn.task_result {
         Some(crate::acp::TurnResult::Completed { output }) => DispatchOutcome::Completed { output },
@@ -751,6 +980,10 @@ fn map_turn(turn: client::PromptTurn, legacy_results: bool) -> DispatchOutcome {
 fn reason_of(error: &AcpError) -> String {
     bounded(&error.to_string())
 }
+
+#[cfg(test)]
+#[path = "stream_completion_tests.rs"]
+mod stream_completion_tests;
 
 #[cfg(test)]
 mod tests {

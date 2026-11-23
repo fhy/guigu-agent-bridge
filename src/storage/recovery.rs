@@ -47,6 +47,255 @@ pub struct RecoveryPlan {
     pub awaiting_outcome: Vec<Delivery>,
 }
 
+/// Stable, redacted startup diagnosis used by isolated recovery probes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecoveryBlocker {
+    Owner,
+    Admission,
+    Unfinished,
+    Unacknowledged,
+    Outcome,
+    RuntimeReady,
+    RuntimeAmbiguous,
+    ActiveLease,
+    RecoveryLease,
+    RecoveryContinuation,
+    Capacity,
+}
+
+impl RecoveryBlocker {
+    pub const fn name(self) -> &'static str {
+        match self {
+            Self::Owner => "owner",
+            Self::Admission => "admission",
+            Self::Unfinished => "unfinished",
+            Self::Unacknowledged => "unacknowledged",
+            Self::Outcome => "outcome",
+            Self::RuntimeReady => "runtime-ready",
+            Self::RuntimeAmbiguous => "runtime-ambiguous",
+            Self::ActiveLease => "active-lease",
+            Self::RecoveryLease => "recovery-lease",
+            Self::RecoveryContinuation => "recovery-continuation",
+            Self::Capacity => "capacity",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RecoverySignals {
+    pub owns_runtime: bool,
+    pub admission_blocked: bool,
+    pub unfinished: usize,
+    pub unacknowledged: usize,
+    pub awaiting_outcome: usize,
+    pub runtime_ready: usize,
+    pub runtime_ambiguous: usize,
+    pub active_leases: usize,
+    pub recovery_leases: usize,
+    pub recovery_continuations: usize,
+    pub capacity_overflow: bool,
+}
+
+/// Deterministic signal fixtures for isolated startup tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RecoveryFixture;
+
+#[allow(dead_code)]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReadinessProbe {
+    pub pid: u32,
+    pub port: u16,
+    pub card_status: u16,
+    pub content_type: &'static str,
+    pub listener_identity: u64,
+}
+
+#[allow(dead_code)]
+impl ReadinessProbe {
+    pub fn owned(pid: u32, identity: u64) -> Self {
+        Self {
+            pid,
+            port: 9292,
+            card_status: 200,
+            content_type: "application/json",
+            listener_identity: identity,
+        }
+    }
+
+    pub fn is_ready_for(&self, expected_pid: u32, expected_identity: u64) -> bool {
+        self.pid == expected_pid
+            && self.port == 9292
+            && self.card_status == 200
+            && self.content_type == "application/json"
+            && self.listener_identity == expected_identity
+    }
+}
+
+impl RecoveryFixture {
+    /// Build startup signals from the durable SQLite recovery facts. This is
+    /// the production adapter used by AppRuntime; tests must provide a real
+    /// snapshot/counts pair rather than synthetic readiness booleans.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_runtime_facts(
+        owns_runtime: bool,
+        admission_blocked: bool,
+        plan: &RecoveryPlan,
+        snapshot: &crate::runtime::RecoverySnapshot,
+        counts: &crate::runtime::RuntimeCounts,
+    ) -> RecoverySignals {
+        RecoverySignals {
+            owns_runtime,
+            admission_blocked,
+            unfinished: plan.unfinished.len(),
+            unacknowledged: plan.unacknowledged.len(),
+            awaiting_outcome: plan.awaiting_outcome.len(),
+            runtime_ready: snapshot.ready.len(),
+            runtime_ambiguous: snapshot.ambiguous.len(),
+            active_leases: counts.active_leases as usize,
+            recovery_leases: counts.recovery_needed_leases as usize,
+            recovery_continuations: counts.recovery_backlog as usize,
+            capacity_overflow: false,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_facts(
+        owns_runtime: bool,
+        admission_blocked: bool,
+        plan: &RecoveryPlan,
+        runtime_ready: usize,
+        runtime_ambiguous: usize,
+        active_leases: usize,
+        recovery_leases: usize,
+        recovery_continuations: usize,
+    ) -> RecoverySignals {
+        RecoverySignals {
+            owns_runtime,
+            admission_blocked,
+            unfinished: plan.unfinished.len(),
+            unacknowledged: plan.unacknowledged.len(),
+            awaiting_outcome: plan.awaiting_outcome.len(),
+            runtime_ready,
+            runtime_ambiguous,
+            active_leases,
+            recovery_leases,
+            recovery_continuations,
+            capacity_overflow: false,
+        }
+    }
+
+    pub const fn clean() -> RecoverySignals {
+        RecoverySignals {
+            owns_runtime: true,
+            ..RecoverySignals {
+                owns_runtime: false,
+                admission_blocked: false,
+                unfinished: 0,
+                unacknowledged: 0,
+                awaiting_outcome: 0,
+                runtime_ready: 0,
+                runtime_ambiguous: 0,
+                active_leases: 0,
+                recovery_leases: 0,
+                recovery_continuations: 0,
+                capacity_overflow: false,
+            }
+        }
+    }
+
+    pub const fn eligible_stale_owner() -> RecoverySignals {
+        RecoverySignals {
+            owns_runtime: false,
+            ..Self::clean()
+        }
+    }
+
+    pub const fn ambiguous_active_owner() -> RecoverySignals {
+        RecoverySignals {
+            owns_runtime: true,
+            runtime_ambiguous: 1,
+            ..Self::clean()
+        }
+    }
+
+    pub const fn recovery_lease() -> RecoverySignals {
+        RecoverySignals {
+            owns_runtime: true,
+            recovery_leases: 1,
+            ..Self::clean()
+        }
+    }
+
+    pub const fn recovery_continuation() -> RecoverySignals {
+        RecoverySignals {
+            owns_runtime: true,
+            recovery_continuations: 1,
+            ..Self::clean()
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryDiagnostic {
+    pub status: u8,
+    pub blocker: Option<RecoveryBlocker>,
+    pub counts: RecoverySignals,
+}
+
+impl RecoveryDiagnostic {
+    pub fn classify(signals: RecoverySignals) -> Self {
+        let blocker = if !signals.owns_runtime {
+            Some(RecoveryBlocker::Owner)
+        } else if signals.admission_blocked {
+            Some(RecoveryBlocker::Admission)
+        } else if signals.unfinished != 0 {
+            Some(RecoveryBlocker::Unfinished)
+        } else if signals.unacknowledged != 0 {
+            Some(RecoveryBlocker::Unacknowledged)
+        } else if signals.awaiting_outcome != 0 {
+            Some(RecoveryBlocker::Outcome)
+        } else if signals.runtime_ready != 0 {
+            Some(RecoveryBlocker::RuntimeReady)
+        } else if signals.runtime_ambiguous != 0 {
+            Some(RecoveryBlocker::RuntimeAmbiguous)
+        } else if signals.active_leases != 0 {
+            Some(RecoveryBlocker::ActiveLease)
+        } else if signals.recovery_leases != 0 {
+            Some(RecoveryBlocker::RecoveryLease)
+        } else if signals.recovery_continuations != 0 {
+            Some(RecoveryBlocker::RecoveryContinuation)
+        } else if signals.capacity_overflow {
+            Some(RecoveryBlocker::Capacity)
+        } else {
+            None
+        };
+        Self {
+            status: u8::from(blocker.is_some()) * 3,
+            blocker,
+            counts: signals,
+        }
+    }
+
+    pub fn line(&self) -> String {
+        let blocking = self.blocker.map_or("none", RecoveryBlocker::name);
+        let c = self.counts;
+        format!(
+            "t050-recovery status={} blocking={} counts=unfinished:{},unacknowledged:{},outcome:{},runtime-ready:{},runtime-ambiguous:{},active-lease:{},recovery-lease:{},recovery-continuation:{},capacity:{}",
+            self.status,
+            blocking,
+            c.unfinished,
+            c.unacknowledged,
+            c.awaiting_outcome,
+            c.runtime_ready,
+            c.runtime_ambiguous,
+            c.active_leases,
+            c.recovery_leases,
+            c.recovery_continuations,
+            u8::from(c.capacity_overflow)
+        )
+    }
+}
+
 impl RecoveryPlan {
     /// Whether the store has nothing to recover.
     ///
@@ -125,5 +374,97 @@ mod tests {
             ..RecoveryPlan::default()
         };
         assert!(!plan.is_empty());
+    }
+
+    #[test]
+    fn diagnostic_uses_fixed_precedence_and_redacted_line() {
+        let diagnostic = RecoveryDiagnostic::classify(RecoverySignals {
+            owns_runtime: true,
+            unfinished: 2,
+            active_leases: 1,
+            ..RecoverySignals::default()
+        });
+        assert_eq!(diagnostic.status, 3);
+        assert_eq!(diagnostic.blocker, Some(RecoveryBlocker::Unfinished));
+        assert_eq!(
+            diagnostic.line(),
+            "t050-recovery status=3 blocking=unfinished counts=unfinished:2,unacknowledged:0,outcome:0,runtime-ready:0,runtime-ambiguous:0,active-lease:1,recovery-lease:0,recovery-continuation:0,capacity:0"
+        );
+    }
+
+    #[test]
+    fn clean_and_ambiguous_fixtures_are_distinct_without_mutation() {
+        let clean = RecoveryDiagnostic::classify(RecoverySignals {
+            owns_runtime: true,
+            ..Default::default()
+        });
+        assert_eq!(clean.status, 0);
+        assert_eq!(clean.blocker, None);
+        let ambiguous = RecoveryDiagnostic::classify(RecoverySignals {
+            owns_runtime: true,
+            runtime_ambiguous: 1,
+            ..Default::default()
+        });
+        assert_eq!(ambiguous.blocker, Some(RecoveryBlocker::RuntimeAmbiguous));
+        assert_ne!(clean.line(), ambiguous.line());
+    }
+
+    #[test]
+    fn fixture_matrix_has_stable_status_and_owner_precedence() {
+        let cases = [
+            (RecoveryFixture::clean(), 0, "none"),
+            (RecoveryFixture::eligible_stale_owner(), 3, "owner"),
+            (
+                RecoveryFixture::ambiguous_active_owner(),
+                3,
+                "runtime-ambiguous",
+            ),
+            (RecoveryFixture::recovery_lease(), 3, "recovery-lease"),
+            (
+                RecoveryFixture::recovery_continuation(),
+                3,
+                "recovery-continuation",
+            ),
+        ];
+        for (signals, status, blocker) in cases {
+            let diagnostic = RecoveryDiagnostic::classify(signals);
+            assert_eq!(diagnostic.status, status);
+            assert!(diagnostic.line().contains(&format!("blocking={blocker}")));
+            assert!(!diagnostic.line().contains("token"));
+        }
+    }
+
+    #[test]
+    fn readiness_harness_rejects_stale_identity_and_models_shutdown_repeat() {
+        let ready = ReadinessProbe::owned(1712267, 44);
+        assert!(ready.is_ready_for(1712267, 44));
+        assert!(!ready.is_ready_for(1712266, 44));
+        assert!(!ready.is_ready_for(1712267, 43));
+        let shutdown = ReadinessProbe {
+            port: 0,
+            card_status: 0,
+            ..ready.clone()
+        };
+        assert!(!shutdown.is_ready_for(1712267, 44));
+        let repeat = ReadinessProbe::owned(1712268, 45);
+        assert!(repeat.is_ready_for(1712268, 45));
+    }
+
+    #[test]
+    fn sqlite_fact_snapshot_classifies_legal_ambiguous_runtime_as_blocked() {
+        let task = TaskId::generate();
+        let signals = RecoveryFixture::from_runtime_facts(
+            true,
+            false,
+            &RecoveryPlan::default(),
+            &crate::runtime::RecoverySnapshot {
+                ready: Vec::new(),
+                ambiguous: vec![task],
+            },
+            &crate::runtime::RuntimeCounts::default(),
+        );
+        let diagnostic = RecoveryDiagnostic::classify(signals);
+        assert_eq!(diagnostic.status, 3);
+        assert_eq!(diagnostic.blocker, Some(RecoveryBlocker::RuntimeAmbiguous));
     }
 }

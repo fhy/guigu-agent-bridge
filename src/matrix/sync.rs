@@ -1,5 +1,20 @@
 //! Bounded, cancellable Matrix sync ownership.
 
+#[path = "sync_owner.rs"]
+mod owner;
+#[path = "sync_rebuild.rs"]
+mod rebuild;
+#[path = "sync_shutdown.rs"]
+mod shutdown;
+use owner::classify_sdk_error;
+pub(crate) use shutdown::MatrixSyncLease;
+
+#[path = "sync_batch.rs"]
+mod batch;
+#[cfg(test)]
+#[path = "succession_runloop_tests.rs"]
+mod succession_tests;
+
 use std::{
     future::Future,
     pin::Pin,
@@ -24,6 +39,20 @@ use super::{InboundMatrixEvent, MatrixClient, MatrixError, event::decode_event};
 use crate::storage::{BatchAdmission, MatrixRecoveryStore};
 
 /// Boxed future returned by [`SyncTokenStore`].
+pub(crate) type FailureObserver = Arc<dyn Fn(&MatrixError) + Send + Sync>;
+pub(super) type Disposition = Result<(), MatrixError>;
+
+struct RequestOwner<'a>(&'a AtomicBool);
+impl Drop for RequestOwner<'_> {
+    fn drop(&mut self) {
+        self.0.store(false, Ordering::Release);
+    }
+}
+
+fn timestamp() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)
+}
+
 pub type SyncTokenFuture<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
 pub trait RawMatrixEventConsumer: Send + Sync {
@@ -32,6 +61,13 @@ pub trait RawMatrixEventConsumer: Send + Sync {
         raw: &'a str,
         room_id: &'a str,
     ) -> SyncTokenFuture<'a, Result<bool, MatrixError>>;
+    fn admit<'a>(
+        &'a self,
+        _raw: &'a str,
+        _room: &'a str,
+    ) -> SyncTokenFuture<'a, Result<(), MatrixError>> {
+        Box::pin(async { Ok(()) })
+    }
 }
 
 pub trait MissingRoomKeyObserver: Send + Sync {
@@ -73,18 +109,8 @@ impl SyncTokenStore for SqliteSyncTokenStore {
         })
     }
 
-    fn save<'a>(&'a self, token: &'a str) -> SyncTokenFuture<'a, Result<(), MatrixError>> {
-        Box::pin(async move {
-            let result = sqlx::query("UPDATE matrix_recovery_control SET watermark=?,updated_at=strftime('%Y-%m-%dT%H:%M:%fZ','now') WHERE control_id=1 AND phase='active'")
-                .bind(token)
-                .execute(&self.pool)
-                .await
-                .map_err(|_| MatrixError::Storage)?;
-            if result.rows_affected() != 1 {
-                return Err(MatrixError::Storage);
-            }
-            Ok(())
-        })
+    fn save<'a>(&'a self, _token: &'a str) -> SyncTokenFuture<'a, Result<(), MatrixError>> {
+        Box::pin(async { Err(MatrixError::Storage) })
     }
 }
 
@@ -115,10 +141,22 @@ pub struct MatrixSync {
     raw_consumer: Option<Arc<dyn RawMatrixEventConsumer>>,
     missing_key_observer: Option<Arc<dyn MissingRoomKeyObserver>>,
     recovery: Option<RecoveryBinding>,
+    initial_response: Mutex<Option<matrix_sdk::sync::SyncResponse>>,
+    rebuild_started: AtomicBool,
+    initial_token: Mutex<Option<String>>,
+    in_flight: AtomicBool,
+    processing: AtomicBool,
+    first_sync: AtomicBool,
+    failure_observer: Option<FailureObserver>,
+    #[cfg(test)]
+    test_failure: Mutex<Option<MatrixError>>,
+    #[cfg(test)]
+    before_receipt: Option<(Arc<tokio::sync::Notify>, Arc<tokio::sync::Notify>)>,
 }
 
 #[derive(Clone)]
-struct RecoveryBinding {
+pub(super) struct RecoveryBinding {
+    owner_token: String,
     store: MatrixRecoveryStore,
     account_id: String,
     operation_id: String,
@@ -152,6 +190,17 @@ impl MatrixSync {
             raw_consumer: None,
             missing_key_observer: None,
             recovery: None,
+            initial_response: Mutex::new(None),
+            rebuild_started: AtomicBool::new(false),
+            initial_token: Mutex::new(None),
+            in_flight: AtomicBool::new(false),
+            processing: AtomicBool::new(false),
+            first_sync: AtomicBool::new(true),
+            failure_observer: None,
+            #[cfg(test)]
+            test_failure: Mutex::new(None),
+            #[cfg(test)]
+            before_receipt: None,
         })
     }
 
@@ -172,267 +221,204 @@ impl MatrixSync {
         operation_id: impl Into<String>,
         owner_epoch: i64,
     ) -> Self {
+        let operation_id = operation_id.into();
         self.recovery = Some(RecoveryBinding {
+            owner_token: operation_id.clone(),
             store,
             account_id: account_id.into(),
-            operation_id: operation_id.into(),
+            operation_id,
             owner_epoch,
         });
         self
     }
 
-    /// Spawn the single sync owner task.
-    pub fn start(self) -> (MatrixSyncHandle, mpsc::Receiver<InboundMatrixEvent>) {
-        let (events_tx, events_rx) = mpsc::channel(self.capacity);
-        let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let alive = Arc::new(AtomicBool::new(true));
-        let task_alive = Arc::clone(&alive);
-        let join = tokio::spawn(async move {
-            let result = self.run(events_tx, shutdown_rx).await;
-            task_alive.store(false, Ordering::Release);
-            result
-        });
-        (
-            MatrixSyncHandle {
-                shutdown_tx,
-                join,
-                alive,
-            },
-            events_rx,
-        )
+    pub(crate) fn with_failure_observer(mut self, observer: FailureObserver) -> Self {
+        self.failure_observer = Some(observer);
+        self
     }
 
-    /// Run one initial or incremental sync and commit its checkpoint.
+    pub fn with_initial_response(self, response: matrix_sdk::sync::SyncResponse) -> Self {
+        *self.initial_response.lock().expect("initial response lock") = Some(response);
+        self
+    }
+
+    pub fn with_component_owner(mut self, owner: String) -> Self {
+        if let Some(recovery) = &mut self.recovery {
+            recovery.owner_token = owner;
+        }
+        self
+    }
+
+    #[cfg(test)]
+    pub(crate) fn with_test_failure(mut self, error: MatrixError) -> Self {
+        self.test_failure = Mutex::new(Some(error));
+        self
+    }
+
+    pub fn start(self) -> (MatrixSyncHandle, mpsc::Receiver<InboundMatrixEvent>) {
+        let (handle, events, _) = self.spawn(false);
+        (handle, events)
+    }
+
+    pub fn start_with_dispositions(
+        self,
+    ) -> (
+        MatrixSyncHandle,
+        mpsc::Receiver<InboundMatrixEvent>,
+        mpsc::Sender<Disposition>,
+    ) {
+        self.spawn(true)
+    }
+
     pub async fn sync_once(
         &self,
         events: &mpsc::Sender<InboundMatrixEvent>,
     ) -> Result<usize, MatrixError> {
-        let token = self.tokens.load().await?;
-        let mut settings = SyncSettings::new().timeout(self.server_timeout);
-        if let Some(ref token) = token {
-            settings = settings.token(token);
-        }
-        let response = self
-            .client
-            .inner
-            .sync_once(settings)
-            .await
-            .map_err(classify_sdk_error)?;
-        let recovery = self.recovery.clone();
-        let batch_id = Uuid::now_v7().to_string();
-        if let Some(recovery) = &recovery {
-            let expected_events = response
-                .rooms
-                .joined
-                .values()
-                .flat_map(|update| update.timeline.events.iter())
-                .filter_map(|event| {
-                    serde_json::from_str::<serde_json::Value>(event.kind.raw().json().get())
-                        .ok()
-                        .and_then(|value| {
-                            value
-                                .get("event_id")
-                                .and_then(|id| id.as_str())
-                                .map(str::to_owned)
-                        })
-                })
-                .collect::<Vec<_>>();
-            let mut digest = Sha256::new();
-            digest.update(response.next_batch.as_str());
-            digest.update(serde_json::to_vec(&expected_events).map_err(|_| MatrixError::Storage)?);
-            recovery
-                .store
-                .begin_batch(
-                    &batch_id,
-                    token.as_deref(),
-                    &response.next_batch,
-                    &format!("{:x}", digest.finalize()),
-                    token.as_deref().unwrap_or_default(),
-                    &recovery.operation_id,
-                    recovery.owner_epoch,
-                    &expected_events,
-                    "sync",
-                )
-                .await
-                .map_err(|_| MatrixError::Storage)?;
-        }
-        let mut delivered = 0;
-        for (room_id, update) in response.rooms.joined {
-            for timeline in update.timeline.events {
-                let raw = timeline.kind.raw().json().get();
-                let receipt_event = serde_json::from_str::<serde_json::Value>(raw)
-                    .ok()
-                    .and_then(|value| {
-                        value
-                            .get("event_id")
-                            .and_then(|id| id.as_str())
-                            .map(str::to_owned)
-                    });
-                if let (Some(recovery), Some(event_id)) = (&recovery, &receipt_event) {
-                    let mut digest = Sha256::new();
-                    digest.update(raw.as_bytes());
-                    let admission = recovery
-                        .store
-                        .reserve_event(
-                            &recovery.account_id,
-                            room_id.as_str(),
-                            event_id,
-                            &recovery.operation_id,
-                            &format!("{:x}", digest.finalize()),
-                            &batch_id,
-                            "sync",
-                        )
-                        .await
-                        .map_err(|_| MatrixError::Storage)?;
-                    if admission == BatchAdmission::Duplicate {
-                        continue;
-                    }
-                }
-                if let Some(consumer) = &self.raw_consumer
-                    && consumer.consume(raw, room_id.as_str()).await?
-                {
-                    if let (Some(recovery), Some(event_id)) = (&recovery, &receipt_event) {
-                        recovery
-                            .store
-                            .finish_event(
-                                &recovery.account_id,
-                                room_id.as_str(),
-                                event_id,
-                                &recovery.operation_id,
-                                &batch_id,
-                                &recovery.operation_id,
-                                recovery.owner_epoch,
-                                "sync",
-                            )
-                            .await
-                            .map_err(|_| MatrixError::Storage)?;
-                    }
-                    delivered += 1;
-                    continue;
-                }
-                if let Some(event) = decode_event(raw, room_id.as_str(), &self.client.user_id)? {
-                    events.try_send(event).map_err(|error| match error {
-                        mpsc::error::TrySendError::Full(_) => MatrixError::Backpressure,
-                        mpsc::error::TrySendError::Closed(_) => MatrixError::ConsumerClosed,
-                    })?;
-                    delivered += 1;
-                    if let (Some(recovery), Some(event_id)) = (&recovery, &receipt_event) {
-                        recovery
-                            .store
-                            .finish_event(
-                                &recovery.account_id,
-                                room_id.as_str(),
-                                event_id,
-                                &recovery.operation_id,
-                                &batch_id,
-                                &recovery.operation_id,
-                                recovery.owner_epoch,
-                                "sync",
-                            )
-                            .await
-                            .map_err(|_| MatrixError::Storage)?;
-                    }
-                } else if serde_json::from_str::<serde_json::Value>(raw)
-                    .ok()
-                    .and_then(|event| {
-                        event
-                            .get("type")
-                            .and_then(|value| value.as_str())
-                            .map(str::to_owned)
-                    })
-                    .as_deref()
-                    == Some("m.room.encrypted")
-                    && let Some(observer) = &self.missing_key_observer
-                {
-                    observer.record_missing_room_key();
-                    if let (Some(recovery), Some(event_id)) = (&recovery, &receipt_event) {
-                        recovery
-                            .store
-                            .refuse_event(
-                                &recovery.account_id,
-                                room_id.as_str(),
-                                event_id,
-                                &recovery.operation_id,
-                                &batch_id,
-                                &recovery.operation_id,
-                                recovery.owner_epoch,
-                                "missing_room_key",
-                                "sync",
-                            )
-                            .await
-                            .map_err(|_| MatrixError::Storage)?;
-                    }
-                }
-            }
-        }
-        if let Some(recovery) = &recovery {
-            recovery
-                .store
-                .complete_batch(
-                    &batch_id,
-                    &response.next_batch,
-                    &recovery.operation_id,
-                    recovery.owner_epoch,
-                    "sync",
-                )
-                .await
-                .map_err(|_| MatrixError::Storage)?;
-        } else {
-            self.tokens.save(&response.next_batch).await?;
-        }
-        Ok(delivered)
+        self.sync_with_dispositions(events, &mut None).await
     }
 
-    async fn run(
-        self,
-        events: mpsc::Sender<InboundMatrixEvent>,
-        mut shutdown: watch::Receiver<bool>,
+    async fn response_for(
+        &self,
+        token: Option<&str>,
+    ) -> Result<matrix_sdk::sync::SyncResponse, MatrixError> {
+        let initial = self
+            .initial_response
+            .lock()
+            .map_err(|_| MatrixError::Storage)?
+            .take();
+        let response = if let Some(response) = initial {
+            if self.recovery.is_some()
+                && self
+                    .initial_token
+                    .lock()
+                    .map_err(|_| MatrixError::Storage)?
+                    .take()
+                    .as_deref()
+                    != token
+            {
+                return Err(MatrixError::CutoverRefused);
+            }
+            response
+        } else {
+            let mut settings = SyncSettings::new()
+                .timeout(self.server_timeout)
+                .full_state(self.recovery.is_some() && self.first_sync.load(Ordering::Acquire));
+            if let Some(token) = token {
+                settings = settings.token(token);
+            }
+            self.client
+                .inner
+                .sync_once(settings)
+                .await
+                .map_err(classify_sdk_error)?
+        };
+        Ok(response)
+    }
+
+    pub(super) async fn fence_fatal_response(
+        &self,
+        error: &MatrixError,
     ) -> Result<(), MatrixError> {
+        if matches!(
+            error,
+            MatrixError::CutoverRefused
+                | MatrixError::Protocol { .. }
+                | MatrixError::CryptoInitialization
+                | MatrixError::DeviceKicked
+        ) && let Some(recovery) = &self.recovery
+        {
+            recovery
+                .store
+                .refuse_response(
+                    &recovery.operation_id,
+                    &recovery.owner_token,
+                    recovery.owner_epoch,
+                    "invalid-or-unrecoverable-response",
+                    &timestamp(),
+                )
+                .await
+                .map_err(|_| MatrixError::Storage)?;
+        }
+        Ok(())
+    }
+
+    pub(super) async fn sync_with_dispositions(
+        &self,
+        events: &mpsc::Sender<InboundMatrixEvent>,
+        dispositions: &mut Option<mpsc::Receiver<Disposition>>,
+    ) -> Result<usize, MatrixError> {
+        if self
+            .in_flight
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return Err(MatrixError::Protocol {
+                detail: "concurrent sync owner",
+            });
+        }
+        let _owner = RequestOwner(&self.in_flight);
+        #[cfg(test)]
+        if let Some(error) = self
+            .test_failure
+            .lock()
+            .map_err(|_| MatrixError::Storage)?
+            .take()
+        {
+            return Err(error);
+        }
+        let token = self.tokens.load().await?;
         if let Some(recovery) = &self.recovery {
             recovery
                 .store
-                .reconcile_restart()
+                .renew_component_lease(
+                    "MatrixSync",
+                    &recovery.owner_token,
+                    recovery.owner_epoch,
+                    &timestamp(),
+                )
                 .await
                 .map_err(|_| MatrixError::Storage)?;
         }
-        let mut failures = 0_u8;
-        loop {
-            let response = tokio::select! {
-                biased;
-                changed = shutdown.changed() => {
-                    let _ = changed;
-                    return Ok(());
-                }
-                response = self.sync_once(&events) => response,
-            };
-            match response {
-                Ok(_) => {
-                    failures = 0;
-                }
-                Err(MatrixError::Transport) if failures < 2 => {
-                    failures += 1;
-                    tokio::select! {
-                        biased;
-                        changed = shutdown.changed() => {
-                            let _ = changed;
-                            return Ok(());
-                        }
-                        _ = tokio::time::sleep(Duration::from_millis(100 * u64::from(failures))) => {}
-                    }
-                    continue;
-                }
-                Err(error) => return Err(error),
+        let response = match self.response_for(token.as_deref()).await {
+            Ok(response) => response,
+            Err(error) => {
+                self.fence_fatal_response(&error).await?;
+                return Err(error);
             }
+        };
+        self.processing.store(true, Ordering::Release);
+        let _processing = RequestOwner(&self.processing);
+        let maintain = async {
+            let mut tick = tokio::time::interval(Duration::from_secs(15));
+            loop {
+                tick.tick().await;
+                if let Some(recovery) = &self.recovery
+                    && recovery
+                        .store
+                        .renew_component_lease(
+                            "MatrixSync",
+                            &recovery.owner_token,
+                            recovery.owner_epoch,
+                            &timestamp(),
+                        )
+                        .await
+                        .is_err()
+                {
+                    break MatrixError::Storage;
+                }
+            }
+        };
+        // Both futures remain polled while either waits for the shared writer
+        // lock. Awaiting renewal inside a timer branch would deadlock a paused
+        // batch that already owns that lock. No detached task survives shutdown.
+        let result = tokio::select! {
+            result = self.process_batch(response, token.as_deref(), events, dispositions) => result,
+            error = maintain, if self.recovery.is_some() => Err(error),
+        };
+        if let Err(error) = &result {
+            self.fence_fatal_response(error).await?;
         }
-    }
-}
-
-fn classify_sdk_error(error: matrix_sdk::Error) -> MatrixError {
-    match error.client_api_error_kind() {
-        Some(
-            ErrorKind::UnknownToken { .. } | ErrorKind::MissingToken | ErrorKind::Forbidden { .. },
-        ) => MatrixError::DeviceKicked,
-        _ => MatrixError::Transport,
+        result
     }
 }
 
@@ -441,6 +427,7 @@ pub struct MatrixSyncHandle {
     shutdown_tx: watch::Sender<bool>,
     join: JoinHandle<Result<(), MatrixError>>,
     alive: Arc<AtomicBool>,
+    recovery_lease: Option<MatrixSyncLease>,
 }
 
 impl std::fmt::Debug for MatrixSyncHandle {
@@ -456,7 +443,52 @@ impl MatrixSyncHandle {
     /// Request shutdown and wait until the owner has released its request/task.
     pub async fn shutdown(self) -> Result<(), MatrixError> {
         let _ = self.shutdown_tx.send(true);
-        self.join.await.map_err(|_| MatrixError::Join)?
+        self.join.await.map_err(|_| MatrixError::Join)??;
+        if let Some(lease) = self.recovery_lease {
+            lease.release().await?;
+        }
+        Ok(())
+    }
+
+    pub async fn shutdown_bounded(self, timeout: Duration) -> Result<(), MatrixError> {
+        if let Some(lease) = self.shutdown_bounded_deferred(timeout).await? {
+            lease.release().await?;
+        }
+        Ok(())
+    }
+
+    pub(crate) async fn shutdown_bounded_deferred(
+        self,
+        timeout: Duration,
+    ) -> Result<Option<MatrixSyncLease>, MatrixError> {
+        let (result, lease) = self.shutdown_joined(timeout).await?;
+        result?;
+        Ok(lease)
+    }
+
+    pub(crate) async fn shutdown_joined(
+        mut self,
+        timeout: Duration,
+    ) -> Result<(Result<(), MatrixError>, Option<MatrixSyncLease>), MatrixError> {
+        let _ = self.shutdown_tx.send(true);
+        match tokio::time::timeout(timeout, &mut self.join).await {
+            Ok(result) => {
+                let result = result.map_err(|_| MatrixError::Join)?;
+                tracing::debug!(
+                    stage = "matrix-sync-cleanup",
+                    joined = true,
+                    processing_failed = result.is_err(),
+                    lease_deferred = self.recovery_lease.is_some(),
+                    "sync task joined; processing result is separate from cleanup"
+                );
+                Ok((result, self.recovery_lease))
+            }
+            Err(_) => {
+                self.join.abort();
+                let _ = self.join.await;
+                Err(MatrixError::Join)
+            }
+        }
     }
 
     /// Wait for a terminal sync failure without requesting shutdown.

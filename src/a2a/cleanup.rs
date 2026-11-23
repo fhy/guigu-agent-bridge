@@ -33,9 +33,10 @@ pub async fn start_cleanup(
         return Err(A2aError::RecoveryNeeded);
     }
     let (stop, mut stopped) = tokio::sync::oneshot::channel();
+    let mut ticker = tokio::time::interval(policy.interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    ticker.tick().await;
     let owner = tokio::spawn(async move {
-        let mut ticker = tokio::time::interval(policy.interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         loop {
             tokio::select! {
                 _ = &mut stopped => return Ok(()),

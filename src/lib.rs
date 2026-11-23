@@ -5,25 +5,42 @@
 
 pub mod a2a;
 pub mod acp;
+mod admission_hold;
 pub mod agents;
 pub mod app;
 pub mod bus;
 pub mod config;
 pub mod error;
+pub mod failed_before_prompt;
 pub mod gateway;
+pub(crate) mod historical_unknown_abandonment;
+pub mod isolated_fixture_migration;
+pub mod isolated_state_backup;
 pub mod lease_owner_diagnostics;
+pub mod legacy_owner_reconciliation;
+pub(crate) mod maintenance_lock;
 pub mod matrix;
 pub mod models;
+pub(crate) mod native_succession;
 pub mod observer;
 pub mod offline_delivery;
+pub mod offline_identity;
 pub mod offline_preacceptance;
+pub(crate) mod offline_production_migration;
 pub mod offline_recovery;
+pub mod orphaned_preacceptance;
+pub mod owner_binding_remediation;
+pub mod privileged_proc_proof;
 pub mod readonly_tuple;
 pub mod readonly_tuple_diagnostics;
 pub mod runtime;
+pub mod runtime_admission;
 pub mod selected_preacceptance;
 pub mod storage;
+pub(crate) mod terminal_acknowledged_cleanup;
 pub(crate) mod terminal_closure;
+#[cfg(test)]
+mod test_diagnostics;
 
 use std::future::Future;
 
@@ -90,14 +107,153 @@ pub fn init_tracing() {
 /// Production entry point: initialize tracing, then run until an interrupt or
 /// termination signal.
 pub async fn run() -> Result<(), Error> {
-    let mut version_args = std::env::args_os().skip(1);
-    if version_args
-        .next()
-        .as_deref()
-        .and_then(|value| value.to_str())
-        == Some("--version")
+    let all_args = std::env::args_os().collect::<Vec<_>>();
+    if all_args.get(1).and_then(|value| value.to_str()) == Some("reconcile-failed-before-prompt") {
+        let database = failed_before_prompt::parse_args(&all_args[1..]).map_err(|e| {
+            Error::Cli(error::CliFailure {
+                command: "reconcile-failed-before-prompt",
+                category: e.slug(),
+                status: e.status(),
+            })
+        })?;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        failed_before_prompt::reconcile(database, &now)
+            .await
+            .map_err(|e| {
+                Error::Cli(error::CliFailure {
+                    command: "reconcile-failed-before-prompt",
+                    category: e.slug(),
+                    status: e.status(),
+                })
+            })?;
+        println!("reconcile-failed-before-prompt result=reconciled status=0");
+        return Ok(());
+    }
+    if all_args.get(1).and_then(|value| value.to_str()) == Some("--version") {
+        if all_args.len() == 2 {
+            println!("guigu-agent-bridge {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
+        return Err(Error::Cli(error::CliFailure {
+            command: "--version",
+            category: "invalid-arguments",
+            status: 2,
+        }));
+    }
+    if all_args.get(1).and_then(|value| value.to_str()) == Some("offline-capture-matrix-identity") {
+        return offline_production_migration::dispatch_identity(&all_args[1..]).await;
+    }
+    if all_args.get(1).and_then(|value| value.to_str())
+        == Some("offline-transition-matrix-compatibility")
     {
-        if version_args.next().is_some() {
+        return offline_production_migration::dispatch_transition(&all_args[1..]).await;
+    }
+    if all_args.get(1).and_then(|v| v.to_str()) == Some("offline-migrate-production") {
+        let req = offline_production_migration::parse_args(&all_args[1..]).map_err(|_| {
+            Error::Cli(error::CliFailure {
+                command: "offline-migrate-production",
+                category: "invalid-arguments",
+                status: 2,
+            })
+        })?;
+        let result = offline_production_migration::run(req)
+            .await
+            .map_err(|error| {
+                let (category, status) = match error {
+                    offline_production_migration::Failure::InvalidArguments => {
+                        ("invalid-arguments", 2)
+                    }
+                    offline_production_migration::Failure::Busy => ("busy", 4),
+                    offline_production_migration::Failure::Preflight => ("preflight", 5),
+                    offline_production_migration::Failure::ManualRequired => ("manual-required", 6),
+                    offline_production_migration::Failure::Migration => ("migration", 7),
+                };
+                Error::Cli(error::CliFailure {
+                    command: "offline-migrate-production",
+                    category,
+                    status,
+                })
+            })?;
+        println!("{result}");
+        return Ok(());
+    }
+    if all_args.get(1).and_then(|value| value.to_str()) == Some("hold-unresolved-admission") {
+        init_tracing();
+        tracing::debug!(
+            stage = "maintenance-exclusion",
+            "acquiring offline admission hold exclusion"
+        );
+    }
+    let _maintenance_guard = offline_production_migration::cli_exclusion::acquire(&all_args)
+        .map_err(|_| {
+            Error::Cli(error::CliFailure {
+                command: "maintenance-exclusion",
+                category: "busy-or-unresolved",
+                status: 4,
+            })
+        })?;
+    if all_args.get(1).and_then(|value| value.to_str()) == Some("hold-unresolved-admission") {
+        let request = admission_hold::parse(&all_args[1..])
+            .map_err(|_| recovery_failure("hold-unresolved-admission"))?;
+        admission_hold::run(request)
+            .await
+            .map_err(|_| recovery_failure("hold-unresolved-admission"))?;
+        println!("hold-unresolved-admission result=held-no-replay");
+        return Ok(());
+    }
+    if all_args.get(1).and_then(|v| v.to_str()) == Some("historical-terminal-cleanup") {
+        let req = terminal_acknowledged_cleanup::parse_args(&all_args[1..]).map_err(|_| {
+            Error::Cli(error::CliFailure {
+                command: "historical-terminal-cleanup",
+                category: "invalid-arguments",
+                status: 2,
+            })
+        })?;
+        let result = terminal_acknowledged_cleanup::run(req)
+            .await
+            .map_err(|error| {
+                let (category, status) = match error {
+                    terminal_acknowledged_cleanup::CleanupError::InvalidArguments => {
+                        ("invalid-arguments", 2)
+                    }
+                    terminal_acknowledged_cleanup::CleanupError::Schema => ("schema", 5),
+                    terminal_acknowledged_cleanup::CleanupError::NoUniqueTarget => {
+                        ("no-unique-target", 3)
+                    }
+                    terminal_acknowledged_cleanup::CleanupError::Conflict => ("conflicting", 6),
+                    terminal_acknowledged_cleanup::CleanupError::Database => ("database", 9),
+                };
+                Error::Cli(error::CliFailure {
+                    command: "historical-terminal-cleanup",
+                    category,
+                    status,
+                })
+            })?;
+        println!("historical-terminal-cleanup result={result}");
+        return Ok(());
+    }
+    if all_args.get(1).and_then(|v| v.to_str()) == Some("historical-unknown-abandon") {
+        let req = historical_unknown_abandonment::parse_args(&all_args[1..]).map_err(|_| {
+            Error::Cli(error::CliFailure {
+                command: "historical-unknown-abandon",
+                category: "invalid-arguments",
+                status: 2,
+            })
+        })?;
+        let result = historical_unknown_abandonment::run(req)
+            .await
+            .map_err(|_| {
+                Error::Cli(error::CliFailure {
+                    command: "historical-unknown-abandon",
+                    category: "conflicting",
+                    status: 6,
+                })
+            })?;
+        println!("historical-unknown-abandon result={result}");
+        return Ok(());
+    }
+    if all_args.get(1).and_then(|value| value.to_str()) == Some("--version") {
+        if all_args.len() != 2 {
             return Err(Error::Cli(error::CliFailure {
                 command: "--version",
                 category: "invalid-arguments",
@@ -107,21 +263,211 @@ pub async fn run() -> Result<(), Error> {
         println!("guigu-agent-bridge {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    if all_args.get(1).and_then(|value| value.to_str()) == Some("remediate-isolated-owner-bindings")
+    {
+        let parsed =
+            owner_binding_remediation::parse_args(&all_args[1..]).map_err(Error::OwnerBinding)?;
+        let outcome = owner_binding_remediation::run_production(&parsed)
+            .await
+            .map_err(Error::OwnerBinding)?;
+        println!(
+            "remediate-isolated-owner-bindings result={} status=0 cause=none substage=none",
+            outcome.code()
+        );
+        return Ok(());
+    }
+    if let Some(output) = isolated_state_backup::dispatch(std::env::args_os().collect()).await {
+        match output {
+            Ok(line) => {
+                println!("{line}");
+                return Ok(());
+            }
+            Err(failure) => {
+                return Err(Error::Cli(error::CliFailure {
+                    command: failure.command,
+                    category: failure.cause,
+                    status: failure.status,
+                }));
+            }
+        }
+    }
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref().and_then(|v| v.to_str())
+        == Some("prepare-isolated-legacy-fixture-migration-manifest")
+    {
+        let mut cli = vec![std::ffi::OsString::from(
+            "prepare-isolated-legacy-fixture-migration-manifest",
+        )];
+        cli.extend(args);
+        let prepare = isolated_fixture_migration::parse_prepare_args(&cli)
+            .map_err(isolated_fixture_migration::prepare_cli_rejected)
+            .map_err(|e| {
+                Error::Cli(error::CliFailure {
+                    command: "prepare-isolated-legacy-fixture-migration-manifest",
+                    category: e.slug(),
+                    status: e.status(),
+                })
+            })?;
+        isolated_fixture_migration::prepare_manifest(prepare)
+            .await
+            .map_err(|e| {
+                Error::Cli(error::CliFailure {
+                    command: "prepare-isolated-legacy-fixture-migration-manifest",
+                    category: e.slug(),
+                    status: e.status(),
+                })
+            })?;
+        println!("prepare-isolated-legacy-fixture-migration-manifest result=prepared status=0");
+        return Ok(());
+    }
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref().and_then(|v| v.to_str()) == Some("migrate-isolated-legacy-fixture") {
+        let mut cli = vec![std::ffi::OsString::from("migrate-isolated-legacy-fixture")];
+        cli.extend(args);
+        let manifest = isolated_fixture_migration::parse_args(&cli).map_err(|e| {
+            Error::Cli(error::CliFailure {
+                command: "migrate-isolated-legacy-fixture",
+                category: e.slug(),
+                status: e.status(),
+            })
+        })?;
+        let outcome = isolated_fixture_migration::migrate(manifest)
+            .await
+            .map_err(|e| {
+                Error::Cli(error::CliFailure {
+                    command: "migrate-isolated-legacy-fixture",
+                    category: e.slug(),
+                    status: e.status(),
+                })
+            })?;
+        println!(
+            "migrate-isolated-legacy-fixture result={} status=0",
+            match outcome {
+                isolated_fixture_migration::Outcome::Migrated => "migrated",
+                isolated_fixture_migration::Outcome::AlreadyMigrated => "already-migrated",
+            }
+        );
+        return Ok(());
+    }
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref().and_then(|v| v.to_str())
+        == Some("prepare-isolated-legacy-owner-manifest")
+    {
+        let mut cli = vec![std::ffi::OsString::from(
+            "prepare-isolated-legacy-owner-manifest",
+        )];
+        cli.extend(args);
+        let prepare = legacy_owner_reconciliation::parse_prepare_args(&cli).map_err(|e| {
+            Error::Cli(error::CliFailure {
+                command: "prepare-isolated-legacy-owner-manifest",
+                category: e.slug(),
+                status: e.status(),
+            })
+        })?;
+        legacy_owner_reconciliation::prepare_manifest(prepare)
+            .await
+            .map_err(|e| {
+                Error::Cli(error::CliFailure {
+                    command: "prepare-isolated-legacy-owner-manifest",
+                    category: e.slug(),
+                    status: e.status(),
+                })
+            })?;
+        println!("prepare-isolated-legacy-owner-manifest result=prepared status=0");
+        return Ok(());
+    }
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref().and_then(|v| v.to_str()) == Some("reconcile-isolated-legacy-owner") {
+        let mut cli = vec![std::ffi::OsString::from("reconcile-isolated-legacy-owner")];
+        cli.extend(args);
+        let manifest = legacy_owner_reconciliation::parse_args(&cli).map_err(|e| {
+            Error::Cli(error::CliFailure {
+                command: "reconcile-isolated-legacy-owner",
+                category: e.slug(),
+                status: e.status(),
+            })
+        })?;
+        let outcome = legacy_owner_reconciliation::reconcile(manifest)
+            .await
+            .map_err(|e| {
+                Error::Cli(error::CliFailure {
+                    command: "reconcile-isolated-legacy-owner",
+                    category: e.slug(),
+                    status: e.status(),
+                })
+            })?;
+        println!(
+            "reconcile-isolated-legacy-owner result={} status=0",
+            match outcome {
+                legacy_owner_reconciliation::Outcome::Recovered => "recovered",
+                legacy_owner_reconciliation::Outcome::AlreadyStopped => "already-stopped",
+            }
+        );
+        return Ok(());
+    }
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref().and_then(|v| v.to_str()) == Some("reconcile-orphaned-preacceptance") {
+        let mut cli = vec![std::ffi::OsString::from("reconcile-orphaned-preacceptance")];
+        cli.extend(args);
+        let database = orphaned_preacceptance::parse_args(&cli).map_err(|e| {
+            Error::Cli(error::CliFailure {
+                command: "reconcile-orphaned-preacceptance",
+                category: e.slug(),
+                status: e.status(),
+            })
+        })?;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        match orphaned_preacceptance::reconcile(database, &now).await {
+            Ok(orphaned_preacceptance::Outcome::Reconciled) => {
+                println!("reconcile-orphaned-preacceptance result=reconciled status=0")
+            }
+            Ok(orphaned_preacceptance::Outcome::AlreadyReconciled) => {
+                println!("reconcile-orphaned-preacceptance result=already-reconciled status=0")
+            }
+            Err(e) => {
+                return Err(Error::Cli(error::CliFailure {
+                    command: "reconcile-orphaned-preacceptance",
+                    category: e.slug(),
+                    status: e.status(),
+                }));
+            }
+        }
+        return Ok(());
+    }
     let mut args = std::env::args_os().skip(1);
     if args.next().as_deref().and_then(|v| v.to_str()) == Some("recover-runtime") {
         let mut cli = vec![std::ffi::OsString::from("recover-runtime")];
         cli.extend(args);
+        if cli
+            .iter()
+            .any(|arg| arg == "--stop-metadata-archive" || arg == "--config")
+        {
+            let (path, archive) = native_succession::stop_recovery::parse(&cli)
+                .map_err(|_| app::AppError::Assembly("invalid native stop recovery arguments"))?;
+            let config = config::load(&path)?;
+            native_succession::stop_recovery::recover(&config, &path, &archive).await
+                .map_err(|error| {
+                    tracing::error!(phase="recover-runtime", reason=%error, "native stop metadata recovery refused");
+                    app::AppError::Runtime
+                })?;
+            println!("recover-runtime result=native-stop-confirmed");
+            return Ok(());
+        }
         let (database, token, fingerprint) = offline_recovery::parse_cli_args(&cli)
             .map_err(|_| app::AppError::Assembly("invalid recover-runtime arguments"))?;
         let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
         let result = offline_recovery::recover_stale_runtime(database, &token, &fingerprint, &now)
             .await
-            .map_err(|_| app::AppError::Runtime)?;
+            .map_err(|error| {
+                tracing::error!(phase = "recover-runtime", reason = %error, "runtime recovery refused");
+                app::AppError::Runtime
+            })?;
         println!(
             "recover-runtime result={}",
             match result {
                 offline_recovery::RecoveryOutcome::Recovered => "recovered",
                 offline_recovery::RecoveryOutcome::AlreadyStopped => "already-stopped",
+                offline_recovery::RecoveryOutcome::RestartEligible => "restart-eligible",
             }
         );
         return Ok(());
@@ -290,6 +636,31 @@ where
 }
 
 #[cfg(test)]
+pub(crate) fn test_binary_path(name: &str) -> std::path::PathBuf {
+    let variable = format!("CARGO_BIN_EXE_{name}");
+    resolve_test_binary(
+        name,
+        std::env::var_os(&variable),
+        std::env::var_os("CARGO_TARGET_DIR"),
+    )
+}
+
+#[cfg(test)]
+fn resolve_test_binary(
+    name: &str,
+    cargo_path: Option<std::ffi::OsString>,
+    target_dir: Option<std::ffi::OsString>,
+) -> std::path::PathBuf {
+    if let Some(path) = cargo_path {
+        return path.into();
+    }
+    if let Some(target) = target_dir {
+        return std::path::PathBuf::from(target).join("debug").join(name);
+    }
+    std::path::PathBuf::from("target/debug").join(name)
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -346,5 +717,22 @@ mod tests {
     fn init_tracing_is_idempotent() {
         init_tracing();
         init_tracing();
+    }
+
+    #[test]
+    fn process_fixture_binary_binding_uses_hyphenated_cargo_name() {
+        let path = resolve_test_binary(
+            "guigu-agent-bridge",
+            Some("/shared/target/debug/guigu-agent-bridge".into()),
+            Some("/ignored/target".into()),
+        );
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/shared/target/debug/guigu-agent-bridge")
+        );
+        assert_eq!(
+            resolve_test_binary("guigu-agent-bridge", None, Some("/shared/target".into())),
+            std::path::PathBuf::from("/shared/target/debug/guigu-agent-bridge")
+        );
     }
 }

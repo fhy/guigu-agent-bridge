@@ -1,0 +1,642 @@
+--- a/vendor/matrix-sdk-0.13.0/src/client/mod.rs
++++ b/vendor/matrix-sdk-0.13.0/src/client/mod.rs
+@@ -464,0 +465,5 @@
++    /// Enable full repeated-response processing on a hydrated isolated client.
++    pub fn enable_isolated_sync_replay(&self) -> matrix_sdk_base::Result<()> {
++        self.base_client().enable_isolated_sync_replay()
++    }
++
+--- a/vendor/matrix-sdk-base-0.13.0/src/client.rs
++++ b/vendor/matrix-sdk-base-0.13.0/src/client.rs
+@@ -16 +15,0 @@
+-#[cfg(feature = "e2e-encryption")]
+@@ -64 +63 @@
+-        ambiguity_map::AmbiguityCache, BaseStateStore, DynStateStore, MemoryStore,
++        ambiguity_map::AmbiguityCache, BaseStateStore, DynStateStore,
+@@ -128,0 +128 @@
++    isolated_sync_replay: Option<Arc<std::sync::atomic::AtomicBool>>,
+@@ -199,0 +200 @@
++            isolated_sync_replay: None,
+@@ -210,0 +212,3 @@
++        self.session_meta().ok_or(Error::InsufficientData)?;
++        let snapshot = self.state_store.snapshot().await?;
++        let memory = snapshot.into_memory_store().await?;
+@@ -212 +216 @@
+-            .state_store(MemoryStore::new());
++            .state_store(memory);
+@@ -231,0 +236 @@
++            isolated_sync_replay: Some(Default::default()),
+@@ -251 +256 @@
+-            .state_store(MemoryStore::new());
++            .state_store(crate::store::MemoryStore::new());
+@@ -522,0 +528,9 @@
++    /// Enable full repeated-response processing on a hydrated isolated client.
++    pub fn enable_isolated_sync_replay(&self) -> Result<()> {
++        self.isolated_sync_replay
++            .as_ref()
++            .ok_or(Error::InsufficientData)?
++            .store(true, std::sync::atomic::Ordering::Release);
++        Ok(())
++    }
++
+@@ -555 +569,3 @@
+-        if self.state_store.sync_token.read().await.as_ref() == Some(&response.next_batch) {
++        if !self.isolated_sync_replay.as_ref().is_some_and(|enabled| {
++            enabled.load(std::sync::atomic::Ordering::Acquire)
++        }) && self.state_store.sync_token.read().await.as_ref() == Some(&response.next_batch) {
+--- a/vendor/matrix-sdk-base-0.13.0/src/store/mod.rs
++++ b/vendor/matrix-sdk-base-0.13.0/src/store/mod.rs
+@@ -68,0 +69,2 @@
++mod snapshot;
++pub use snapshot::{SnapshotKey, StateSnapshot};
+--- a/vendor/matrix-sdk-base-0.13.0/src/store/snapshot.rs
++++ b/vendor/matrix-sdk-base-0.13.0/src/store/snapshot.rs
+@@ -0,0 +1,53 @@
++use ruma::{OwnedEventId, OwnedRoomId, OwnedUserId};
++
++use super::{
++    MemoryStore, Result, StateChanges, StateStore, StateStoreDataKey, StateStoreDataValue,
++};
++
++#[derive(Debug)]
++#[doc(hidden)]
++pub enum SnapshotKey {
++    SyncToken,
++    ServerInfo,
++    UtdHookManagerData,
++    UserAvatarUrl(OwnedUserId),
++    RecentlyVisitedRooms(OwnedUserId),
++    ComposerDraft(OwnedRoomId, Option<OwnedEventId>),
++    SeenKnockRequests(OwnedRoomId),
++    Filter(String),
++}
++
++impl SnapshotKey {
++    pub fn as_key(&self) -> StateStoreDataKey<'_> {
++        match self {
++            Self::SyncToken => StateStoreDataKey::SyncToken,
++            Self::ServerInfo => StateStoreDataKey::ServerInfo,
++            Self::UtdHookManagerData => StateStoreDataKey::UtdHookManagerData,
++            Self::UserAvatarUrl(user) => StateStoreDataKey::UserAvatarUrl(user),
++            Self::RecentlyVisitedRooms(user) => StateStoreDataKey::RecentlyVisitedRooms(user),
++            Self::ComposerDraft(room, thread) => {
++                StateStoreDataKey::ComposerDraft(room, thread.as_deref())
++            }
++            Self::SeenKnockRequests(room) => StateStoreDataKey::SeenKnockRequests(room),
++            Self::Filter(name) => StateStoreDataKey::Filter(name),
++        }
++    }
++}
++
++#[derive(Debug, Default)]
++#[doc(hidden)]
++pub struct StateSnapshot {
++    pub changes: StateChanges,
++    pub kv: Vec<(SnapshotKey, StateStoreDataValue)>,
++}
++
++impl StateSnapshot {
++    pub async fn into_memory_store(self) -> Result<MemoryStore> {
++        let memory = MemoryStore::new();
++        memory.save_changes(&self.changes).await?;
++        for (key, value) in self.kv {
++            memory.set_kv_data(key.as_key(), value).await?;
++        }
++        Ok(memory)
++    }
++}
+--- a/vendor/matrix-sdk-base-0.13.0/src/store/traits.rs
++++ b/vendor/matrix-sdk-base-0.13.0/src/store/traits.rs
+@@ -67,0 +68,7 @@
++    #[doc(hidden)]
++    async fn snapshot(&self) -> Result<super::StateSnapshot, StoreError> {
++        Err(StoreError::backend(std::io::Error::other(
++            "state snapshot unsupported",
++        )))
++    }
++
+@@ -496,0 +504,4 @@
++
++    async fn snapshot(&self) -> Result<super::StateSnapshot, StoreError> {
++        self.0.snapshot().await
++    }
+--- a/vendor/matrix-sdk-sqlite-0.13.0/src/state_store.rs
++++ b/vendor/matrix-sdk-sqlite-0.13.0/src/state_store.rs
+@@ -69,0 +70,3 @@
++mod snapshot;
++mod snapshot_aux;
++
+@@ -976,0 +980,6 @@
++
++    async fn snapshot(
++        &self,
++    ) -> std::result::Result<matrix_sdk_base::store::StateSnapshot, matrix_sdk_base::store::StoreError> {
++        self.export_snapshot().await.map_err(Into::into)
++    }
+--- a/vendor/matrix-sdk-sqlite-0.13.0/src/state_store/snapshot.rs
++++ b/vendor/matrix-sdk-sqlite-0.13.0/src/state_store/snapshot.rs
+@@ -0,0 +1,193 @@
++use super::*;
++use matrix_sdk_base::store::StateSnapshot;
++use ruma::events::AnyStrippedStateEvent;
++
++pub(super) fn invalid() -> Error {
++    refused("incomplete or unsupported fields")
++}
++
++pub(super) fn refused(stage: &str) -> Error {
++    Error::InvalidData {
++        details: format!("state snapshot refused: {stage}"),
++    }
++}
++
++pub(super) fn room_for(
++    store: &SqliteStateStore,
++    snapshot: &StateSnapshot,
++    table: &str,
++    encoded: &[u8],
++) -> Result<OwnedRoomId> {
++    snapshot
++        .changes
++        .room_infos
++        .keys()
++        .find(|room| store.encode_key(table, room).as_ref() == encoded)
++        .cloned()
++        .ok_or_else(invalid)
++}
++
++impl SqliteStateStore {
++    pub(super) async fn export_snapshot(&self) -> Result<StateSnapshot> {
++        let store = self.clone();
++        self.acquire()
++            .await?
++            .with_transaction(move |txn| {
++                let version: Vec<u8> =
++                    txn.query_row("SELECT value FROM kv WHERE key='version'", [], |row| {
++                        row.get(0)
++                    })?;
++                if version != [DATABASE_VERSION] {
++                    return Err(invalid());
++                }
++                let mut snapshot = StateSnapshot::default();
++                store
++                    .snapshot_rooms(txn, &mut snapshot)
++                    .map_err(|_| refused("room info"))?;
++                store
++                    .snapshot_state(txn, &mut snapshot)
++                    .map_err(|_| refused("room state"))?;
++                store
++                    .snapshot_account_data(txn, &mut snapshot)
++                    .map_err(|_| refused("account data"))?;
++                store.snapshot_auxiliary(txn, &mut snapshot)?;
++                if snapshot
++                    .changes
++                    .sync_token
++                    .as_deref()
++                    .is_none_or(str::is_empty)
++                {
++                    return Err(invalid());
++                }
++                Ok(snapshot)
++            })
++            .await
++    }
++
++    fn snapshot_rooms(&self, txn: &Transaction<'_>, snapshot: &mut StateSnapshot) -> Result<()> {
++        let mut statement = txn.prepare("SELECT room_id, state, data FROM room_info")?;
++        let mut rows = statement.query([])?;
++        while let Some(row) = rows.next()? {
++            let room: RoomInfo = self.deserialize_json(&row.get::<_, Vec<u8>>(2)?)?;
++            let encoded_room: Vec<u8> = row.get(0)?;
++            let encoded_state: Vec<u8> = row.get(1)?;
++            if self.encode_key(keys::ROOM_INFO, room.room_id()).as_ref() != encoded_room
++                || self
++                    .encode_key(keys::ROOM_INFO, serde_json::to_string(&room.state())?)
++                    .as_ref()
++                    != encoded_state
++            {
++                return Err(invalid());
++            }
++            if snapshot
++                .changes
++                .room_infos
++                .insert(room.room_id().to_owned(), room)
++                .is_some()
++            {
++                return Err(invalid());
++            }
++        }
++        Ok(())
++    }
++
++    fn snapshot_state(&self, txn: &Transaction<'_>, snapshot: &mut StateSnapshot) -> Result<()> {
++        let mut statement =
++            txn.prepare("SELECT room_id, event_type, state_key, stripped, data FROM state_event")?;
++        let mut rows = statement.query([])?;
++        while let Some(row) = rows.next()? {
++            let room = room_for(
++                self,
++                snapshot,
++                keys::STATE_EVENT,
++                &row.get::<_, Vec<u8>>(0)?,
++            )?;
++            let raw: Raw<serde_json::Value> = self.deserialize_json(&row.get::<_, Vec<u8>>(4)?)?;
++            let event_type: StateEventType = raw.get_field("type")?.ok_or_else(invalid)?;
++            let state_key: String = raw.get_field("state_key")?.ok_or_else(invalid)?;
++            if self
++                .encode_key(keys::STATE_EVENT, event_type.to_string())
++                .as_ref()
++                != row.get::<_, Vec<u8>>(1)?
++                || self.encode_key(keys::STATE_EVENT, &state_key).as_ref()
++                    != row.get::<_, Vec<u8>>(2)?
++            {
++                return Err(invalid());
++            }
++            if row.get::<_, bool>(3)? {
++                let raw = raw.cast::<AnyStrippedStateEvent>();
++                raw.deserialize()?;
++                snapshot
++                    .changes
++                    .stripped_state
++                    .entry(room)
++                    .or_default()
++                    .entry(event_type)
++                    .or_default()
++                    .insert(state_key, raw);
++            } else {
++                let raw = raw.cast::<AnySyncStateEvent>();
++                raw.deserialize()?;
++                snapshot
++                    .changes
++                    .state
++                    .entry(room)
++                    .or_default()
++                    .entry(event_type)
++                    .or_default()
++                    .insert(state_key, raw);
++            }
++        }
++        Ok(())
++    }
++
++    fn snapshot_account_data(
++        &self,
++        txn: &Transaction<'_>,
++        snapshot: &mut StateSnapshot,
++    ) -> Result<()> {
++        let mut statement = txn.prepare("SELECT event_type, data FROM global_account_data")?;
++        let mut rows = statement.query([])?;
++        while let Some(row) = rows.next()? {
++            let raw: Raw<AnyGlobalAccountDataEvent> =
++                self.deserialize_json(&row.get::<_, Vec<u8>>(1)?)?;
++            let event_type = raw.deserialize()?.event_type();
++            if self
++                .encode_key(keys::GLOBAL_ACCOUNT_DATA, event_type.to_string())
++                .as_ref()
++                != row.get::<_, Vec<u8>>(0)?
++            {
++                return Err(invalid());
++            }
++            snapshot.changes.account_data.insert(event_type, raw);
++        }
++        let mut statement =
++            txn.prepare("SELECT room_id, event_type, data FROM room_account_data")?;
++        let mut rows = statement.query([])?;
++        while let Some(row) = rows.next()? {
++            let room = room_for(
++                self,
++                snapshot,
++                keys::ROOM_ACCOUNT_DATA,
++                &row.get::<_, Vec<u8>>(0)?,
++            )?;
++            let raw: Raw<AnyRoomAccountDataEvent> =
++                self.deserialize_json(&row.get::<_, Vec<u8>>(2)?)?;
++            let event_type = raw.deserialize()?.event_type();
++            if self
++                .encode_key(keys::ROOM_ACCOUNT_DATA, event_type.to_string())
++                .as_ref()
++                != row.get::<_, Vec<u8>>(1)?
++            {
++                return Err(invalid());
++            }
++            snapshot
++                .changes
++                .room_account_data
++                .entry(room)
++                .or_default()
++                .insert(event_type, raw);
++        }
++        Ok(())
++    }
++}
+--- a/vendor/matrix-sdk-sqlite-0.13.0/src/state_store/snapshot_aux.rs
++++ b/vendor/matrix-sdk-sqlite-0.13.0/src/state_store/snapshot_aux.rs
+@@ -0,0 +1,308 @@
++use super::snapshot::{invalid, refused, room_for};
++use super::*;
++use matrix_sdk_base::store::{SnapshotKey, StateSnapshot};
++
++impl SqliteStateStore {
++    pub(super) fn snapshot_auxiliary(
++        &self,
++        txn: &Transaction<'_>,
++        snapshot: &mut StateSnapshot,
++    ) -> Result<()> {
++        let users = self
++            .snapshot_members(txn, snapshot)
++            .map_err(|_| refused("membership"))?;
++        self.snapshot_profiles(txn, snapshot, &users)
++            .map_err(|_| refused("profiles"))?;
++        self.snapshot_receipts(txn, snapshot)
++            .map_err(|_| refused("receipts"))?;
++        self.snapshot_names(txn, snapshot)
++            .map_err(|_| refused("display names"))?;
++        self.snapshot_kv(txn, snapshot, users)
++            .map_err(|_| refused("key/value"))
++    }
++
++    fn snapshot_members(
++        &self,
++        txn: &Transaction<'_>,
++        snapshot: &StateSnapshot,
++    ) -> Result<BTreeSet<OwnedUserId>> {
++        let mut users = BTreeSet::new();
++        let mut statement =
++            txn.prepare("SELECT room_id, user_id, membership, stripped, data FROM member")?;
++        let mut rows = statement.query([])?;
++        while let Some(row) = rows.next()? {
++            let room = room_for(self, snapshot, keys::MEMBER, &row.get::<_, Vec<u8>>(0)?)?;
++            let user: OwnedUserId = self.deserialize_value(&row.get::<_, Vec<u8>>(4)?)?;
++            let membership = if row.get::<_, bool>(3)? {
++                let raw = snapshot
++                    .changes
++                    .stripped_state
++                    .get(&room)
++                    .and_then(|types| types.get(&StateEventType::RoomMember))
++                    .and_then(|members| members.get(user.as_str()))
++                    .ok_or_else(invalid)?;
++                raw.deserialize_as::<StrippedRoomMemberEvent>()?
++                    .content
++                    .membership
++            } else {
++                let raw = snapshot
++                    .changes
++                    .state
++                    .get(&room)
++                    .and_then(|types| types.get(&StateEventType::RoomMember))
++                    .and_then(|members| members.get(user.as_str()))
++                    .ok_or_else(invalid)?;
++                raw.deserialize_as::<SyncRoomMemberEvent>()?
++                    .membership()
++                    .clone()
++            };
++            if self.encode_key(keys::MEMBER, &user).as_ref() != row.get::<_, Vec<u8>>(1)?
++                || self.encode_key(keys::MEMBER, membership.as_str()).as_ref()
++                    != row.get::<_, Vec<u8>>(2)?
++            {
++                return Err(invalid());
++            }
++            users.insert(user);
++        }
++        Ok(users)
++    }
++
++    fn snapshot_profiles(
++        &self,
++        txn: &Transaction<'_>,
++        snapshot: &mut StateSnapshot,
++        users: &BTreeSet<OwnedUserId>,
++    ) -> Result<()> {
++        let mut statement = txn.prepare("SELECT room_id, user_id, data FROM profile")?;
++        let mut rows = statement.query([])?;
++        while let Some(row) = rows.next()? {
++            let room = room_for(self, snapshot, keys::PROFILE, &row.get::<_, Vec<u8>>(0)?)?;
++            let encoded: Vec<u8> = row.get(1)?;
++            let user = users
++                .iter()
++                .find(|user| self.encode_key(keys::PROFILE, user).as_ref() == encoded)
++                .ok_or_else(invalid)?
++                .clone();
++            let profile: MinimalRoomMemberEvent =
++                self.deserialize_json(&row.get::<_, Vec<u8>>(2)?)?;
++            snapshot
++                .changes
++                .profiles
++                .entry(room)
++                .or_default()
++                .insert(user, profile);
++        }
++        Ok(())
++    }
++
++    fn snapshot_receipts(&self, txn: &Transaction<'_>, snapshot: &mut StateSnapshot) -> Result<()> {
++        let mut statement = txn.prepare(
++            "SELECT room_id, user_id, receipt_type, thread, event_id, data FROM receipt",
++        )?;
++        let mut rows = statement.query([])?;
++        while let Some(row) = rows.next()? {
++            let room = room_for(self, snapshot, keys::RECEIPT, &row.get::<_, Vec<u8>>(0)?)?;
++            let data: ReceiptData = self.deserialize_json(&row.get::<_, Vec<u8>>(5)?)?;
++            let encoded_type: Vec<u8> = row.get(2)?;
++            let receipt_type = [ReceiptType::Read, ReceiptType::ReadPrivate]
++                .into_iter()
++                .find(|kind| self.encode_key(keys::RECEIPT, kind.as_str()).as_ref() == encoded_type)
++                .ok_or_else(invalid)?;
++            if self.encode_key(keys::RECEIPT, &data.user_id).as_ref() != row.get::<_, Vec<u8>>(1)?
++                || self
++                    .encode_key(
++                        keys::RECEIPT,
++                        rmp_serde::to_vec_named(&data.receipt.thread)?,
++                    )
++                    .as_ref()
++                    != row.get::<_, Vec<u8>>(3)?
++                || self.encode_key(keys::RECEIPT, &data.event_id).as_ref()
++                    != row.get::<_, Vec<u8>>(4)?
++            {
++                return Err(invalid());
++            }
++            snapshot
++                .changes
++                .receipts
++                .entry(room)
++                .or_insert_with(|| ruma::events::receipt::ReceiptEventContent(BTreeMap::new()))
++                .entry(data.event_id)
++                .or_default()
++                .entry(receipt_type)
++                .or_default()
++                .insert(data.user_id, data.receipt);
++        }
++        Ok(())
++    }
++
++    fn snapshot_names(&self, txn: &Transaction<'_>, snapshot: &mut StateSnapshot) -> Result<()> {
++        let mut statement = txn.prepare("SELECT room_id, name, data FROM display_name")?;
++        let mut rows = statement.query([])?;
++        while let Some(row) = rows.next()? {
++            let room = room_for(
++                self,
++                snapshot,
++                keys::DISPLAY_NAME,
++                &row.get::<_, Vec<u8>>(0)?,
++            )?;
++            let encoded: Vec<u8> = row.get(1)?;
++            let users: BTreeSet<OwnedUserId> = self.deserialize_json(&row.get::<_, Vec<u8>>(2)?)?;
++            let mut names: Vec<_> = snapshot
++                .changes
++                .profiles
++                .get(&room)
++                .into_iter()
++                .flat_map(|profiles| profiles.values())
++                .filter_map(|profile| {
++                    profile
++                        .as_original()
++                        .and_then(|event| event.content.displayname.as_ref())
++                })
++                .map(|name| DisplayName::new(name))
++                .collect();
++            names.extend(member_names(snapshot, &room)?);
++            let name = names
++                .into_iter()
++                .find(|name| {
++                    [
++                        name.as_raw_str(),
++                        name.as_normalized_str()
++                            .unwrap_or_else(|| name.as_raw_str()),
++                    ]
++                    .iter()
++                    .any(|value| self.encode_key(keys::DISPLAY_NAME, value).as_ref() == encoded)
++                })
++                .ok_or_else(invalid)?;
++            snapshot
++                .changes
++                .ambiguity_maps
++                .entry(room)
++                .or_default()
++                .entry(name)
++                .or_default()
++                .extend(users);
++        }
++        Ok(())
++    }
++
++    fn snapshot_kv(
++        &self,
++        txn: &Transaction<'_>,
++        snapshot: &mut StateSnapshot,
++        users: BTreeSet<OwnedUserId>,
++    ) -> Result<()> {
++        let mut candidates = vec![
++            SnapshotKey::SyncToken,
++            SnapshotKey::ServerInfo,
++            SnapshotKey::UtdHookManagerData,
++        ];
++        for user in &users {
++            candidates.push(SnapshotKey::UserAvatarUrl(user.clone()));
++            candidates.push(SnapshotKey::RecentlyVisitedRooms(user.clone()));
++        }
++        for room in snapshot.changes.room_infos.keys() {
++            candidates.push(SnapshotKey::ComposerDraft(room.clone(), None));
++            candidates.push(SnapshotKey::SeenKnockRequests(room.clone()));
++        }
++        let mut statement = txn.prepare("SELECT key, value FROM kv_blob")?;
++        let mut rows = statement.query([])?;
++        while let Some(row) = rows.next()? {
++            let encoded: Vec<u8> = row.get(0)?;
++            let data: Vec<u8> = row.get(1)?;
++            if let Some(user) = users
++                .iter()
++                .find(|user| self.encode_presence_key(user).as_ref() == encoded)
++            {
++                let event: Raw<PresenceEvent> = self.deserialize_json(&data)?;
++                if event.deserialize()?.sender != *user {
++                    return Err(invalid());
++                }
++                snapshot.changes.presence.insert(user.clone(), event);
++                continue;
++            }
++            let position = candidates
++                .iter()
++                .position(|key| self.encode_state_store_data_key(key.as_key()).as_ref() == encoded)
++                .ok_or_else(invalid)?;
++            let key = candidates.remove(position);
++            let value = self.snapshot_kv_value(key.as_key(), &data)?;
++            if let StateStoreDataValue::SyncToken(token) = &value {
++                snapshot.changes.sync_token = Some(token.clone());
++            }
++            snapshot.kv.push((key, value));
++        }
++        Ok(())
++    }
++
++    fn snapshot_kv_value(
++        &self,
++        key: StateStoreDataKey<'_>,
++        data: &[u8],
++    ) -> Result<StateStoreDataValue> {
++        Ok(match key {
++            StateStoreDataKey::SyncToken => {
++                StateStoreDataValue::SyncToken(self.deserialize_value(data)?)
++            }
++            StateStoreDataKey::ServerInfo => {
++                StateStoreDataValue::ServerInfo(self.deserialize_value(data)?)
++            }
++            StateStoreDataKey::UtdHookManagerData => {
++                StateStoreDataValue::UtdHookManagerData(self.deserialize_value(data)?)
++            }
++            StateStoreDataKey::UserAvatarUrl(_) => {
++                StateStoreDataValue::UserAvatarUrl(self.deserialize_value(data)?)
++            }
++            StateStoreDataKey::RecentlyVisitedRooms(_) => {
++                StateStoreDataValue::RecentlyVisitedRooms(self.deserialize_value(data)?)
++            }
++            StateStoreDataKey::ComposerDraft(_, _) => {
++                StateStoreDataValue::ComposerDraft(self.deserialize_value(data)?)
++            }
++            StateStoreDataKey::SeenKnockRequests(_) => {
++                StateStoreDataValue::SeenKnockRequests(self.deserialize_value(data)?)
++            }
++            StateStoreDataKey::Filter(_) => {
++                StateStoreDataValue::Filter(self.deserialize_value(data)?)
++            }
++        })
++    }
++}
++
++fn member_names(snapshot: &StateSnapshot, room: &RoomId) -> Result<Vec<DisplayName>> {
++    let mut names = Vec::new();
++    if let Some(members) = snapshot
++        .changes
++        .state
++        .get(room)
++        .and_then(|events| events.get(&StateEventType::RoomMember))
++    {
++        for (user, event) in members {
++            let user = UserId::parse(user).map_err(|_| invalid())?;
++            let content: serde_json::Value = event.get_field("content")?.ok_or_else(invalid)?;
++            names.push(DisplayName::new(
++                content
++                    .get("displayname")
++                    .and_then(serde_json::Value::as_str)
++                    .unwrap_or_else(|| user.localpart()),
++            ));
++        }
++    }
++    if let Some(members) = snapshot
++        .changes
++        .stripped_state
++        .get(room)
++        .and_then(|events| events.get(&StateEventType::RoomMember))
++    {
++        for (user, event) in members {
++            let user = UserId::parse(user).map_err(|_| invalid())?;
++            let content: serde_json::Value = event.get_field("content")?.ok_or_else(invalid)?;
++            names.push(DisplayName::new(
++                content
++                    .get("displayname")
++                    .and_then(serde_json::Value::as_str)
++                    .unwrap_or_else(|| user.localpart()),
++            ));
++        }
++    }
++    Ok(names)
++}

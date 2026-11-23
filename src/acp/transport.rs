@@ -86,6 +86,8 @@ pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 64 * 1024;
 /// The default bound on a graceful shutdown.
 pub const DEFAULT_SHUTDOWN_DEADLINE: Duration = Duration::from_secs(5);
 
+pub(crate) use super::spawn_gate::AcpSpawnGate;
+
 /// Bounds the transport enforces while it runs.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct TransportLimits {
@@ -159,13 +161,17 @@ impl AcpTurnHandle {
 }
 
 /// A live ACP child process speaking JSONL over stdio.
+type ChildWait = (bool, Option<i32>);
+
 pub struct AcpTransport {
     outgoing: mpsc::Sender<Outgoing>,
     next_id: AtomicI64,
     alive: Arc<AtomicBool>,
     /// Taken by [`AcpTransport::shutdown`] so the handle is awaited exactly once.
     /// The lock is held only to take it out, never across an await.
-    loop_handle: Mutex<Option<JoinHandle<Option<i32>>>>,
+    loop_handle: Mutex<Option<JoinHandle<ChildWait>>>,
+    reaped: AtomicBool,
+    child_pid: u32,
 }
 
 /// A message from a caller to the transport loop.
@@ -177,6 +183,7 @@ enum Outgoing {
         params: Value,
         responder: oneshot::Sender<Result<CompletedRequest, AcpError>>,
         updates: Option<mpsc::Sender<TurnUpdate>>,
+        durable_updates: Option<mpsc::Sender<String>>,
     },
     Shutdown,
     Notification {
@@ -216,6 +223,7 @@ struct Pending {
     output: String,
     output_truncated: bool,
     updates: Option<mpsc::Sender<TurnUpdate>>,
+    durable_updates: Option<mpsc::Sender<String>>,
 }
 
 impl AcpTransport {
@@ -260,6 +268,7 @@ impl AcpTransport {
             source,
         })?;
 
+        let child_pid = child.id().ok_or_else(|| missing_pipe("pid"))?;
         let stdin = child.stdin.take().ok_or_else(|| missing_pipe("stdin"))?;
         let stdout = child.stdout.take().ok_or_else(|| missing_pipe("stdout"))?;
         let stderr = child.stderr.take().ok_or_else(|| missing_pipe("stderr"))?;
@@ -281,7 +290,13 @@ impl AcpTransport {
             next_id: AtomicI64::new(0),
             alive,
             loop_handle: Mutex::new(Some(loop_handle)),
+            reaped: AtomicBool::new(false),
+            child_pid,
         })
+    }
+
+    pub(crate) fn child_pid(&self) -> u32 {
+        self.child_pid
     }
 
     /// Whether the child and its loop are still running.
@@ -316,6 +331,7 @@ impl AcpTransport {
                 params,
                 responder,
                 updates: None,
+                durable_updates: None,
             })
             .await
             .map_err(|_| AcpError::TransportClosed)?;
@@ -348,6 +364,19 @@ impl AcpTransport {
         deadline: Duration,
         capacity: usize,
     ) -> Result<AcpTurnHandle, AcpError> {
+        self.request_stream_with_durable(phase, method, params, deadline, capacity, None)
+            .await
+    }
+
+    pub(crate) async fn request_stream_with_durable(
+        &self,
+        phase: Phase,
+        method: &str,
+        params: Value,
+        deadline: Duration,
+        capacity: usize,
+        durable_updates: Option<mpsc::Sender<String>>,
+    ) -> Result<AcpTurnHandle, AcpError> {
         if !self.is_alive() {
             return Err(AcpError::TransportClosed);
         }
@@ -362,6 +391,7 @@ impl AcpTransport {
                 params,
                 responder,
                 updates: Some(updates),
+                durable_updates,
             })
             .await
             .map_err(|_| AcpError::TransportClosed)?;
@@ -400,10 +430,13 @@ impl AcpTransport {
         let _ = self.outgoing.send(Outgoing::Shutdown).await;
         match handle {
             Some(handle) => match handle.await {
-                Ok(code) => (true, code),
+                Ok((reaped, code)) => {
+                    self.reaped.store(reaped, Ordering::Release);
+                    (reaped, code)
+                }
                 Err(_) => (false, None),
             },
-            None => (false, None),
+            None => (self.reaped.load(Ordering::Acquire), None),
         }
     }
 
@@ -444,7 +477,7 @@ async fn run_loop(
     mut outgoing: mpsc::Receiver<Outgoing>,
     limits: TransportLimits,
     alive: Arc<AtomicBool>,
-) -> Option<i32> {
+) -> (bool, Option<i32>) {
     let mut reader = BufReader::new(stdout);
     let mut frames = FrameReader::new(limits.max_frame_bytes);
     let mut pending: HashMap<i64, Pending> = HashMap::new();
@@ -514,7 +547,7 @@ async fn run_loop(
                 }
             },
             message = outgoing.recv() => match message {
-                Some(Outgoing::Request { id, phase, method, params, responder, updates }) => {
+                Some(Outgoing::Request { id, phase, method, params, responder, updates, durable_updates }) => {
                     let session = prompt_session(&method, &params);
                     let envelope = jsonrpc::request(id, &method, params);
                     if let Err(source) = framing::write_frame(&mut stdin, &envelope).await {
@@ -531,6 +564,7 @@ async fn run_loop(
                         output: String::new(),
                         output_truncated: false,
                         updates,
+                        durable_updates,
                     });
                 }
                 Some(Outgoing::Cancel(id)) => {
@@ -617,10 +651,10 @@ async fn run_loop(
         }
     }
 
-    let code = terminate(&mut child, stdin, limits.shutdown_deadline).await;
+    let (reaped, code) = terminate(&mut child, stdin, limits.shutdown_deadline).await;
     tracing::debug!(code, "acp transport stopped");
     alive.store(false, Ordering::Relaxed);
-    code
+    (reaped, code)
 }
 
 /// Remove requests whose caller no longer owns the reply receiver.
@@ -672,7 +706,7 @@ async fn route(
         }
         jsonrpc::JsonRpcMessage::Notification(notification) => {
             if notification.method == schema::METHOD_SESSION_UPDATE {
-                accumulate(&notification.params, pending, limits)?;
+                accumulate(&notification.params, pending, limits).await?;
             }
             Ok(())
         }
@@ -692,7 +726,7 @@ async fn route(
 }
 
 /// Add a streamed chunk to the matching in-flight prompt.
-fn accumulate(
+async fn accumulate(
     params: &Value,
     pending: &mut HashMap<i64, Pending>,
     limits: &TransportLimits,
@@ -716,11 +750,21 @@ fn accumulate(
             && updates
                 .try_send(TurnUpdate::AgentMessageChunk(text.to_owned()))
                 .is_err()
+            && entry.durable_updates.is_none()
         {
             overflowed.push(*id);
             continue;
         }
-        if entry.output.len() + text.len() <= limits.max_output_bytes {
+        if let Some(durable) = &entry.durable_updates {
+            durable
+                .send(text.to_owned())
+                .await
+                .map_err(|_| AcpError::Schema {
+                    method: schema::METHOD_SESSION_PROMPT.into(),
+                    detail: "durable output owner stopped".into(),
+                })?;
+        }
+        if entry.output.len().saturating_add(text.len()) <= limits.max_output_bytes {
             entry.output.push_str(text);
         } else if !entry.output_truncated {
             entry.output.push_str(TRUNCATION_MARKER);
@@ -755,14 +799,21 @@ fn fail_all(pending: &mut HashMap<i64, Pending>, failure: impl Fn(Phase) -> AcpE
 }
 
 /// Close stdin, wait for the child, kill it if needed, and reap it.
-async fn terminate(child: &mut Child, stdin: ChildStdin, deadline: Duration) -> Option<i32> {
+async fn terminate(
+    child: &mut Child,
+    stdin: ChildStdin,
+    deadline: Duration,
+) -> (bool, Option<i32>) {
     drop(stdin);
     match tokio::time::timeout(deadline, child.wait()).await {
-        Ok(Ok(status)) => status.code(),
+        Ok(Ok(status)) => (true, status.code()),
         // It did not exit in time (or waiting failed): kill and reap.
         _ => {
             let _ = child.start_kill();
-            child.wait().await.ok().and_then(|status| status.code())
+            match child.wait().await {
+                Ok(status) => (true, status.code()),
+                Err(_) => (false, None),
+            }
         }
     }
 }
@@ -816,6 +867,7 @@ mod tests {
                 output: "stale".to_owned(),
                 output_truncated: false,
                 updates: None,
+                durable_updates: None,
             },
         )]);
         drop(receiver);
@@ -823,5 +875,82 @@ mod tests {
         sweep_abandoned(&mut pending);
 
         assert!(pending.is_empty());
+    }
+
+    #[tokio::test]
+    async fn durable_display_overflow_keeps_terminal_and_durable_lanes_alive() {
+        let (responder, _reply) = oneshot::channel();
+        let (updates, mut update_rx) = mpsc::channel(1);
+        updates
+            .try_send(TurnUpdate::AgentMessageChunk("occupied".into()))
+            .unwrap();
+        let (durable, mut durable_rx) = mpsc::channel(1);
+        let mut pending = HashMap::from([(
+            9,
+            Pending {
+                responder,
+                phase: Phase::Prompt,
+                session: Some("s".into()),
+                output: String::new(),
+                output_truncated: false,
+                updates: Some(updates),
+                durable_updates: Some(durable),
+            },
+        )]);
+        accumulate(
+            &serde_json::json!({"sessionId":"s","update":{"sessionUpdate":"agent_message_chunk","content":{"type":"text","text":"durable"}}}),
+            &mut pending,
+            &TransportLimits::default(),
+        ).await.unwrap();
+        assert!(pending.contains_key(&9));
+        assert_eq!(durable_rx.recv().await.as_deref(), Some("durable"));
+        assert_eq!(
+            update_rx.try_recv().unwrap(),
+            TurnUpdate::AgentMessageChunk("occupied".into())
+        );
+    }
+
+    #[tokio::test]
+    async fn runtime_spawn_gate_drains_and_rejects_after_close() {
+        let gate = AcpSpawnGate::new();
+        let reservation = gate.reserve().expect("open gate reserves");
+        let join = {
+            let gate = gate.clone();
+            tokio::spawn(async move { gate.close_and_join().await })
+        };
+        tokio::task::yield_now().await;
+        assert!(!gate.is_closed_joined());
+        drop(reservation);
+        join.await.unwrap();
+        assert!(gate.is_closed_joined());
+        assert!(gate.reserve().is_none());
+    }
+
+    #[tokio::test]
+    async fn runtime_gate_tracks_real_local_child_and_rescan_fails_closed_after_exit() {
+        let gate = AcpSpawnGate::new();
+        let mut reservation = gate.reserve().expect("reservation");
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "sleep 1"])
+            .spawn()
+            .expect("local child");
+        let pid = child.id().expect("pid");
+        assert!(AcpSpawnGate::register_child(&mut reservation, pid));
+        assert!(
+            reservation
+                .identity
+                .as_deref()
+                .unwrap()
+                .contains("starttime=")
+        );
+        assert!(reservation.identity.as_deref().unwrap().contains("cgroup="));
+        drop(reservation);
+        gate.close_and_join().await;
+        assert!(gate.is_closed_joined());
+        assert!(gate.reserve().is_none());
+        let _pre_exit = gate.rescan_children();
+        let _ = child.kill().await;
+        let _ = child.wait().await;
+        assert!(gate.rescan_children().is_err());
     }
 }

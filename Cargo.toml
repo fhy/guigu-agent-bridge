@@ -1,23 +1,24 @@
 [package]
 name = "guigu-agent-bridge"
-version = "0.2.24"
+version = "0.2.28"
 edition = "2024"
 rust-version = "1.94"
 description = "Durable Matrix, ACP, and A2A task routing bridge for external agents"
 license = "MIT"
-repository = "https://github.com/guigu-ai/guigu-agent-bridge"
-homepage = "https://github.com/guigu-ai/guigu-agent-bridge"
+repository = "https://github.com/fhy/guigu-agent-bridge"
+homepage = "https://github.com/fhy/guigu-agent-bridge"
 documentation = "https://docs.rs/guigu-agent-bridge"
 readme = "README.md"
 keywords = ["agent", "matrix", "acp", "a2a", "sqlite"]
 categories = ["asynchronous", "command-line-utilities"]
+
 include = [
     "!/.agent-governance/**",
     "!/AGENTS.md",
-    "!/tests/**",
     "!/target/**",
     "/Cargo.toml",
     "/Cargo.lock",
+    "/build.rs",
     "/LICENSE",
     "/README.md",
     "/config.example.toml",
@@ -25,6 +26,7 @@ include = [
     "/docs/CONFIGURATION.md",
     "/docs/PRODUCT.md",
     "/docs/RELEASE.md",
+    "/docs/RELEASE_CHECKLIST.md",
     "/docs/RELEASE-0.2.0.md",
     "/docs/RELEASE-0.2.1.md",
     "/docs/RELEASE-0.2.2.md",
@@ -33,14 +35,37 @@ include = [
     "/docs/RELEASE-0.2.5.md",
     "/docs/RELEASE-0.2.6.md",
     "/docs/RELEASE-0.2.7.md",
-    "/docs/RELEASE-0.2.24.md",
+    "/docs/RELEASE-0.2.8.md",
+    "/docs/RELEASE-0.2.9.md",
+    "/docs/RELEASE-0.2.10.md",
+    "/docs/RELEASE-0.2.11.md",
+    "/docs/RELEASE-0.2.12.md",
+    "/docs/RELEASE-0.2.19.md",
+    "/docs/RELEASE-0.2.20.md",
+    "/docs/RELEASE-0.2.21.md",
+    "/docs/RELEASE-0.2.22.md",
     "/docs/USER_GUIDE.md",
+    "/docs/OFFLINE_PRODUCTION_MIGRATION.md",
     "/docs/decisions/**",
     "/docs/integrations/**",
-    "/examples/**",
+    "/examples/acp-mock-backend.rs",
+    "/examples/t053-sdk.rs",
     "/migrations/**",
     "/src/**",
+    "/release/**",
+    "/tests/matrix_sdk_clone_capability.rs",
+    "/tests/matrix_sdk_hydration.rs",
+    "/tests/support/matrix_hydration.rs",
+    "/docs/RELEASE-0.2.23.md",
+    "/docs/RELEASE-0.2.24.md",
+    "/docs/RELEASE-0.2.26.md",
+    "/docs/RELEASE-0.2.27.md",
+    "/docs/RELEASE-0.2.28.md",
+    "/docs/NATIVE-STOP-RECOVERY.md",
 ]
+
+[features]
+test-support = []
 
 [dependencies]
 # `time` backs the production `Timer` (`TokioTimer`, T006 D1/Q2 = T-B): the
@@ -65,6 +90,7 @@ thiserror = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
+libc = "0.2"
 uuid = { version = "1", features = ["v7", "serde", "v5"] }
 chrono = { version = "0.4", features = ["serde"] }
 toml = "1.1.6"
@@ -81,6 +107,15 @@ sqlx = { version = "0.9.0", default-features = false, features = [
     "migrate",
     "macros",
 ] }
+libsqlite3-sys = "=0.33.0"
 
 [dev-dependencies]
+matrix-sdk-crypto = { version = "=0.13.0", default-features = false }
 wiremock = "0.6.5"
+tempfile = "3"
+
+[build-dependencies]
+sha2 = "0.10"
+
+[profile.dev.package."sha2:0.10.9"]
+opt-level = 3

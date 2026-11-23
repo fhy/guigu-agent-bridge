@@ -52,6 +52,10 @@ use crate::models::{ConversationId, EndpointId};
 use crate::storage::StorageError;
 use crate::storage::codec::{decode_id, decode_timestamp, encode_id, encode_timestamp};
 
+#[cfg(test)]
+#[path = "session_recovery_tests.rs"]
+mod recovery_tests;
+
 /// The largest session id the adapter accepts.
 ///
 /// Session ids are opaque backend strings; the bound keeps one hostile id from
@@ -235,12 +239,23 @@ impl StoredSession {
 #[derive(Debug, Clone)]
 pub struct SqliteSessionStore {
     pool: SqlitePool,
+    recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
 }
 
 impl SqliteSessionStore {
     /// Wrap a pool that has been connected and migrated.
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            recovery: None,
+        }
+    }
+
+    pub fn new_scoped(
+        pool: SqlitePool,
+        recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
+    ) -> Self {
+        Self { pool, recovery }
     }
 
     /// The live session for this endpoint, conversation and working directory.
@@ -256,14 +271,31 @@ impl SqliteSessionStore {
         conversation: ConversationId,
         cwd: &str,
     ) -> Result<Option<StoredSession>, StorageError> {
+        let mut scoped =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await
+                .map_err(StorageError::from)?;
         let row = sqlx::query(SELECT_LIVE_SESSION_LEGACY)
             .bind(encode_id(endpoint))
             .bind(encode_id(conversation))
             .bind(cwd)
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *scoped)
             .await
             .map_err(StorageError::from)?;
-        row.as_ref().map(session_from_row).transpose()
+        let result = row.as_ref().map(session_from_row).transpose();
+        if let Ok(Some(session)) = &result {
+            crate::storage::recovery_eligibility::writer::require(
+                &mut scoped,
+                self.recovery.as_ref(),
+                &crate::storage::recovery_eligibility::writer::composite_text_identity(
+                    "sessions",
+                    &[&session.session_id, &encode_id(session.endpoint_id)],
+                )?,
+            )
+            .await?;
+        }
+        scoped.commit().await.map_err(StorageError::from)?;
+        result
     }
 
     pub async fn live_session_with_workspaces(
@@ -280,6 +312,10 @@ impl SqliteSessionStore {
             cwd,
             additional_directories,
         );
+        let mut scoped =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await
+                .map_err(StorageError::from)?;
         let row = sqlx::query(SELECT_LIVE_SESSION)
             .bind(encode_id(endpoint))
             .bind(encode_id(conversation))
@@ -293,10 +329,23 @@ impl SqliteSessionStore {
             .bind(hash)
             .bind(backend_id)
             .bind(i64::from(crate::acp::PROTOCOL_VERSION))
-            .fetch_optional(&self.pool)
+            .fetch_optional(&mut *scoped)
             .await
             .map_err(StorageError::from)?;
-        row.as_ref().map(session_from_row).transpose()
+        let result = row.as_ref().map(session_from_row).transpose();
+        if let Ok(Some(session)) = &result {
+            crate::storage::recovery_eligibility::writer::require(
+                &mut scoped,
+                self.recovery.as_ref(),
+                &crate::storage::recovery_eligibility::writer::composite_text_identity(
+                    "sessions",
+                    &[&session.session_id, &encode_id(session.endpoint_id)],
+                )?,
+            )
+            .await?;
+        }
+        scoped.commit().await.map_err(StorageError::from)?;
+        result
     }
 
     /// Insert a session, or refresh the row for the same session id.
@@ -307,6 +356,31 @@ impl SqliteSessionStore {
     /// to a different conversation or working directory, or when the referenced
     /// endpoint/conversation does not exist (the migration's foreign keys).
     pub async fn upsert_session(&self, session: &StoredSession) -> Result<(), StorageError> {
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await
+                .map_err(StorageError::from)?;
+        let identity = crate::storage::recovery_eligibility::writer::composite_text_identity(
+            "sessions",
+            &[&session.session_id, &encode_id(session.endpoint_id)],
+        )?;
+        let existing: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM sessions WHERE session_id=? AND endpoint_id=?",
+        )
+        .bind(&session.session_id)
+        .bind(encode_id(session.endpoint_id))
+        .fetch_one(&mut *tx)
+        .await?;
+        let mutation = if existing == 1 {
+            crate::storage::recovery_eligibility::writer::prepare_mutation(
+                &mut tx,
+                self.recovery.as_ref(),
+                &identity,
+            )
+            .await?
+        } else {
+            None
+        };
         let result = sqlx::query(UPSERT_SESSION)
             .bind(&session.session_id)
             .bind(encode_id(session.endpoint_id))
@@ -320,12 +394,30 @@ impl SqliteSessionStore {
             .bind(session.state.as_str())
             .bind(encode_timestamp(&session.created_at))
             .bind(encode_timestamp(&session.updated_at))
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(StorageError::from)?;
         if result.rows_affected() == 1 {
+            if existing == 1 {
+                crate::storage::recovery_eligibility::writer::complete_mutation(
+                    &mut tx,
+                    self.recovery.as_ref(),
+                    mutation,
+                )
+                .await?;
+            } else if let Some(scope) = self.recovery.as_ref() {
+                crate::storage::recovery_eligibility::writer::inserted(
+                    &mut tx,
+                    Some(scope),
+                    &identity,
+                )
+                .await
+                .map_err(StorageError::from)?;
+            }
+            tx.commit().await.map_err(StorageError::from)?;
             return Ok(());
         }
+        tx.rollback().await.map_err(StorageError::from)?;
         Err(StorageError::IntegrityViolation {
             detail: "sessions.session_id is bound to another conversation or cwd".to_owned(),
         })
@@ -345,17 +437,56 @@ impl SqliteSessionStore {
         state: SessionState,
         at: DateTime<Utc>,
     ) -> Result<(), StorageError> {
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await
+                .map_err(StorageError::from)?;
+        let exists: bool = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM sessions WHERE session_id=? AND endpoint_id=?)",
+        )
+        .bind(session_id)
+        .bind(encode_id(endpoint))
+        .fetch_one(&mut *tx)
+        .await?;
+        let mutation = if self.recovery.is_some() && exists {
+            Some(
+                crate::storage::recovery_eligibility::writer::prepare_mutation(
+                    &mut tx,
+                    self.recovery.as_ref(),
+                    &crate::storage::recovery_eligibility::writer::composite_text_identity(
+                        "sessions",
+                        &[session_id, &encode_id(endpoint)],
+                    )
+                    .map_err(StorageError::from)?,
+                )
+                .await
+                .map_err(StorageError::from)?,
+            )
+        } else {
+            None
+        };
         let result = sqlx::query(UPDATE_SESSION_STATE)
             .bind(state.as_str())
             .bind(encode_timestamp(&at))
             .bind(session_id)
             .bind(encode_id(endpoint))
-            .execute(&self.pool)
+            .execute(&mut *tx)
             .await
             .map_err(StorageError::from)?;
         if result.rows_affected() == 1 {
+            if let Some(mutation) = mutation {
+                crate::storage::recovery_eligibility::writer::complete_mutation(
+                    &mut tx,
+                    self.recovery.as_ref(),
+                    mutation,
+                )
+                .await
+                .map_err(StorageError::from)?;
+            }
+            tx.commit().await.map_err(StorageError::from)?;
             return Ok(());
         }
+        tx.rollback().await.map_err(StorageError::from)?;
         Err(StorageError::NotFound {
             entity: "session",
             id: session_id.to_owned(),

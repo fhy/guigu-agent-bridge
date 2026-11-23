@@ -136,7 +136,8 @@ pub struct AuthMethod {
 
 impl AuthMethod {
     pub fn is_supported_api_key(&self) -> bool {
-        self.id == "api-key" && matches!(self.r#type.as_deref(), None | Some("agent"))
+        matches!(self.id.as_str(), "api-key" | "openai")
+            && matches!(self.r#type.as_deref(), None | Some("agent"))
     }
 
     pub fn is_terminal(&self) -> bool {

@@ -1,100 +1,52 @@
-# Rust Build Cache And Gate Profile
+# Rust Build Cache and Validation Inputs
 
-This template applies to Rust projects using Cargo. It is a language-specific
-companion to the general release manifest, not a requirement for non-Rust
-projects.
+This guidance is for Cargo/Rust, not a mandatory profile for other languages.
+Project policy is summarized in [Local Rust Build Cache](../DEVELOPMENT_BUILD_CACHE.md).
 
-## Profile
+## Record the effective inputs
 
-Record the selected profile in the task handoff:
-
-```text
-build_language: Rust
-build_profile: fast | balanced | constrained
-rust_toolchain:
-msrv:
-target_directory:
-sccache_cache_size:
-incremental: enabled | disabled
-linker:
-test_fixture_ttl:
-```
-
-Use `fast` when disk space is plentiful, `balanced` for normal development, and
-`constrained` for small disks or shared CI workers. Profiles may change build
-speed and storage use, but never weaken release gates or MSRV requirements.
-
-## Cargo Path Closure
-
-Before an Agent runs a build, record the effective path from:
-
-```bash
-cargo metadata --no-deps --format-version 1 | jq -r .target_directory
-```
-
-`CARGO_TARGET_DIR` and explicit `--target-dir` override Cargo configuration.
-They are allowed only when the resulting path is an approved cache root and is
-recorded in the handoff. An unregistered project-local `target` or temporary
-target is a build hygiene finding.
-
-## Agent Build Concurrency
-
-The Project Controller assigns one primary Rust build owner at a time for a shared
-project. Agents must not run full check/clippy/test gates concurrently against the
-same project, and an idle worktree must not create a second local `target/` directory.
-All active worktrees use the approved shared target root recorded in the handoff;
-independent target roots require an explicit reason, an owner, and a cleanup deadline.
-
-Before a full gate, the handoff records:
+For each build owner/candidate, record:
 
 ```text
-build_owner:
-build_lock:
-target_directory:
-target_budget_gib:
+source_commit and relevant tree identities
+Rust/Cargo versions and MSRV
+profile, target triple, features, locked/offline flags
+shared target directory and build lock
+sccache wrapper and incremental settings
+RUSTFLAGS and binary bindings used by process fixtures
+filesystem free space/usage, lock acquire/release, cache retention
+per-command exits and required binary hashes
 ```
 
-If the target root exceeds its budget, stop new full builds, report the size and
-owner, and clean only after the owner exits. A completed handoff must remove stale
-temporary target roots or record their exact retention reason. Build concurrency is
-separate from task parallelism: agents may analyze or review unrelated work while
-only one agent owns the shared Rust gate.
+Inspect the effective Cargo target using metadata; configuration, environment
+and explicit CLI options can affect it. Use only the task's assigned shared
+target. A separate target requires a recorded owner and reason; do not silently
+create one for an idle worktree. Never commit host-specific Cargo settings.
 
-## Optional Speed Settings
+## Validation
 
-- A persistent per-project target directory avoids recompiling unchanged
-  dependencies.
-- `sccache` can reuse compiler outputs across target directories. Set its size
-  with `SCCACHE_CACHE_SIZE` in user or CI environment configuration.
-- Cargo incremental compilation is usually faster for repeated local edits but
-  consumes more disk. Disable it when cache reuse or disk limits take priority.
-- `mold` with `clang` can reduce Linux link time when both tools are available.
-
-These settings are local performance choices. They must not be committed with
-machine-specific paths or made a prerequisite for published artifacts.
-
-## Rust Gates
-
-Development may use `cargo check` and focused tests. Review and release use the
-exact project gates:
+Use focused tests while repairing. The designated owner runs the stable-candidate
+validation required by the task; reuse accepted unchanged-input evidence rather
+than repeating the same gate for docs or refs. Standard Rust checks are:
 
 ```text
 cargo fmt --check
 cargo check --locked
-cargo clippy --locked --all-targets --all-features -- -D warnings
-cargo test --locked --all-targets
+cargo clippy --locked -- -D warnings
+cargo test --locked
 ```
 
-Release work additionally runs the package and publish dry-run checks required by
-the release task. Caches and faster linkers never replace these gates.
+Record actual features, all-target coverage and serial fixture flags as required
+by the task. Process fixtures must resolve the intended shared-target executable,
+including Cargo's exact hyphenated `CARGO_BIN_EXE_*` binding where used. An assembled
+coverage ledger is not a single successful monolithic gate. Release package checks
+are separate and are not authorized by routine source integration.
 
-## Cleanup
+## Performance and retention
 
-Keep project targets, sccache, and test fixtures under named roots with explicit
-budgets or TTLs. Clean only a verified target root after stopping builds. Never
-clean Cargo registries, databases, WAL/SHM files, crypto stores, credentials,
-sessions, or logs as part of Rust cache maintenance.
-
-For this project, the default shared target budget is 20 GiB. The Project Controller
-must schedule cleanup when the budget is exceeded and must not solve repeated growth
-by silently creating another worktree-local target.
+A persistent shared target and sccache can avoid repeated dependency compilation.
+Incremental compilation or an alternative linker is optional, not a correctness
+requirement. Retain warm caches; only filesystem pressure (less than 30 GiB free
+or at least 85% used) triggers cleanup under the build lock after builds exit.
+There is no default 20 GiB stop threshold. Preserve active images and dependencies,
+and never clean runtime state, credentials or retained evidence as build artifacts.

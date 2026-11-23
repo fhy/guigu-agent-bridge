@@ -504,8 +504,7 @@ mod tests {
         );
         sqlx::query("ROLLBACK").execute(&mut lock).await.unwrap();
         let _ = lock.close().await;
-        let exe = std::env::var("CARGO_BIN_EXE_guigu-agent-bridge")
-            .unwrap_or_else(|_| "target/debug/guigu-agent-bridge".into());
+        let exe = crate::test_binary_path("guigu-agent-bridge");
         let db = path.to_str().unwrap().to_owned();
         let out = tokio::process::Command::new(exe)
             .args([
@@ -525,22 +524,19 @@ mod tests {
             String::from_utf8_lossy(&out.stdout).contains("reconcile-delivery result=reconciled")
         );
         assert!(out.stderr.is_empty());
-        let bad = tokio::process::Command::new(
-            std::env::var("CARGO_BIN_EXE_guigu-agent-bridge")
-                .unwrap_or_else(|_| "target/debug/guigu-agent-bridge".into()),
-        )
-        .args([
-            "reconcile-delivery",
-            "--database",
-            db.as_str(),
-            "--delivery",
-            "wrong",
-            tuple.task_id.as_str(),
-            "1",
-        ])
-        .output()
-        .await
-        .unwrap();
+        let bad = tokio::process::Command::new(crate::test_binary_path("guigu-agent-bridge"))
+            .args([
+                "reconcile-delivery",
+                "--database",
+                db.as_str(),
+                "--delivery",
+                "wrong",
+                tuple.task_id.as_str(),
+                "1",
+            ])
+            .output()
+            .await
+            .unwrap();
         assert!(!bad.status.success());
         let text = format!(
             "{}{}",
@@ -548,46 +544,40 @@ mod tests {
             String::from_utf8_lossy(&bad.stderr)
         );
         assert!(!text.contains("wrong") && !text.contains("SELECT") && !text.contains(&db));
-        let again = tokio::process::Command::new(
-            std::env::var("CARGO_BIN_EXE_guigu-agent-bridge")
-                .unwrap_or_else(|_| "target/debug/guigu-agent-bridge".into()),
-        )
-        .args([
-            "reconcile-delivery",
-            "--database",
-            db.as_str(),
-            "--delivery",
-            tuple.delivery_id.as_str(),
-            tuple.task_id.as_str(),
-            "1",
-        ])
-        .output()
-        .await
-        .unwrap();
+        let again = tokio::process::Command::new(crate::test_binary_path("guigu-agent-bridge"))
+            .args([
+                "reconcile-delivery",
+                "--database",
+                db.as_str(),
+                "--delivery",
+                tuple.delivery_id.as_str(),
+                tuple.task_id.as_str(),
+                "1",
+            ])
+            .output()
+            .await
+            .unwrap();
         assert!(again.status.success());
         assert!(
             String::from_utf8_lossy(&again.stdout).contains("reconcile-delivery result=reconciled")
         );
-        let multi = tokio::process::Command::new(
-            std::env::var("CARGO_BIN_EXE_guigu-agent-bridge")
-                .unwrap_or_else(|_| "target/debug/guigu-agent-bridge".into()),
-        )
-        .args([
-            "reconcile-delivery",
-            "--database",
-            db.as_str(),
-            "--delivery",
-            tuple.delivery_id.as_str(),
-            tuple.task_id.as_str(),
-            "1",
-            "--delivery",
-            "missing",
-            tuple.task_id.as_str(),
-            "1",
-        ])
-        .output()
-        .await
-        .unwrap();
+        let multi = tokio::process::Command::new(crate::test_binary_path("guigu-agent-bridge"))
+            .args([
+                "reconcile-delivery",
+                "--database",
+                db.as_str(),
+                "--delivery",
+                tuple.delivery_id.as_str(),
+                tuple.task_id.as_str(),
+                "1",
+                "--delivery",
+                "missing",
+                tuple.task_id.as_str(),
+                "1",
+            ])
+            .output()
+            .await
+            .unwrap();
         assert!(!multi.status.success());
         let multi_text = format!(
             "{}{}",
@@ -616,26 +606,24 @@ mod tests {
         verify.close().await;
         let (fresh_path, fresh_tuple) = fixture(Some("prepared")).await;
         let fresh_db = fresh_path.to_str().unwrap().to_owned();
-        let fresh_multi = tokio::process::Command::new(
-            std::env::var("CARGO_BIN_EXE_guigu-agent-bridge")
-                .unwrap_or_else(|_| "target/debug/guigu-agent-bridge".into()),
-        )
-        .args([
-            "reconcile-delivery",
-            "--database",
-            fresh_db.as_str(),
-            "--delivery",
-            fresh_tuple.delivery_id.as_str(),
-            fresh_tuple.task_id.as_str(),
-            "1",
-            "--delivery",
-            "missing",
-            fresh_tuple.task_id.as_str(),
-            "1",
-        ])
-        .output()
-        .await
-        .unwrap();
+        let fresh_multi =
+            tokio::process::Command::new(crate::test_binary_path("guigu-agent-bridge"))
+                .args([
+                    "reconcile-delivery",
+                    "--database",
+                    fresh_db.as_str(),
+                    "--delivery",
+                    fresh_tuple.delivery_id.as_str(),
+                    fresh_tuple.task_id.as_str(),
+                    "1",
+                    "--delivery",
+                    "missing",
+                    fresh_tuple.task_id.as_str(),
+                    "1",
+                ])
+                .output()
+                .await
+                .unwrap();
         assert!(!fresh_multi.status.success());
         let fresh_verify = connect(&fresh_path).await.unwrap();
         let fresh_ack: Option<String> =

@@ -1,0 +1,35 @@
+format = 1
+task = "R076"
+upstream_commit = "18b169ca7ec17440f9fa1170026cbc32e20a06d8"
+license = "Apache-2.0"
+license_text = "LICENSE-APACHE-2.0"
+selection = "Renamed guigu SDK identities at exact 0.13.0-guigu.1; Rust aliases unchanged"
+distribution = "R077 registry-compatible fork; rehearsal does not establish publication"
+
+[[crate]]
+name = "matrix-sdk"
+version = "0.13.0"
+archive_sha256 = "1de309d33d0c5d77829f952110e8b9e3e6c730880152db6e1778bcaa2cbfaef9"
+path = "matrix-sdk-0.13.0"
+upstream_path = "crates/matrix-sdk"
+
+[[crate]]
+name = "matrix-sdk-base"
+version = "0.13.0"
+archive_sha256 = "ad7f18305090c059293ebafefbfd8cac494f43386c3f255861995ee7b48f9e89"
+path = "matrix-sdk-base-0.13.0"
+upstream_path = "crates/matrix-sdk-base"
+
+[[crate]]
+name = "matrix-sdk-sqlite"
+version = "0.13.0"
+archive_sha256 = "aa2ff57473e92bad1b7320b3d70d640661b95064e091b925c5ef88acfa281853"
+path = "matrix-sdk-sqlite-0.13.0"
+upstream_path = "crates/matrix-sdk-sqlite"
+
+[distribution_fork]
+package = "guigu-matrix-sdk-sqlite"
+version = "0.13.0-guigu.1"
+reviewed_source = "d9caa351fb6d4f4eaf6f4d38b5e4fea5fee08006"
+reviewed_patch_sha256 = "ba6eb16fa407dd183e01aab4e2da00059d1e2048a03ed0ef0f1e6697af8a9be7"
+scope = "Native SQLite graph; registry rehearsal is not publication"

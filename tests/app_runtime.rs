@@ -1,7 +1,8 @@
 use std::{
     collections::BTreeMap,
+    process::{Child, Command},
     sync::{
-        Arc, Mutex,
+        Arc, Mutex, OnceLock,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
 };
@@ -11,7 +12,7 @@ use guigu_agent_bridge::{
     app::{
         AppRuntime, ConfigSource, HealthServer, HealthState, MatrixIngress, OwnerState,
         PersistenceFirstProjection, PersistingBus, ProjectionMetrics, ReloadController,
-        ReloadOutcome, ReplyRegistry,
+        ReloadOutcome, ReplyRegistry, TerminalReplyConsumer,
     },
     bus::{
         AdmissionContext, Bus, BusError, BusFuture, Cancellation, Clock, EndpointRegistry,
@@ -30,6 +31,13 @@ use guigu_agent_bridge::{
     storage::{ReliabilityStore, Repository, SqliteRepository, connect, migrate, sync_agents},
 };
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+#[path = "support/r107_ingress_feedback.rs"]
+mod r107_ingress_feedback;
+
+#[path = "support/runtime_child.rs"]
+mod runtime_child;
+use runtime_child::RuntimeChild;
 
 struct TempDir(std::path::PathBuf);
 impl TempDir {
@@ -505,6 +513,111 @@ async fn matrix_ingress_reads_back_unknown_commit_before_changed_routing_and_per
 }
 
 #[tokio::test]
+async fn healthy_message_round_trip_admits_completes_and_sends_reply() {
+    let temp = TempDir::new();
+    let pool = connect(temp.0.join("state.db")).await.unwrap();
+    migrate(&pool).await.unwrap();
+    let repository = Arc::new(SqliteRepository::new(pool.clone()));
+    let mut initial = config("");
+    initial.transports.matrix.enabled = true;
+    initial
+        .transports
+        .matrix
+        .allowed_users
+        .push("@alice:example".into());
+    initial
+        .transports
+        .matrix
+        .routes
+        .rooms
+        .insert("!room:example".into(), "worker".into());
+    let registry = Arc::new(EndpointRegistry::from_config(&initial));
+    sync_agents(repository.as_ref(), &registry).await.unwrap();
+    let conversation = Conversation {
+        id: ConversationId::generate(),
+        participants: vec![],
+        external_ref: None,
+    };
+    repository.insert_conversation(&conversation).await.unwrap();
+    let reliability = ReliabilityStore::new(pool.clone());
+    reliability
+        .begin_runtime("runtime-round-trip", "fp", "2026-09-18T00:00:00Z")
+        .await
+        .unwrap();
+    let (sink, mut events) = guigu_agent_bridge::bus::MpscEventSink::new(4);
+    let (bus, mut tasks) = PersistingBus::new(
+        Arc::clone(&registry),
+        4,
+        Arc::new(sink),
+        repository.as_ref().clone(),
+        Clock::fixed("2026-09-18T00:00:00Z".parse().unwrap()),
+    );
+    let admission: Arc<dyn DurableMatrixAdmission> =
+        Arc::new(bus.with_reliability(reliability, "runtime-round-trip".into()));
+    let sender = Arc::new(RecordingMatrixSender::default());
+    let replies = Arc::new(ReplyRegistry::default());
+    let reload = Arc::new(
+        ReloadController::new(
+            initial.clone(),
+            Arc::new(MutableSource(Mutex::new(initial))),
+        )
+        .unwrap(),
+    );
+    let (tx, rx) = tokio::sync::mpsc::channel(1);
+    let ingress = MatrixIngress::new(
+        rx,
+        repository.clone(),
+        registry,
+        admission,
+        sender.clone(),
+        reload,
+        Cancellation::new(),
+        Arc::new(CommandLedger::new(8)),
+        replies.clone(),
+        8,
+    )
+    .start();
+    tx.send(InboundMatrixEvent {
+        event_id: "$round-trip:example".into(),
+        room_id: "!room:example".into(),
+        thread_root: Some("$root:example".into()),
+        sender: "@alice:example".into(),
+        body: "run".into(),
+    })
+    .await
+    .unwrap();
+    let task = tasks.recv().await.unwrap();
+    assert_eq!(events.recv().await.unwrap().task_id, task.task_id);
+    ingress.shutdown().await;
+    let terminal = TaskEvent {
+        id: EventId::generate(),
+        task_id: task.task_id,
+        seq: 2,
+        status: TaskStatus::Completed,
+        timestamp: "2026-09-18T00:00:01Z".parse().unwrap(),
+        payload: TaskEventPayload::Completed {
+            output: "done".into(),
+        },
+    };
+    TerminalReplyConsumer::new(sender.clone(), replies)
+        .consume(&terminal)
+        .await
+        .unwrap();
+    assert_eq!(
+        sender.0.lock().unwrap().as_slice(),
+        &[(
+            ReplyContext {
+                room_id: "!room:example".into(),
+                thread_root: Some("$root:example".into()),
+                event_id: "$round-trip:example".into()
+            },
+            "done".into()
+        )]
+    );
+    pool.close().await;
+}
+
+#[tokio::test]
 async fn reload_publishes_hot_generation_and_rejects_restart_changes_atomically() {
     let initial = config("");
     let initial_queue_capacity = initial.bridge.queue_capacity;
@@ -617,22 +730,435 @@ async fn production_runtime_starts_and_shuts_down_without_resource_residue() {
 }
 
 #[tokio::test]
-async fn startup_recovery_backlog_blocks_readiness_without_spawning_acp() {
+async fn app_runtime_owns_real_a2a_listener_and_agent_card_until_shutdown() {
+    let _port_guard = a2a_port_guard().lock().await;
     let temp = TempDir::new();
     let config_path = temp.0.join("bridge.toml");
     let database = temp.0.join("state.db");
     let sessions = temp.0.join("sessions");
-    let crypto_store = temp.0.join("matrix-crypto");
     unsafe {
-        std::env::set_var("T055_DUMMY_MATRIX_TOKEN", "dummy-nonsecret");
+        std::env::set_var("T050_TOKEN", "test-token");
     }
     std::fs::write(
         &config_path,
         format!(
-            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\n\n[transports.matrix]\nenabled = true\nhomeserver = \"https://matrix.invalid\"\nuser_id = \"@observer:matrix.invalid\"\ndevice_id = \"TEST_DEVICE\"\naccess_token = \"{{env:T055_DUMMY_MATRIX_TOKEN}}\"\ncrypto_store_path = {:?}\ndevice_trusted = true\n\n[agents.worker]\ntransport = \"acp\"\ncommand = \"definitely-not-started\"\nworkspace = \"/tmp\"\nenabled = true\n",
+            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nshutdown_timeout_seconds = 1\n\n[transports.a2a]\nenabled = true\nlisten = \"tcp:127.0.0.1:9292\"\nallow_private_plaintext = true\nexposed_endpoints = [\"worker\"]\n\n[transports.a2a.peers.test]\nurl = \"http://127.0.0.1:9/a2a/worker/rpc\"\nexpected_peer_id = \"peer\"\ntoken = \"{{env:T050_TOKEN}}\"\nallowed_targets = [\"worker\"]\n\n[agents.worker]\ntransport = \"acp\"\ncommand = \"true\"\nworkspace = \"/tmp\"\nenabled = true\n",
             database.to_string_lossy(),
-            sessions.to_string_lossy(),
-            crypto_store.to_string_lossy()
+            sessions.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    let runtime = AppRuntime::start(&config_path).await.unwrap();
+    let address = runtime.a2a_addr().expect("real A2A listener");
+    let first_pid = std::process::id();
+    let first_inode = runtime.a2a_listener_inode().expect("listener inode");
+    assert_eq!(address.port(), 9292);
+    let response = reqwest::get(format!("http://{address}/.well-known/agent-card.json"))
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        response.headers()[reqwest::header::CONTENT_TYPE],
+        "application/json"
+    );
+    let _ = runtime.shutdown().await;
+    assert!(tokio::net::TcpListener::bind(address).await.is_ok());
+    let restarted = AppRuntime::start(&config_path).await.unwrap();
+    let replacement = restarted.a2a_addr().expect("replacement listener");
+    assert_eq!(replacement, address);
+    assert_eq!(std::process::id(), first_pid);
+    let replacement_inode = restarted.a2a_listener_inode().expect("replacement inode");
+    assert_ne!(replacement_inode, first_inode);
+    let card = reqwest::get(format!("http://{replacement}/.well-known/agent-card.json"))
+        .await
+        .unwrap();
+    assert_eq!(card.status(), reqwest::StatusCode::OK);
+    let _ = restarted.shutdown().await;
+    assert!(tokio::net::TcpListener::bind(replacement).await.is_ok());
+    let stale = tokio::net::TcpListener::bind("127.0.0.1:9292")
+        .await
+        .unwrap();
+    assert!(AppRuntime::start(&config_path).await.is_err());
+    drop(stale);
+}
+
+fn a2a_port_guard() -> &'static tokio::sync::Mutex<()> {
+    static GUARD: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    GUARD.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+fn child_listener_inode(pid: u32) -> Option<u64> {
+    let listener_inodes = std::fs::read_to_string("/proc/net/tcp")
+        .ok()?
+        .lines()
+        .skip(1)
+        .filter_map(|line| {
+            let fields: Vec<_> = line.split_whitespace().collect();
+            (fields.get(1)?.ends_with(":244C") && *fields.get(3)? == "0A")
+                .then(|| fields.get(9)?.parse::<u64>().ok())
+                .flatten()
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    let dir = std::fs::read_dir(format!("/proc/{pid}/fd")).ok()?;
+    for entry in dir.flatten() {
+        let link = std::fs::read_link(entry.path()).ok()?;
+        let text = link.to_string_lossy();
+        if let Some(value) = text
+            .strip_prefix("socket:[")
+            .and_then(|v| v.strip_suffix(']'))
+            && let Ok(inode) = value.parse()
+            && listener_inodes.contains(&inode)
+        {
+            return Some(inode);
+        }
+    }
+    None
+}
+
+async fn wait_for_child_listener(child: &mut Child) -> u64 {
+    let pid = child.id();
+    let result = tokio::time::timeout(std::time::Duration::from_secs(90), async {
+        loop {
+            if let Some(status) = child.try_wait().expect("poll child status") {
+                let mut stderr = String::new();
+                if let Some(mut pipe) = child.stderr.take() {
+                    std::io::Read::read_to_string(&mut pipe, &mut stderr).ok();
+                }
+                panic!("child exited before binding 9292: pid={pid}; status={status}; stderr={stderr:?}");
+            }
+            if tokio::net::TcpStream::connect("127.0.0.1:9292")
+                .await
+                .is_ok()
+                && let Some(inode) = child_listener_inode(pid)
+            {
+                break inode;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await;
+    match result {
+        Ok(inode) => inode,
+        Err(_) => {
+            let _ = child.kill();
+            let status = child.wait().expect("wait timed-out child");
+            let mut stderr = String::new();
+            if let Some(mut pipe) = child.stderr.take() {
+                std::io::Read::read_to_string(&mut pipe, &mut stderr).ok();
+            }
+            let mut stdout = String::new();
+            if let Some(mut pipe) = child.stdout.take() {
+                std::io::Read::read_to_string(&mut pipe, &mut stdout).ok();
+            }
+            panic!(
+                "child did not bind 9292: pid={pid}; status={status}; stdout={stdout:?}; stderr={stderr:?}"
+            );
+        }
+    }
+}
+
+async fn wait_for_port_free() {
+    tokio::time::timeout(std::time::Duration::from_secs(20), async {
+        loop {
+            if let Ok(listener) = tokio::net::TcpListener::bind("127.0.0.1:9292").await {
+                drop(listener);
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("9292 remained occupied before child spawn");
+}
+
+fn stop_child(mut child: RuntimeChild) {
+    Command::new("kill")
+        .args(["-INT", &child.id().to_string()])
+        .status()
+        .expect("send child shutdown");
+    let status = child.wait().expect("wait for child shutdown");
+    assert!(status.success(), "child shutdown failed: {status}");
+}
+
+async fn wait_for_child_diagnostic(child: &mut Child, path: &std::path::Path, needle: &str) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        assert!(
+            child.try_wait().unwrap().is_none(),
+            "runtime exited before diagnostic; expected={needle:?}; stderr={:?}; stdout={:?}",
+            std::fs::read_to_string(path).unwrap_or_default(),
+            std::fs::read_to_string(path.with_extension("stdout")).unwrap_or_default()
+        );
+        if std::fs::read_to_string(path)
+            .unwrap_or_default()
+            .contains(needle)
+        {
+            return;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "runtime diagnostic timed out; stderr={:?}; stdout={:?}",
+            std::fs::read_to_string(path).unwrap_or_default(),
+            std::fs::read_to_string(path.with_extension("stdout")).unwrap_or_default()
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+    }
+}
+
+#[tokio::test]
+async fn child_process_restart_replaces_9292_pid_and_listener_inode() {
+    let _port_guard = a2a_port_guard().lock().await;
+    wait_for_port_free().await;
+    let temp = TempDir::new();
+    let config_path = temp.0.join("bridge.toml");
+    let database = temp.0.join("state.db");
+    let sessions = temp.0.join("sessions");
+    unsafe {
+        std::env::set_var("T050_TOKEN", "test-token");
+    }
+    std::fs::write(&config_path, format!(
+        "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nshutdown_timeout_seconds = 10\n\n[transports.a2a]\nenabled = true\nlisten = \"tcp:127.0.0.1:9292\"\nallow_private_plaintext = true\nexposed_endpoints = []\n",
+        database.to_string_lossy(), sessions.to_string_lossy())).unwrap();
+    assert!(config_path.exists());
+    assert!(std::fs::metadata(&config_path).is_ok());
+    let mut first = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        .arg(&config_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map(RuntimeChild)
+        .unwrap();
+    let first_pid = first.id();
+    let first_inode = wait_for_child_listener(&mut first).await;
+    let card = reqwest::get("http://127.0.0.1:9292/.well-known/agent-card.json")
+        .await
+        .unwrap_or_else(|error| {
+            panic!(
+                "card request failed: {error}; config={:?} exists={}",
+                config_path,
+                config_path.exists()
+            )
+        });
+    assert_eq!(card.status(), reqwest::StatusCode::OK);
+    assert_eq!(
+        card.headers()[reqwest::header::CONTENT_TYPE],
+        "application/json"
+    );
+    tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    stop_child(first);
+    wait_for_port_free().await;
+    let mut second = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        .arg(&config_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map(RuntimeChild)
+        .unwrap();
+    let second_pid = second.id();
+    let second_inode = wait_for_child_listener(&mut second).await;
+    assert_ne!(second_pid, first_pid);
+    assert_ne!(second_inode, first_inode);
+    let card = reqwest::get("http://127.0.0.1:9292/.well-known/agent-card.json")
+        .await
+        .unwrap();
+    assert_eq!(card.status(), reqwest::StatusCode::OK);
+    stop_child(second);
+}
+
+#[tokio::test]
+async fn concurrent_second_start_rejects_live_owner_without_takeover() {
+    let temp = TempDir::new();
+    let config_path = temp.0.join("bridge.toml");
+    let database = temp.0.join("state.db");
+    let sessions = temp.0.join("sessions");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nhealth_bind = \"127.0.0.1:0\"\nshutdown_timeout_seconds = 10\n\n[transports.matrix]\nenabled = false\n\n[transports.a2a]\nenabled = false\n",
+            database.to_string_lossy(),
+            sessions.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    // Schema installation belongs to fixture preparation. The timed scenario
+    // below exercises two real owner generations and the maintenance lock.
+    let pool = connect(&database).await.unwrap();
+    migrate(&pool).await.unwrap();
+    pool.close().await;
+    let first_stderr = temp.0.join("first.stderr");
+    let mut first = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        .arg(&config_path)
+        .stdout(std::fs::File::create(first_stderr.with_extension("stdout")).unwrap())
+        .stderr(std::fs::File::create(&first_stderr).unwrap())
+        .spawn()
+        .map(RuntimeChild)
+        .unwrap();
+    let first_pid = first.id();
+    wait_for_child_diagnostic(
+        &mut first,
+        &first_stderr,
+        "t050-recovery status=0 blocking=none",
+    )
+    .await;
+    let pool = connect(&database).await.unwrap();
+    let before: (i64, String, String) = sqlx::query_as(
+        "SELECT count(*),state,process_fingerprint FROM runtime_instances WHERE state='active'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(before.0, 1);
+    assert_eq!(before.1, "active");
+    assert!(before.2.starts_with(&format!("pid:{first_pid};exe:")));
+    let lock = std::fs::File::open(temp.0.join(".state.db.offline-migration.lock")).unwrap();
+    assert_eq!(
+        unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&lock),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        },
+        -1
+    );
+    assert_eq!(
+        std::io::Error::last_os_error().raw_os_error(),
+        Some(libc::EWOULDBLOCK)
+    );
+    let second_stderr = temp.0.join("second.stderr");
+    let mut second = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        .arg(&config_path)
+        .stdout(std::fs::File::create(second_stderr.with_extension("stdout")).unwrap())
+        .stderr(std::fs::File::create(&second_stderr).unwrap())
+        .spawn()
+        .map(RuntimeChild)
+        .unwrap();
+    assert!(first_pid != second.id());
+    let status = tokio::time::timeout(std::time::Duration::from_secs(60), async {
+        loop {
+            if let Some(status) = second.try_wait().unwrap() {
+                break status;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    })
+    .await
+    .expect("blocked second runtime did not exit");
+    assert_eq!(status.code(), Some(1));
+    let diagnostic = std::fs::read_to_string(second_stderr).unwrap();
+    let lines: Vec<_> = diagnostic.lines().collect();
+    assert_eq!(
+        lines.first().copied(),
+        Some("startup-runtime-error phase=maintenance-lock error_class=io")
+    );
+    assert_eq!(lines.get(1).copied(), Some("Error: Application(Runtime)"));
+    assert!(first.try_wait().unwrap().is_none());
+    let after: (i64, String, String) = sqlx::query_as(
+        "SELECT count(*),state,process_fingerprint FROM runtime_instances WHERE state='active'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(after, before);
+    pool.close().await;
+    stop_child(first);
+}
+
+#[tokio::test]
+async fn stale_owner_startup_recovers_then_acquires_durable_generation() {
+    let temp = TempDir::new();
+    let config_path = temp.0.join("bridge.toml");
+    let database = temp.0.join("state.db");
+    let sessions = temp.0.join("sessions");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nhealth_bind = \"127.0.0.1:0\"\nshutdown_timeout_seconds = 10\n\n[transports.matrix]\nenabled = false\n\n[transports.a2a]\nenabled = false\n",
+            database.to_string_lossy(),
+            sessions.to_string_lossy()
+        ),
+    )
+    .unwrap();
+    // Schema installation belongs to fixture preparation. The timed scenario
+    // below exercises two real owner generations and the maintenance lock.
+    let pool = connect(&database).await.unwrap();
+    migrate(&pool).await.unwrap();
+    pool.close().await;
+    let first_stderr = temp.0.join("first.stderr");
+    let mut first = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        .arg(&config_path)
+        .stdout(std::fs::File::create(first_stderr.with_extension("stdout")).unwrap())
+        .stderr(std::fs::File::create(&first_stderr).unwrap())
+        .spawn()
+        .map(RuntimeChild)
+        .unwrap();
+    let first_pid = first.id();
+    wait_for_child_diagnostic(
+        &mut first,
+        &first_stderr,
+        "t050-recovery status=0 blocking=none",
+    )
+    .await;
+    let pool = connect(&database).await.unwrap();
+    let fingerprint: String = sqlx::query_scalar(
+        "SELECT process_fingerprint FROM runtime_instances WHERE state='active'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(fingerprint.starts_with(&format!("pid:{first_pid};exe:")));
+    pool.close().await;
+    Command::new("kill")
+        .args(["-KILL", &first_pid.to_string()])
+        .status()
+        .unwrap();
+    let first_status = first.wait().unwrap();
+    assert!(!first_status.success());
+    let second_stderr = temp.0.join("second.stderr");
+    let mut second = Command::new(env!("CARGO_BIN_EXE_guigu-agent-bridge"))
+        .arg(&config_path)
+        .stdout(std::fs::File::create(second_stderr.with_extension("stdout")).unwrap())
+        .stderr(std::fs::File::create(&second_stderr).unwrap())
+        .spawn()
+        .map(RuntimeChild)
+        .unwrap();
+    wait_for_child_diagnostic(
+        &mut second,
+        &second_stderr,
+        "t050-recovery status=0 blocking=none",
+    )
+    .await;
+    let pool = connect(&database).await.unwrap();
+    let stopped: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM runtime_instances WHERE state='stopped' AND process_fingerprint=?",
+    )
+    .bind(fingerprint)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    let active: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM runtime_instances WHERE state='active'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(stopped, 1);
+    assert_eq!(active, 1);
+    pool.close().await;
+    stop_child(second);
+}
+
+#[tokio::test]
+async fn startup_recovery_backlog_blocks_readiness_without_spawning_acp() {
+    let _port_guard = a2a_port_guard().lock().await;
+    let temp = TempDir::new();
+    let config_path = temp.0.join("bridge.toml");
+    let database = temp.0.join("state.db");
+    let sessions = temp.0.join("sessions");
+    std::fs::write(
+        &config_path,
+        format!(
+            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nhealth_bind = \"127.0.0.1:19292\"\n\n[agents.worker]\ntransport = \"acp\"\ncommand = \"definitely-not-started\"\nworkspace = \"/tmp\"\nenabled = true\n",
+            database.to_string_lossy(),
+            sessions.to_string_lossy()
         ),
     )
     .unwrap();
@@ -663,26 +1189,15 @@ async fn startup_recovery_backlog_blocks_readiness_without_spawning_acp() {
         .unwrap();
     pool.close().await;
 
-    let runtime = AppRuntime::start(&config_path).await.unwrap();
-    assert_eq!(
-        runtime.health_state().snapshot().await.readiness,
-        guigu_agent_bridge::runtime::Readiness::RecoveryBlocked
+    assert!(matches!(
+        AppRuntime::start(&config_path).await,
+        Err(guigu_agent_bridge::app::AppError::Runtime)
+    ));
+    assert!(
+        tokio::net::TcpListener::bind("127.0.0.1:19292")
+            .await
+            .is_ok()
     );
-    assert_eq!(
-        runtime.health_state().snapshot().await.diagnostic,
-        Some("recovery-blocked")
-    );
-    let diagnostics = runtime.health_state().matrix().startup_diagnostics();
-    let blocked = guigu_agent_bridge::app::MatrixStartupAttempt::NotAttemptedRecoveryBlocked;
-    assert_eq!(diagnostics.authentication, blocked);
-    assert_eq!(diagnostics.store_binding, blocked);
-    assert_eq!(diagnostics.session_restore, blocked);
-    assert_eq!(diagnostics.e2ee_initialization, blocked);
-    assert_eq!(diagnostics.server_device_key_proof, blocked);
-    runtime.shutdown().await.unwrap();
-    unsafe {
-        std::env::remove_var("T055_DUMMY_MATRIX_TOKEN");
-    }
 }
 
 #[tokio::test]

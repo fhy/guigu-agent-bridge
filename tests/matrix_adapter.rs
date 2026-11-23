@@ -4,6 +4,7 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    time::Duration,
 };
 
 use guigu_agent_bridge::{
@@ -16,6 +17,7 @@ use guigu_agent_bridge::{
     observer::{MessageCategory, MonitorSender, ObserverMessage, Severity},
     storage::{MatrixRecoveryStore, SqliteRepository, connect, migrate},
 };
+use matrix_sdk::sync::SyncResponse;
 
 #[derive(Default)]
 struct MissingKeyCount(AtomicU64);
@@ -113,6 +115,51 @@ async fn mount_identity(server: &MockServer, user_id: &str, device_id: Option<&s
         .respond_with(ResponseTemplate::new(200).set_body_json(whoami))
         .mount(server)
         .await;
+}
+
+async fn prepare_initialized_client(
+    server: &MockServer,
+    config: &MatrixTransportConfig,
+) -> MatrixClient {
+    mount_versions(server).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"/_matrix/client/.*/sync"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({
+            "next_batch": "prep",
+            "rooms": {"join": {}, "invite": {}, "leave": {}, "knock": {}},
+            "presence": {"events": []}, "account_data": {"events": []},
+            "to_device": {"events": []},
+            "device_lists": {"changed": [], "left": []},
+            "device_one_time_keys_count": {}
+        })))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/_matrix/client/.*/keys/upload"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"one_time_key_counts": {}})))
+        .mount(server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/_matrix/client/.*/keys/query"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"failures": {}, "device_keys": {}})),
+        )
+        .mount(server)
+        .await;
+
+    let client = MatrixClient::restore(config).await.unwrap();
+    let prep =
+        MatrixSync::new(client.clone(), Arc::new(MemorySyncTokenStore::default()), 4).unwrap();
+    let (tx, mut rx) = mpsc::channel(4);
+    prep.sync_once(&tx).await.unwrap();
+    assert!(
+        rx.try_recv().is_err(),
+        "preparation must deliver no business event"
+    );
+    drop(prep);
+    drop(tx);
+    drop(rx);
+    client
 }
 
 #[tokio::test]
@@ -315,6 +362,165 @@ async fn rebuilt_sync_uses_the_last_committed_since_token() {
             .any(|(key, value)| key == "since" && value == "s1")
     );
     assert_eq!(tokens.load().await.unwrap().as_deref(), Some("s2"));
+}
+
+#[tokio::test]
+async fn durable_disposition_precedes_checkpoint_and_failure_keeps_cursor() {
+    let server = MockServer::start().await;
+    mount_versions(&server).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"/_matrix/client/.*/sync"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(sync_response("s1", "$one:x")))
+        .mount(&server)
+        .await;
+    let tokens: Arc<dyn SyncTokenStore> = Arc::new(MemorySyncTokenStore::default());
+    let sync = MatrixSync::new(
+        MatrixClient::restore(&config(&server.uri())).await.unwrap(),
+        Arc::clone(&tokens),
+        4,
+    )
+    .unwrap();
+    let (handle, mut events, dispositions) = sync.start_with_dispositions();
+    assert_eq!(events.recv().await.unwrap().event_id, "$one:x");
+    assert_eq!(tokens.load().await.unwrap(), None);
+    dispositions.send(Ok(())).await.unwrap();
+    tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if tokens.load().await.unwrap().as_deref() == Some("s1") {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    handle.shutdown().await.unwrap();
+
+    server.reset().await;
+    mount_versions(&server).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"/_matrix/client/.*/sync"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(sync_response("s2", "$two:x")))
+        .mount(&server)
+        .await;
+    let sync = MatrixSync::new(
+        MatrixClient::restore(&config(&server.uri())).await.unwrap(),
+        Arc::clone(&tokens),
+        4,
+    )
+    .unwrap();
+    let (handle, mut events, dispositions) = sync.start_with_dispositions();
+    assert_eq!(events.recv().await.unwrap().event_id, "$two:x");
+    dispositions.send(Err(MatrixError::Storage)).await.unwrap();
+    assert!(matches!(handle.wait().await, Err(MatrixError::Storage)));
+    assert_eq!(tokens.load().await.unwrap().as_deref(), Some("s1"));
+}
+
+#[tokio::test]
+async fn initial_response_checkpoint_is_owned_before_the_second_sync() {
+    let server = MockServer::start().await;
+    let config = config(&server.uri());
+    let client = tokio::time::timeout(Duration::from_secs(60), {
+        prepare_initialized_client(&server, &config)
+    })
+    .await
+    .expect("preparation exceeded 60 s watchdog");
+
+    server.reset().await;
+    mount_versions(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/_matrix/client/.*/keys/upload"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"one_time_key_counts": {}})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/_matrix/client/.*/keys/query"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"failures": {}, "device_keys": {}})),
+        )
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"/_matrix/client/.*/sync"))
+        .respond_with(ResponseTemplate::new(500))
+        .mount(&server)
+        .await;
+    let tokens: Arc<dyn SyncTokenStore> = Arc::new(MemorySyncTokenStore::default());
+    let initial = SyncResponse {
+        next_batch: "initial-batch".into(),
+        ..SyncResponse::default()
+    };
+    let sync = MatrixSync::new(client, Arc::clone(&tokens), 4)
+        .unwrap()
+        .with_initial_response(initial);
+    let (handle, _events) = sync.start();
+    let reached_sync = tokio::time::timeout(Duration::from_secs(1), async {
+        loop {
+            if server
+                .received_requests()
+                .await
+                .unwrap()
+                .iter()
+                .any(|request| request.url.path().ends_with("/sync"))
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await;
+    assert!(
+        reached_sync.is_ok(),
+        "sync not reached: checkpoint={:?}; requests={:?}",
+        tokens.load().await.unwrap(),
+        server
+            .received_requests()
+            .await
+            .unwrap()
+            .iter()
+            .map(|request| request.url.path().to_owned())
+            .collect::<Vec<_>>()
+    );
+    assert_eq!(
+        tokens.load().await.unwrap().as_deref(),
+        Some("initial-batch")
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert!(
+        requests
+            .iter()
+            .filter(|request| request.url.path().ends_with("/sync"))
+            .all(|request| request
+                .url
+                .query_pairs()
+                .any(|(key, value)| key == "since" && value == "initial-batch"))
+    );
+    handle.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn shutdown_cancels_pending_disposition_without_checkpointing() {
+    let server = MockServer::start().await;
+    mount_versions(&server).await;
+    Mock::given(method("GET"))
+        .and(path_regex(r"/_matrix/client/.*/sync"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(sync_response("blocked", "$one:x")))
+        .mount(&server)
+        .await;
+    let tokens: Arc<dyn SyncTokenStore> = Arc::new(MemorySyncTokenStore::default());
+    let sync = MatrixSync::new(
+        MatrixClient::restore(&config(&server.uri())).await.unwrap(),
+        Arc::clone(&tokens),
+        4,
+    )
+    .unwrap();
+    let (handle, mut events, _dispositions) = sync.start_with_dispositions();
+    assert_eq!(events.recv().await.unwrap().event_id, "$one:x");
+    tokio::time::timeout(Duration::from_secs(1), handle.shutdown())
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(tokens.load().await.unwrap(), None);
 }
 
 #[tokio::test]
@@ -588,7 +794,27 @@ async fn unknown_token_is_authentication_and_the_owner_shuts_down_cleanly() {
 #[tokio::test]
 async fn sync_owner_reconnects_after_a_transient_failure() {
     let server = MockServer::start().await;
+    let config = config(&server.uri());
+    let client = tokio::time::timeout(Duration::from_secs(60), {
+        prepare_initialized_client(&server, &config)
+    })
+    .await
+    .expect("preparation exceeded 60 s watchdog");
+
+    server.reset().await;
     mount_versions(&server).await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/_matrix/client/.*/keys/upload"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(json!({"one_time_key_counts": {}})))
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path_regex(r"/_matrix/client/.*/keys/query"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_json(json!({"failures": {}, "device_keys": {}})),
+        )
+        .mount(&server)
+        .await;
     Mock::given(method("GET"))
         .and(path_regex(r"/_matrix/client/.*/sync"))
         .respond_with(ResponseTemplate::new(500).set_body_json(json!({
@@ -607,12 +833,7 @@ async fn sync_owner_reconnects_after_a_transient_failure() {
         .mount(&server)
         .await;
     let tokens: Arc<dyn SyncTokenStore> = Arc::new(MemorySyncTokenStore::default());
-    let owner = MatrixSync::new(
-        MatrixClient::restore(&config(&server.uri())).await.unwrap(),
-        Arc::clone(&tokens),
-        2,
-    )
-    .unwrap();
+    let owner = MatrixSync::new(client, Arc::clone(&tokens), 2).unwrap();
     let (handle, mut events) = owner.start();
     let event = tokio::time::timeout(std::time::Duration::from_secs(5), events.recv())
         .await
@@ -874,17 +1095,22 @@ async fn encrypted_event_without_a_room_key_is_never_delivered_as_plaintext() {
         .mount(&server)
         .await;
     let missing = Arc::new(MissingKeyCount::default());
+    let tokens: Arc<dyn SyncTokenStore> = Arc::new(MemorySyncTokenStore::default());
     let sync = MatrixSync::new(
         MatrixClient::restore(&config(&server.uri())).await.unwrap(),
-        Arc::new(MemorySyncTokenStore::default()),
+        Arc::clone(&tokens),
         4,
     )
     .unwrap()
     .with_missing_key_observer(missing.clone());
     let (tx, mut rx) = mpsc::channel(4);
-    assert_eq!(sync.sync_once(&tx).await.unwrap(), 0);
+    assert!(matches!(
+        sync.sync_once(&tx).await,
+        Err(MatrixError::CryptoInitialization)
+    ));
     assert!(rx.try_recv().is_err());
     assert_eq!(missing.0.load(Ordering::Relaxed), 1);
+    assert_eq!(tokens.load().await.unwrap(), None);
 }
 
 #[tokio::test]

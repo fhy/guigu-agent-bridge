@@ -1,6 +1,6 @@
 use std::collections::BTreeMap;
 
-use super::{EventDedup, InboundMatrixEvent, PermissionPolicy, derive_matrix_user_id};
+use super::{EventDedup, InboundMatrixEvent, PermissionPolicy};
 use crate::{
     bus::{AdmissionContext, Bus, BusError, EndpointRegistry},
     models::{
@@ -38,6 +38,9 @@ pub struct RoutePolicy {
 impl RoutePolicy {
     pub fn new() -> Self {
         Self::default()
+    }
+    pub(crate) fn knows_room(&self, room: &str) -> bool {
+        self.room_targets.contains_key(room) || self.direct_targets.contains_key(room)
     }
     pub fn alias(mut self, alias: impl Into<String>, agent_id: impl Into<String>) -> Self {
         self.aliases.insert(alias.into(), agent_id.into());
@@ -223,17 +226,11 @@ pub async fn route_event_with_monitor(
     if dedup.contains(&event.room_id, &event.event_id) {
         return Err(RouteError::Duplicate);
     }
-    let (agent_name, text) = select_target(event, policy)?;
-    let target = registry
-        .resolve_agent_id(agent_name)
-        .ok_or(RouteError::Target)?;
-    registry
-        .validate_target(target)
-        .map_err(|_| RouteError::Target)?;
-    let sender = derive_matrix_user_id(&event.sender).map_err(|_| RouteError::Identity)?;
-    if !permissions.permits(&event.sender, target) {
-        return Err(RouteError::Forbidden);
-    }
+    let super::ingress_decision::Selection {
+        target,
+        sender,
+        text,
+    } = super::ingress_decision::select(event, policy, permissions, registry)?;
     let task_id = TaskId::generate();
     let task = AgentTask {
         task_id,
@@ -295,17 +292,11 @@ pub async fn route_event_durable(
     if dedup.contains(&event.room_id, &event.event_id) {
         return Err(RouteError::Duplicate);
     }
-    let (agent_name, text) = select_target(event, policy)?;
-    let target = registry
-        .resolve_agent_id(agent_name)
-        .ok_or(RouteError::Target)?;
-    registry
-        .validate_target(target)
-        .map_err(|_| RouteError::Target)?;
-    let sender = derive_matrix_user_id(&event.sender).map_err(|_| RouteError::Identity)?;
-    if !permissions.permits(&event.sender, target) {
-        return Err(RouteError::Forbidden);
-    }
+    let super::ingress_decision::Selection {
+        target,
+        sender,
+        text,
+    } = super::ingress_decision::select(event, policy, permissions, registry)?;
     let task_id = TaskId::generate();
     let task = AgentTask {
         task_id,
@@ -339,7 +330,7 @@ pub async fn route_event_durable(
     Ok(task)
 }
 
-fn select_target<'a>(
+pub(super) fn select_target<'a>(
     event: &InboundMatrixEvent,
     policy: &'a RoutePolicy,
 ) -> Result<(&'a str, String), RouteError> {

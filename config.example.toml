@@ -2,6 +2,7 @@
 # Keep credentials in environment variables or a secret manager.
 
 [bridge]
+owner_evidence_max_age_seconds = 30
 database = "~/.local/share/guigu-agent-bridge/state.db"
 session_root = "~/.cache/guigu-agent-bridge/sessions"
 max_task_depth = 8

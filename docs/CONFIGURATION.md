@@ -1,5 +1,73 @@
 # Configuration Reference
 
+## Owner-evidence freshness
+
+`bridge.owner_evidence_max_age_seconds` is optional (default 30) and must be
+between 1 and 300 seconds inclusive. Existing configurations remain valid.
+The window controls freshness, not containment: no configuration value enables
+modeled positive owner qualification or supplies a trusted execution domain.
+
+For a standard single-turn ACP agent without the bridge's structured `taskResult`
+extension, opt into `[runtime] legacy_acp_results = true`. This treats successful
+`end_turn` as terminal and returns streamed output; refusal and other stop reasons
+remain failures. The default is false (strict structured results). Do not combine
+it with `allow_nonterminal_end_turn`, which deliberately continues rather than
+completing such turns.
+
+For ordinary Codex ACP, set this option explicitly before the first task; a
+connected Matrix listener does not prove that the Agent can complete a turn.
+Verify an encrypted request and its successful Agent reply, then repeat after a
+same-device/store restart. Do not reset the store to work around admission errors.
+
+## Retaining an unresolved dispatch
+
+`hold-unresolved-admission --database DB --config CONFIG --task TASK --owner OWNER
+--revision REVISION` is an offline, exact-scope recovery operation for a stopped,
+non-administrative deployment. It changes only a matching `dispatching` admission
+to `recovery_needed`, preserving the task and its queued/dispatched events. It
+records an exact owner/revision-bound administrative hold receipt atomically;
+an unrelated `recovery_needed` row does not gain this no-replay exemption. It
+does not assert failure, nonacceptance or absence of effects and never replays it.
+It refuses delivery, execution lease, continuation, workspace, queue or session
+binding evidence for that task, a live durable runtime, stale revision or owner,
+and administrative bindings. Preserve a consistent backup before using it.
+Other unresolved execution/delivery evidence still blocks startup normally.
+
+## Diagnosing chat and restart failures
+
+Default INFO includes the first fatal category, task/delivery correlation where
+available, secondary finalization failure and required-worker health degradation.
+Do not treat an active PID or HTTP readiness alone as proof of a working Agent.
+For one bounded reproduction, use `RUST_LOG=info,guigu_agent_bridge=debug` with the
+existing launcher; inspect that instance's journal with
+`journalctl --user -u UNIT --since 'YYYY-MM-DD HH:MM:SS' --no-pager`.
+Return to the ordinary filter after capturing the incident. Do not enable global
+TRACE, print environment files or publish raw logs containing private identifiers.
+
+Execution-lease heartbeats also cover bounded ACP session initialization and
+resume, before the first task prompt. DEBUG stage `delivery-lease` reports the
+unchanged task/fence and renewal progress; INFO-level ERROR distinguishes an
+expired lease, lost owner fence and storage failure. If ownership is lost, the
+adapter retains the bounded setup through backend reap and preserves recovery
+state without prompting or replaying the task. It never revives an expired lease.
+An acknowledged setup with no continuation is not eligible for the no-execution-
+evidence admission hold; preserve that state instead of manually clearing it.
+
+| Stage | Safe diagnostic distinction |
+|---|---|
+| initial-baseline / baseline-publication | No checkpoint versus durable active checkpoint; limited-room count; history executed=0; response acceptance is not a committed baseline. |
+| incremental-sync | Actual checkpoint gap refuses without advancement; first transport retry warns, repeats count at DEBUG, bounded recovery reports its count. |
+| acp-delivery / acp-session | Effective legacy/strict completion settings, delivery attempt and new/resume choice; session identifiers, prompts and remote payloads are not logged here. |
+| acp-execution | Missing structured result in strict mode is distinct from transport, schema and agent refusal; explicit legacy mode is not an automatic fallback. |
+| lease-acquisition / lease-reassignment | Pre-state/fence, authenticated released-parent reassignment and committed versus attempted transaction. |
+| task-worker | Delivery and secondary-finalization categories remain distinct; a required owner exit degrades health without automatic respawn. |
+| admission-recovery / hold-* | Exact state/revision/owner-state refusal, offline input/exclusion/classification/transaction stages and no-replay hold result. |
+
+Correlate the first failure before interpreting a later channel-closed or startup
+refusal. Reproduce a historically lost error only on a controlled equivalent;
+never claim diagnostics reconstructed an error that was not preserved. An
+unknown task stays unknown until a supported exact-scope disposition succeeds.
+
 Start from `config.example.toml`. Unknown or invalid values fail startup. Secret values
 use `{env:VARIABLE}` references; do not store access tokens in the file.
 

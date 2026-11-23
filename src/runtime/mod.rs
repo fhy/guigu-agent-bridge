@@ -1,5 +1,11 @@
 //! Durable runtime control for exclusive execution and bounded continuation.
 
+mod delivery_lease;
+#[cfg(all(test, feature = "test-support"))]
+pub(crate) mod lifecycle_tests;
+mod recovery_audit;
+mod refused_projection;
+
 use crate::{
     acp::{AcpDispatcher, TurnResult},
     bus::{
@@ -7,26 +13,33 @@ use crate::{
         FinalizeResult, LifecycleResult, PreparedExecution, QueueLeaseContext, TaskDispatcher,
         TaskLifecycle,
     },
-    models::{AgentTask, DeliveryId, EndpointId, TaskId},
+    models::{
+        AgentTask, DeliveryId, EndpointId, EventId, TaskEvent, TaskEventPayload, TaskId, TaskStatus,
+    },
     storage::StorageError,
 };
 use chrono::{DateTime, Utc};
 use sqlx::{Row, SqlitePool};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     future::Future,
     path::Path,
     pin::Pin,
     str::FromStr,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 use uuid::Uuid;
 
 const RESOURCE_NAMESPACE: Uuid = Uuid::from_u128(0x8ce9c0d7_8257_5068_a369_b075e9d30e21);
 const WORKSPACE_NAMESPACE: Uuid = Uuid::from_u128(0xf6af15e8_6e64_56df_851f_24589ba97713);
-const TERMINAL_OUTBOX_NAMESPACE: Uuid = Uuid::from_u128(0x6c1ab2ee_4834_5f40_901b_0fbdbf95dbd0);
-const OUTBOX_BODY_NAMESPACE: Uuid = Uuid::from_u128(0x7297ec04_1338_57b4_9bc4_f0ff9f84fa5a);
+pub(crate) const TERMINAL_OUTBOX_NAMESPACE: Uuid =
+    Uuid::from_u128(0x6c1ab2ee_4834_5f40_901b_0fbdbf95dbd0);
+pub(crate) const OUTBOX_BODY_NAMESPACE: Uuid =
+    Uuid::from_u128(0x7297ec04_1338_57b4_9bc4_f0ff9f84fa5a);
 const CONTINUATION_RUNTIME_GENERATION: &str = "generation.v1:strict";
 pub const MAX_CONTINUATION_PROMPT_BYTES: usize = 4096;
 const MAX_OUTBOX_BODY_BYTES: usize = 2048;
@@ -182,6 +195,7 @@ pub struct RecoverySnapshot {
 #[derive(Clone)]
 pub struct SqliteRuntimeStore {
     pool: SqlitePool,
+    recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
 }
 
 fn path_components(path: &Path) -> Result<Vec<String>, RuntimeError> {
@@ -207,7 +221,17 @@ fn overlaps(left: &[String], right: &[String]) -> bool {
 
 impl SqliteRuntimeStore {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            recovery: None,
+        }
+    }
+
+    pub(crate) fn new_scoped(
+        pool: SqlitePool,
+        recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
+    ) -> Self {
+        Self { pool, recovery }
     }
 
     pub async fn lease_for_task(
@@ -235,13 +259,16 @@ impl SqliteRuntimeStore {
     ) -> Result<AcquireOutcome, RuntimeError> {
         let owner = Uuid::now_v7();
         let expires = add(now, ttl)?;
-        let mut tx = match self.pool.begin_with("BEGIN IMMEDIATE").await {
+        let mut tx = match self.transaction().await {
             Ok(value) => value,
             Err(error) if error.to_string().contains("database is locked") => {
                 return Ok(AcquireOutcome::Busy);
             }
             Err(error) => return Err(error.into()),
         };
+        let mutation = self
+            .prepare_existing_lease(&mut tx, &resource.to_string())
+            .await?;
         let inserted = match sqlx::query("INSERT INTO execution_leases(resource_key,task_id,owner_token,fence,state,acquired_at,heartbeat_at,expires_at) VALUES(?,?,?,1,'active',?,?,?) ON CONFLICT(resource_key) DO NOTHING")
             .bind(resource.to_string()).bind(task_id.to_string()).bind(owner.to_string()).bind(ts(now)).bind(ts(now)).bind(ts(expires)).execute(&mut *tx).await {
             Ok(value) => value,
@@ -249,6 +276,8 @@ impl SqliteRuntimeStore {
             Err(error) => return Err(error.into()),
         };
         if inserted.rows_affected() == 1 {
+            self.insert(&mut tx, "execution_leases", &resource.to_string())
+                .await?;
             if let Err(error) = tx.commit().await {
                 if error.to_string().contains("database is locked") {
                     return Ok(AcquireOutcome::Busy);
@@ -276,8 +305,10 @@ impl SqliteRuntimeStore {
             }
             Err(error) => return Err(error.into()),
         };
+        let mut reassigned = false;
         let outcome = if let Some(row) = row {
             let state: String = row.try_get("state").map_err(|_| RuntimeError::Malformed)?;
+            tracing::debug!(%task_id, stage = "lease-acquisition", state, fence = row.try_get::<i64, _>("fence").ok(), "evaluating existing lease without assuming acceptance");
             match state.as_str() {
                 "active" => {
                     let stored: String = row
@@ -314,6 +345,7 @@ impl SqliteRuntimeStore {
                     if result.rows_affected() != 1 {
                         return Err(RuntimeError::Fenced);
                     }
+                    reassigned = true;
                     AcquireOutcome::Acquired(Lease {
                         resource,
                         task_id,
@@ -327,12 +359,20 @@ impl SqliteRuntimeStore {
         } else {
             return Err(RuntimeError::Malformed);
         };
+        if reassigned {
+            tracing::debug!(%task_id, stage = "lease-reassignment", committed = false, "validating released lease parent replacement");
+            self.complete_reassigned_lease(&mut tx, mutation).await?;
+        } else {
+            self.complete_or_insert(&mut tx, "execution_leases", &resource.to_string(), mutation)
+                .await?;
+        }
         if let Err(error) = tx.commit().await {
             if error.to_string().contains("database is locked") {
                 return Ok(AcquireOutcome::Busy);
             }
             return Err(error.into());
         }
+        tracing::debug!(%task_id, stage = "lease-acquisition", reassigned, committed = true, "lease transaction committed");
         Ok(outcome)
     }
 
@@ -346,12 +386,18 @@ impl SqliteRuntimeStore {
             return Err(RuntimeError::Expired);
         }
         let expires = add(now, ttl)?;
+        let mut tx = self.transaction().await?;
+        let mutation = self
+            .prepare(&mut tx, "execution_leases", &lease.resource.to_string())
+            .await?;
         let result=sqlx::query("UPDATE execution_leases SET heartbeat_at=?,expires_at=? WHERE resource_key=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
-            .bind(ts(now)).bind(ts(expires)).bind(lease.resource.to_string()).bind(lease.owner.to_string()).bind(to_i64(lease.fence)?).bind(ts(now)).execute(&self.pool).await?;
+            .bind(ts(now)).bind(ts(expires)).bind(lease.resource.to_string()).bind(lease.owner.to_string()).bind(to_i64(lease.fence)?).bind(ts(now)).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Err(RuntimeError::Fenced);
         }
         let mut next = lease.clone();
+        self.complete(&mut tx, mutation).await?;
+        tx.commit().await?;
         next.expires_at = expires;
         Ok(next)
     }
@@ -365,7 +411,7 @@ impl SqliteRuntimeStore {
         for path in paths {
             candidates.push((path.to_string_lossy().into_owned(), path_components(path)?));
         }
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.transaction().await?;
         let rows = sqlx::query(
             "SELECT canonical_path,path_components_json FROM workspace_claims WHERE state='active'",
         )
@@ -384,10 +430,12 @@ impl SqliteRuntimeStore {
             }
         }
         for (path, components) in candidates {
+            let claim_id = Uuid::now_v7().to_string();
             sqlx::query("INSERT INTO workspace_claims(claim_id,runtime_owner,task_id,canonical_path,path_components_json,owner_fence,revision,state,created_at,updated_at) VALUES(?,?,?,?,?,?,1,'active',?,?)")
-                .bind(Uuid::now_v7().to_string()).bind(lease.owner.to_string()).bind(lease.task_id.to_string())
+                .bind(&claim_id).bind(lease.owner.to_string()).bind(lease.task_id.to_string())
                 .bind(path).bind(serde_json::to_string(&components).map_err(|_| RuntimeError::Malformed)?)
                 .bind(to_i64(lease.fence)?).bind(ts(lease.expires_at)).bind(ts(lease.expires_at)).execute(&mut *tx).await?;
+            self.insert(&mut tx, "workspace_claims", &claim_id).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -403,19 +451,23 @@ impl SqliteRuntimeStore {
             ReleaseDisposition::Released => "released",
             ReleaseDisposition::RecoveryNeeded => "recovery_needed",
         };
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx = self.transaction().await?;
+        let mutation = self
+            .prepare(&mut tx, "execution_leases", &lease.resource.to_string())
+            .await?;
         let result=sqlx::query("UPDATE execution_leases SET state=?,heartbeat_at=?,expires_at=? WHERE resource_key=? AND owner_token=? AND fence=? AND state='active'")
             .bind(state).bind(ts(now)).bind(ts(now)).bind(lease.resource.to_string()).bind(lease.owner.to_string()).bind(to_i64(lease.fence)?).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Err(RuntimeError::Fenced);
         }
-        if disposition == ReleaseDisposition::Released {
-            sqlx::query("DELETE FROM workspace_claims WHERE runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'")
-                .bind(lease.owner.to_string()).bind(lease.task_id.to_string()).bind(to_i64(lease.fence)?).execute(&mut *tx).await?;
-        } else {
-            sqlx::query("UPDATE workspace_claims SET state='recovery_needed',revision=revision+1,updated_at=? WHERE runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'")
-                .bind(ts(now)).bind(lease.owner.to_string()).bind(lease.task_id.to_string()).bind(to_i64(lease.fence)?).execute(&mut *tx).await?;
-        }
+        self.complete(&mut tx, mutation).await?;
+        self.release_workspaces(
+            &mut tx,
+            lease,
+            disposition == ReleaseDisposition::Released,
+            now,
+        )
+        .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -428,13 +480,59 @@ impl SqliteRuntimeStore {
         now: DateTime<Utc>,
     ) -> Result<(), RuntimeError> {
         let prompt = bounded_prompt(prompt)?;
+        let mut tx = self.transaction().await?;
         let result=sqlx::query("INSERT INTO task_continuations(task_id,resource_key,delivery_id,lease_fence,revision,state,next_turn,completed_turns,consecutive_no_progress,next_prompt,started_at,heartbeat_at,last_progress_at,observed_output_bytes) SELECT ?,?,?,?,1,'ready',1,0,0,?,?,?,?,0 FROM execution_leases l WHERE l.resource_key=? AND l.task_id=? AND l.owner_token=? AND l.fence=? AND l.state='active' AND l.expires_at>?")
-            .bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(delivery_id.to_string()).bind(to_i64(lease.fence)?).bind(prompt).bind(ts(now)).bind(ts(now)).bind(ts(now)).bind(lease.resource.to_string()).bind(lease.task_id.to_string()).bind(lease.owner.to_string()).bind(to_i64(lease.fence)?).bind(ts(now)).execute(&self.pool).await?;
+            .bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(delivery_id.to_string()).bind(to_i64(lease.fence)?).bind(prompt).bind(ts(now)).bind(ts(now)).bind(ts(now)).bind(lease.resource.to_string()).bind(lease.task_id.to_string()).bind(lease.owner.to_string()).bind(to_i64(lease.fence)?).bind(ts(now)).execute(&mut *tx).await?;
         if result.rows_affected() == 1 {
+            self.insert(&mut tx, "task_continuations", &lease.task_id.to_string())
+                .await?;
+            tx.commit().await?;
             Ok(())
         } else {
             Err(RuntimeError::Fenced)
         }
+    }
+
+    pub(super) async fn ensure_unstarted_continuation(
+        &self,
+        lease: &Lease,
+        delivery: DeliveryId,
+        prompt: &str,
+        now: DateTime<Utc>,
+    ) -> Result<(), RuntimeError> {
+        let prompt = bounded_prompt(prompt)?;
+        let mut tx = self.transaction().await?;
+        let exists: bool =
+            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM task_continuations WHERE task_id=?)")
+                .bind(lease.task_id.to_string())
+                .fetch_one(&mut *tx)
+                .await?;
+        if !exists {
+            tx.rollback().await?;
+            // Ordinary writer retains its exact active lease CAS. A concurrent creation
+            // fails closed; this is not an UPSERT or permission to overwrite a row.
+            return self.begin_continuation(lease, delivery, prompt, now).await;
+        }
+        for (table, key) in [
+            ("execution_leases", lease.resource.to_string()),
+            ("task_continuations", lease.task_id.to_string()),
+        ] {
+            crate::storage::recovery_eligibility::writer::require(
+                &mut tx,
+                self.recovery.as_ref(),
+                &crate::storage::recovery_eligibility::writer::text_identity(table, &key)?,
+            )
+            .await?;
+        }
+        let matches: i64 = sqlx::query_scalar("SELECT count(*) FROM task_continuations c JOIN execution_leases l ON l.resource_key=c.resource_key AND l.task_id=c.task_id AND l.fence=c.lease_fence WHERE c.task_id=? AND c.resource_key=? AND c.delivery_id=? AND c.lease_fence=? AND c.runtime_generation=? AND c.runtime_generation_version=1 AND c.state='ready' AND c.revision=1 AND c.next_turn=1 AND c.completed_turns=0 AND c.consecutive_no_progress=0 AND c.observed_output_bytes=0 AND c.next_prompt=? AND c.started_at=c.heartbeat_at AND c.started_at=c.last_progress_at AND l.owner_token=? AND l.state='active' AND l.expires_at>? AND NOT EXISTS(SELECT 1 FROM continuation_response_receipts r WHERE r.task_id=c.task_id) AND NOT EXISTS(SELECT 1 FROM acp_output_sets o WHERE o.task_id=c.task_id)")
+            .bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(delivery.to_string())
+            .bind(to_i64(lease.fence)?).bind(CONTINUATION_RUNTIME_GENERATION).bind(prompt)
+            .bind(lease.owner.to_string()).bind(ts(now)).fetch_one(&mut *tx).await?;
+        if matches != 1 {
+            return Err(RuntimeError::Fenced);
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     pub async fn continuation(
@@ -468,21 +566,8 @@ impl SqliteRuntimeStore {
         revision: u64,
         now: DateTime<Utc>,
     ) -> Result<Continuation, RuntimeError> {
-        self.ensure_runtime_generation(lease.task_id).await?;
-        let mut tx = self.pool.begin().await?;
-        let result=sqlx::query("UPDATE task_continuations SET state='in_flight',revision=revision+1,heartbeat_at=? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND state='ready' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
-            .bind(ts(now)).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
-        if result.rows_affected() != 1 {
-            return Err(RuntimeError::Fenced);
-        }
-        let row = sqlx::query("SELECT * FROM task_continuations WHERE task_id=?")
-            .bind(lease.task_id.to_string())
-            .fetch_optional(&mut *tx)
-            .await?
-            .ok_or(RuntimeError::Malformed)?;
-        let continuation = decode_continuation(&row)?;
-        tx.commit().await?;
-        Ok(continuation)
+        self.claim_turn_with_generation(lease, revision, CONTINUATION_RUNTIME_GENERATION, now)
+            .await
     }
 
     pub async fn claim_turn_with_generation(
@@ -500,7 +585,10 @@ impl SqliteRuntimeStore {
         if current.as_deref() != Some(generation) {
             return Err(RuntimeError::Fenced);
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.transaction().await?;
+        let mutation = self
+            .prepare(&mut tx, "task_continuations", &lease.task_id.to_string())
+            .await?;
         let result = sqlx::query("UPDATE task_continuations SET state='in_flight',revision=revision+1,heartbeat_at=? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='ready' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
             .bind(ts(now)).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(generation).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
@@ -511,6 +599,7 @@ impl SqliteRuntimeStore {
             .fetch_one(&mut *tx)
             .await?;
         let continuation = decode_continuation(&row)?;
+        self.complete(&mut tx, mutation).await?;
         tx.commit().await?;
         Ok(continuation)
     }
@@ -525,7 +614,10 @@ impl SqliteRuntimeStore {
     ) -> Result<Continuation, RuntimeError> {
         self.ensure_runtime_generation(lease.task_id).await?;
         let prompt = bounded_prompt(next_prompt)?;
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.transaction().await?;
+        let mutation = self
+            .prepare(&mut tx, "task_continuations", &lease.task_id.to_string())
+            .await?;
         let result=sqlx::query("UPDATE task_continuations SET state='ready',revision=revision+1,next_turn=next_turn+1,completed_turns=completed_turns+1,consecutive_no_progress=consecutive_no_progress+1,next_prompt=?,heartbeat_at=?,observed_output_bytes=observed_output_bytes+? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND state='in_flight' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
             .bind(prompt).bind(ts(now)).bind(to_i64(observed_bytes)?).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
@@ -537,6 +629,7 @@ impl SqliteRuntimeStore {
             .await?
             .ok_or(RuntimeError::Malformed)?;
         let continuation = decode_continuation(&row)?;
+        self.complete(&mut tx, mutation).await?;
         tx.commit().await?;
         Ok(continuation)
     }
@@ -562,7 +655,10 @@ impl SqliteRuntimeStore {
             revision
         );
         let hash = Uuid::new_v5(&OUTBOX_BODY_NAMESPACE, response.as_bytes()).to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.transaction().await?;
+        let mutation = self
+            .prepare(&mut tx, "task_continuations", &lease.task_id.to_string())
+            .await?;
         let result = sqlx::query("UPDATE task_continuations SET state='ready',revision=revision+1,next_turn=next_turn+1,completed_turns=completed_turns+1,consecutive_no_progress=consecutive_no_progress+1,next_prompt=?,heartbeat_at=?,observed_output_bytes=observed_output_bytes+? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='in_flight' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
             .bind(prompt).bind(ts(now)).bind(to_i64(observed_bytes)?).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(generation).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
@@ -573,11 +669,14 @@ impl SqliteRuntimeStore {
         if inserted.rows_affected() != 1 {
             return Err(RuntimeError::Continuation);
         }
+        self.insert(&mut tx, "continuation_response_receipts", &key)
+            .await?;
         let row = sqlx::query("SELECT * FROM task_continuations WHERE task_id=?")
             .bind(lease.task_id.to_string())
             .fetch_one(&mut *tx)
             .await?;
         let continuation = decode_continuation(&row)?;
+        self.complete(&mut tx, mutation).await?;
         tx.commit().await?;
         Ok(continuation)
     }
@@ -605,7 +704,7 @@ impl SqliteRuntimeStore {
             continuation.revision
         );
         let hash = Uuid::new_v5(&OUTBOX_BODY_NAMESPACE, response.as_bytes()).to_string();
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.transaction().await?;
         let inserted = sqlx::query("INSERT INTO continuation_response_receipts(idempotency_key,task_id,delivery_id,resource_key,lease_fence,continuation_revision,response_hash,outcome,output_bytes,runtime_generation,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(idempotency_key) DO NOTHING")
             .bind(&key).bind(continuation.task_id.to_string()).bind(continuation.delivery_id.to_string()).bind(continuation.resource.to_string())
             .bind(to_i64(continuation.lease_fence)?).bind(to_i64(continuation.revision)?).bind(&hash).bind(outcome)
@@ -622,6 +721,8 @@ impl SqliteRuntimeStore {
                 return Err(RuntimeError::Continuation);
             }
         }
+        self.insert(&mut tx, "continuation_response_receipts", &key)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -634,9 +735,15 @@ impl SqliteRuntimeStore {
         observed_bytes: u64,
         now: DateTime<Utc>,
     ) -> Result<(), RuntimeError> {
+        let mut tx = self.transaction().await?;
+        let mutation = self
+            .prepare(&mut tx, "task_continuations", &lease.task_id.to_string())
+            .await?;
         let result=sqlx::query("UPDATE task_continuations SET heartbeat_at=?,observed_output_bytes=observed_output_bytes+? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='in_flight' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
-            .bind(ts(now)).bind(to_i64(observed_bytes)?).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(generation).bind(lease.owner.to_string()).bind(ts(now)).execute(&self.pool).await?;
+            .bind(ts(now)).bind(to_i64(observed_bytes)?).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(generation).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
         if result.rows_affected() == 1 {
+            self.complete(&mut tx, mutation).await?;
+            tx.commit().await?;
             Ok(())
         } else {
             Err(RuntimeError::Fenced)
@@ -678,23 +785,37 @@ impl SqliteRuntimeStore {
         if current.as_deref() != Some(generation) {
             return Err(RuntimeError::Fenced);
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.transaction().await?;
+        let mutation = self
+            .prepare(&mut tx, "task_continuations", &lease.task_id.to_string())
+            .await?;
         let result=sqlx::query("UPDATE task_continuations SET state=?,revision=revision+1,completed_turns=completed_turns+1,heartbeat_at=?,observed_output_bytes=observed_output_bytes+? WHERE task_id=? AND resource_key=? AND lease_fence=? AND revision=? AND runtime_generation=? AND state='in_flight' AND EXISTS (SELECT 1 FROM execution_leases l WHERE l.resource_key=task_continuations.resource_key AND l.task_id=task_continuations.task_id AND l.owner_token=? AND l.fence=task_continuations.lease_fence AND l.state='active' AND l.expires_at>?)")
             .bind(state.as_str()).bind(ts(now)).bind(to_i64(observed_bytes)?).bind(lease.task_id.to_string()).bind(lease.resource.to_string()).bind(to_i64(lease.fence)?).bind(to_i64(revision)?).bind(generation).bind(lease.owner.to_string()).bind(ts(now)).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Err(RuntimeError::Fenced);
         }
+        self.complete(&mut tx, mutation).await?;
         let lease_state = if state == ContinuationState::RecoveryNeeded {
             "recovery_needed"
         } else {
             "released"
         };
+        let lease_mutation = self
+            .prepare(&mut tx, "execution_leases", &lease.resource.to_string())
+            .await?;
         let result=sqlx::query("UPDATE execution_leases SET state=?,heartbeat_at=?,expires_at=? WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
             .bind(lease_state).bind(ts(now)).bind(ts(now)).bind(lease.resource.to_string()).bind(lease.task_id.to_string()).bind(lease.owner.to_string()).bind(to_i64(lease.fence)?).bind(ts(now)).execute(&mut *tx).await?;
         if result.rows_affected() != 1 {
             return Err(RuntimeError::Fenced);
         }
+        self.complete(&mut tx, lease_mutation).await?;
         if state == ContinuationState::RecoveryNeeded {
+            let delivery: Option<String> = sqlx::query_scalar("SELECT d.delivery_id FROM delivery_dispositions d JOIN task_continuations c USING(delivery_id) WHERE c.task_id=? AND d.state IN ('prepared','acknowledged')")
+                .bind(lease.task_id.to_string()).fetch_optional(&mut *tx).await?;
+            let disposition = match delivery.as_deref() {
+                Some(id) => self.prepare(&mut tx, "delivery_dispositions", id).await?,
+                None => None,
+            };
             sqlx::query(
                 "UPDATE delivery_dispositions SET state='outcome_unknown',reason_code='recovery_needed' \
                  WHERE delivery_id=(SELECT delivery_id FROM task_continuations WHERE task_id=?) \
@@ -704,6 +825,7 @@ impl SqliteRuntimeStore {
             .bind(lease.task_id.to_string())
             .execute(&mut *tx)
             .await?;
+            self.complete(&mut tx, disposition).await?;
         }
         tx.commit().await?;
         Ok(())
@@ -748,7 +870,10 @@ impl SqliteRuntimeStore {
         if current.as_deref() != Some(generation) {
             return Ok(FinalizeResult::Fenced);
         }
-        let mut tx = self.pool.begin().await?;
+        let mut tx = self.transaction().await?;
+        let continuation_mutation = self
+            .prepare(&mut tx, "task_continuations", &lease.task_id.to_string())
+            .await?;
         let envelope = sqlx::query(
             "SELECT a.reply_room,a.reply_thread_root,a.reply_event_id,a.monitor_room,
                     a.monitor_generation,COALESCE(a.render_version,'v1') AS render_version,
@@ -765,6 +890,7 @@ impl SqliteRuntimeStore {
         if continuation.rows_affected() != 1 {
             return Ok(FinalizeResult::Fenced);
         }
+        self.complete(&mut tx, continuation_mutation).await?;
         let terminal_response =
             serde_json::to_string(&event.payload).map_err(|_| RuntimeError::Malformed)?;
         let terminal_hash =
@@ -786,6 +912,8 @@ impl SqliteRuntimeStore {
                 return Ok(FinalizeResult::RecoveryNeeded);
             }
         }
+        self.insert(&mut tx, "continuation_response_receipts", &receipt_key)
+            .await?;
         let latest: Option<i64> =
             sqlx::query_scalar("SELECT MAX(seq) FROM task_events WHERE task_id=?")
                 .bind(event.task_id.to_string())
@@ -799,6 +927,9 @@ impl SqliteRuntimeStore {
             return Ok(FinalizeResult::Stale);
         }
         let expected_version = event.seq.checked_sub(2).ok_or(RuntimeError::Malformed)?;
+        let task_mutation = self
+            .prepare(&mut tx, "tasks", &event.task_id.to_string())
+            .await?;
         let version =
             sqlx::query("UPDATE tasks SET version=version+1 WHERE task_id=? AND version=?")
                 .bind(event.task_id.to_string())
@@ -808,6 +939,7 @@ impl SqliteRuntimeStore {
         if version.rows_affected() != 1 {
             return Ok(FinalizeResult::Stale);
         }
+        self.complete(&mut tx, task_mutation).await?;
         let status = match event.status {
             crate::models::TaskStatus::Completed => "completed",
             crate::models::TaskStatus::Failed => "failed",
@@ -816,7 +948,7 @@ impl SqliteRuntimeStore {
             _ => return Err(RuntimeError::Malformed),
         };
         let now_text = ts(now);
-        crate::terminal_closure::apply(
+        crate::terminal_closure::apply_scoped(
             &mut tx,
             crate::terminal_closure::ClosureContext {
                 task_id: &event.task_id.to_string(),
@@ -833,6 +965,7 @@ impl SqliteRuntimeStore {
                 fence: to_i64(lease.fence)?,
                 now: &now_text,
             },
+            self.recovery.as_ref(),
         )
         .await
         .map_err(|error| match error {
@@ -846,13 +979,8 @@ impl SqliteRuntimeStore {
         } else {
             "released"
         };
-        if claim_state == "released" {
-            sqlx::query("DELETE FROM workspace_claims WHERE runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'")
-                .bind(lease.owner.to_string()).bind(lease.task_id.to_string()).bind(to_i64(lease.fence)?).execute(&mut *tx).await?;
-        } else {
-            sqlx::query("UPDATE workspace_claims SET state='recovery_needed',revision=revision+1,updated_at=? WHERE runtime_owner=? AND task_id=? AND owner_fence=? AND state='active'")
-                .bind(ts(now)).bind(lease.owner.to_string()).bind(lease.task_id.to_string()).bind(to_i64(lease.fence)?).execute(&mut *tx).await?;
-        }
+        self.release_workspaces(&mut tx, lease, claim_state == "released", now)
+            .await?;
         let render_version: String = envelope.try_get("render_version")?;
         if let Some(room) = envelope.try_get::<Option<String>, _>("reply_room")? {
             let body = terminal_reply_body(&event.payload).ok_or(RuntimeError::Malformed)?;
@@ -871,6 +999,7 @@ impl SqliteRuntimeStore {
                 &render_version,
                 &body,
                 now,
+                self.recovery.as_ref(),
             )
             .await?;
         }
@@ -909,6 +1038,7 @@ impl SqliteRuntimeStore {
                 &render_version,
                 &body,
                 now,
+                self.recovery.as_ref(),
             )
             .await?;
         }
@@ -963,11 +1093,22 @@ impl SqliteRuntimeStore {
 #[derive(Clone)]
 pub struct SqliteTaskLifecycle {
     pool: SqlitePool,
+    recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
 }
 
 impl SqliteTaskLifecycle {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            recovery: None,
+        }
+    }
+
+    pub(crate) fn new_scoped(
+        pool: SqlitePool,
+        recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
+    ) -> Self {
+        Self { pool, recovery }
     }
 }
 
@@ -1066,7 +1207,13 @@ impl TaskLifecycle for SqliteTaskLifecycle {
         event: &'a crate::models::TaskEvent,
     ) -> BusFuture<'a, Result<LifecycleResult, DispatchError>> {
         Box::pin(async move {
-            let mut tx = self.pool.begin().await.map_err(runtime_dispatch_error)?;
+            // Take the write lock before reading replay identity. A deferred WAL
+            // snapshot cannot be promoted while another writer is active, even
+            // with busy_timeout; that would fail-stop the worker on a valid event.
+            use crate::storage::recovery_eligibility::writer;
+            let mut tx = writer::begin(&self.pool, self.recovery.as_ref())
+                .await
+                .map_err(runtime_dispatch_error)?;
             let replay: Option<i64> = sqlx::query_scalar(
                 "SELECT 1 FROM task_events WHERE event_id=? AND task_id=? AND seq=?",
             )
@@ -1077,8 +1224,22 @@ impl TaskLifecycle for SqliteTaskLifecycle {
             .await
             .map_err(runtime_dispatch_error)?;
             if replay.is_some() {
+                let identity = writer::text_identity("task_events", &event.id.to_string())
+                    .map_err(runtime_dispatch_error)?;
+                writer::require(&mut tx, self.recovery.as_ref(), &identity)
+                    .await
+                    .map_err(runtime_dispatch_error)?;
                 return Ok(LifecycleResult::Replay);
             }
+            let task_identity = writer::text_identity("tasks", &event.task_id.to_string())
+                .map_err(runtime_dispatch_error)?;
+            let admission_identity =
+                writer::text_identity("task_admissions", &event.task_id.to_string())
+                    .map_err(runtime_dispatch_error)?;
+            let task_mutation =
+                writer::prepare_mutation(&mut tx, self.recovery.as_ref(), &task_identity)
+                    .await
+                    .map_err(runtime_dispatch_error)?;
             let expected = event.seq.checked_sub(2).ok_or_else(|| {
                 runtime_dispatch_error("durable lifecycle does not own queued events")
             })?;
@@ -1092,6 +1253,13 @@ impl TaskLifecycle for SqliteTaskLifecycle {
             if version.rows_affected() != 1 {
                 return Ok(LifecycleResult::Stale);
             }
+            writer::complete_mutation(&mut tx, self.recovery.as_ref(), task_mutation)
+                .await
+                .map_err(runtime_dispatch_error)?;
+            let admission_mutation =
+                writer::prepare_mutation(&mut tx, self.recovery.as_ref(), &admission_identity)
+                    .await
+                    .map_err(runtime_dispatch_error)?;
             let (status, from_state, to_state) = lifecycle_transition(event.status)
                 .ok_or_else(|| runtime_dispatch_error("invalid lifecycle transition"))?;
             let admission = sqlx::query(sqlx::AssertSqlSafe(format!(
@@ -1107,6 +1275,9 @@ impl TaskLifecycle for SqliteTaskLifecycle {
             if admission.rows_affected() != 1 {
                 return Ok(LifecycleResult::Stale);
             }
+            writer::complete_mutation(&mut tx, self.recovery.as_ref(), admission_mutation)
+                .await
+                .map_err(runtime_dispatch_error)?;
             let payload = serde_json::to_string(&event.payload).map_err(runtime_dispatch_error)?;
             sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES (?,?,?,?,?,?)")
                 .bind(event.id.to_string())
@@ -1116,6 +1287,14 @@ impl TaskLifecycle for SqliteTaskLifecycle {
                 .bind(ts(event.timestamp))
                 .bind(payload)
                 .execute(&mut *tx)
+                .await
+                .map_err(runtime_dispatch_error)?;
+            let event_identity = writer::text_identity("task_events", &event.id.to_string())
+                .map_err(runtime_dispatch_error)?;
+            writer::inserted(&mut tx, self.recovery.as_ref(), &event_identity)
+                .await
+                .map_err(runtime_dispatch_error)?;
+            refused_projection::record(&mut tx, event, self.recovery.as_ref())
                 .await
                 .map_err(runtime_dispatch_error)?;
             tx.commit().await.map_err(runtime_dispatch_error)?;
@@ -1314,6 +1493,7 @@ impl RuntimeTimer for TokioRuntimeTimer {
 struct PendingLease {
     lease: Lease,
     claimed: tokio::sync::oneshot::Sender<()>,
+    preserved: bool,
 }
 
 struct ExecutionGuard {
@@ -1359,6 +1539,7 @@ impl Drop for ExecutionGuard {
 
 #[derive(Clone)]
 pub struct LeasedAcpDispatcher {
+    refused_before_delivery: Arc<Mutex<std::collections::HashSet<TaskId>>>,
     dispatcher: AcpDispatcher,
     store: SqliteRuntimeStore,
     workspace: WorkspaceId,
@@ -1371,6 +1552,8 @@ pub struct LeasedAcpDispatcher {
     cleanup: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     active:
         Arc<Mutex<std::collections::HashMap<TaskId, tokio::sync::mpsc::Sender<SupervisorCommand>>>>,
+    reap_results: Arc<Mutex<VecDeque<bool>>>,
+    renewal_fault: Arc<AtomicBool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1445,6 +1628,7 @@ impl LeasedAcpDispatcher {
         metrics: Arc<RuntimeMetrics>,
     ) -> Self {
         Self {
+            refused_before_delivery: Arc::new(Mutex::new(std::collections::HashSet::new())),
             dispatcher,
             store,
             workspace,
@@ -1456,21 +1640,43 @@ impl LeasedAcpDispatcher {
             pending: Arc::new(Mutex::new(std::collections::HashMap::new())),
             cleanup: Arc::new(Mutex::new(Vec::new())),
             active: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            reap_results: Arc::new(Mutex::new(VecDeque::new())),
+            renewal_fault: Arc::new(AtomicBool::new(false)),
         }
     }
 
+    #[cfg(test)]
+    pub(crate) fn queue_test_reap_results(&self, results: impl IntoIterator<Item = bool>) {
+        self.reap_results
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .extend(results);
+    }
+
+    #[cfg(test)]
+    pub(crate) fn arm_test_renewal_fault(&self) {
+        self.renewal_fault.store(true, Ordering::SeqCst);
+    }
+
+    async fn shutdown_reaped(&self) -> bool {
+        reap_with_override(&self.dispatcher, &self.reap_results).await
+    }
+
     pub async fn shutdown(&self) {
-        let leases: Vec<_> = self
+        let drained: Vec<_> = self
             .pending
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .drain()
-            .map(|(_, pending)| pending.lease)
+            .map(|(_, pending)| (pending.lease, pending.preserved))
             .collect();
-        if !leases.is_empty() {
+        if !drained.is_empty() {
             let _ = self.dispatcher.shutdown().await;
         }
-        for lease in leases {
+        for (lease, preserved) in drained {
+            if preserved {
+                continue;
+            }
             let _ = self
                 .store
                 .release(&lease, ReleaseDisposition::RecoveryNeeded, self.clock.now())
@@ -1547,6 +1753,21 @@ impl LeasedAcpDispatcher {
     fn execution_error(error: impl std::fmt::Display) -> DispatchError {
         DispatchError::ExecutionFailed {
             reason: crate::acp::bounded(&error.to_string()),
+        }
+    }
+
+    fn refuse_before_delivery(&self, task: TaskId, reason: &'static str) -> DispatchError {
+        let mut refused = self
+            .refused_before_delivery
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if refused.len() >= 4096 && !refused.contains(&task) {
+            return DispatchError::RecoveryNeeded;
+        }
+        refused.insert(task);
+        tracing::warn!(%task, stage = "lease-acquisition", category = reason, "delivery refused before ACP");
+        DispatchError::NotAccepted {
+            reason: reason.into(),
         }
     }
 
@@ -1639,6 +1860,7 @@ impl LeasedAcpDispatcher {
         guard: &mut ExecutionGuard,
         state: &Continuation,
         cancel: &mut tokio::sync::mpsc::Receiver<SupervisorCommand>,
+        defer: bool,
     ) -> Result<TurnRun, DispatchError> {
         let mut turn = self
             .dispatcher
@@ -1648,10 +1870,12 @@ impl LeasedAcpDispatcher {
         let mut last_activity = self.clock.now();
         let wall_deadline =
             add(state.started_at, self.policy.max_wall_time).map_err(Self::execution_error)?;
-        let hard_deadline = request
-            .task
-            .deadline
-            .map_or(wall_deadline, |deadline| deadline.min(wall_deadline));
+        // Prepared execution delegates task-deadline finalization to the bus.
+        // Racing that same deadline here can reap before its cancellation command
+        // arrives, losing the capability needed to commit the timed-out event.
+        let task_deadline = (!defer).then_some(request.task.deadline).flatten();
+        let hard_deadline =
+            task_deadline.map_or(wall_deadline, |deadline| deadline.min(wall_deadline));
         loop {
             let now = self.clock.now();
             if now >= hard_deadline {
@@ -1712,10 +1936,14 @@ impl LeasedAcpDispatcher {
                 }
             }
         }
-        turn.finish()
-            .await
-            .map(TurnRun::Result)
-            .map_err(Self::execution_error)
+        match turn.finish().await {
+            Err(error @ crate::acp::AcpError::MissingTaskResult) => {
+                Ok(TurnRun::Result(TurnResult::Failed {
+                    reason: Self::execution_error(error).to_string(),
+                }))
+            }
+            result => result.map(TurnRun::Result).map_err(Self::execution_error),
+        }
     }
 
     async fn execute_loop(
@@ -1740,7 +1968,8 @@ impl LeasedAcpDispatcher {
             .ok_or_else(|| Self::execution_error(RuntimeError::Malformed))?;
         loop {
             let now = self.clock.now();
-            if let Err(error) = self.policy.check(&state, now, request.task.deadline) {
+            let task_deadline = (!defer).then_some(request.task.deadline).flatten();
+            if let Err(error) = self.policy.check(&state, now, task_deadline) {
                 return self.exhaust(&mut guard, &state, error, defer).await;
             }
             let renewed = self
@@ -1760,7 +1989,9 @@ impl LeasedAcpDispatcher {
                 .await
                 .map_err(Self::execution_error)?;
             self.metrics.increment(Metric::TurnStarted);
-            let result = self.run_turn(request, &mut guard, &state, cancel).await;
+            let result = self
+                .run_turn(request, &mut guard, &state, cancel, defer)
+                .await;
             if let Ok(TurnRun::Cancelled(command)) = result {
                 let lease = guard.lease().clone();
                 guard.disarm();
@@ -1951,6 +2182,115 @@ impl LeasedAcpDispatcher {
             }
         }
     }
+
+    async fn finish_failed_setup(
+        &self,
+        request: &DispatchRequest<'_>,
+        lease: &Lease,
+        event: &crate::models::TaskEvent,
+    ) -> Result<(), DispatchError> {
+        self.finish_failed_setup_for(lease, request.delivery_id, &request.task.text, event)
+            .await
+    }
+
+    async fn finish_failed_setup_for(
+        &self,
+        lease: &Lease,
+        delivery_id: DeliveryId,
+        prompt: &str,
+        event: &crate::models::TaskEvent,
+    ) -> Result<(), DispatchError> {
+        finish_failed_setup_store(&self.store, &self.clock, lease, delivery_id, prompt, event).await
+    }
+
+    async fn preserve_uncertain_pending(
+        pending: &Arc<Mutex<std::collections::HashMap<TaskId, PendingLease>>>,
+        task_id: TaskId,
+        value: PendingLease,
+    ) -> Result<(), DispatchError> {
+        let mut preserved = value;
+        preserved.preserved = true;
+        pending
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(task_id, preserved);
+        Err(DispatchError::RecoveryNeeded)
+    }
+}
+
+async fn reap_with_override(
+    dispatcher: &AcpDispatcher,
+    results: &Arc<Mutex<VecDeque<bool>>>,
+) -> bool {
+    let actual = dispatcher.shutdown_reaped().await;
+    results
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .pop_front()
+        .unwrap_or(actual)
+}
+
+async fn failed_setup_event_store(
+    store: &SqliteRuntimeStore,
+    clock: &Arc<dyn RuntimeClock>,
+    task_id: TaskId,
+) -> Result<TaskEvent, DispatchError> {
+    let latest: Option<i64> =
+        sqlx::query_scalar("SELECT MAX(seq) FROM task_events WHERE task_id=?")
+            .bind(task_id.to_string())
+            .fetch_one(&store.pool)
+            .await
+            .map_err(LeasedAcpDispatcher::execution_error)?;
+    let next = latest
+        .unwrap_or_default()
+        .checked_add(1)
+        .and_then(|value| u64::try_from(value).ok())
+        .ok_or(DispatchError::RecoveryNeeded)?;
+    Ok(TaskEvent {
+        id: EventId::generate(),
+        task_id,
+        seq: next,
+        status: TaskStatus::Failed,
+        timestamp: clock.now(),
+        payload: TaskEventPayload::Failed {
+            error: "failed_before_prompt".into(),
+        },
+    })
+}
+
+async fn finish_failed_setup_store(
+    store: &SqliteRuntimeStore,
+    clock: &Arc<dyn RuntimeClock>,
+    lease: &Lease,
+    delivery_id: DeliveryId,
+    prompt: &str,
+    event: &TaskEvent,
+) -> Result<(), DispatchError> {
+    store
+        .ensure_unstarted_continuation(lease, delivery_id, prompt, clock.now())
+        .await
+        .map_err(LeasedAcpDispatcher::execution_error)?;
+    let state = store
+        .claim_turn_with_generation(lease, 1, CONTINUATION_RUNTIME_GENERATION, clock.now())
+        .await
+        .map_err(LeasedAcpDispatcher::execution_error)?;
+    let result = store
+        .finalize_terminal(
+            lease,
+            state.revision,
+            &state.runtime_generation,
+            ContinuationState::Terminal,
+            0,
+            event,
+            clock.now(),
+        )
+        .await
+        .map_err(LeasedAcpDispatcher::execution_error)?;
+    if matches!(result, FinalizeResult::Committed) {
+        Ok(())
+    } else {
+        Err(DispatchError::RecoveryNeeded)
+    }
 }
 
 impl TaskDispatcher for LeasedAcpDispatcher {
@@ -1960,7 +2300,11 @@ impl TaskDispatcher for LeasedAcpDispatcher {
     ) -> BusFuture<'a, Result<(), DispatchError>> {
         Box::pin(async move {
             let resource = ExecutionResourceKey::new(request.task.to_agent, self.workspace);
-            let lease = match self
+            self.refused_before_delivery
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&request.task.task_id);
+            let acquired = self
                 .store
                 .acquire(
                     resource,
@@ -1968,24 +2312,39 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                     self.clock.now(),
                     self.policy.lease_ttl,
                 )
-                .await
-                .map_err(Self::execution_error)?
-            {
-                AcquireOutcome::Acquired(value) => {
+                .await;
+            let mut lease = match acquired {
+                Err(error) => {
+                    let category = match &error {
+                        RuntimeError::Storage(StorageError::Query(sqlx::Error::Protocol(
+                            detail,
+                        ))) if detail == "offline-recovery-eligibility-refused" => {
+                            "eligibility-refused"
+                        }
+                        RuntimeError::Storage(_) => "storage",
+                        _ => "runtime",
+                    };
+                    tracing::error!(task_id = %request.task.task_id, stage = "lease-acquisition", category, "lease acquisition failed before ACP");
+                    return Err(self.refuse_before_delivery(
+                        request.task.task_id,
+                        "execution lease acquisition failed",
+                    ));
+                }
+                Ok(AcquireOutcome::Acquired(value)) => {
                     self.metrics.increment(Metric::LeaseAcquired);
                     value
                 }
-                AcquireOutcome::Busy => {
+                Ok(AcquireOutcome::Busy) => {
                     self.metrics.increment(Metric::LeaseBusy);
-                    return Err(DispatchError::NotAccepted {
-                        reason: "execution resource busy".into(),
-                    });
+                    return Err(self
+                        .refuse_before_delivery(request.task.task_id, "execution resource busy"));
                 }
-                AcquireOutcome::RecoveryNeeded => {
+                Ok(AcquireOutcome::RecoveryNeeded) => {
                     self.metrics.increment(Metric::LeaseRecoveryNeeded);
-                    return Err(DispatchError::NotAccepted {
-                        reason: "execution resource needs recovery".into(),
-                    });
+                    return Err(self.refuse_before_delivery(
+                        request.task.task_id,
+                        "execution resource needs recovery",
+                    ));
                 }
             };
             if let Err(error) = self
@@ -1993,13 +2352,17 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                 .claim_workspaces(&lease, &self.workspace_paths)
                 .await
             {
-                let _ = self
+                let released = self
                     .store
                     .release(&lease, ReleaseDisposition::Released, self.clock.now())
                     .await;
+                if released.is_ok() {
+                    return Err(self
+                        .refuse_before_delivery(request.task.task_id, "workspace claim refused"));
+                }
                 return Err(Self::execution_error(error));
             }
-            if let Err(error) = self.dispatcher.deliver(request.clone()).await {
+            if let Err(error) = self.deliver_with_renewal(request.clone(), &mut lease).await {
                 self.pending
                     .lock()
                     .unwrap_or_else(|p| p.into_inner())
@@ -2008,6 +2371,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                         PendingLease {
                             lease,
                             claimed: tokio::sync::oneshot::channel().0,
+                            preserved: false,
                         },
                     );
                 return Err(error);
@@ -2022,11 +2386,19 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                 )
                 .await
             {
-                let _ = self.dispatcher.shutdown().await;
-                let _ = self
-                    .store
-                    .release(&lease, ReleaseDisposition::RecoveryNeeded, self.clock.now())
-                    .await;
+                tracing::error!(task_id = %request.task.task_id, delivery_id = %request.delivery_id, stage = "continuation-setup", fence = lease.fence, lease_expired = self.clock.now() >= lease.expires_at, acknowledged = true, "continuation setup failed before any task prompt; preserving recovery state");
+                let _ = self.dispatcher.shutdown_reaped().await;
+                self.pending
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .insert(
+                        request.task.task_id,
+                        PendingLease {
+                            lease,
+                            claimed: tokio::sync::oneshot::channel().0,
+                            preserved: false,
+                        },
+                    );
                 return Err(Self::execution_error(error));
             }
             let (claimed, receiver) = tokio::sync::oneshot::channel();
@@ -2039,6 +2411,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                     PendingLease {
                         lease: lease.clone(),
                         claimed,
+                        preserved: false,
                     },
                 );
             self.active
@@ -2051,7 +2424,10 @@ impl TaskDispatcher for LeasedAcpDispatcher {
             let store = self.store.clone();
             let clock = Arc::clone(&self.clock);
             let timer = Arc::clone(&self.timer);
+            let reap_results = Arc::clone(&self.reap_results);
             let task_id = request.task.task_id;
+            let delivery_id = request.delivery_id;
+            let prompt = request.task.text.clone();
             let ttl = self.policy.lease_ttl;
             let supervisor = tokio::spawn(async move {
                 tokio::select! {
@@ -2060,16 +2436,16 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                     command = cancel_rx.recv() => {
                         active.lock().unwrap_or_else(|p|p.into_inner()).remove(&task_id);
                         let Some(command) = command else { return; };
-                        let Some(pending) = pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&task_id) else {
+                        let Some(entry) = pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&task_id) else {
                             let _ = command.response.send(Err(DispatchError::RecoveryNeeded));
                             return;
                         };
-                        let lease = pending.lease;
-                        if !dispatcher.shutdown_reaped().await {
-                            let _ = store.release(&lease,ReleaseDisposition::RecoveryNeeded,clock.now()).await;
+                        if !reap_with_override(&dispatcher, &reap_results).await {
+                            let _ = Self::preserve_uncertain_pending(&pending, task_id, entry).await;
                             let _ = command.response.send(Err(DispatchError::RecoveryNeeded));
                             return;
                         }
+                        let lease = entry.lease;
                         if command.reap_only {
                             let result = store.release(&lease, ReleaseDisposition::Released, clock.now()).await;
                             let response = result.map(|_| FinalizationCapability { task_id, command: None }).map_err(|_| DispatchError::RecoveryNeeded);
@@ -2105,8 +2481,36 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                     }
                     _ = timer.sleep(ttl) => {
                         active.lock().unwrap_or_else(|p|p.into_inner()).remove(&task_id);
-                        let stale=pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&task_id).map(|v|v.lease);
-                        if let Some(stale)=stale { let _=dispatcher.shutdown().await; let _=store.release(&stale,ReleaseDisposition::RecoveryNeeded,clock.now()).await; }
+                        let stale = pending.lock().unwrap_or_else(|p|p.into_inner()).remove(&task_id);
+                        if let Some(stale) = stale {
+                            if !reap_with_override(&dispatcher, &reap_results).await {
+                                let _ = Self::preserve_uncertain_pending(&pending, task_id, stale).await;
+                            } else {
+                                let result = match
+                                    failed_setup_event_store(&store, &clock, task_id).await
+                                {
+                                    Ok(event) => finish_failed_setup_store(
+                                        &store,
+                                        &clock,
+                                        &stale.lease,
+                                        delivery_id,
+                                        &prompt,
+                                        &event,
+                                    )
+                                    .await,
+                                    Err(error) => Err(error),
+                                };
+                                if result.is_err() {
+                                    let _ = store
+                                        .release(
+                                            &stale.lease,
+                                            ReleaseDisposition::RecoveryNeeded,
+                                            clock.now(),
+                                        )
+                                        .await;
+                                }
+                            }
+                        }
                     }
                 }
             });
@@ -2153,55 +2557,54 @@ impl TaskDispatcher for LeasedAcpDispatcher {
         event: crate::models::TaskEvent,
     ) -> BusFuture<'a, Result<(), DispatchError>> {
         Box::pin(async move {
+            let refused = self
+                .refused_before_delivery
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .remove(&request.task.task_id);
+            if refused {
+                return match self.store.lease_for_task(request.task.task_id).await {
+                    Ok(None) => Ok(()),
+                    _ => Err(DispatchError::RecoveryNeeded),
+                };
+            }
             let pending = self
                 .pending
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&request.task.task_id)
                 .ok_or(DispatchError::RecoveryNeeded)?;
-            self.store
-                .begin_continuation(
-                    &pending.lease,
-                    request.delivery_id,
-                    &request.task.text,
-                    self.clock.now(),
-                )
-                .await
-                .map_err(Self::execution_error)?;
-            let ready = self
-                .store
-                .continuation(request.task.task_id)
-                .await
-                .map_err(Self::execution_error)?
-                .ok_or(DispatchError::RecoveryNeeded)?;
-            let state = self
-                .store
-                .claim_turn_with_generation(
-                    &pending.lease,
-                    ready.revision,
-                    &ready.runtime_generation,
-                    self.clock.now(),
-                )
-                .await
-                .map_err(Self::execution_error)?;
-            let result = self
-                .store
-                .finalize_terminal(
-                    &pending.lease,
-                    state.revision,
-                    &state.runtime_generation,
-                    ContinuationState::Terminal,
-                    0,
-                    &event,
-                    self.clock.now(),
-                )
-                .await
-                .map_err(Self::execution_error)?;
-            if matches!(result, FinalizeResult::Committed) {
-                Ok(())
-            } else {
-                Err(DispatchError::RecoveryNeeded)
+            let reaped = self.shutdown_reaped().await;
+            tracing::warn!(
+                task_id = %request.task.task_id,
+                delivery_id = %request.delivery_id,
+                attempt = request.attempt,
+                stage = "delivery-finalization",
+                reason = "failed_before_prompt",
+                reaped,
+                "closing ACP delivery failure before any prompt"
+            );
+            if !reaped {
+                let _ =
+                    Self::preserve_uncertain_pending(&self.pending, request.task.task_id, pending)
+                        .await;
+                return Err(DispatchError::RecoveryNeeded);
             }
+            if let Err(error) = self
+                .finish_failed_setup(&request, &pending.lease, &event)
+                .await
+            {
+                let _ = self
+                    .store
+                    .release(
+                        &pending.lease,
+                        ReleaseDisposition::RecoveryNeeded,
+                        self.clock.now(),
+                    )
+                    .await;
+                return Err(error);
+            }
+            Ok(())
         })
     }
 
@@ -2216,6 +2619,12 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                 .unwrap_or_else(|p| p.into_inner())
                 .remove(&request.task.task_id)
                 .ok_or(DispatchError::RecoveryNeeded)?;
+            if pending.preserved {
+                let _ =
+                    Self::preserve_uncertain_pending(&self.pending, request.task.task_id, pending)
+                        .await;
+                return Err(DispatchError::RecoveryNeeded);
+            }
             self.active
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
@@ -2239,6 +2648,7 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                     target: &target,
                     delivery_id,
                     attempt,
+                    queue_lease: None,
                 };
                 let outcome = dispatcher
                     .execute_loop(&owned, pending_lease.clone(), true, &mut cancel_rx)
@@ -2384,12 +2794,10 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                             }
                         }
                     }
-                    Err(error) => {
-                        // Delivery was already durable before ACP execution began. Even
-                        // an initialize/auth/session/child-exit failure must therefore
-                        // return a finalization capability so the worker writes the
-                        // terminal event and the store closes acknowledgement and
-                        // disposition atomically.
+                    Err(_error) => {
+                        // The ACP request was accepted, but no terminal result was
+                        // committed. Preserve recovery-needed uncertainty; the
+                        // Worker must not turn this into a terminal Failed event.
                         let Some(current) = dispatcher
                             .store
                             .continuation(task.task_id)
@@ -2397,66 +2805,21 @@ impl TaskDispatcher for LeasedAcpDispatcher {
                             .ok()
                             .flatten()
                         else {
-                            let _ = result_tx.send(Err(error));
+                            let _ = result_tx.send(Err(DispatchError::RecoveryNeeded));
                             return;
                         };
-                        let (command_tx, command_rx) = tokio::sync::oneshot::channel();
-                        let capability = FinalizationCapability {
-                            task_id: task.task_id,
-                            command: Some(command_tx),
-                        };
-                        if result_tx
-                            .send(Ok(PreparedExecution {
-                                outcome: DispatchOutcome::Failed {
-                                    error: crate::acp::bounded(&error.to_string()),
-                                },
-                                capability,
-                            }))
-                            .is_err()
-                        {
-                            let _ = dispatcher
-                                .store
-                                .finish_with_generation(
-                                    &pending_lease,
-                                    current.revision,
-                                    &current.runtime_generation,
-                                    ContinuationState::RecoveryNeeded,
-                                    0,
-                                    dispatcher.clock.now(),
-                                )
-                                .await;
-                            return;
-                        }
-                        match command_rx.await {
-                            Ok(command) if command.task_id == task.task_id => {
-                                let _ = dispatcher
-                                    .store
-                                    .finalize_terminal(
-                                        &pending_lease,
-                                        current.revision,
-                                        &current.runtime_generation,
-                                        ContinuationState::Terminal,
-                                        0,
-                                        &command.event,
-                                        dispatcher.clock.now(),
-                                    )
-                                    .await;
-                                let _ = command.response.send(FinalizeResult::Committed);
-                            }
-                            _ => {
-                                let _ = dispatcher
-                                    .store
-                                    .finish_with_generation(
-                                        &pending.lease,
-                                        current.revision,
-                                        &current.runtime_generation,
-                                        ContinuationState::RecoveryNeeded,
-                                        0,
-                                        dispatcher.clock.now(),
-                                    )
-                                    .await;
-                            }
-                        }
+                        let _ = dispatcher
+                            .store
+                            .finish_with_generation(
+                                &pending_lease,
+                                current.revision,
+                                &current.runtime_generation,
+                                ContinuationState::RecoveryNeeded,
+                                0,
+                                dispatcher.clock.now(),
+                            )
+                            .await;
+                        let _ = result_tx.send(Err(DispatchError::RecoveryNeeded));
                     }
                 }
             });
@@ -2534,7 +2897,7 @@ fn bounded_outbox(mut body: String) -> String {
 
 #[allow(clippy::too_many_arguments)]
 async fn insert_terminal_projection(
-    tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+    tx: &mut sqlx::SqliteConnection,
     event: &crate::models::TaskEvent,
     projection: &str,
     room: &str,
@@ -2544,7 +2907,62 @@ async fn insert_terminal_projection(
     render_version: &str,
     body: &str,
     now: DateTime<Utc>,
+    recovery: Option<&crate::storage::recovery_eligibility::RecoveryScope>,
 ) -> Result<(), RuntimeError> {
+    use crate::storage::recovery_eligibility::writer;
+    if projection == "terminal_reply"
+        && let crate::models::TaskEventPayload::Completed { .. } = &event.payload
+    {
+        let existing=sqlx::query("SELECT set_id,room_id,thread_root,reply_event_id,render_version,state FROM acp_output_sets WHERE task_id=? AND state IN ('prepared','sealed','delivering','delivered','partial','cleaning','cleaned') ORDER BY turn DESC LIMIT 1")
+            .bind(event.task_id.to_string()).fetch_optional(&mut *tx).await?;
+        if let Some(existing) = existing {
+            if existing.try_get::<String, _>("room_id")? != room
+                || existing
+                    .try_get::<Option<String>, _>("thread_root")?
+                    .as_deref()
+                    != thread
+                || existing
+                    .try_get::<Option<String>, _>("reply_event_id")?
+                    .as_deref()
+                    != reply
+                || existing.try_get::<String, _>("render_version")? != render_version
+            {
+                return Err(RuntimeError::Malformed);
+            }
+            if existing.try_get::<String, _>("state")? == "prepared" {
+                let identity = writer::text_identity(
+                    "acp_output_sets",
+                    &existing.try_get::<String, _>("set_id")?,
+                )?;
+                let mutation = writer::prepare_mutation(tx, recovery, &identity).await?;
+                let changed=sqlx::query("UPDATE acp_output_sets SET state='sealed',updated_at=? WHERE set_id=? AND state='prepared'").bind(ts(now)).bind(existing.try_get::<String,_>("set_id")?).execute(&mut *tx).await?;
+                if changed.rows_affected() != 1 {
+                    return Err(RuntimeError::Malformed);
+                }
+                writer::complete_mutation(tx, recovery, mutation).await?;
+            }
+            return Ok(());
+        }
+        let set_id = Uuid::new_v5(
+            &TERMINAL_OUTBOX_NAMESPACE,
+            format!("acp-output\0{}", event.id).as_bytes(),
+        )
+        .to_string();
+        let inserted = sqlx::query("INSERT INTO acp_output_sets(set_id,task_id,attempt,turn,runtime_fence,room_id,thread_root,reply_event_id,render_version,state,created_at,updated_at) SELECT ?,c.task_id,d.attempt,c.completed_turns,c.runtime_generation,?,?,?,?, 'assembling',?,? FROM task_continuations c JOIN deliveries d ON d.delivery_id=c.delivery_id WHERE c.task_id=? ON CONFLICT(task_id,attempt,turn) DO NOTHING")
+            .bind(&set_id).bind(room).bind(thread).bind(reply).bind(render_version)
+            .bind(ts(now)).bind(ts(now)).bind(event.task_id.to_string())
+            .execute(&mut *tx).await?;
+        if inserted.rows_affected() != 1 {
+            let existing: Option<String> = sqlx::query_scalar("SELECT set_id FROM acp_output_sets WHERE task_id=? AND state IN ('assembling','sealed','delivering','delivered','partial','cleaning','cleaned') ORDER BY turn DESC LIMIT 1")
+                .bind(event.task_id.to_string()).fetch_optional(&mut *tx).await?;
+            if existing.as_deref() != Some(set_id.as_str()) {
+                return Err(RuntimeError::Malformed);
+            }
+        }
+        let identity = writer::text_identity("acp_output_sets", &set_id)?;
+        writer::inserted(tx, recovery, &identity).await?;
+        return Ok(());
+    }
     let stable_txn_id = Uuid::new_v5(
         &TERMINAL_OUTBOX_NAMESPACE,
         format!("task_event\0{}\0{projection}", event.id).as_bytes(),
@@ -2564,8 +2982,13 @@ async fn insert_terminal_projection(
         .bind(body_hash)
         .bind(ts(now))
         .bind(ts(now))
-        .execute(&mut **tx)
+        .execute(&mut *tx)
         .await?;
+    let identity = writer::composite_text_identity(
+        "projection_outbox",
+        &["task_event", &event.id.to_string(), projection],
+    )?;
+    writer::inserted(tx, recovery, &identity).await?;
     Ok(())
 }
 

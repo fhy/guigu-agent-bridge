@@ -208,6 +208,7 @@ pub trait GatewayMatrixSender: Send + Sync {
 #[derive(Clone)]
 pub struct GatewayStore {
     pool: SqlitePool,
+    recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -224,7 +225,17 @@ pub enum TaskWinner {
 
 impl GatewayStore {
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            recovery: None,
+        }
+    }
+
+    pub fn new_scoped(
+        pool: SqlitePool,
+        recovery: Option<crate::storage::recovery_eligibility::RecoveryScope>,
+    ) -> Self {
+        Self { pool, recovery }
     }
 
     pub async fn insert_envelope(
@@ -233,6 +244,9 @@ impl GatewayStore {
         canonical_json: &[u8],
         retained_bytes: i64,
     ) -> Result<(), sqlx::Error> {
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         sqlx::query("INSERT INTO gateway_envelopes (envelope_id,version,direction,peer_id,sender_user_id,idempotency_key,sender_endpoint,recipient_endpoint,conversation_id,correlation_id,kind,canonical_json,payload_sha256,created_at,route_generation,state,retained_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(envelope.envelope_id.to_string()).bind(&envelope.version).bind(match envelope.direction { Direction::Inbound => "inbound", Direction::Outbound => "outbound" })
             .bind(&envelope.peer_id).bind(&envelope.sender.peer_id).bind(&envelope.idempotency_key)
@@ -240,7 +254,19 @@ impl GatewayStore {
             .bind(envelope.conversation_id.to_string()).bind(envelope.correlation_id.to_string())
             .bind(format!("{:?}", envelope.kind).to_lowercase()).bind(canonical_json).bind(&envelope.payload_sha256)
             .bind(&envelope.created_at).bind(0_i64).bind("received").bind(retained_bytes)
-            .execute(&self.pool).await.map(|_| ())
+            .execute(&mut *tx).await?;
+        if let Some(scope) = self.recovery.as_ref() {
+            crate::storage::recovery_eligibility::writer::inserted(
+                &mut tx,
+                Some(scope),
+                &crate::storage::recovery_eligibility::writer::text_identity(
+                    "gateway_envelopes",
+                    &envelope.envelope_id.to_string(),
+                )?,
+            )
+            .await?;
+        }
+        tx.commit().await.map(|_| ())
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -255,7 +281,9 @@ impl GatewayStore {
         thread_root: Option<&str>,
         route_generation: u64,
     ) -> Result<InboundAdmission, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         let inserted = sqlx::query("INSERT OR IGNORE INTO gateway_envelopes (envelope_id,version,direction,peer_id,sender_user_id,idempotency_key,sender_endpoint,recipient_endpoint,conversation_id,correlation_id,kind,canonical_json,payload_sha256,created_at,route_generation,state,retained_bytes) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(envelope.envelope_id.to_string()).bind(&envelope.version).bind("inbound")
             .bind(&envelope.peer_id).bind(sender_user).bind(&envelope.idempotency_key)
@@ -269,6 +297,17 @@ impl GatewayStore {
         if inserted {
             sqlx::query("INSERT INTO gateway_deliveries (envelope_id,direction,transport,phase,attempt,event_id,room_id,thread_root) VALUES (?,'inbound','matrix','transport_acked',0,?,?,?)")
                 .bind(&winner).bind(event_id).bind(room_id).bind(thread_root).execute(&mut *tx).await?;
+            if let Some(scope) = self.recovery.as_ref() {
+                crate::storage::recovery_eligibility::writer::inserted(
+                    &mut tx,
+                    Some(scope),
+                    &crate::storage::recovery_eligibility::writer::text_identity(
+                        "gateway_envelopes",
+                        &winner,
+                    )?,
+                )
+                .await?;
+            }
         }
         tx.commit().await?;
         Ok(if inserted {
@@ -297,7 +336,9 @@ impl GatewayStore {
         thread_root: Option<&str>,
         route_generation: u64,
     ) -> Result<TaskWinner, sqlx::Error> {
-        let mut tx = self.pool.begin().await?;
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         let fenced = sqlx::query("UPDATE runtime_instances SET heartbeat_at=heartbeat_at WHERE instance_token=? AND state='active'")
             .bind(runtime_instance).execute(&mut *tx).await?.rows_affected() == 1;
         if !fenced {
@@ -367,8 +408,12 @@ impl GatewayStore {
         owner_revision: i64,
     ) -> Result<bool, sqlx::Error> {
         let phase = format!("{phase:?}").to_lowercase();
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         let result = sqlx::query("UPDATE gateway_deliveries SET phase=?, owner_runtime=?, owner_revision=owner_revision+1 WHERE envelope_id=? AND owner_runtime=? AND owner_revision=?")
-            .bind(phase).bind(owner_runtime).bind(envelope_id).bind(owner_runtime).bind(owner_revision).execute(&self.pool).await?;
+            .bind(phase).bind(owner_runtime).bind(envelope_id).bind(owner_runtime).bind(owner_revision).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -396,6 +441,17 @@ impl GatewayStore {
             sqlx::query("INSERT INTO gateway_deliveries(envelope_id,direction,transport,phase,attempt,txn_id,room_id,thread_root,owner_runtime,owner_revision) VALUES (?,'outbound','matrix','pending',0,?,?,?, ?,0)")
                 .bind(envelope.envelope_id.to_string()).bind(txn_id).bind(room_id).bind(thread_root).bind(owner)
                 .execute(&mut *tx).await?;
+            if let Some(scope) = self.recovery.as_ref() {
+                crate::storage::recovery_eligibility::writer::inserted(
+                    &mut tx,
+                    Some(scope),
+                    &crate::storage::recovery_eligibility::writer::text_identity(
+                        "gateway_envelopes",
+                        &envelope.envelope_id.to_string(),
+                    )?,
+                )
+                .await?;
+            }
         } else {
             let valid: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM gateway_envelopes e JOIN gateway_deliveries d ON d.envelope_id=e.envelope_id WHERE e.envelope_id=? AND e.canonical_json=? AND d.direction='outbound' AND d.transport='matrix' AND d.txn_id=? AND d.room_id=?")
                 .bind(envelope.envelope_id.to_string()).bind(&canonical).bind(txn_id).bind(room_id)
@@ -425,8 +481,12 @@ impl GatewayStore {
         revision: i64,
         expected_phase: &str,
     ) -> Result<bool, sqlx::Error> {
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         let result = sqlx::query("UPDATE gateway_deliveries SET attempt=attempt+1,owner_revision=owner_revision+1 WHERE envelope_id=? AND direction='outbound' AND owner_runtime=? AND owner_revision=? AND phase=? AND attempt<2")
-            .bind(envelope_id).bind(owner).bind(revision).bind(expected_phase).execute(&self.pool).await?;
+            .bind(envelope_id).bind(owner).bind(revision).bind(expected_phase).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -438,8 +498,12 @@ impl GatewayStore {
         phase: &str,
         event_id: Option<&str>,
     ) -> Result<bool, sqlx::Error> {
+        let mut tx =
+            crate::storage::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref())
+                .await?;
         let result = sqlx::query("UPDATE gateway_deliveries SET phase=?,event_id=COALESCE(?,event_id),owner_revision=owner_revision+1 WHERE envelope_id=? AND direction='outbound' AND owner_runtime=? AND owner_revision=?")
-            .bind(phase).bind(event_id).bind(envelope_id).bind(owner).bind(revision).execute(&self.pool).await?;
+            .bind(phase).bind(event_id).bind(envelope_id).bind(owner).bind(revision).execute(&mut *tx).await?;
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -636,8 +700,25 @@ impl crate::matrix::RawMatrixEventConsumer for GatewayRawConsumer {
     fn consume<'a>(
         &'a self,
         raw: &'a str,
-        room_id: &'a str,
+        _room: &'a str,
     ) -> crate::matrix::SyncTokenFuture<'a, Result<bool, crate::matrix::MatrixError>> {
+        Box::pin(async move {
+            let value: serde_json::Value =
+                serde_json::from_str(raw).map_err(|_| crate::matrix::MatrixError::Protocol {
+                    detail: "malformed gateway event",
+                })?;
+            Ok(value
+                .pointer("/content/msgtype")
+                .and_then(serde_json::Value::as_str)
+                == Some("com.guigu.bridge.a2a.v1"))
+        })
+    }
+
+    fn admit<'a>(
+        &'a self,
+        raw: &'a str,
+        room_id: &'a str,
+    ) -> crate::matrix::SyncTokenFuture<'a, Result<(), crate::matrix::MatrixError>> {
         Box::pin(async move {
             let value: serde_json::Value =
                 serde_json::from_str(raw).map_err(|_| crate::matrix::MatrixError::Protocol {
@@ -649,7 +730,7 @@ impl crate::matrix::RawMatrixEventConsumer for GatewayRawConsumer {
                 .and_then(|v| v.as_str())
                 != Some("com.guigu.bridge.a2a.v1")
             {
-                return Ok(false);
+                return Ok(());
             }
             let sender = value.get("sender").and_then(|v| v.as_str()).ok_or(
                 crate::matrix::MatrixError::Protocol {
@@ -657,7 +738,7 @@ impl crate::matrix::RawMatrixEventConsumer for GatewayRawConsumer {
                 },
             )?;
             if sender == self.gateway.route.own_user || room_id != self.gateway.route.room_id {
-                return Ok(true);
+                return Ok(());
             }
             let event_id = value.get("event_id").and_then(|v| v.as_str()).ok_or(
                 crate::matrix::MatrixError::Protocol {
@@ -674,7 +755,7 @@ impl crate::matrix::RawMatrixEventConsumer for GatewayRawConsumer {
                 .await
                 .map_err(|_| crate::matrix::MatrixError::Storage)?;
             let Some((winner, envelope)) = winner else {
-                return Ok(false);
+                return Ok(());
             };
             let task_id = match winner {
                 TaskWinner::Inserted(task_id) | TaskWinner::Replay(task_id) => task_id,
@@ -708,7 +789,7 @@ impl crate::matrix::RawMatrixEventConsumer for GatewayRawConsumer {
                     .await
                     .map_err(|_| crate::matrix::MatrixError::Storage)?;
             }
-            Ok(true)
+            Ok(())
         })
     }
 }

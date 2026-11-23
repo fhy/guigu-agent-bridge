@@ -1,0 +1,39 @@
+schema_version = 1
+
+# Normative field inventory. Candidate values live only in governance.
+[identity]
+target_version = "<vMAJOR.MINOR.PATCH>"
+package_name = "<crate-name>"
+base_version = "<vMAJOR.MINOR.PATCH>"
+base_commit = "<40 lowercase Git object ID>"
+candidate_commit = "<40 lowercase Git object ID>"
+source_tree_hash = "<40 lowercase Git tree ID>"
+cargo_lock_sha256 = "<64 lowercase hex>"
+expected_tag = "<annotated-tag>"
+package_filename = "<crate-file>"
+package_sha256 = "<64 lowercase hex>"
+package_entries = 1
+binary_filename = "<binary-file>"
+binary_sha256 = "<64 lowercase hex>"
+binary_profile = "release"
+rollback_version = "<vMAJOR.MINOR.PATCH>"
+rollback_commit = "<40 lowercase Git object ID>"
+rollback_package_sha256 = "<64 lowercase hex>"
+rollback_binary_sha256 = "<64 lowercase hex>"
+freeze_state = "frozen"
+freeze_authority = "bridge-coordinator"
+digest_algorithm = "sha256"
+
+[[capabilities]]
+id = "example-cli"
+kind = "cli"
+requiring_task = "T000"
+source_commit = "<40 lowercase Git object ID>"
+source_path = "src/bin/example.rs"
+gate = "example_process"
+evidence = "exact-binary"
+result = "PASS"
+argv = ["--version"]
+expected_status = 0
+expected_stdout = "example 1.0.0\n"
+expected_stderr = ""

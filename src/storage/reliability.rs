@@ -1,10 +1,28 @@
 //! T018 durable idempotency facts.  This store is intentionally additive: the
 //! event log remains the task-status authority while receipts are replay keys.
 
+use super::recovery_eligibility::writer;
+#[cfg(test)]
+use chrono::Utc;
 use sqlx::{Row, SqlitePool};
 use thiserror::Error;
 use uuid::Uuid;
 
+#[path = "owner_lifecycle.rs"]
+mod owner_lifecycle;
+#[path = "owner_restart.rs"]
+pub(crate) mod owner_restart;
+#[path = "reliability_projection.rs"]
+mod projections;
+#[path = "queue_control.rs"]
+mod queue_control;
+#[cfg(test)]
+#[path = "workflow_writer_tests.rs"]
+mod workflow_writer_tests;
+
+pub const OWNER_EVIDENCE_MAX_AGE_SECS: i64 = 30;
+
+use super::session_owner_binding::SessionOwnerBinding;
 use crate::{
     bus::AdmissionContext,
     models::{AgentTask, TaskEvent, WorkflowRole},
@@ -32,6 +50,33 @@ pub struct WorkflowAuthorization<'a> {
     pub endpoint: &'a str,
     pub role: WorkflowRole,
     pub expected_revision: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct RuntimeOwnerEvidence {
+    pub pid: i64,
+    pub proc_starttime: i64,
+    pub boot_id: String,
+    pub boottime_ns: i64,
+}
+
+fn valid_owner_clock(evidence: &RuntimeOwnerEvidence, now: &str) -> bool {
+    if evidence.boot_id.trim().is_empty()
+        || evidence.boottime_ns <= 0
+        || evidence.pid <= 0
+        || evidence.proc_starttime <= 0
+    {
+        return false;
+    }
+    super::owner_observation::current_timestamp(now)
+}
+
+fn boot_identity_matches(expected: &str, observed: &str) -> bool {
+    !expected.is_empty() && expected == observed
+}
+
+fn boottime_monotonic(previous: i64, observed: i64) -> bool {
+    previous > 0 && observed >= previous
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,6 +112,13 @@ pub enum ReliabilityError {
     WorkflowUnauthorized,
     #[error("agent queue is full")]
     QueueFull,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OwnerHeartbeatOutcome {
+    Published,
+    NoOwner,
+    EvidenceRefused(&'static str),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -124,11 +176,83 @@ pub struct AdmissionRecovery {
 #[derive(Clone)]
 pub struct ReliabilityStore {
     pool: SqlitePool,
+    owner_evidence_max_age: i64,
+    recovery: Option<super::recovery_eligibility::RecoveryScope>,
+    executable: Option<super::owner_executable::RuntimeExecutable>,
 }
 
 impl ReliabilityStore {
+    #[cfg(test)]
+    pub(crate) fn test_recovery_scope(&self) -> Option<super::recovery_eligibility::RecoveryScope> {
+        self.recovery.clone()
+    }
+
+    pub(crate) async fn release_outbox_component(&self) -> Result<(), ReliabilityError> {
+        let Some(scope) = self.recovery.as_ref() else {
+            return Ok(());
+        };
+        scope.require_matrix_component("OutboxDrain")?;
+        let fence = scope.component_fence().ok_or(ReliabilityError::Malformed)?;
+        let now = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true);
+        super::MatrixRecoveryStore::new_scoped(self.pool.clone(), Some(scope.clone()))
+            .release_component_lease("OutboxDrain", &fence.owner, fence.epoch, &now)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn renew_outbox_component(&self, now: &str) -> Result<(), ReliabilityError> {
+        let Some(scope) = self.recovery.as_ref() else {
+            return Ok(());
+        };
+        scope.require_matrix_component("OutboxDrain")?;
+        let fence = scope.component_fence().ok_or(ReliabilityError::Malformed)?;
+        super::MatrixRecoveryStore::new_scoped(self.pool.clone(), Some(scope.clone()))
+            .renew_component_lease("OutboxDrain", &fence.owner, fence.epoch, now)
+            .await?;
+        Ok(())
+    }
+
+    pub(crate) async fn runtime_generation(
+        &self,
+        instance_token: &str,
+    ) -> Result<Option<i64>, ReliabilityError> {
+        Ok(sqlx::query_scalar("SELECT runtime_generation FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1")
+            .bind(instance_token).fetch_optional(&self.pool).await?)
+    }
     pub fn new(pool: SqlitePool) -> Self {
-        Self { pool }
+        Self {
+            pool,
+            owner_evidence_max_age: OWNER_EVIDENCE_MAX_AGE_SECS,
+            recovery: None,
+            executable: None,
+        }
+    }
+
+    pub fn with_recovery(
+        pool: SqlitePool,
+        recovery: super::recovery_eligibility::RecoveryScope,
+    ) -> Self {
+        Self {
+            pool,
+            owner_evidence_max_age: OWNER_EVIDENCE_MAX_AGE_SECS,
+            recovery: Some(recovery),
+            executable: None,
+        }
+    }
+
+    pub(crate) fn with_owner_evidence_window(
+        pool: SqlitePool,
+        seconds: i64,
+    ) -> Result<Self, ReliabilityError> {
+        if !(1..=300).contains(&seconds) {
+            return Err(ReliabilityError::Malformed);
+        }
+        Ok(Self {
+            pool,
+            owner_evidence_max_age: seconds,
+            recovery: None,
+            executable: None,
+        })
     }
 
     /// Atomically reserves a bounded queue row after T025 admission has committed.
@@ -148,8 +272,9 @@ impl ReliabilityStore {
         capacity: i64,
         now: &str,
     ) -> Result<QueueReservation, ReliabilityError> {
-        let mut conn = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
+        // This legacy split admission API has no classified queue contract.
+        // Reject classified stores before any mutation; production uses atomic admission.
+        let mut conn = writer::begin(&self.pool, None).await?;
         let result = self
             .reserve_queue_inner(
                 &mut conn,
@@ -167,11 +292,11 @@ impl ReliabilityStore {
             .await;
         match result {
             Ok(value) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
+                conn.commit().await?;
                 Ok(value)
             }
             Err(error) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
+                conn.rollback().await?;
                 Err(error)
             }
         }
@@ -180,7 +305,7 @@ impl ReliabilityStore {
     #[allow(clippy::too_many_arguments)]
     async fn reserve_queue_inner(
         &self,
-        conn: &mut sqlx::pool::PoolConnection<sqlx::Sqlite>,
+        conn: &mut writer::ScopedTransaction<'_>,
         task_id: &str,
         delivery_id: &str,
         target_endpoint_id: &str,
@@ -226,242 +351,6 @@ impl ReliabilityStore {
         })
     }
 
-    /// Claims the oldest queued item while holding the SQLite immediate writer lock.
-    pub async fn claim_next(
-        &self,
-        target_endpoint_id: &str,
-        resource_key: &str,
-        runtime_owner: &str,
-        owner_fence: i64,
-        now: &str,
-    ) -> Result<Option<QueueClaim>, ReliabilityError> {
-        let mut conn = self.pool.acquire().await?;
-        sqlx::query("BEGIN IMMEDIATE").execute(&mut *conn).await?;
-        let result = async {
-            let lease = sqlx::query("SELECT task_id FROM execution_leases WHERE resource_key=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
-                .bind(resource_key).bind(runtime_owner).bind(owner_fence).bind(now).fetch_optional(&mut *conn).await?;
-            let Some(lease) = lease else { return Err(ReliabilityError::WorkflowConflict); };
-            let lease_task: String = lease.try_get("task_id")?;
-            let row = sqlx::query("SELECT queue_id,task_id,revision FROM agent_work_queue WHERE target_endpoint_id=? AND lane='ordinary' AND state='queued' ORDER BY sequence LIMIT 1")
-                .bind(target_endpoint_id).fetch_optional(&mut *conn).await?;
-            let Some(row) = row else { return Ok(None); };
-            let queue_id: String = row.try_get("queue_id")?;
-            let task_id: String = row.try_get("task_id")?;
-            if task_id != lease_task { return Err(ReliabilityError::WorkflowConflict); }
-            let revision: i64 = row.try_get("revision")?;
-            let next = sqlx::query("UPDATE agent_work_queue SET state='claimed',revision=revision+1,claimed_at=?,runtime_owner=?,owner_fence=?,updated_at=? WHERE queue_id=? AND state='queued' AND revision=?")
-                .bind(now).bind(runtime_owner).bind(owner_fence).bind(now).bind(&queue_id).bind(revision).execute(&mut *conn).await?;
-            if next.rows_affected() != 1 { return Err(ReliabilityError::WorkflowConflict); }
-            Ok(Some(QueueClaim { queue_id, task_id, revision: revision + 1, owner_fence }))
-        }.await;
-        match result {
-            Ok(v) => {
-                sqlx::query("COMMIT").execute(&mut *conn).await?;
-                Ok(v)
-            }
-            Err(e) => {
-                let _ = sqlx::query("ROLLBACK").execute(&mut *conn).await;
-                Err(e)
-            }
-        }
-    }
-
-    pub async fn mark_send_started(
-        &self,
-        claim: &QueueClaim,
-        resource_key: &str,
-        runtime_owner: &str,
-        now: &str,
-    ) -> Result<(), ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let lease: i64 = sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
-            .bind(resource_key).bind(&claim.task_id).bind(runtime_owner).bind(claim.owner_fence).bind(now).fetch_one(&mut *tx).await?;
-        if lease != 1 {
-            return Err(ReliabilityError::WorkflowConflict);
-        }
-        let changed = sqlx::query("UPDATE agent_work_queue SET state='running',send_started=1,revision=revision+1,updated_at=? WHERE queue_id=? AND task_id=? AND state='claimed' AND send_started=0 AND revision=? AND runtime_owner=? AND owner_fence=?")
-            .bind(now).bind(&claim.queue_id).bind(&claim.task_id).bind(claim.revision).bind(runtime_owner).bind(claim.owner_fence).execute(&mut *tx).await?;
-        if changed.rows_affected() != 1 {
-            return Err(ReliabilityError::WorkflowConflict);
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn pause_queue(
-        &self,
-        queue_id: &str,
-        revision: i64,
-        owner: &str,
-        fence: i64,
-        now: &str,
-    ) -> Result<(), ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let changed = sqlx::query("UPDATE agent_work_queue SET state='paused',revision=revision+1,updated_at=? WHERE queue_id=? AND revision=? AND state IN ('queued','claimed','running') AND send_started=0 AND runtime_owner=? AND owner_fence=?")
-            .bind(now).bind(queue_id).bind(revision).bind(owner).bind(fence).execute(&mut *tx).await?;
-        if changed.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Err(ReliabilityError::WorkflowConflict);
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
-    /// Coordinator control for a queued row, which has no owner/fence yet.
-    pub async fn pause_task_queued(
-        &self,
-        task_id: &str,
-        now: &str,
-    ) -> Result<u64, ReliabilityError> {
-        let changed = sqlx::query("UPDATE agent_work_queue SET state='paused',revision=revision+1,updated_at=? WHERE task_id=? AND state='queued' AND send_started=0 AND runtime_owner IS NULL AND owner_fence IS NULL")
-            .bind(now).bind(task_id).execute(&self.pool).await?;
-        Ok(changed.rows_affected())
-    }
-
-    /// Control boundary after ACP shutdown/reap. An active lease means reap is
-    /// not proven and is classified as recovery_needed rather than requeued.
-    pub(crate) async fn pause_task_after_reap(
-        &self,
-        task_id: &str,
-        resource_key: &str,
-        owner_token: &str,
-        owner_fence: i64,
-        now: &str,
-    ) -> Result<&'static str, ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let row = sqlx::query("SELECT queue_id,revision,state,runtime_owner,owner_fence,send_started FROM agent_work_queue WHERE task_id=? AND state IN ('queued','claimed','running') ORDER BY sequence LIMIT 1")
-            .bind(task_id).fetch_optional(&mut *tx).await?;
-        let Some(row) = row else {
-            tx.rollback().await?;
-            return Ok("absent");
-        };
-        let id: String = row.try_get("queue_id")?;
-        let rev: i64 = row.try_get("revision")?;
-        let state: String = row.try_get("state")?;
-        let owner: Option<String> = row.try_get("runtime_owner")?;
-        let fence: Option<i64> = row.try_get("owner_fence")?;
-        if state == "queued" {
-            sqlx::query("UPDATE agent_work_queue SET state='paused',revision=revision+1,updated_at=? WHERE queue_id=? AND revision=? AND state='queued' AND send_started=0")
-                .bind(now).bind(id).bind(rev).execute(&mut *tx).await?;
-            tx.commit().await?;
-            return Ok("paused");
-        }
-        if owner.as_deref() != Some(owner_token) || fence != Some(owner_fence) {
-            tx.rollback().await?;
-            return Err(ReliabilityError::WorkflowConflict);
-        }
-        let bound: i64 = sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=?")
-            .bind(resource_key).bind(task_id).bind(owner_token).bind(owner_fence)
-            .fetch_one(&mut *tx).await?;
-        if bound != 1 {
-            tx.rollback().await?;
-            return Err(ReliabilityError::WorkflowConflict);
-        }
-        let live: i64 = sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE resource_key=? AND task_id=? AND owner_token=? AND fence=? AND state='active' AND expires_at>?")
-            .bind(resource_key).bind(task_id).bind(owner_token).bind(owner_fence).bind(now).fetch_one(&mut *tx).await?;
-        if live != 0 {
-            sqlx::query("UPDATE agent_work_queue SET state='recovery_needed',revision=revision+1,reason='pause reap not confirmed',updated_at=? WHERE queue_id=? AND revision=?").bind(now).bind(id).bind(rev).execute(&mut *tx).await?;
-            tx.commit().await?;
-            return Ok("recovery_needed");
-        }
-        let changed = sqlx::query("UPDATE agent_work_queue SET state='paused',revision=revision+1,updated_at=? WHERE queue_id=? AND revision=? AND runtime_owner=? AND owner_fence=? AND state IN ('claimed','running')").bind(now).bind(id).bind(rev).bind(owner_token).bind(owner_fence).execute(&mut *tx).await?;
-        if changed.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Err(ReliabilityError::WorkflowConflict);
-        }
-        tx.commit().await?;
-        Ok("paused")
-    }
-
-    pub(crate) async fn mark_pause_recovery_needed(
-        &self,
-        task_id: &str,
-        now: &str,
-    ) -> Result<&'static str, ReliabilityError> {
-        let changed = sqlx::query("UPDATE agent_work_queue SET state='recovery_needed',revision=revision+1,reason='pause reap not confirmed',updated_at=? WHERE task_id=? AND state IN ('claimed','running') AND send_started=1")
-            .bind(now).bind(task_id).execute(&self.pool).await?;
-        Ok(if changed.rows_affected() == 1 {
-            "recovery_needed"
-        } else {
-            "absent"
-        })
-    }
-
-    pub async fn resume_task(&self, task_id: &str, now: &str) -> Result<u64, ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let rows = sqlx::query("SELECT queue_id,revision,target_endpoint_id,runtime_owner,owner_fence FROM agent_work_queue WHERE task_id=? AND state='paused' ORDER BY sequence")
-            .bind(task_id).fetch_all(&mut *tx).await?;
-        let mut count = 0;
-        for row in rows {
-            let id: String = row.try_get("queue_id")?;
-            let rev: i64 = row.try_get("revision")?;
-            let target: String = row.try_get("target_endpoint_id")?;
-            let owner: Option<String> = row.try_get("runtime_owner")?;
-            let fence: Option<i64> = row.try_get("owner_fence")?;
-            let sequence: i64 = sqlx::query_scalar(
-                "SELECT next_sequence FROM agent_queue_counters WHERE target_endpoint_id=?",
-            )
-            .bind(&target)
-            .fetch_one(&mut *tx)
-            .await?;
-            sqlx::query("UPDATE agent_queue_counters SET next_sequence=next_sequence+1,updated_at=? WHERE target_endpoint_id=?").bind(now).bind(&target).execute(&mut *tx).await?;
-            let changed = sqlx::query("UPDATE agent_work_queue SET state='queued',sequence=?,revision=revision+1,claimed_at=NULL,send_started=0,runtime_owner=NULL,owner_fence=NULL,updated_at=? WHERE queue_id=? AND revision=? AND state='paused' AND ((runtime_owner=? AND owner_fence=?) OR (runtime_owner IS NULL AND owner_fence IS NULL))")
-                .bind(sequence).bind(now).bind(&id).bind(rev).bind(owner.as_deref()).bind(fence).execute(&mut *tx).await?;
-            if changed.rows_affected() != 1 {
-                tx.rollback().await?;
-                return Err(ReliabilityError::WorkflowConflict);
-            }
-            count += 1;
-        }
-        tx.commit().await?;
-        Ok(count)
-    }
-
-    pub async fn resume_queue(
-        &self,
-        queue_id: &str,
-        revision: i64,
-        owner: &str,
-        fence: i64,
-        now: &str,
-    ) -> Result<(), ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let target: String = sqlx::query_scalar("SELECT target_endpoint_id FROM agent_work_queue WHERE queue_id=? AND revision=? AND state='paused' AND ((runtime_owner=? AND owner_fence=?) OR (runtime_owner IS NULL AND owner_fence IS NULL))")
-            .bind(queue_id).bind(revision).bind(owner).bind(fence).fetch_one(&mut *tx).await?;
-        let sequence: i64 = sqlx::query_scalar(
-            "SELECT next_sequence FROM agent_queue_counters WHERE target_endpoint_id=?",
-        )
-        .bind(&target)
-        .fetch_one(&mut *tx)
-        .await?;
-        sqlx::query("UPDATE agent_queue_counters SET next_sequence=next_sequence+1,updated_at=? WHERE target_endpoint_id=?").bind(now).bind(&target).execute(&mut *tx).await?;
-        let changed = sqlx::query("UPDATE agent_work_queue SET state='queued',sequence=?,revision=revision+1,claimed_at=NULL,send_started=0,runtime_owner=NULL,owner_fence=NULL,updated_at=? WHERE queue_id=? AND revision=? AND state='paused' AND ((runtime_owner=? AND owner_fence=?) OR (runtime_owner IS NULL AND owner_fence IS NULL))")
-            .bind(sequence).bind(now).bind(queue_id).bind(revision).bind(owner).bind(fence).execute(&mut *tx).await?;
-        if changed.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Err(ReliabilityError::WorkflowConflict);
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
-    pub async fn recover_queue(
-        &self,
-        queue_id: &str,
-        revision: i64,
-        now: &str,
-    ) -> Result<(), ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
-        let changed = sqlx::query("UPDATE agent_work_queue SET state=CASE WHEN send_started=0 THEN 'queued' ELSE 'recovery_needed' END,revision=revision+1,claimed_at=CASE WHEN send_started=0 THEN NULL ELSE claimed_at END,runtime_owner=CASE WHEN send_started=0 THEN NULL ELSE runtime_owner END,owner_fence=CASE WHEN send_started=0 THEN NULL ELSE owner_fence END,updated_at=? WHERE queue_id=? AND revision=? AND state IN ('claimed','running') AND NOT EXISTS (SELECT 1 FROM execution_leases l WHERE l.task_id=agent_work_queue.task_id AND l.owner_token=agent_work_queue.runtime_owner AND l.fence=agent_work_queue.owner_fence AND l.state='active' AND l.expires_at>?)")
-            .bind(now).bind(queue_id).bind(revision).bind(now).execute(&mut *tx).await?;
-        if changed.rows_affected() != 1 {
-            tx.rollback().await?;
-            return Err(ReliabilityError::WorkflowConflict);
-        }
-        tx.commit().await?;
-        Ok(())
-    }
-
     /// Startup recovery entrypoint. Each row is classified independently so a
     /// malformed/stale row cannot cause a bulk requeue of another owner's work.
     pub async fn recover_orphaned_queues(&self, now: &str) -> Result<u64, ReliabilityError> {
@@ -493,7 +382,8 @@ impl ReliabilityStore {
         &self,
         input: WorkflowAdmission<'_>,
     ) -> Result<ReceiptOutcome, ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let result = self.admit_workflow_tx(&mut tx, input).await;
         match result {
             Ok(value) => {
@@ -509,7 +399,7 @@ impl ReliabilityStore {
 
     async fn admit_workflow_tx(
         &self,
-        tx: &mut sqlx::Transaction<'_, sqlx::Sqlite>,
+        tx: &mut super::recovery_eligibility::writer::ScopedTransaction<'_>,
         input: WorkflowAdmission<'_>,
     ) -> Result<ReceiptOutcome, ReliabilityError> {
         if let Some(auth) = &input.authorization {
@@ -601,6 +491,11 @@ impl ReliabilityStore {
                     .unwrap_or_else(|| "reserved".into()),
             });
         }
+        let envelope = writer::composite_text_identity(
+            "workflow_envelopes",
+            &[input.transport, input.external_event_id],
+        )?;
+        // Parents must exist before the envelope classification is published.
         if input.authorization.is_none() {
             sqlx::query("INSERT INTO tasks(task_id,root_task_id,parent_task_id,from_agent,to_agent,conversation_id,reply_to,text,priority,depth,hops,deadline,version) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)")
             .bind(input.task.task_id.to_string()).bind(input.task.root_task_id.to_string())
@@ -612,19 +507,44 @@ impl ReliabilityStore {
             .bind(input.task.deadline.map(|value| value.to_rfc3339_opts(chrono::SecondsFormat::Nanos, true)))
             .bind(i64::try_from(input.task.version).map_err(|_| ReliabilityError::Malformed)?)
             .execute(&mut **tx).await?;
+            writer::inserted(
+                tx,
+                self.recovery.as_ref(),
+                &writer::text_identity("tasks", input.task_id)?,
+            )
+            .await?;
+            let event_id = Uuid::now_v7().to_string();
             sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,1,'queued',?,?)")
-            .bind(Uuid::now_v7().to_string()).bind(input.task.task_id.to_string()).bind(input.now).bind("\"queued\"")
+            .bind(&event_id).bind(input.task.task_id.to_string()).bind(input.now).bind("\"queued\"")
             .execute(&mut **tx).await?;
             sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,reply_room,reply_thread_root,reply_event_id,monitor_room,monitor_generation,render_version,created_at,updated_at) VALUES(?,'enqueued',0,NULL,NULL,?,?,NULL,0,'v1',?,?)")
             .bind(input.task.task_id.to_string()).bind(input.external_event_id).bind(input.external_event_id)
             .bind(input.now).bind(input.now).execute(&mut **tx).await?;
+            for (table, key) in [
+                ("task_events", event_id.as_str()),
+                ("task_admissions", input.task_id),
+            ] {
+                writer::inserted(
+                    tx,
+                    self.recovery.as_ref(),
+                    &writer::text_identity(table, key)?,
+                )
+                .await?;
+            }
         } else if let Some(auth) = &input.authorization {
+            let mutation = writer::prepare_mutation(
+                tx,
+                self.recovery.as_ref(),
+                &writer::text_identity("task_admissions", input.task_id)?,
+            )
+            .await?;
             let result = sqlx::query("UPDATE task_admissions SET revision=revision+1,updated_at=? WHERE task_id=? AND revision=?")
                 .bind(input.now).bind(input.task_id).bind(auth.expected_revision)
                 .execute(&mut **tx).await?;
             if result.rows_affected() != 1 {
                 return Err(ReliabilityError::WorkflowConflict);
             }
+            writer::complete_mutation(tx, self.recovery.as_ref(), mutation).await?;
         }
         let attempt = input
             .authorization
@@ -634,6 +554,15 @@ impl ReliabilityStore {
             .execute(&mut **tx).await?;
         sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state) VALUES(?,?,?,'prepared')")
             .bind(input.delivery_id).bind(input.task.task_id.to_string()).bind(attempt).execute(&mut **tx).await?;
+        for table in ["deliveries", "delivery_dispositions"] {
+            writer::inserted(
+                tx,
+                self.recovery.as_ref(),
+                &writer::text_identity(table, input.delivery_id)?,
+            )
+            .await?;
+        }
+        writer::inserted(tx, self.recovery.as_ref(), &envelope).await?;
         Ok(ReceiptOutcome::Inserted)
     }
 
@@ -648,7 +577,8 @@ impl ReliabilityStore {
         thread_root: Option<&str>,
         capacity: i64,
     ) -> Result<QueueReservation, ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let admission = self.admit_workflow_tx(&mut tx, input).await;
         let result = match admission {
             Ok(ReceiptOutcome::Replay { .. }) => {
@@ -662,6 +592,10 @@ impl ReliabilityStore {
                 let active: i64 = sqlx::query_scalar("SELECT count(*) FROM agent_work_queue WHERE target_endpoint_id=? AND lane='ordinary' AND state IN ('queued','claimed','running','paused')")
                     .bind(input.target_endpoint_id).fetch_one(&mut *tx).await?;
                 if active >= capacity { Err(ReliabilityError::QueueFull) } else {
+                    let counter = writer::text_identity("agent_queue_counters", input.target_endpoint_id)?;
+                    let exists: bool = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM agent_queue_counters WHERE target_endpoint_id=?)")
+                        .bind(input.target_endpoint_id).fetch_one(&mut *tx).await?;
+                    let mutation = if exists { writer::prepare_mutation(&mut tx, self.recovery.as_ref(), &counter).await? } else { None };
                     sqlx::query("INSERT INTO agent_queue_counters(target_endpoint_id,next_sequence,capacity,updated_at) VALUES(?,1,?,?) ON CONFLICT(target_endpoint_id) DO UPDATE SET capacity=excluded.capacity,updated_at=excluded.updated_at")
                         .bind(input.target_endpoint_id).bind(capacity).bind(input.now).execute(&mut *tx).await?;
                     let sequence: i64 = sqlx::query_scalar("SELECT next_sequence FROM agent_queue_counters WHERE target_endpoint_id=?")
@@ -671,6 +605,9 @@ impl ReliabilityStore {
                         .bind(input.now).bind(input.target_endpoint_id).execute(&mut *tx).await?;
                     sqlx::query("INSERT INTO agent_work_queue(queue_id,task_id,delivery_id,target_endpoint_id,room_id,thread_root,sender_endpoint_id,idempotency_key,body_hash,lane,state,sequence,revision,send_started,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,'ordinary','queued',?,0,0,?,?)")
                         .bind(&queue_id).bind(input.task_id).bind(input.delivery_id).bind(input.target_endpoint_id).bind(room_id).bind(thread_root).bind(input.sender_endpoint_id).bind(input.idempotency_key).bind(input.body_hash).bind(sequence).bind(input.now).bind(input.now).execute(&mut *tx).await?;
+                    if exists { writer::complete_mutation(&mut tx, self.recovery.as_ref(), mutation).await?; }
+                    else { writer::inserted(&mut tx, self.recovery.as_ref(), &counter).await?; }
+                    writer::inserted(&mut tx, self.recovery.as_ref(), &writer::text_identity("agent_work_queue", &queue_id)?).await?;
                     Ok(QueueReservation { queue_id, sequence, state: "queued".into() })
                 }
             }
@@ -696,7 +633,8 @@ impl ReliabilityStore {
         runtime_instance: &str,
         context: Option<&AdmissionContext>,
     ) -> Result<ReceiptOutcome, ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         if let Some(context) = context {
             let inserted = sqlx::query("INSERT INTO transport_receipts(transport,external_event_id,room_id,thread_ref,reply_event_id,conversation_id,selected_endpoint_id,task_id,receipt_kind,route_kind,state,result_code,created_at,updated_at) VALUES(?,?,?,?,?,?,?,NULL,'ordinary','message','reserved','reserved',?,?) ON CONFLICT(transport,external_event_id) DO NOTHING")
                 .bind(&context.transport).bind(&context.external_event_id).bind(&context.room_id)
@@ -736,13 +674,17 @@ impl ReliabilityStore {
         sqlx::query("INSERT INTO task_events(event_id,task_id,seq,status,timestamp,payload) VALUES(?,?,1,'queued',?,?)")
             .bind(event.id.to_string()).bind(task.task_id.to_string()).bind(&at).bind(payload)
             .execute(&mut *tx).await?;
+        // A2A context IDs are transport receipt identities, not Matrix rooms.
+        // Keep the receipt intact without creating cross-transport projections.
+        let matrix_context = context
+            .filter(|value| matches!(value.transport.as_str(), "matrix" | "matrix-workflow"));
         sqlx::query("INSERT INTO task_admissions(task_id,state,revision,runtime_instance,reply_room,reply_thread_root,reply_event_id,monitor_room,monitor_generation,render_version,created_at,updated_at) VALUES(?,'enqueued',0,?,?,?,?,?,?,'v1',?,?)")
             .bind(task.task_id.to_string()).bind(runtime_instance)
-            .bind(context.map(|value| value.room_id.as_str()))
-            .bind(context.and_then(|value| value.thread_root.as_deref()))
-            .bind(context.map(|value| value.reply_event_id.as_str()))
-            .bind(context.and_then(|value| value.monitor_room.as_deref()))
-            .bind(context.map(|value| i64::try_from(value.monitor_generation).unwrap_or(i64::MAX)))
+            .bind(matrix_context.map(|value| value.room_id.as_str()))
+            .bind(matrix_context.and_then(|value| value.thread_root.as_deref()))
+            .bind(matrix_context.map(|value| value.reply_event_id.as_str()))
+            .bind(matrix_context.and_then(|value| value.monitor_room.as_deref()))
+            .bind(matrix_context.map(|value| i64::try_from(value.monitor_generation).unwrap_or(i64::MAX)))
             .bind(&at).bind(&at)
             .execute(&mut *tx).await?;
         if let Some(context) = context {
@@ -751,6 +693,25 @@ impl ReliabilityStore {
                 .bind(&context.external_event_id).execute(&mut *tx).await?;
             if receipt.rows_affected() != 1 {
                 return Err(ReliabilityError::Malformed);
+            }
+        }
+        if let Some(scope) = self.recovery.as_ref() {
+            for (table, key) in [
+                ("tasks", task.task_id.to_string()),
+                ("task_events", event.id.to_string()),
+                ("task_admissions", task.task_id.to_string()),
+            ] {
+                let identity = super::recovery_eligibility::writer::text_identity(table, &key)?;
+                super::recovery_eligibility::writer::inserted(&mut tx, Some(scope), &identity)
+                    .await?;
+            }
+            if let Some(context) = context {
+                let identity = super::recovery_eligibility::writer::composite_text_identity(
+                    "transport_receipts",
+                    &[&context.transport, &context.external_event_id],
+                )?;
+                super::recovery_eligibility::writer::inserted(&mut tx, Some(scope), &identity)
+                    .await?;
             }
         }
         tx.commit().await?;
@@ -784,12 +745,22 @@ impl ReliabilityStore {
         target_endpoint: &str,
         now: &str,
     ) -> Result<(), ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         sqlx::query("INSERT INTO deliveries(delivery_id,task_id,attempt,target_endpoint_id,dispatched_at,acknowledged_at) VALUES(?,?,?,?,?,NULL)")
             .bind(delivery_id).bind(task_id).bind(i64::from(attempt)).bind(target_endpoint).bind(now)
             .execute(&mut *tx).await?;
         sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state) VALUES(?,?,?,'prepared')")
             .bind(delivery_id).bind(task_id).bind(i64::from(attempt)).execute(&mut *tx).await?;
+        for table in ["deliveries", "delivery_dispositions"] {
+            let identity = super::recovery_eligibility::writer::text_identity(table, delivery_id)?;
+            super::recovery_eligibility::writer::inserted(
+                &mut tx,
+                self.recovery.as_ref(),
+                &identity,
+            )
+            .await?;
+        }
         tx.commit().await?;
         Ok(())
     }
@@ -800,19 +771,127 @@ impl ReliabilityStore {
         session_id: &str,
         now: &str,
     ) -> Result<bool, ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
+        let identity =
+            super::recovery_eligibility::writer::text_identity("deliveries", delivery_id)?;
+        let mutation = super::recovery_eligibility::writer::prepare_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            &identity,
+        )
+        .await?;
         let delivery = sqlx::query("UPDATE deliveries SET acknowledged_at=? WHERE delivery_id=? AND acknowledged_at IS NULL")
             .bind(now).bind(delivery_id).execute(&mut *tx).await?;
+        super::recovery_eligibility::writer::complete_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            mutation,
+        )
+        .await?;
+        let identity = super::recovery_eligibility::writer::text_identity(
+            "delivery_dispositions",
+            delivery_id,
+        )?;
+        let mutation = super::recovery_eligibility::writer::prepare_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            &identity,
+        )
+        .await?;
         let disposition = sqlx::query("UPDATE delivery_dispositions SET state='acknowledged',session_id=? WHERE delivery_id=? AND state='prepared'")
             .bind(session_id).bind(delivery_id).execute(&mut *tx).await?;
         if delivery.rows_affected() != disposition.rows_affected() {
             return Err(ReliabilityError::Malformed);
         }
+        super::recovery_eligibility::writer::complete_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            mutation,
+        )
+        .await?;
         if delivery.rows_affected() == 0 {
             let acknowledged: Option<i64> = sqlx::query_scalar("SELECT 1 FROM delivery_dispositions WHERE delivery_id=? AND state='acknowledged' AND session_id=?")
                 .bind(delivery_id).bind(session_id).fetch_optional(&mut *tx).await?;
             return Ok(acknowledged.is_some());
         }
+        tx.commit().await?;
+        Ok(true)
+    }
+
+    #[allow(dead_code)]
+    pub(crate) async fn acknowledge_delivery_with_binding(
+        &self,
+        delivery_id: &str,
+        session_id: &str,
+        now: &str,
+        binding: &SessionOwnerBinding,
+    ) -> Result<bool, ReliabilityError> {
+        if binding.delivery_id != delivery_id
+            || binding.session_id_digest != SessionOwnerBinding::digest(session_id)
+        {
+            return Err(ReliabilityError::Malformed);
+        }
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
+        let identity =
+            super::recovery_eligibility::writer::text_identity("deliveries", delivery_id)?;
+        let mutation = super::recovery_eligibility::writer::prepare_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            &identity,
+        )
+        .await?;
+        let delivery = sqlx::query("UPDATE deliveries SET acknowledged_at=? WHERE delivery_id=? AND acknowledged_at IS NULL")
+            .bind(now).bind(delivery_id).execute(&mut *tx).await?;
+        super::recovery_eligibility::writer::complete_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            mutation,
+        )
+        .await?;
+        let identity = super::recovery_eligibility::writer::text_identity(
+            "delivery_dispositions",
+            delivery_id,
+        )?;
+        let mutation = super::recovery_eligibility::writer::prepare_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            &identity,
+        )
+        .await?;
+        let disposition = sqlx::query("UPDATE delivery_dispositions SET state='acknowledged',session_id=? WHERE delivery_id=? AND state='prepared'")
+            .bind(session_id).bind(delivery_id).execute(&mut *tx).await?;
+        if delivery.rows_affected() != disposition.rows_affected() {
+            return Err(ReliabilityError::Malformed);
+        }
+        super::recovery_eligibility::writer::complete_mutation(
+            &mut tx,
+            self.recovery.as_ref(),
+            mutation,
+        )
+        .await?;
+        if delivery.rows_affected() == 0 {
+            let acknowledged: Option<i64> = sqlx::query_scalar("SELECT 1 FROM delivery_dispositions WHERE delivery_id=? AND state='acknowledged' AND session_id=?")
+                .bind(delivery_id).bind(session_id).fetch_optional(&mut *tx).await?;
+            return Ok(acknowledged.is_some());
+        }
+        binding
+            .validate_for_transaction()
+            .map_err(|_| ReliabilityError::Malformed)?;
+        sqlx::query("INSERT INTO session_owner_bindings (binding_id,task_id,delivery_id,attempt,session_id_digest,endpoint_id,conversation_id,cwd_digest,backend_id,runtime_instance,runtime_generation,resource_key,owner_fence,child_pid,child_starttime,executable_fingerprint,boot_id,domain_device,domain_inode,binding_revision,state,created_at,updated_at) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)")
+            .bind(&binding.binding_id).bind(&binding.task_id).bind(&binding.delivery_id).bind(binding.attempt)
+            .bind(&binding.session_id_digest).bind(&binding.endpoint_id).bind(&binding.conversation_id).bind(&binding.cwd_digest)
+            .bind(&binding.backend_id).bind(&binding.runtime_instance).bind(binding.runtime_generation).bind(&binding.resource_key)
+            .bind(binding.owner_fence).bind(binding.child_pid).bind(binding.child_starttime).bind(&binding.executable_fingerprint)
+            .bind(&binding.boot_id).bind(binding.domain_device).bind(binding.domain_inode).bind(binding.binding_revision)
+            .bind(binding.state).bind(&binding.created_at).bind(&binding.updated_at).execute(&mut *tx).await?;
+        let identity = super::recovery_eligibility::writer::text_identity(
+            "session_owner_bindings",
+            &binding.binding_id,
+        )?;
+        super::recovery_eligibility::writer::inserted(&mut tx, self.recovery.as_ref(), &identity)
+            .await?;
         tx.commit().await?;
         Ok(true)
     }
@@ -828,6 +907,8 @@ impl ReliabilityStore {
         route_kind: &str,
         now: &str,
     ) -> Result<ReceiptOutcome, ReliabilityError> {
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let result = sqlx::query(
             "INSERT INTO transport_receipts
              (transport,external_event_id,room_id,receipt_kind,route_kind,state,result_code,created_at,updated_at)
@@ -841,9 +922,18 @@ impl ReliabilityStore {
         .bind(route_kind)
         .bind(now)
         .bind(now)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
         if result.rows_affected() == 1 {
+            if let Some(scope) = self.recovery.as_ref() {
+                let identity = super::recovery_eligibility::writer::composite_text_identity(
+                    "transport_receipts",
+                    &[transport, external_event_id],
+                )?;
+                super::recovery_eligibility::writer::inserted(&mut tx, Some(scope), &identity)
+                    .await?;
+            }
+            tx.commit().await?;
             return Ok(ReceiptOutcome::Inserted);
         }
         let row = sqlx::query(
@@ -852,8 +942,9 @@ impl ReliabilityStore {
         )
         .bind(transport)
         .bind(external_event_id)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *tx)
         .await?;
+        tx.commit().await?;
         Ok(ReceiptOutcome::Replay {
             task_id: row.try_get("task_id")?,
             result_code: row.try_get("result_code")?,
@@ -869,6 +960,18 @@ impl ReliabilityStore {
         task_id: Option<&str>,
         now: &str,
     ) -> Result<bool, ReliabilityError> {
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
+        let mutation = if let Some(scope) = self.recovery.as_ref() {
+            let identity = super::recovery_eligibility::writer::composite_text_identity(
+                "transport_receipts",
+                &[transport, external_event_id],
+            )?;
+            super::recovery_eligibility::writer::prepare_mutation(&mut tx, Some(scope), &identity)
+                .await?
+        } else {
+            None
+        };
         let result = sqlx::query(
             "UPDATE transport_receipts SET state=?,result_code=?,task_id=?,updated_at=?
              WHERE transport=? AND external_event_id=? AND state='reserved'",
@@ -879,8 +982,17 @@ impl ReliabilityStore {
         .bind(now)
         .bind(transport)
         .bind(external_event_id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if result.rows_affected() == 1 {
+            super::recovery_eligibility::writer::complete_mutation(
+                &mut tx,
+                self.recovery.as_ref(),
+                mutation,
+            )
+            .await?;
+        }
+        tx.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -891,7 +1003,8 @@ impl ReliabilityStore {
         &self,
         input: RetryTaskInput<'_>,
     ) -> Result<ReceiptOutcome, ReliabilityError> {
-        let mut tx = self.pool.begin_with("BEGIN IMMEDIATE").await?;
+        let mut tx =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
         let existing = sqlx::query("SELECT task_id,result_code FROM transport_receipts WHERE transport=? AND external_event_id=?")
             .bind(input.transport).bind(input.external_event_id).fetch_optional(&mut *tx).await?;
         if let Some(row) = existing {
@@ -953,54 +1066,6 @@ impl ReliabilityStore {
         Ok(ReceiptOutcome::Inserted)
     }
 
-    pub async fn claim_projections(
-        &self,
-        owner: &str,
-        now: &str,
-        stale_before: &str,
-        limit: u32,
-    ) -> Result<Vec<PendingProjection>, ReliabilityError> {
-        let mut claimed = Vec::new();
-        for _ in 0..limit {
-            let row=sqlx::query("UPDATE projection_outbox SET state='sending',claim_owner=?,claim_revision=COALESCE(claim_revision,0)+1,updated_at=? WHERE rowid=(SELECT rowid FROM projection_outbox WHERE state='pending' ORDER BY created_at,source_kind,source_id,projection LIMIT 1) RETURNING source_kind,source_id,projection,stable_txn_id,room_id,thread_root,reply_event_id,body,claim_revision")
-                .bind(owner).bind(now).bind(stale_before).fetch_optional(&self.pool).await?;
-            let Some(row) = row else { break };
-            claimed.push(PendingProjection {
-                source_kind: row.try_get("source_kind")?,
-                source_id: row.try_get("source_id")?,
-                projection: row.try_get("projection")?,
-                stable_txn_id: row.try_get("stable_txn_id")?,
-                room_id: row.try_get("room_id")?,
-                thread_root: row.try_get("thread_root")?,
-                reply_event_id: row.try_get("reply_event_id")?,
-                body: row.try_get("body")?,
-                claim_owner: owner.into(),
-                claim_revision: row.try_get("claim_revision")?,
-            });
-        }
-        Ok(claimed)
-    }
-
-    pub async fn mark_projection_sent(
-        &self,
-        row: &PendingProjection,
-    ) -> Result<bool, ReliabilityError> {
-        let result=sqlx::query("UPDATE projection_outbox SET state='sent',attempt_count=attempt_count+1 WHERE source_kind=? AND source_id=? AND projection=? AND state='sending' AND claim_owner=? AND claim_revision=?")
-            .bind(&row.source_kind).bind(&row.source_id).bind(&row.projection).bind(&row.claim_owner).bind(row.claim_revision).execute(&self.pool).await?;
-        Ok(result.rows_affected() == 1)
-    }
-
-    pub async fn mark_projection_abandoned(
-        &self,
-        row: &PendingProjection,
-    ) -> Result<bool, ReliabilityError> {
-        let result = sqlx::query("UPDATE projection_outbox SET state='abandoned',attempt_count=attempt_count+1,updated_at=? WHERE source_kind=? AND source_id=? AND projection=? AND state='sending' AND claim_owner=? AND claim_revision=?")
-            .bind(chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Nanos, true))
-            .bind(&row.source_kind).bind(&row.source_id).bind(&row.projection)
-            .bind(&row.claim_owner).bind(row.claim_revision).execute(&self.pool).await?;
-        Ok(result.rows_affected() == 1)
-    }
-
     pub async fn claim_admission(
         &self,
         task_id: &str,
@@ -1057,20 +1122,88 @@ impl ReliabilityStore {
         fingerprint: &str,
         now: &str,
     ) -> Result<bool, ReliabilityError> {
-        let result=sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES (?,?,?,'active',?) ON CONFLICT DO NOTHING")
-            .bind(token).bind(now).bind(now).bind(fingerprint).execute(&self.pool).await?;
-        Ok(result.rows_affected() == 1)
-    }
-
-    pub async fn stop_runtime(&self, token: &str, now: &str) -> Result<bool, ReliabilityError> {
-        let result=sqlx::query("UPDATE runtime_instances SET state='stopped',heartbeat_at=? WHERE instance_token=? AND state IN ('active','stopping')")
-            .bind(now).bind(token).execute(&self.pool).await?;
+        let mut transaction =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
+        let result=sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) SELECT ?,?,?,'active',? WHERE NOT EXISTS (SELECT 1 FROM runtime_instances WHERE state IN ('active','stopping')) ON CONFLICT DO NOTHING")
+            .bind(token).bind(now).bind(now).bind(fingerprint).execute(&mut *transaction).await?;
+        if result.rows_affected() == 1 {
+            let identity =
+                super::recovery_eligibility::writer::text_identity("runtime_instances", token)?;
+            super::recovery_eligibility::writer::inserted(
+                &mut transaction,
+                self.recovery.as_ref(),
+                &identity,
+            )
+            .await?;
+        }
+        transaction.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
     pub async fn stopping_runtime(&self, token: &str, now: &str) -> Result<bool, ReliabilityError> {
+        if super::recovery_eligibility::writer::is_refused(&self.pool).await? {
+            return super::recovery_eligibility::writer::stopping_runtime(
+                &self.pool,
+                self.recovery.as_ref(),
+                token,
+                now,
+            )
+            .await
+            .map_err(Into::into);
+        }
+        let mut transaction =
+            super::recovery_eligibility::writer::begin(&self.pool, self.recovery.as_ref()).await?;
+        let identity =
+            super::recovery_eligibility::writer::text_identity("runtime_instances", token)?;
+        let mutation = super::recovery_eligibility::writer::prepare_mutation(
+            &mut transaction,
+            self.recovery.as_ref(),
+            &identity,
+        )
+        .await?;
         let result=sqlx::query("UPDATE runtime_instances SET state='stopping',heartbeat_at=? WHERE instance_token=? AND state='active'")
-            .bind(now).bind(token).execute(&self.pool).await?;
+            .bind(now).bind(token).execute(&mut *transaction).await?;
+        if result.rows_affected() != 1 {
+            return Ok(false);
+        }
+        super::recovery_eligibility::writer::complete_mutation(
+            &mut transaction,
+            self.recovery.as_ref(),
+            mutation,
+        )
+        .await?;
+        let current: Option<i64> = sqlx::query_scalar("SELECT evidence_revision FROM runtime_owner_evidence WHERE instance_token=? AND is_current=1 AND state='live'")
+            .bind(token).fetch_optional(&mut *transaction).await?;
+        if let Some(revision) = current {
+            let next = revision.checked_add(1).ok_or(ReliabilityError::Malformed)?;
+            let identity =
+                owner_lifecycle::evidence_identity(&mut transaction, token, revision).await?;
+            let mutation = super::recovery_eligibility::writer::prepare_mutation(
+                &mut transaction,
+                self.recovery.as_ref(),
+                &identity,
+            )
+            .await?;
+            sqlx::query("UPDATE runtime_owner_evidence SET is_current=0 WHERE instance_token=? AND is_current=1")
+                .bind(token).execute(&mut *transaction).await?;
+            super::recovery_eligibility::writer::complete_mutation(
+                &mut transaction,
+                self.recovery.as_ref(),
+                mutation,
+            )
+            .await?;
+            sqlx::query("INSERT INTO runtime_owner_evidence(instance_token,runtime_generation,evidence_revision,state,pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,is_current,max_age_seconds) SELECT instance_token,runtime_generation,?,'scan_pending',pid,proc_starttime,process_fingerprint,boot_id,boottime_ns,captured_at,barrier_epoch,barrier_state,in_flight_spawns,child_scan_state,child_snapshot,1,max_age_seconds FROM runtime_owner_evidence WHERE instance_token=? AND evidence_revision=?")
+                .bind(next).bind(token).bind(revision).execute(&mut *transaction).await?;
+            let identity =
+                owner_lifecycle::evidence_identity(&mut transaction, token, next).await?;
+            super::recovery_eligibility::writer::inserted(
+                &mut transaction,
+                self.recovery.as_ref(),
+                &identity,
+            )
+            .await?;
+        }
+        transaction.commit().await?;
         Ok(result.rows_affected() == 1)
     }
 
@@ -1078,7 +1211,7 @@ impl ReliabilityStore {
         &self,
         _limit: u32,
     ) -> Result<AdmissionRecovery, ReliabilityError> {
-        let rows=sqlx::query("SELECT a.task_id,a.revision,a.state,r.state AS owner_state FROM task_admissions a LEFT JOIN runtime_instances r ON r.instance_token=a.runtime_instance WHERE a.state NOT IN ('terminal','recovery_needed') ORDER BY a.created_at")
+        let rows=sqlx::query("SELECT a.task_id,a.revision,a.state,r.state AS owner_state,EXISTS(SELECT 1 FROM transport_receipts receipt WHERE receipt.transport='offline-admission-hold' AND receipt.external_event_id=a.task_id AND receipt.task_id=a.task_id AND receipt.receipt_kind='admin' AND receipt.route_kind='unknown-dispatch-hold-v1' AND receipt.state='rejected' AND receipt.result_code='unknown-preserved:'||a.runtime_instance||':'||a.revision) AS explicit_hold FROM task_admissions a LEFT JOIN runtime_instances r ON r.instance_token=a.runtime_instance WHERE a.state!='terminal' ORDER BY a.created_at")
             .fetch_all(&self.pool).await?;
         let mut result = AdmissionRecovery {
             eligible: Vec::new(),
@@ -1090,10 +1223,17 @@ impl ReliabilityStore {
             let revision: i64 = row.try_get("revision")?;
             let state: String = row.try_get("state")?;
             let owner: Option<String> = row.try_get("owner_state")?;
+            if state == "recovery_needed" {
+                if row.try_get::<bool, _>("explicit_hold")? && owner.as_deref() == Some("stopped") {
+                    result.covered.push(task);
+                }
+                continue;
+            }
             result.covered.push(task.clone());
             if state == "ready" || (state == "enqueued" && owner.as_deref() == Some("stopped")) {
                 result.eligible.push((task, revision));
             } else {
+                tracing::error!(task_id = %task, stage = "admission-recovery", category = "unresolved-admission", state, revision, owner_state = owner.as_deref().unwrap_or("missing"), replay = false, "startup blocked; preserve unknown work and use exact-scope recovery");
                 result.blocked = true;
             }
         }
@@ -1106,9 +1246,16 @@ mod reap_pause_tests {
     use super::*;
     use crate::storage::{connect, migrate};
 
-    async fn fixture() -> (ReliabilityStore, SqlitePool, String, String, String) {
+    async fn fixture() -> (
+        ReliabilityStore,
+        SqlitePool,
+        String,
+        String,
+        String,
+        std::path::PathBuf,
+    ) {
         let path = std::env::temp_dir().join(format!("t022-reap-{}.db", Uuid::now_v7()));
-        let pool = connect(path).await.unwrap();
+        let pool = connect(path.clone()).await.unwrap();
         migrate(&pool).await.unwrap();
         let endpoint = Uuid::now_v7().to_string();
         let conversation = Uuid::now_v7().to_string();
@@ -1124,12 +1271,13 @@ mod reap_pause_tests {
             task,
             delivery,
             endpoint,
+            path,
         )
     }
 
     #[tokio::test]
     async fn forged_resource_binding_is_rejected() {
-        let (store, pool, task, delivery, endpoint) = fixture().await;
+        let (store, pool, task, delivery, endpoint, _) = fixture().await;
         let q = store
             .reserve_queue(
                 &task,
@@ -1156,7 +1304,7 @@ mod reap_pause_tests {
 
     #[tokio::test]
     async fn released_lease_allows_running_pause() {
-        let (store, pool, task, delivery, endpoint) = fixture().await;
+        let (store, pool, task, delivery, endpoint, _) = fixture().await;
         let q = store
             .reserve_queue(
                 &task,
@@ -1181,5 +1329,188 @@ mod reap_pause_tests {
                 .unwrap(),
             "paused"
         );
+    }
+
+    #[tokio::test]
+    async fn acknowledge_binding_rolls_back_on_insert_failure_after_reopen() {
+        let (store, pool, task, delivery, endpoint, path) = fixture().await;
+        let conversation: String =
+            sqlx::query_scalar("SELECT conversation_id FROM tasks WHERE task_id=?")
+                .bind(&task)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        let runtime = Uuid::now_v7().to_string();
+        sqlx::query("INSERT INTO runtime_instances(instance_token,started_at,heartbeat_at,state,process_fingerprint) VALUES(?,?,?,'stopped','fp')")
+            .bind(&runtime).bind("2026-09-20T00:00:00Z").bind("2026-09-20T00:00:01Z")
+            .execute(&pool).await.unwrap();
+        sqlx::query("INSERT INTO delivery_dispositions(delivery_id,task_id,attempt,state) VALUES(?,?,1,'prepared')")
+            .bind(&delivery).bind(&task).execute(&pool).await.unwrap();
+        sqlx::query("CREATE TRIGGER fail_session_owner_binding BEFORE INSERT ON session_owner_bindings BEGIN SELECT RAISE(ABORT, 'injected binding failure'); END")
+            .execute(&pool).await.unwrap();
+
+        let binding = SessionOwnerBinding {
+            binding_id: Uuid::now_v7().to_string(),
+            task_id: task.clone(),
+            delivery_id: delivery.clone(),
+            attempt: 1,
+            session_id_digest: SessionOwnerBinding::digest("session"),
+            endpoint_id: endpoint.clone(),
+            conversation_id: conversation,
+            cwd_digest: "c".repeat(64),
+            backend_id: "backend".into(),
+            runtime_instance: runtime,
+            runtime_generation: 1,
+            resource_key: "resource".into(),
+            owner_fence: 1,
+            child_pid: 1,
+            child_starttime: 1,
+            executable_fingerprint: "exe".into(),
+            boot_id: "boot".into(),
+            domain_device: 1,
+            domain_inode: 1,
+            binding_revision: 1,
+            state: "bound",
+            created_at: "now".into(),
+            updated_at: "now".into(),
+        };
+        assert!(
+            store
+                .acknowledge_delivery_with_binding(&delivery, "session", "now", &binding)
+                .await
+                .is_err()
+        );
+        pool.close().await;
+
+        let reopened = connect(path.clone()).await.unwrap();
+        let acknowledged: Option<String> =
+            sqlx::query_scalar("SELECT acknowledged_at FROM deliveries WHERE delivery_id=?")
+                .bind(&delivery)
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+        let disposition: String =
+            sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=?")
+                .bind(&delivery)
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+        let binding_count: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM session_owner_bindings WHERE delivery_id=?")
+                .bind(&delivery)
+                .fetch_one(&reopened)
+                .await
+                .unwrap();
+        assert!(acknowledged.is_none());
+        assert_eq!(disposition, "prepared");
+        assert_eq!(binding_count, 0);
+        reopened.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[tokio::test]
+    async fn owner_evidence_start_heartbeat_and_finalizer_path() {
+        let path = std::env::temp_dir().join(format!("t096-owner-{}.db", Uuid::now_v7()));
+        let pool = connect(path.clone()).await.unwrap();
+        migrate(&pool).await.unwrap();
+        let store = ReliabilityStore::new(pool.clone());
+        let token = Uuid::now_v7().to_string();
+        let now = Utc::now().to_rfc3339();
+        let evidence = RuntimeOwnerEvidence {
+            pid: 1,
+            proc_starttime: 1,
+            boot_id: "boot".into(),
+            boottime_ns: 1,
+        };
+        assert!(
+            store
+                .begin_runtime_with_evidence(&token, "fp", &now, &evidence)
+                .await
+                .unwrap()
+        );
+        let later = Utc::now().to_rfc3339();
+        assert!(
+            store
+                .publish_owner_heartbeat(
+                    &token,
+                    "fp",
+                    &later,
+                    &RuntimeOwnerEvidence {
+                        boottime_ns: 2,
+                        ..evidence
+                    }
+                )
+                .await
+                .unwrap()
+        );
+        sqlx::query("UPDATE runtime_owner_evidence SET barrier_state='closed_joined' WHERE instance_token=? AND is_current=1").bind(&token).execute(&pool).await.unwrap();
+        sqlx::query("UPDATE runtime_instances SET state='stopping' WHERE instance_token=?")
+            .bind(&token)
+            .execute(&pool)
+            .await
+            .unwrap();
+        assert!(
+            !store
+                .publish_runtime_reaped(
+                    &token,
+                    &later,
+                    0,
+                    "{\"outcome\":\"complete\",\"children\":[]}"
+                )
+                .await
+                .unwrap()
+        );
+        let state: String =
+            sqlx::query_scalar("SELECT state FROM runtime_instances WHERE instance_token=?")
+                .bind(&token)
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, "stopping");
+        pool.close().await;
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn owner_clock_rejects_missing_boot_or_monotonic_sample() {
+        let evidence = RuntimeOwnerEvidence {
+            pid: 1,
+            proc_starttime: 1,
+            boot_id: String::new(),
+            boottime_ns: 0,
+        };
+        assert!(!valid_owner_clock(&evidence, "2026-10-19T00:00:00Z"));
+    }
+
+    #[test]
+    fn owner_clock_rejects_malformed_timestamp() {
+        let evidence = RuntimeOwnerEvidence {
+            pid: 1,
+            proc_starttime: 1,
+            boot_id: "boot".into(),
+            boottime_ns: 1,
+        };
+        assert!(!valid_owner_clock(&evidence, "not-a-timestamp"));
+    }
+
+    #[test]
+    fn owner_clock_rejects_future_skew_and_boot_mismatch() {
+        let evidence = RuntimeOwnerEvidence {
+            pid: 1,
+            proc_starttime: 1,
+            boot_id: "boot".into(),
+            boottime_ns: 1,
+        };
+        assert!(!valid_owner_clock(
+            &evidence,
+            &(Utc::now() + chrono::Duration::seconds(30)).to_rfc3339()
+        ));
+        assert!(!boot_identity_matches("boot-a", "boot-b"));
+    }
+
+    #[test]
+    fn owner_clock_rejects_monotonic_rollback() {
+        assert!(!boottime_monotonic(20, 19));
+        assert!(boottime_monotonic(20, 20));
     }
 }

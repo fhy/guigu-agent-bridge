@@ -3,9 +3,10 @@
 use matrix_sdk::{
     Client, SessionTokens,
     authentication::matrix::MatrixSession,
-    config::SyncSettings,
+    config::{RequestConfig, SyncSettings},
     ruma::{
-        DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceId, OwnedUserId, api::client::keys::get_keys,
+        DeviceKeyAlgorithm, DeviceKeyId, OwnedDeviceId, OwnedUserId,
+        api::client::{keys::get_keys, sync::sync_events},
     },
 };
 use std::collections::BTreeMap;
@@ -14,6 +15,23 @@ use crate::config::MatrixTransportConfig;
 
 use super::MatrixError;
 use super::store_identity;
+
+#[cfg(test)]
+#[path = "baseline_tests.rs"]
+mod baseline_tests;
+
+// Explicit paired-copy tests replace only network transport. Identity binding and
+// SDK session/store restoration still use the unchanged configured identity.
+#[cfg(test)]
+pub(crate) static COPY_LOOPBACK: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+
+fn transport_origin(config: &MatrixTransportConfig) -> &str {
+    #[cfg(test)]
+    if let Some(origin) = COPY_LOOPBACK.get() {
+        return origin;
+    }
+    &config.homeserver
+}
 
 /// Authenticated Matrix client. SDK types do not leave `src/matrix`.
 #[derive(Clone)]
@@ -30,6 +48,58 @@ impl std::fmt::Debug for MatrixClient {
 }
 
 impl MatrixClient {
+    #[cfg(test)]
+    pub(crate) async fn for_test() -> Self {
+        Self {
+            inner: Client::builder()
+                .homeserver_url("http://127.0.0.1:9")
+                .build()
+                .await
+                .expect("test client"),
+            user_id: "@bridge:example.test".into(),
+            device_id: "BRIDGE".into(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn for_test_session(origin: &str) -> Self {
+        let inner = Client::builder()
+            .homeserver_url(origin)
+            .build()
+            .await
+            .unwrap();
+        inner
+            .restore_session(MatrixSession {
+                meta: matrix_sdk::SessionMeta {
+                    user_id: "@bridge:example.test".parse().unwrap(),
+                    device_id: "SYNTHETIC".into(),
+                },
+                tokens: SessionTokens {
+                    access_token: "loopback-only".into(),
+                    refresh_token: None,
+                },
+            })
+            .await
+            .unwrap();
+        Self {
+            inner,
+            user_id: "@bridge:example.test".into(),
+            device_id: "SYNTHETIC".into(),
+        }
+    }
+
+    pub(crate) async fn isolated_active(&self) -> Result<Self, MatrixError> {
+        Ok(Self {
+            inner: self
+                .inner
+                .notification_client("bridge-r080-active".into())
+                .await
+                .map_err(|_| MatrixError::StoreCorrupt)?,
+            user_id: self.user_id.clone(),
+            device_id: self.device_id.clone(),
+        })
+    }
+
     pub fn device_id(&self) -> &str {
         &self.device_id
     }
@@ -51,7 +121,7 @@ impl MatrixClient {
             .map_err(|_| MatrixError::Configuration)?;
         let device_id: OwnedDeviceId = config.device_id.as_str().into();
         let transient = Client::builder()
-            .homeserver_url(&config.homeserver)
+            .homeserver_url(transport_origin(config))
             .build()
             .await
             .map_err(|_| MatrixError::Configuration)?;
@@ -95,7 +165,7 @@ impl MatrixClient {
         validate_store_databases(store)?;
         store_bound();
         let inner = Client::builder()
-            .homeserver_url(&config.homeserver)
+            .homeserver_url(transport_origin(config))
             .sqlite_store(store, None)
             .build()
             .await
@@ -174,11 +244,55 @@ impl MatrixClient {
     }
 
     pub(crate) async fn baseline_sync_token(&self) -> Result<String, MatrixError> {
-        self.inner
-            .sync_once(SyncSettings::new().timeout(std::time::Duration::from_secs(10)))
+        let started = std::time::Instant::now();
+        tracing::debug!(
+            stage = "initial-baseline",
+            checkpoint_present = false,
+            "requesting a historical cutover, not executing its timeline"
+        );
+        let mut request = sync_events::v3::Request::new();
+        request.timeout = Some(std::time::Duration::from_secs(10));
+        let response = self
+            .inner
+            .send(request)
+            .with_request_config(
+                RequestConfig::new()
+                    .retry_limit(0)
+                    .timeout(std::time::Duration::from_secs(60)),
+            )
             .await
-            .map(|response| response.next_batch)
-            .map_err(|_| MatrixError::Transport)
+            .map_err(|_| {
+                tracing::error!(
+                    stage = "initial-baseline",
+                    category = "transport",
+                    "baseline request failed before publication"
+                );
+                MatrixError::Transport
+            })?;
+        if response.next_batch.is_empty() {
+            tracing::error!(
+                stage = "initial-baseline",
+                category = "empty-token",
+                committed = false,
+                "baseline refused"
+            );
+            return Err(MatrixError::CutoverRefused);
+        }
+        let limited_rooms = response
+            .rooms
+            .join
+            .values()
+            .filter(|room| room.timeline.limited)
+            .count();
+        tracing::debug!(
+            stage = "initial-baseline",
+            limited_rooms,
+            elapsed_ms = started.elapsed().as_millis(),
+            historical_events_executed = 0,
+            committed = false,
+            "baseline response accepted; durable publication still required"
+        );
+        Ok(response.next_batch)
     }
 }
 

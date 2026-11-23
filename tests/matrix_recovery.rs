@@ -10,6 +10,200 @@ async fn database() -> SqlitePool {
 }
 
 #[tokio::test]
+async fn scoped_native_activation_and_checkpoint_keep_authority_and_audit_in_sync() {
+    use guigu_agent_bridge::storage::{
+        CompatibilityGate, MatrixCompatibilityStore,
+        recovery_eligibility::{EffectDomain, RecoveryScope, bootstrap_nonadmin},
+    };
+    use sha2::{Digest, Sha256};
+
+    let pool = database().await;
+    let CompatibilityGate::Native(operation) = MatrixCompatibilityStore::new(pool.clone())
+        .gate(true, None)
+        .await
+        .unwrap()
+    else {
+        panic!("native required")
+    };
+    let context = bootstrap_nonadmin(&pool, true).await.unwrap();
+    let scope = RecoveryScope::new(context, EffectDomain::Local, None);
+    assert!(matches!(
+        MatrixCompatibilityStore::new(pool.clone())
+            .gate_scoped(true, None, Some(&scope))
+            .await
+            .unwrap(),
+        CompatibilityGate::Native(_)
+    ));
+    let store = MatrixRecoveryStore::new_scoped(pool.clone(), Some(scope));
+    store.reconcile_restart().await.unwrap();
+    let before: String = sqlx::query_scalar("SELECT original_digest FROM offline_recovery_rows WHERE table_name='matrix_recovery_control'")
+        .fetch_one(&pool).await.unwrap();
+    store.activate_cutover(&operation, "B", "t1").await.unwrap();
+    store.reconcile_restart().await.unwrap();
+    let after: String = sqlx::query_scalar("SELECT original_digest FROM offline_recovery_rows WHERE table_name='matrix_recovery_control'")
+        .fetch_one(&pool).await.unwrap();
+    assert_ne!(before, after);
+    let now = chrono::Utc::now();
+    let timestamp = now.to_rfc3339();
+    let expiry = (now + chrono::Duration::minutes(1)).to_rfc3339();
+    let epoch = store
+        .acquire_component_lease("MatrixSync", "owner", &timestamp, &expiry)
+        .await
+        .unwrap();
+    store
+        .begin_batch(
+            "scoped-batch",
+            Some("B"),
+            "C",
+            "digest",
+            "B",
+            "owner",
+            epoch,
+            &[],
+            &timestamp,
+        )
+        .await
+        .unwrap();
+    store
+        .complete_batch("scoped-batch", "C", "owner", epoch, &timestamp)
+        .await
+        .unwrap();
+    store.reconcile_restart().await.unwrap();
+    let context: (String, String) =
+        sqlx::query_as("SELECT matrix_phase,expected_b_digest FROM runtime_eligibility_context")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        context,
+        ("active".into(), format!("{:x}", Sha256::digest(b"C")))
+    );
+    sqlx::query("UPDATE matrix_recovery_control SET watermark='tampered'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(
+        store
+            .begin_batch(
+                "tampered-batch",
+                Some("tampered"),
+                "C2",
+                "digest",
+                "tampered",
+                "owner",
+                epoch,
+                &[],
+                &timestamp,
+            )
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
+async fn scoped_native_activation_refuses_stale_revision_and_changed_control_snapshot() {
+    use guigu_agent_bridge::storage::{
+        CompatibilityGate, MatrixCompatibilityStore,
+        recovery_eligibility::{EffectDomain, RecoveryScope, bootstrap_nonadmin},
+    };
+
+    for stale_revision in [false, true] {
+        let pool = database().await;
+        let CompatibilityGate::Native(operation) = MatrixCompatibilityStore::new(pool.clone())
+            .gate(true, None)
+            .await
+            .unwrap()
+        else {
+            panic!("native required")
+        };
+        let context = bootstrap_nonadmin(&pool, true).await.unwrap();
+        let store = MatrixRecoveryStore::new_scoped(
+            pool.clone(),
+            Some(RecoveryScope::new(context, EffectDomain::Local, None)),
+        );
+        if stale_revision {
+            sqlx::query("UPDATE runtime_eligibility_context SET revision=revision+1")
+                .execute(&pool)
+                .await
+                .unwrap();
+        } else {
+            sqlx::query("UPDATE matrix_recovery_control SET updated_at='unclassified-change'")
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+        assert!(store.activate_cutover(&operation, "B", "t1").await.is_err());
+        let state: (String, Option<String>) =
+            sqlx::query_as("SELECT phase,watermark FROM matrix_recovery_control")
+                .fetch_one(&pool)
+                .await
+                .unwrap();
+        assert_eq!(state, ("baseline".into(), None));
+    }
+}
+
+#[tokio::test]
+async fn scoped_native_revision_publishes_to_clones_only_after_commit() {
+    use guigu_agent_bridge::storage::{
+        CompatibilityGate, MatrixCompatibilityStore,
+        recovery_eligibility::{EffectDomain, RecoveryScope, bootstrap_nonadmin},
+    };
+
+    let pool = database().await;
+    let CompatibilityGate::Native(operation) = MatrixCompatibilityStore::new(pool.clone())
+        .gate(true, None)
+        .await
+        .unwrap()
+    else {
+        panic!("native required")
+    };
+    let context = bootstrap_nonadmin(&pool, true).await.unwrap();
+    let detached = MatrixRecoveryStore::new_scoped(
+        pool.clone(),
+        Some(RecoveryScope::new(
+            context.clone(),
+            EffectDomain::Local,
+            None,
+        )),
+    );
+    let store = MatrixRecoveryStore::new_scoped(
+        pool.clone(),
+        Some(RecoveryScope::new(context, EffectDomain::Local, None)),
+    );
+    let shared = store.clone();
+    sqlx::query("CREATE TRIGGER fail_control_audit BEFORE UPDATE ON offline_recovery_rows BEGIN SELECT RAISE(ABORT,'synthetic-control-audit-failure'); END")
+        .execute(&pool).await.unwrap();
+    let attempt = store.activate_cutover(&operation, "B", "t1").await;
+    sqlx::query("DROP TRIGGER fail_control_audit")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(attempt.is_err());
+    shared.reconcile_restart().await.unwrap();
+    let revision: i64 = sqlx::query_scalar("SELECT revision FROM runtime_eligibility_context")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(revision, 0);
+    let control = store.control().await.unwrap().unwrap();
+    assert_eq!(control.phase, "baseline");
+    assert_eq!(control.watermark, None);
+    let (activation, readback) = tokio::join!(
+        store.activate_cutover(&operation, "B", "t1"),
+        shared.reconcile_restart(),
+    );
+    activation.unwrap();
+    readback.unwrap();
+    shared.reconcile_restart().await.unwrap();
+    assert!(
+        detached
+            .acquire_component_lease("MatrixSync", "detached", "t2", "t3")
+            .await
+            .is_err()
+    );
+}
+
+#[tokio::test]
 async fn partial_batch_keeps_watermark_until_all_receipts_are_dispositioned() {
     let pool = database().await;
     let store = MatrixRecoveryStore::new(pool.clone());
@@ -335,4 +529,78 @@ async fn activation_requires_operation_provenance_and_reads_back_marker() {
     .await
     .unwrap();
     assert_eq!(marker, ("active".into(), "op-5".into(), "B".into()));
+}
+
+#[tokio::test]
+async fn administrative_activation_intent_prepared_recovery_and_stale_owner_refuse() {
+    use guigu_agent_bridge::storage::cutover_digest;
+    let pool = database().await;
+    let now = chrono::Utc::now();
+    let now_text = now.to_rfc3339();
+    sqlx::query("INSERT INTO offline_recovery_binding(singleton,protocol,db_generation,canonical_db_digest,root_digest,admin_operation_id,schema_intent_digest,schema_complete_digest,plan_digest,identity_digest,classification_digest,transition_intent_digest,transition_complete_digest,native_operation_id,phase,revision) VALUES(1,2,'generation','db','root','operation','schema','complete','plan','identity','class','intent','complete','native-op','baseline_ready',4)")
+        .execute(&pool).await.unwrap();
+    sqlx::query(
+        "UPDATE runtime_eligibility_bootstrap SET state='admin_reserved' WHERE singleton=1",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO matrix_recovery_control(control_id,cutover_operation_id,phase,watermark,updated_at) VALUES(1,'native-op','baseline',NULL,'t0')")
+        .execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO matrix_recovery_compatibility(singleton,decision,source_schema_version,source_state_digest,native_operation_id,reason_code,created_at) VALUES(1,'native',24,'fixture','native-op','administrative-transition','fixture')").execute(&pool).await.unwrap();
+    sqlx::query("INSERT INTO matrix_component_leases(component,owner_token,epoch,state,expires_at,updated_at) VALUES('MatrixSync','owner',1,'active',?,?)")
+        .bind((now+chrono::Duration::minutes(1)).to_rfc3339()).bind(&now_text).execute(&pool).await.unwrap();
+    let store = MatrixRecoveryStore::new(pool.clone());
+    assert!(
+        store
+            .begin_activation_intent(
+                "owner",
+                1,
+                "attempt",
+                &cutover_digest(b"request"),
+                &now_text
+            )
+            .await
+            .unwrap()
+    );
+    let state: String = sqlx::query_scalar(
+        "SELECT state FROM matrix_activation_intent WHERE native_operation_id='native-op'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(state, "inflight");
+    assert!(
+        store
+            .commit_activation_intent("native-op", "owner", 1, "B", &now_text)
+            .await
+            .is_err()
+    );
+    store
+        .prepare_activation_intent("owner", 1, "B", &cutover_digest(b"B"), &now_text)
+        .await
+        .unwrap();
+    let prepared: (String, String, String) = sqlx::query_as("SELECT control.phase,binding.phase,intent.state FROM matrix_recovery_control control JOIN offline_recovery_binding binding ON binding.singleton=1 JOIN matrix_activation_intent intent ON intent.native_operation_id=binding.native_operation_id")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(
+        prepared,
+        (
+            "baseline".into(),
+            "activation_prepared".into(),
+            "prepared".into()
+        )
+    );
+    assert!(
+        store
+            .prepare_activation_intent("stale", 1, "B", &cutover_digest(b"B"), &now_text)
+            .await
+            .is_err()
+    );
+    store
+        .commit_activation_intent("native-op", "owner", 1, "B", &now_text)
+        .await
+        .unwrap();
+    let rows: (String, String, String) = sqlx::query_as("SELECT control.phase,binding.phase,intent.state FROM matrix_recovery_control control JOIN offline_recovery_binding binding ON binding.singleton=1 JOIN matrix_activation_intent intent ON intent.native_operation_id=binding.native_operation_id")
+        .fetch_one(&pool).await.unwrap();
+    assert_eq!(rows, ("active".into(), "active".into(), "committed".into()));
 }

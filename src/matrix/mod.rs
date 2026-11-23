@@ -6,17 +6,31 @@
 mod admin;
 pub(crate) use admin::sealed;
 mod client;
+#[cfg(test)]
+pub(crate) use client::COPY_LOOPBACK;
 mod conversation;
+pub(crate) mod coverage;
 mod dedup;
 mod error;
 mod event;
 mod identity;
-mod outbound;
+pub(crate) mod ingress_decision;
+#[cfg(test)]
+mod ingress_decision_tests;
+pub(crate) mod intent_diagnostic;
+#[cfg(test)]
+mod intent_diagnostic_tests;
+pub(crate) mod outbound;
 mod permission;
+pub(crate) mod rebuild_gap;
 mod reply;
+pub(crate) mod response_identity;
 mod router;
 mod store_identity;
+pub(crate) mod succession_payload;
 mod sync;
+#[cfg(test)]
+mod target_classification_tests;
 
 pub use admin::{
     AdminHandler, AdminPermissionPolicy, AdminResult, CommandLedger, ReapAck, ReapControl,
@@ -28,6 +42,7 @@ pub use dedup::EventDedup;
 pub use error::MatrixError;
 pub use event::InboundMatrixEvent;
 pub use identity::{derive_matrix_user_id, with_matrix_participant};
+pub(crate) use outbound::{DurableMatrixSender, DurableSendError};
 pub use outbound::{MatrixOutboxSender, SdkMatrixSender};
 pub use permission::PermissionPolicy;
 pub use reply::{
@@ -38,6 +53,7 @@ pub use router::{
     DurableMatrixAdmission, MatrixAdmissionFuture, RouteError, RoutePolicy, route_event,
     route_event_durable, route_event_with_monitor, route_workflow,
 };
+pub(crate) use sync::FailureObserver;
 pub use sync::{
     MatrixSync, MatrixSyncHandle, MemorySyncTokenStore, MissingRoomKeyObserver,
     RawMatrixEventConsumer, SqliteSyncTokenStore, SyncTokenFuture, SyncTokenStore,

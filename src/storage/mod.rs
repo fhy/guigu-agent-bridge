@@ -141,22 +141,53 @@ pub(crate) mod codec;
 mod cycle;
 mod error;
 mod event_consumer;
+mod matrix_cutover;
+mod matrix_cutover_receipts;
+mod matrix_recovery_compatibility;
+pub(crate) mod matrix_recovery_snapshot;
+mod matrix_store_evidence;
+mod output_cleanup;
+mod output_delivery;
+mod output_producer;
+mod output_recovery;
+mod output_spool;
+pub(crate) mod owner_executable;
+pub(crate) mod owner_observation;
 mod pool;
 mod recovery;
 mod recovery_bridge;
+pub mod recovery_eligibility;
 mod reliability;
+pub(crate) use reliability::owner_restart;
 mod repository;
+pub use matrix_cutover::{CutoverState, CutoverStore, cutover_digest};
+pub use matrix_cutover_receipts::cutover_event_identity;
+pub(crate) mod session_owner_binding;
 
 pub use cycle::{CycleHit, CycleKind, CycleLimits, DEFAULT_MAX_SUBTASKS, detect};
 pub use error::StorageError;
 pub use event_consumer::RepositoryEventConsumer;
+#[cfg(test)]
+pub(crate) use output_spool::OutputSetInput;
+pub(crate) use output_spool::{
+    DeliveryPart, OutputSegment, OutputSpoolStore, OutputStoreError, PendingDelivery,
+};
+pub(crate) use pool::connect_for_runtime;
+pub(crate) use pool::migration_contract;
 pub use pool::{DEFAULT_BUSY_TIMEOUT, MAX_CONNECTIONS, connect, migrate};
-pub use recovery::{RecoveryPlan, plan_recovery, sync_agents};
+pub use recovery::{
+    RecoveryBlocker, RecoveryDiagnostic, RecoveryFixture, RecoveryPlan, RecoverySignals,
+    plan_recovery, sync_agents,
+};
+pub(crate) use reliability::OwnerHeartbeatOutcome;
+pub use reliability::{
+    AdmissionRecovery, PendingProjection, QueueReservation, ReceiptOutcome, ReliabilityError,
+    ReliabilityStore, RetryTaskInput, RuntimeOwnerEvidence, WorkflowAdmission,
+    WorkflowAuthorization,
+};
+pub use repository::{AckOutcome, Delivery, Repository, SqliteRepository, StorageFuture};
+
+pub use matrix_recovery_compatibility::{CompatibilityGate, MatrixCompatibilityStore};
 pub use recovery_bridge::{
     BatchAdmission, BatchState, MatrixRecoveryStore, RecoveryControl, event_set,
 };
-pub use reliability::{
-    AdmissionRecovery, PendingProjection, QueueReservation, ReceiptOutcome, ReliabilityError,
-    ReliabilityStore, RetryTaskInput, WorkflowAdmission, WorkflowAuthorization,
-};
-pub use repository::{AckOutcome, Delivery, Repository, SqliteRepository, StorageFuture};

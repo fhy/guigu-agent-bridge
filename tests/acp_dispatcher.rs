@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use chrono::{DateTime, Utc};
 use serde_json::json;
-use sqlx::SqlitePool;
+use sqlx::{Row, SqlitePool};
 use tokio::sync::mpsc;
 
 use guigu_agent_bridge::acp::{
@@ -26,8 +26,8 @@ use guigu_agent_bridge::acp::{
 use guigu_agent_bridge::app::AcpDispatcherRouter;
 use guigu_agent_bridge::bus::{
     Bus, BusFuture, Clock, ConsumerError, DispatcherRegistry, EndpointRegistry, EventBroadcaster,
-    EventConsumer, EventSink, MemoryBus, MpscEventSink, TaskDispatcher, Worker, WorkerConfig,
-    derive_endpoint_id,
+    EventConsumer, EventSink, MemoryBus, MpscEventSink, TaskDispatcher, Timer, Worker,
+    WorkerConfig, derive_endpoint_id,
 };
 use guigu_agent_bridge::config::{Config, load_from_str_with_env};
 use guigu_agent_bridge::matrix::{
@@ -137,6 +137,140 @@ async fn a_crashed_prompt_is_resumed_without_replaying_the_accepted_delivery() {
     let _ = std::fs::remove_file(marker);
 }
 
+#[tokio::test]
+async fn leased_worker_preserves_unknown_after_accepted_acp_crash() {
+    let marker =
+        std::env::temp_dir().join(format!("guigu-acp-unknown-{}.log", uuid::Uuid::now_v7()));
+    std::fs::write(&marker, "resume\n").expect("seed only the disposable mock marker");
+    let scenario = format!("crash-prompt-once:{}", marker.display());
+    let harness = Harness::new_reliable("unknown-worker", &scenario, default_limits(), true).await;
+    let task = harness.task("accepted crash remains unknown");
+    let (outcome, continuations, _) = harness
+        .run_leased(vec![task.clone()], default_policy(), Cp2Action::None)
+        .await;
+
+    let events = outcome.task_events(task.task_id);
+    let status_snapshot: Vec<_> = events.iter().map(|event| event.status).collect();
+    let failed_snapshot = status_snapshot.contains(&TaskStatus::Failed);
+    let continuation_state = continuations.first().map(|continuation| continuation.state);
+    let admission_state: String =
+        sqlx::query_scalar("SELECT state FROM task_admissions WHERE task_id=?")
+            .bind(task.task_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .expect("admission remains durable");
+    let delivery_id = dispatched_delivery(&events[1]);
+    let disposition: String =
+        sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=?")
+            .bind(delivery_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .expect("accepted delivery has a disposition");
+    let recovery_leases: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE state='recovery_needed'")
+            .fetch_one(&outcome.pool)
+            .await
+            .expect("recovery lease remains durable");
+    let plan = plan_recovery(outcome.repository.as_ref()).await.unwrap();
+    let summary_snapshot = (
+        status_snapshot.clone(),
+        admission_state.clone(),
+        disposition.clone(),
+        recovery_leases,
+        continuation_state,
+        plan.unfinished.contains(&task.task_id),
+    );
+    let row_snapshot_before = recovery_snapshot(&outcome.pool, task.task_id).await;
+    println!("candidate pre-start recovery snapshot: {row_snapshot_before:?}");
+    let config_path =
+        std::env::temp_dir().join(format!("guigu-t092-startup-{}.toml", uuid::Uuid::now_v7()));
+    let health_port = 19300 + (u16::from(uuid::Uuid::now_v7().as_bytes()[0]) % 100);
+    std::fs::write(
+        &config_path,
+        format!(
+            "[bridge]\ndatabase = {:?}\nsession_root = {:?}\nhealth_bind = \"127.0.0.1:{}\"\n\n[agents.worker]\ntransport = \"acp\"\ncommand = \"definitely-not-started\"\nworkspace = \"/tmp\"\nenabled = true\n",
+            outcome.path.to_string_lossy(),
+            std::env::temp_dir().to_string_lossy(),
+            health_port
+        ),
+    )
+    .expect("write disposable startup config");
+    assert!(matches!(
+        guigu_agent_bridge::app::AppRuntime::start(&config_path).await,
+        Err(guigu_agent_bridge::app::AppError::Runtime)
+    ));
+    assert!(
+        tokio::net::TcpListener::bind(format!("127.0.0.1:{health_port}"))
+            .await
+            .is_ok()
+    );
+    let post_start_admission: String =
+        sqlx::query_scalar("SELECT state FROM task_admissions WHERE task_id=?")
+            .bind(task.task_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .expect("admission remains after blocked startup");
+    let post_start_disposition: String =
+        sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=?")
+            .bind(delivery_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .expect("disposition remains after blocked startup");
+    let post_start_recovery_leases: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM execution_leases WHERE state='recovery_needed'")
+            .fetch_one(&outcome.pool)
+            .await
+            .expect("lease remains after blocked startup");
+    let post_start_continuation = SqliteRuntimeStore::new(outcome.pool.clone())
+        .continuation(task.task_id)
+        .await
+        .unwrap()
+        .map(|continuation| continuation.state);
+    let post_start_plan = plan_recovery(outcome.repository.as_ref()).await.unwrap();
+    let row_snapshot_after = recovery_snapshot(&outcome.pool, task.task_id).await;
+    println!("candidate post-start recovery snapshot: {row_snapshot_after:?}");
+    assert_eq!(
+        summary_snapshot,
+        (
+            vec![
+                TaskStatus::Queued,
+                TaskStatus::Dispatched,
+                TaskStatus::Running
+            ],
+            "running".to_owned(),
+            "outcome_unknown".to_owned(),
+            1,
+            Some(guigu_agent_bridge::runtime::ContinuationState::RecoveryNeeded),
+            true,
+        ),
+        "candidate snapshot: failed={failed_snapshot}, summary={summary_snapshot:?}, rows_before={row_snapshot_before:?}, rows_after={row_snapshot_after:?}"
+    );
+    assert_eq!(
+        (
+            post_start_admission,
+            post_start_disposition,
+            post_start_recovery_leases,
+            post_start_continuation,
+            post_start_plan.unfinished.contains(&task.task_id)
+        ),
+        (
+            "running".to_owned(),
+            "outcome_unknown".to_owned(),
+            1,
+            Some(guigu_agent_bridge::runtime::ContinuationState::RecoveryNeeded),
+            true
+        ),
+        "post-start snapshot changed durable uncertainty"
+    );
+    assert_eq!(
+        row_snapshot_after, row_snapshot_before,
+        "post-start row-level snapshot changed durable uncertainty"
+    );
+    let _ = std::fs::remove_file(config_path);
+    outcome.cleanup().await;
+    let _ = std::fs::remove_file(marker);
+}
+
 fn remove_db_files(path: &Path) {
     for suffix in ["", "-wal", "-shm"] {
         let mut candidate = path.as_os_str().to_owned();
@@ -160,6 +294,9 @@ impl RuntimeClock for FixedClock {
         ts()
     }
 }
+
+#[path = "support/r107_delivery_lease.rs"]
+mod r107_delivery_lease;
 fn default_policy() -> ContinuationPolicy {
     ContinuationPolicy {
         max_turns: 2,
@@ -230,6 +367,7 @@ async fn authenticated_pause_uses_real_router_and_marks_running_queue_paused() {
             target: &target,
             delivery_id: delivery_for_run,
             attempt: 1,
+            queue_lease: None,
         };
         let _ = leased_for_run.deliver(request.clone()).await;
         let _ = leased_for_run.execute_prepared(request).await;
@@ -794,6 +932,14 @@ impl Harness {
                 ts()
             }
         });
+        struct FixedDeadlineTimer;
+        impl Timer for FixedDeadlineTimer {
+            fn sleep_until(&self, deadline: DateTime<Utc>) -> BusFuture<'_, ()> {
+                Box::pin(async move {
+                    tokio::time::sleep((deadline - ts()).to_std().unwrap_or_default()).await;
+                })
+            }
+        }
         let worker = Worker::builder(
             Arc::clone(&registry),
             tasks_rx,
@@ -804,6 +950,10 @@ impl Harness {
         .lifecycle(Arc::new(SqliteTaskLifecycle::new(pool.clone())))
         .config(WorkerConfig {
             cancellation: Some(cancellation),
+            // Match production's bus-owned deferred deadline. Scripted CP2
+            // tests still advance the injected clock synchronously themselves.
+            timer: (cp2_action == Cp2Action::None)
+                .then(|| Arc::new(FixedDeadlineTimer) as Arc<dyn Timer>),
             ..WorkerConfig::default()
         })
         .build();
@@ -864,6 +1014,115 @@ fn failed_payload(event: &TaskEvent) -> String {
     match &event.payload {
         TaskEventPayload::Failed { error } => error.clone(),
         other => panic!("expected a Failed payload, got {other:?}"),
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RecoverySnapshot {
+    task_version: i64,
+    events: Vec<(String, i64, String)>,
+    admission: (String, i64),
+    delivery: (String, i64, bool),
+    disposition: (String, String, String, i64),
+    lease: (String, String, i64, String),
+    continuation: (String, String, i64, i64, String, String),
+    receipts: i64,
+    outbox: i64,
+}
+
+async fn recovery_snapshot(pool: &SqlitePool, task_id: TaskId) -> RecoverySnapshot {
+    let task_version: i64 = sqlx::query_scalar("SELECT version FROM tasks WHERE task_id=?")
+        .bind(task_id.to_string())
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let rows =
+        sqlx::query("SELECT event_id,seq,status FROM task_events WHERE task_id=? ORDER BY seq")
+            .bind(task_id.to_string())
+            .fetch_all(pool)
+            .await
+            .unwrap();
+    let events = rows
+        .into_iter()
+        .map(|row| (row.get(0), row.get(1), row.get(2)))
+        .collect();
+    let admission = sqlx::query("SELECT state,revision FROM task_admissions WHERE task_id=?")
+        .bind(task_id.to_string())
+        .fetch_one(pool)
+        .await
+        .map(|row| (row.get(0), row.get(1)))
+        .unwrap();
+    let delivery = sqlx::query(
+        "SELECT delivery_id,attempt,acknowledged_at IS NOT NULL FROM deliveries WHERE task_id=?",
+    )
+    .bind(task_id.to_string())
+    .fetch_one(pool)
+    .await
+    .map(|row| (row.get(0), row.get(1), row.get(2)))
+    .unwrap();
+    let disposition = sqlx::query(
+        "SELECT delivery_id,state,reason_code,attempt FROM delivery_dispositions WHERE task_id=?",
+    )
+    .bind(task_id.to_string())
+    .fetch_one(pool)
+    .await
+    .map(|row| {
+        (
+            row.get(0),
+            row.get(1),
+            row.get::<Option<String>, _>(2).unwrap_or_default(),
+            row.get(3),
+        )
+    })
+    .unwrap();
+    let lease = sqlx::query(
+        "SELECT resource_key,owner_token,fence,state FROM execution_leases WHERE task_id=?",
+    )
+    .bind(task_id.to_string())
+    .fetch_one(pool)
+    .await
+    .map(|row| (row.get(0), row.get(1), row.get(2), row.get(3)))
+    .unwrap();
+    let continuation = sqlx::query(
+        "SELECT resource_key,delivery_id,lease_fence,revision,state,runtime_generation FROM task_continuations WHERE task_id=?",
+    )
+    .bind(task_id.to_string())
+    .fetch_one(pool)
+    .await
+    .map(|row| {
+        (
+            row.get(0),
+            row.get(1),
+            row.get(2),
+            row.get(3),
+            row.get(4),
+            row.get(5),
+        )
+    })
+    .unwrap();
+    let receipts: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM continuation_response_receipts WHERE task_id=?")
+            .bind(task_id.to_string())
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    let outbox: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM projection_outbox WHERE source_kind='task_event' AND source_id IN (SELECT event_id FROM task_events WHERE task_id=?)",
+    )
+    .bind(task_id.to_string())
+    .fetch_one(pool)
+    .await
+    .unwrap();
+    RecoverySnapshot {
+        task_version,
+        events,
+        admission,
+        delivery,
+        disposition,
+        lease,
+        continuation,
+        receipts,
+        outbox,
     }
 }
 
@@ -1034,17 +1293,23 @@ async fn structured_continue_reuses_the_real_session_and_delivery_until_complete
     .fetch_all(&outcome.pool)
     .await
     .expect("terminal projection siblings");
-    assert_eq!(projections.len(), 2);
+    assert_eq!(projections.len(), 1);
     assert_eq!(projections[0].0, "observer");
     assert_eq!(projections[0].1, "!monitor:example");
     assert_eq!(projections[0].2, None);
     assert_eq!(projections[0].3, None);
     assert!(projections[0].4.contains("status=completed"));
-    assert_eq!(projections[1].0, "terminal_reply");
-    assert_eq!(projections[1].1, "!reply:example");
-    assert_eq!(projections[1].2.as_deref(), Some("$thread"));
-    assert_eq!(projections[1].3.as_deref(), Some("$event"));
-    assert_eq!(projections[1].4, "Hello, world");
+    let durable: (String, String, Option<String>, Option<String>) = sqlx::query_as(
+        "SELECT state,room_id,thread_root,reply_event_id FROM acp_output_sets WHERE task_id=?",
+    )
+    .bind(task.task_id.to_string())
+    .fetch_one(&outcome.pool)
+    .await
+    .expect("durable terminal output");
+    assert_eq!(durable.0, "assembling");
+    assert_eq!(durable.1, "!reply:example");
+    assert_eq!(durable.2.as_deref(), Some("$thread"));
+    assert_eq!(durable.3.as_deref(), Some("$event"));
     outcome.cleanup().await;
 }
 
@@ -1183,14 +1448,12 @@ async fn active_chunks_do_not_extend_the_hard_deadline_and_the_child_is_reaped()
         )
         .await;
     let events = outcome.task_events(task.task_id);
-    assert_eq!(events.last().unwrap().status, TaskStatus::Failed);
-    assert!(
-        failed_payload(events.last().unwrap()).contains("deadline"),
-        "the earlier task deadline, not inactivity, wall time, or the ACP deadline, must end the turn"
-    );
+    assert_eq!(events.last().unwrap().status, TaskStatus::TimedOut);
+    assert!(matches!(&events.last().unwrap().payload,
+        TaskEventPayload::TimedOut { deadline } if Some(*deadline) == task.deadline));
     assert_eq!(
         continuations[0].state,
-        guigu_agent_bridge::runtime::ContinuationState::RecoveryNeeded
+        guigu_agent_bridge::runtime::ContinuationState::Terminal
     );
     assert!(
         backend_reaped,
@@ -1202,7 +1465,7 @@ async fn active_chunks_do_not_extend_the_hard_deadline_and_the_child_is_reaped()
             .fetch_one(&outcome.pool)
             .await
             .expect("uncertain delivery disposition");
-    assert_eq!(disposition, "outcome_unknown");
+    assert_eq!(disposition, "terminal");
     outcome.cleanup().await;
 }
 
@@ -1265,11 +1528,54 @@ async fn lease_conflict_is_rejected_before_the_acp_process_starts() {
         target,
         delivery_id: DeliveryId::generate(),
         attempt: 1,
+        queue_lease: None,
     };
     assert!(matches!(
-        leased.deliver(request).await,
+        leased.deliver(request.clone()).await,
         Err(guigu_agent_bridge::bus::DispatchError::NotAccepted { .. })
     ));
+    let failed = TaskEvent {
+        id: EventId::generate(),
+        task_id: task.task_id,
+        seq: 3,
+        status: TaskStatus::Failed,
+        timestamp: ts(),
+        payload: TaskEventPayload::Failed {
+            error: "refused".into(),
+        },
+    };
+    assert!(matches!(
+        leased.finalize_delivery_failure(request, failed).await,
+        Err(guigu_agent_bridge::bus::DispatchError::RecoveryNeeded)
+    ));
+    let second = harness.task("also must not start");
+    let request = guigu_agent_bridge::bus::DispatchRequest {
+        task: &second,
+        target,
+        delivery_id: DeliveryId::generate(),
+        attempt: 1,
+        queue_lease: None,
+    };
+    assert!(matches!(
+        leased.deliver(request.clone()).await,
+        Err(guigu_agent_bridge::bus::DispatchError::NotAccepted { .. })
+    ));
+    let refused = TaskEvent {
+        id: EventId::generate(),
+        task_id: second.task_id,
+        seq: 3,
+        status: TaskStatus::Failed,
+        timestamp: ts(),
+        payload: TaskEventPayload::Failed {
+            error: "not accepted".into(),
+        },
+    };
+    assert!(
+        leased
+            .finalize_delivery_failure(request, refused)
+            .await
+            .is_ok()
+    );
     assert_eq!(harness.dispatcher.backend_id(), None);
     harness.dispatcher.shutdown().await;
     harness.pool.close().await;
@@ -1346,6 +1652,92 @@ async fn a_bad_protocol_version_fails_before_the_task_runs() {
             .is_none()
     );
 
+    outcome.cleanup().await;
+}
+
+#[tokio::test]
+async fn reliable_pre_acceptance_without_a_client_closes_once() {
+    let harness = Harness::new_reliable(
+        "reliable-bad-version",
+        "bad-protocol-version",
+        default_limits(),
+        true,
+    )
+    .await;
+    let task = harness.task("fail before ACP acceptance");
+    let (outcome, continuations, backend_reaped) = harness
+        .run_leased(vec![task.clone()], default_policy(), Cp2Action::None)
+        .await;
+
+    let events = outcome.task_events(task.task_id);
+    assert_eq!(
+        statuses(&events),
+        [
+            TaskStatus::Queued,
+            TaskStatus::Dispatched,
+            TaskStatus::Failed
+        ]
+    );
+    assert!(failed_payload(&events[2]).contains("protocol version"));
+    assert!(backend_reaped, "failed initialization must leave no child");
+    assert_eq!(continuations.len(), 1);
+    assert_eq!(
+        continuations[0].state,
+        guigu_agent_bridge::runtime::ContinuationState::Terminal
+    );
+    let delivery_id = dispatched_delivery(&events[1]);
+    let acknowledged: Option<String> =
+        sqlx::query_scalar("SELECT acknowledged_at FROM deliveries WHERE delivery_id=?")
+            .bind(delivery_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .unwrap();
+    assert!(acknowledged.is_some());
+    let disposition: String =
+        sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=?")
+            .bind(delivery_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .unwrap();
+    assert_eq!(disposition, "terminal");
+    let plan = plan_recovery(outcome.repository.as_ref()).await.unwrap();
+    assert!(!plan.unfinished.contains(&task.task_id));
+    outcome.cleanup().await;
+}
+
+#[tokio::test]
+async fn reliable_pre_acceptance_after_child_exit_closes_once() {
+    let harness =
+        Harness::new_reliable("reliable-child-exit", "exit-early", default_limits(), true).await;
+    let task = harness.task("fail after the ACP child exits");
+    let (outcome, continuations, backend_reaped) = harness
+        .run_leased(vec![task.clone()], default_policy(), Cp2Action::None)
+        .await;
+
+    let events = outcome.task_events(task.task_id);
+    assert_eq!(
+        statuses(&events),
+        [
+            TaskStatus::Queued,
+            TaskStatus::Dispatched,
+            TaskStatus::Failed
+        ]
+    );
+    assert!(failed_payload(&events[2]).contains("delivery was not accepted"));
+    assert!(backend_reaped, "the exited child must be positively reaped");
+    assert_eq!(continuations.len(), 1);
+    assert_eq!(
+        continuations[0].state,
+        guigu_agent_bridge::runtime::ContinuationState::Terminal
+    );
+    let delivery_id = dispatched_delivery(&events[1]);
+    let disposition: String =
+        sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE delivery_id=?")
+            .bind(delivery_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .unwrap();
+    assert_eq!(disposition, "terminal");
     outcome.cleanup().await;
 }
 
@@ -1428,6 +1820,7 @@ async fn router_finalization_missing_endpoint_and_second_consumption_are_recover
         target,
         delivery_id: DeliveryId::generate(),
         attempt: 1,
+        queue_lease: None,
     };
     let empty = AcpDispatcherRouter::new(HashMap::new());
     assert!(matches!(
@@ -1515,6 +1908,7 @@ async fn router_finalization_missing_endpoint_and_second_consumption_are_recover
         target,
         delivery_id,
         attempt: 1,
+        queue_lease: None,
     };
     let delivery_error = leased2.deliver(request2.clone()).await;
     assert!(
@@ -1620,6 +2014,7 @@ async fn router_finalization_missing_endpoint_and_second_consumption_are_recover
         target,
         delivery_id: delivery3,
         attempt: 1,
+        queue_lease: None,
     };
     assert!(leased3.deliver(request3.clone()).await.is_err());
     sqlx::query("UPDATE execution_leases SET state='recovery_needed' WHERE task_id=?")
@@ -1717,6 +2112,45 @@ async fn end_turn_without_a_structured_result_is_not_completed() {
     assert_eq!(events.last().unwrap().status, TaskStatus::Failed);
     assert!(failed_payload(events.last().unwrap()).contains("execution failed after acceptance"));
     assert!(failed_payload(events.last().unwrap()).contains("missing taskResult"));
+    outcome.cleanup().await;
+}
+
+#[tokio::test]
+async fn leased_strict_completed_response_commits_failure_and_releases_ownership() {
+    let harness =
+        Harness::new_reliable("leased-strict", "legacy-end-turn", default_limits(), true).await;
+    let task = harness.task("strict terminal failure");
+    let (outcome, continuations, _) = harness
+        .run_leased(vec![task.clone()], default_policy(), Cp2Action::None)
+        .await;
+    let events = outcome.task_events(task.task_id);
+    assert_eq!(
+        statuses(&events),
+        [
+            TaskStatus::Queued,
+            TaskStatus::Dispatched,
+            TaskStatus::Running,
+            TaskStatus::Failed
+        ]
+    );
+    assert!(failed_payload(events.last().unwrap()).contains("missing taskResult"));
+    assert_eq!(
+        continuations[0].state,
+        guigu_agent_bridge::runtime::ContinuationState::Terminal
+    );
+    let lease: String = sqlx::query_scalar("SELECT state FROM execution_leases WHERE task_id=?")
+        .bind(task.task_id.to_string())
+        .fetch_one(&outcome.pool)
+        .await
+        .unwrap();
+    assert_eq!(lease, "released");
+    let disposition: String =
+        sqlx::query_scalar("SELECT state FROM delivery_dispositions WHERE task_id=?")
+            .bind(task.task_id.to_string())
+            .fetch_one(&outcome.pool)
+            .await
+            .unwrap();
+    assert_eq!(disposition, "terminal");
     outcome.cleanup().await;
 }
 

@@ -155,12 +155,7 @@ impl AdminHandler {
     }
 
     pub async fn handle(&self, event: &InboundMatrixEvent) -> Result<AdminResult, ReplyError> {
-        if !event
-            .body
-            .split_ascii_whitespace()
-            .next()
-            .is_some_and(|token| token.starts_with('/'))
-        {
+        if !super::ingress_decision::is_admin(event) {
             return Ok(AdminResult::Ordinary);
         }
         let context = ReplyContext {

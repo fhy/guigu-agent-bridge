@@ -58,6 +58,7 @@ pub struct BridgeConfig {
     pub event_capacity: usize,
     /// Graceful shutdown deadline.
     pub shutdown_timeout_seconds: u64,
+    pub owner_evidence_max_age_seconds: u64,
     /// Optional loopback-only health listener.
     pub health_bind: Option<SocketAddr>,
 }
@@ -65,6 +66,8 @@ pub struct BridgeConfig {
 /// Bounded continuation and execution-lease policy.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RuntimeConfig {
+    /// Explicit standard ACP single-turn completion; strict taskResult is default.
+    pub legacy_acp_results: bool,
     pub allow_nonterminal_end_turn: bool,
     pub max_turns: u32,
     pub max_wall_seconds: u64,
@@ -331,6 +334,8 @@ struct RawBridge {
     event_capacity: usize,
     #[serde(default = "default_shutdown_timeout")]
     shutdown_timeout_seconds: u64,
+    #[serde(default = "default_shutdown_timeout")]
+    owner_evidence_max_age_seconds: u64,
     #[serde(default)]
     health_bind: String,
 }
@@ -338,6 +343,8 @@ struct RawBridge {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct RawRuntime {
+    #[serde(default)]
+    legacy_acp_results: bool,
     #[serde(default)]
     allow_nonterminal_end_turn: bool,
     #[serde(default = "default_max_turns")]
@@ -574,6 +581,7 @@ impl Default for RawBridge {
             queue_capacity: default_queue_capacity(),
             event_capacity: default_event_capacity(),
             shutdown_timeout_seconds: default_shutdown_timeout(),
+            owner_evidence_max_age_seconds: default_shutdown_timeout(),
             health_bind: String::new(),
         }
     }
@@ -582,6 +590,7 @@ impl Default for RawBridge {
 impl Default for RawRuntime {
     fn default() -> Self {
         Self {
+            legacy_acp_results: false,
             allow_nonterminal_end_turn: false,
             max_turns: default_max_turns(),
             max_wall_seconds: default_max_wall(),
@@ -956,6 +965,12 @@ fn build_config(raw: RawConfig, env: &BTreeMap<String, String>) -> Result<Config
     }
 
     validate_capacity("bridge.queue_capacity", raw.bridge.queue_capacity)?;
+    if !(1..=300).contains(&raw.bridge.owner_evidence_max_age_seconds) {
+        return Err(validation(
+            "bridge.owner_evidence_max_age_seconds",
+            "must be in range 1..=300",
+        ));
+    }
     validate_capacity("bridge.event_capacity", raw.bridge.event_capacity)?;
     if !(1..=300).contains(&raw.bridge.shutdown_timeout_seconds) {
         return Err(validation(
@@ -1007,6 +1022,7 @@ fn build_config(raw: RawConfig, env: &BTreeMap<String, String>) -> Result<Config
             queue_capacity: raw.bridge.queue_capacity,
             event_capacity: raw.bridge.event_capacity,
             shutdown_timeout_seconds: raw.bridge.shutdown_timeout_seconds,
+            owner_evidence_max_age_seconds: raw.bridge.owner_evidence_max_age_seconds,
             health_bind,
         },
         transports: TransportsConfig {
@@ -1126,6 +1142,12 @@ fn validate_capacity(field: &str, value: usize) -> Result<(), ConfigError> {
 }
 
 fn build_runtime(raw: RawRuntime) -> Result<RuntimeConfig, ConfigError> {
+    if raw.legacy_acp_results && raw.allow_nonterminal_end_turn {
+        return Err(validation(
+            "runtime.legacy_acp_results",
+            "conflicts with nonterminal end_turn",
+        ));
+    }
     if !(1..=64).contains(&raw.max_turns) {
         return Err(validation("runtime.max_turns", "must be in range 1..=64"));
     }
@@ -1164,6 +1186,7 @@ fn build_runtime(raw: RawRuntime) -> Result<RuntimeConfig, ConfigError> {
         ));
     }
     Ok(RuntimeConfig {
+        legacy_acp_results: raw.legacy_acp_results,
         allow_nonterminal_end_turn: raw.allow_nonterminal_end_turn,
         max_turns: raw.max_turns,
         max_wall_seconds: raw.max_wall_seconds,
