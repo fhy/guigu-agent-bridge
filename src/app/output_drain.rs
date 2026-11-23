@@ -188,7 +188,10 @@ mod tests {
         matrix::{DurableSendError, outbound::DurableSendFuture},
         storage::OutputSetInput,
     };
-    use sqlx::SqlitePool;
+    use sqlx::{
+        Connection, SqlitePool,
+        sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePoolOptions},
+    };
     use std::{collections::VecDeque, future::pending, sync::Mutex};
     use tokio::sync::Notify;
     use tracing::instrument::WithSubscriber;
@@ -586,59 +589,216 @@ mod tests {
 
     #[tokio::test]
     async fn cleanup_fatal_paths_do_not_become_deferred() {
-        let (_t, drain, _sender, pool) = fixture(vec![]).await;
-
-        assert_eq!(drain.drain_once().await, Ok(1));
-
-        let state: String =
-            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
-                .fetch_one(&pool)
+        // Part 1: fence drift — set is no longer in 'cleaning', so the final
+        // UPDATE matches 0 rows and returns Conflict (not CleanupDeferred).
+        {
+            let (_t, drain, _sender, pool) = fixture(vec![]).await;
+            assert_eq!(drain.drain_once().await, Ok(1));
+            sqlx::query("UPDATE acp_output_sets SET state='delivered' WHERE set_id='set'")
+                .execute(&pool)
                 .await
                 .unwrap();
-        assert_eq!(state, "cleaned");
+            let now = Utc::now().to_rfc3339();
+            let result = drain.store.finish_cleanup("set", &now).await;
+            assert!(
+                matches!(result, Err(OutputStoreError::Conflict)),
+                "expected Conflict for fence drift, got {result:?}"
+            );
+            let state: String =
+                sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(state, "delivered");
+        }
 
-        let (_t2, drain2, _sender2, pool2) = fixture(vec![]).await;
-
-        sqlx::query(
-            "CREATE TRIGGER fail_final_cleanup BEFORE UPDATE ON acp_output_sets \
-             WHEN NEW.state='cleaned' AND OLD.state='cleaning' AND OLD.set_id='set' \
-             BEGIN SELECT RAISE(ABORT,'injected cleanup failure'); END",
-        )
-        .execute(&pool2)
-        .await
-        .unwrap();
-
-        assert_eq!(drain2.drain_once().await, Ok(1));
-
-        let state2: String =
-            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
-                .fetch_one(&pool2)
+        // Part 2: commit failure — a separate connection holds a SHARED lock so
+        // BEGIN IMMEDIATE (RESERVED) succeeds but COMMIT (EXCLUSIVE) fails with
+        // SQLITE_BUSY, returning Sql (not CleanupDeferred).
+        {
+            let root =
+                std::env::temp_dir().join(format!("t051-fatal-commit-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir(&root).unwrap();
+            let _temp = Temp(root.clone());
+            let db_path = root.join("state.db");
+            let pool = SqlitePoolOptions::new()
+                .connect_with(
+                    SqliteConnectOptions::new()
+                        .filename(&db_path)
+                        .create_if_missing(true)
+                        .journal_mode(SqliteJournalMode::Delete)
+                        .foreign_keys(true),
+                )
                 .await
                 .unwrap();
-        assert_eq!(state2, "cleaning");
-
-        sqlx::query("DROP TRIGGER fail_final_cleanup")
-            .execute(&pool2)
+            crate::storage::migrate(&pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO conversations(conversation_id,participants_json) \
+                 VALUES('conversation','[]')",
+            )
+            .execute(&pool)
             .await
             .unwrap();
-
-        sqlx::query("UPDATE acp_output_quota SET landed_bytes=0 WHERE singleton=1")
-            .execute(&pool2)
+            sqlx::query(
+                "INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,\
+                 text,priority,depth,hops,version) \
+                 VALUES('task','task','from','to','conversation','text',1,0,0,0)",
+            )
+            .execute(&pool)
             .await
             .unwrap();
-
-        let now = Utc::now().to_rfc3339();
-        let result = drain2.store.finish_cleanup("set", &now).await;
-        assert!(
-            matches!(result, Err(OutputStoreError::Conflict)),
-            "expected Conflict, got {result:?}"
-        );
-
-        let state3: String =
-            sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
-                .fetch_one(&pool2)
+            let policy = DurableOutputPolicy::derive(&db_path, 64).unwrap();
+            let store = OutputSpoolStore::new(pool.clone(), policy.process_quota_bytes).unwrap();
+            store
+                .create_set(&OutputSetInput {
+                    set_id: "set",
+                    task_id: "task",
+                    attempt: 1,
+                    turn: 1,
+                    runtime_fence: "f",
+                    room_id: "!r:x",
+                    thread_root: Some("$t"),
+                    reply_event_id: Some("$e"),
+                    now: "n",
+                })
                 .await
                 .unwrap();
-        assert_eq!(state3, "cleaning");
+            let spool = DurableOutputSpool::new(policy, store.clone());
+            spool.publish("set", "o", b"abcdefghij", "n").await.unwrap();
+            sqlx::query("UPDATE acp_output_sets SET state='cleaning' WHERE set_id='set'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let bytes: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(byte_length),0) FROM acp_output_segments \
+                 WHERE set_id='set' AND state='landed'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE acp_output_quota SET landed_bytes=? WHERE singleton=1")
+                .bind(bytes)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            let mut lock = sqlx::SqliteConnection::connect_with(
+                &SqliteConnectOptions::new().filename(&db_path),
+            )
+            .await
+            .unwrap();
+            sqlx::query("BEGIN").execute(&mut lock).await.unwrap();
+            sqlx::query("SELECT count(*) FROM acp_output_sets")
+                .execute(&mut lock)
+                .await
+                .unwrap();
+
+            let now = Utc::now().to_rfc3339();
+            let result = store.finish_cleanup("set", &now).await;
+            assert!(
+                matches!(result, Err(OutputStoreError::Sql(_))),
+                "expected Sql for commit failure, got {result:?}"
+            );
+            let state: String =
+                sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(state, "cleaning");
+        }
+
+        // Part 3: transaction-start failure — a separate connection holds a
+        // RESERVED lock (via BEGIN IMMEDIATE) so the pool's BEGIN IMMEDIATE
+        // fails with SQLITE_BUSY, returning Sql (not CleanupDeferred).
+        {
+            let root =
+                std::env::temp_dir().join(format!("t051-fatal-begin-{}", uuid::Uuid::now_v7()));
+            std::fs::create_dir(&root).unwrap();
+            let _temp = Temp(root.clone());
+            let db_path = root.join("state.db");
+            let pool = SqlitePoolOptions::new()
+                .connect_with(
+                    SqliteConnectOptions::new()
+                        .filename(&db_path)
+                        .create_if_missing(true)
+                        .journal_mode(SqliteJournalMode::Delete)
+                        .foreign_keys(true),
+                )
+                .await
+                .unwrap();
+            crate::storage::migrate(&pool).await.unwrap();
+            sqlx::query(
+                "INSERT INTO conversations(conversation_id,participants_json) \
+                 VALUES('conversation','[]')",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            sqlx::query(
+                "INSERT INTO tasks(task_id,root_task_id,from_agent,to_agent,conversation_id,\
+                 text,priority,depth,hops,version) \
+                 VALUES('task','task','from','to','conversation','text',1,0,0,0)",
+            )
+            .execute(&pool)
+            .await
+            .unwrap();
+            let policy = DurableOutputPolicy::derive(&db_path, 64).unwrap();
+            let store = OutputSpoolStore::new(pool.clone(), policy.process_quota_bytes).unwrap();
+            store
+                .create_set(&OutputSetInput {
+                    set_id: "set",
+                    task_id: "task",
+                    attempt: 1,
+                    turn: 1,
+                    runtime_fence: "f",
+                    room_id: "!r:x",
+                    thread_root: Some("$t"),
+                    reply_event_id: Some("$e"),
+                    now: "n",
+                })
+                .await
+                .unwrap();
+            let spool = DurableOutputSpool::new(policy, store.clone());
+            spool.publish("set", "o", b"abcdefghij", "n").await.unwrap();
+            sqlx::query("UPDATE acp_output_sets SET state='cleaning' WHERE set_id='set'")
+                .execute(&pool)
+                .await
+                .unwrap();
+            let bytes: i64 = sqlx::query_scalar(
+                "SELECT COALESCE(SUM(byte_length),0) FROM acp_output_segments \
+                 WHERE set_id='set' AND state='landed'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            sqlx::query("UPDATE acp_output_quota SET landed_bytes=? WHERE singleton=1")
+                .bind(bytes)
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            let mut lock = sqlx::SqliteConnection::connect_with(
+                &SqliteConnectOptions::new().filename(&db_path),
+            )
+            .await
+            .unwrap();
+            sqlx::query("BEGIN IMMEDIATE")
+                .execute(&mut lock)
+                .await
+                .unwrap();
+
+            let now = Utc::now().to_rfc3339();
+            let result = store.finish_cleanup("set", &now).await;
+            assert!(
+                matches!(result, Err(OutputStoreError::Sql(_))),
+                "expected Sql for begin failure, got {result:?}"
+            );
+            let state: String =
+                sqlx::query_scalar("SELECT state FROM acp_output_sets WHERE set_id='set'")
+                    .fetch_one(&pool)
+                    .await
+                    .unwrap();
+            assert_eq!(state, "cleaning");
+        }
     }
 }
